@@ -9,13 +9,15 @@
 
 ## 鉴权
 
-三种方式等价（源码 `server/auth.rs` 三通道）：
+三种方式等价（源码 `server/handlers/mod.rs::authorized` 三通道）：
 
 | 方式 | 示例 |
 |---|---|
 | HTTP 头 | `Authorization: Bearer <token>` |
-| HTTP 头 | `X-Api-Key: <token>`（如已实现） |
+| HTTP 头 | `X-Api-Key: <token>` |
 | 查询参数 | `?access_token=<token>` 或 `?token=<token>` |
+
+> 所有通道的 token 比对均为**常时比较**（constant-time，无提前返回，防时序侧信道；与 qqflow-server 同款）。
 
 ## 错误信封
 
