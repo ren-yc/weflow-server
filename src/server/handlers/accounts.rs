@@ -30,10 +30,6 @@ pub struct AccountBody {
     pub img_aes_key: Option<String>,
     pub img_xor_key: Option<String>,
     pub db_path: Option<String>,
-    // (persist option removed: keys stay in memory only and
-    //  must be re-supplied on restart)
-
-
 }
 
 pub async fn handler(

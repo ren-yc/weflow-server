@@ -8,7 +8,7 @@
 //!
 //! Reliability: watch backends can silently drop events, so a slow fallback
 //! poll (default 30 s) re-runs the sync — `poll_once` is cheap when nothing
-//! changed (metadata-only skip in the mirror). A dead watcher (directory
+//! changed (metadata-only skip when nothing changed). A dead watcher (directory
 //! recreated) is re-attached on each fallback tick.
 
 use std::ffi::OsStr;

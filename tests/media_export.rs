@@ -1,5 +1,5 @@
 //! Media export pipeline tests: synthetic attach tree + hardlink/media
-//! snapshot databases, exercising resolve→decode→export for all kinds.
+//! auxiliary databases, exercising resolve→decode→export for all kinds.
 
 mod common;
 
@@ -76,8 +76,8 @@ fn setup(dir: &Path) -> (ExportCtx, std::collections::HashMap<String, Connection
     std::fs::create_dir_all(&vdir).unwrap();
     std::fs::write(vdir.join(format!("{VID_MD5}.mp4")), &mp4).unwrap();
 
-    // --- snapshot dbs
-    let snap = dir.join("mirror").join(common::FAKE_WXID);
+// --- auxiliary dbs (hardlink + media)
+let snap = dir.join("aux").join(common::FAKE_WXID);
     let hl_dir = snap.join("hardlink");
     std::fs::create_dir_all(&hl_dir).unwrap();
     let hl = Connection::open(hl_dir.join("hardlink.db")).unwrap();

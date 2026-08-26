@@ -1,4 +1,4 @@
-//! In-memory index over the decrypted mirror (mirrors qqflow-server's store
+//! In-memory index over live read-only connections (mirrors qqflow-server's store
 //! skeleton, WeChat-ized). Everything the HTTP API and SSE push serve comes
 //! from this structure; queries never touch the encrypted databases.
 

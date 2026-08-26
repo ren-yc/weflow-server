@@ -3,7 +3,7 @@
 //! - GET /api/v1/sns/usernames
 //! - GET /api/v1/sns/stats
 //!
-//! Data source: the decrypted `sns.db:SnsTimeLine` snapshot (read-only).
+//! Data source: `sns.db:SnsTimeLine` read through the live-pool index (read-only).
 //! Moments media is referenced by CDN url (thumb/full) — WeChat 4.x does not
 //! cache moments media on disk by default, so no local export applies.
 

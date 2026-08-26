@@ -6,9 +6,9 @@ WCDB/SQLCipher-4 风格加密）。独立纯 Rust 实现，架构参考同目录
 
 ## 范围
 
-- ✅ 解密层：纯 Rust 实现微信 4.0 页密码（AES-256-CBC + HMAC-SHA512，reserve=80，
-  每库独立 enc_key + 16B salt）；整库解密到镜像目录 + 变更文件/WAL 帧增量重解密；
-  WAL 帧以 WAL 头 salt 校验（预分配 4MB，尺寸不变，只认 mtime）
+- ✅ 解密/读取层：纯 Rust 实现微信 4.0 页密码（AES-256-CBC + HMAC-SHA512，reserve=80，
+  每库独立 enc_key + 16B salt）；活库直读（qqflow 式只读长连接，无镜像、无明文落盘），
+  原始钥 PRAGMA key="x.." 跳过 KDF；页 1 HMAC 注册预校验；WAL 合并工具保留（探针/验证用）
 - ✅ 密钥：**仅 API 注册**（不读取微信进程）：`POST /api/v1/accounts` 传 64-hex 密钥
   （每库独立 key 或统一 key），页 1 HMAC 确定性校验；密钥仅内存
 - ✅ 数据读取：session.db（会话）/ message_*.db（`Msg_<md5>` 消息表 + Name2Id 反查）/ contact.db
@@ -16,10 +16,11 @@ WCDB/SQLCipher-4 风格加密）。独立纯 Rust 实现，架构参考同目录
 - ✅ 实时监控：notify（ReadDirectoryChangesW/inotify/FSEvents）监听 `db_storage`，防抖 350ms，
   慢速兜底轮询 30s；撤回检测（local_type 10000/10002 + 关键词 + XML msgid 回溯）
 - ✅ 服务封装：axum HTTP + SSE（WeFlow 契约：health/accounts/messages/sessions/contacts/
-  group-members/media/push），默认端口 **5033**（WeFlow 5031、qqflow-server 5032）
+  group-members/media/push/sync），另含 SNS 只读全套（timeline/usernames/stats/export/
+  export-stats/media-proxy），默认端口 **5033**（WeFlow 5031、qqflow-server 5032）
 - ✅ 测试：SQLCipher 互操作 roundtrip（bundled sqlcipher 造库 → 本实现解密）、假库夹具驱动
   索引/增量/撤回、HTTP 契约、文件事件 e2e；真库探针 `#[ignore]`（环境变量开启）
-- ❌ 不做：微信进程内存读取/注入、防撤回钩子、朋友圈 SNS、桌面通知（v1）
+- ❌ 不做：微信进程内存读取/注入、防撤回钩子、桌面通知
 
 ## 构建
 
@@ -37,6 +38,8 @@ MSVC 环境与 Perl/nasm（Windows 专属），透传全部 cargo 参数（`test
 ```powershell
 # 1. 准备密钥：用你信任的工具获得每库 32 字节(64 hex) 的 enc_key（微信 4.x 每库独立）；
 #    或使用 WeFlow/wechat-dump 系工具导出 keys 列表后手动填入
+#    密钥提取参考 repo（本地只读取证工具，不入库）：
+#     https://github.com/TANGandXUE/wcdb-key-tool
 # 2. 启动
 .\weflow-server.exe
 .\weflow-server.exe --port 5033 --host 127.0.0.1 --log info
@@ -44,9 +47,9 @@ MSVC 环境与 Perl/nasm（Windows 专属），透传全部 cargo 参数（`test
 
 命令行参数：`--port`（默认 5033）/ `--host`（默认 127.0.0.1）/ `--log`（默认 info）/
 `--watch-debounce-ms`（默认 350）/ `--watch-fallback-ms`（默认 30000，0 关闭）/
-`--base-url`。数据目录：Windows `%LOCALAPPDATA%\weflow-server`；token 自动生成于 `token.txt`
-（启动日志只打印路径）。**账号为客户端驱动**：启动后为空账号状态（`/health` 列出 `awaiting_key`），
-密钥由客户端注册（仅内存保存，不落盘）：
+`--media-export-dir`（默认 `<data-dir>/api-media`）/ `--base-url`。
+数据目录：Windows `%LOCALAPPDATA%\weflow-server`；token 自动生成于 `token.txt`（启动日志只打印路径）。
+**账号为客户端驱动**：启动后无账号，密钥由客户端注册（仅内存保存，不落盘）：
 
 ```bash
 curl -X POST http://127.0.0.1:5033/api/v1/accounts \
@@ -55,16 +58,17 @@ curl -X POST http://127.0.0.1:5033/api/v1/accounts \
 ```
 
 每库独立密钥时传 `keys` 映射（相对路径 → 64hex），至少 session.db 的 key 必须匹配
-（用于 page-1 HMAC 校验）。可选 `img_code` 用于图片 `.dat` V2 解密（xorKey=code&0xff，
-aesKey=MD5(code+wxid)[:16]）。密钥错误时账号进入 `error` 状态，重新注册即可恢复。
+（用于 page-1 HMAC 校验）。可选 `img_code` 用于图片 `.dat` 解密（xorKey=code&0xff，
+aesKey=MD5(code+wxid)[:16]），或直接指定 `img_aes_key`/`img_xor_key`（推荐）。
+密钥错误时账号进入 `error` 状态，重新注册即可恢复。
 
-SSE 推送（token 三通道之一：Header / `?access_token=` / POST body）：
+SSE 推送（token 任一通道：`Authorization: Bearer` / `X-Api-Key` / 查询或 POST body 参数 `access_token`/`token`，比对为常时比较）：
 
 ```bash
 curl -N "http://127.0.0.1:5033/api/v1/push/messages?access_token=<token>"
 ```
 
-完整接口文档见 [docs/api.md](docs/api.md)（与 WeFlow `docs/HTTP-API.md` 对齐）。
+完整接口文档见 [docs/weflow-server-api.md](docs/weflow-server-api.md)（与 WeFlow `docs/HTTP-API.md` 契约对齐）。
 
 ## 测试
 

@@ -1,4 +1,4 @@
-//! Build the in-memory index from the decrypted mirror, and incremental reads.
+//! Build the in-memory index over live read-only connections, and incremental reads.
 //!
 //! Every schema assumption is probed at runtime (`PRAGMA table_info`) against
 //! candidate column aliases (the same aliases WeFlow consumes), and any

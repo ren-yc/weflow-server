@@ -253,7 +253,7 @@ pub fn parse_time_bound(s: &str) -> Option<i64> {
 /// Register an account and schedule its async build/watcher.
 ///
 /// Shared by the HTTP handler.
-/// the spec is written to `<data_dir>/accounts/` (startup restore skips it).
+/// Keys are held in memory only; nothing is persisted to disk.
 pub async fn start_account(
     state: Arc<AppState>,
     body: crate::server::handlers::accounts::AccountBody,
