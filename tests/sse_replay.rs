@@ -34,7 +34,6 @@ async fn start(dir: &std::path::Path) -> TestServer {
     let sync = Arc::new(Mutex::new(AccountSync::new(
         common::FAKE_WXID,
         &storage,
-        &dir.join("mirror"),
         keystore::KeyMap::from(key),
         store.clone(),
     )));
@@ -64,7 +63,6 @@ async fn start(dir: &std::path::Path) -> TestServer {
         log: "info".into(),
         watch_debounce_ms: 10,
         watch_fallback_ms: 0,
-        mirror_dir: dir.join("mirror"),
         media_export_dir: dir.join("api-media"),
         base_url: None,
         data_dir: dir.join("data"),

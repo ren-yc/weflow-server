@@ -44,7 +44,6 @@ MSVC 环境与 Perl/nasm（Windows 专属），透传全部 cargo 参数（`test
 
 命令行参数：`--port`（默认 5033）/ `--host`（默认 127.0.0.1）/ `--log`（默认 info）/
 `--watch-debounce-ms`（默认 350）/ `--watch-fallback-ms`（默认 30000，0 关闭）/
-`--mirror-dir`（默认 `<data-dir>/mirror`）/ `--media-export-dir`（默认 `<data-dir>/api-media`）/
 `--base-url`。数据目录：Windows `%LOCALAPPDATA%\weflow-server`；token 自动生成于 `token.txt`
 （启动日志只打印路径）。**账号为客户端驱动**：启动后为空账号状态（`/health` 列出 `awaiting_key`），
 密钥由客户端注册（仅内存保存，不落盘）：
@@ -87,8 +86,8 @@ src/
 ├─ db/
 │  ├─ scan.rs                  # xwechat_files 账号发现 + db_storage 库枚举
 │  ├─ wcdb.rs                  # 微信 4.0 页密码（加密/解密/HMAC 校验/WAL 帧）
-│  ├─ mirror.rs                # 解密镜像 + 清单驱动增量重解密
-│  └─ open.rs                  # rusqlite 打开快照 + 值驱动列探测
+│  ├─ live.rs                  # qqflow 式活库直读连接池（只读 SQLCipher，无镜像）
+│  └─ open.rs                  # rusqlite 打开/列探测辅助
 ├─ parser/                     # 消息内容解析（XML / zstd / 类型占位符 / 引用 / 撤回）
 ├─ store/                      # 内存索引（会话/联系人/消息/水位）+ 查询
 ├─ sync/                       # 实时同步引擎（poll + 事件）+ watch（notify 防抖/兜底）

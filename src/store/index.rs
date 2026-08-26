@@ -5,13 +5,14 @@
 //! missing table degrades to an empty section instead of failing the account.
 //! Tables named `Msg_<md5>` / `msg_<md5>` are picked up case-insensitively.
 
-use std::path::Path;
 
 use anyhow::Result;
 use rusqlite::{Connection, Row};
 
 use super::{Contact, MessageRecord, Session, SessionKind, Store, Watermark};
+use crate::db::live::LivePool;
 use crate::db::open;
+use crate::keystore::KeyMap;
 use crate::db::scan::{DbFile, DbKind};
 use crate::parser;
 
@@ -80,7 +81,7 @@ fn get_opt_bytes(row: &Row, idx: usize) -> Option<Vec<u8>> {
 }
 
 /// Parse the `Session` table of `session.db` into the sessions map.
-fn load_sessions(conn: &Connection, store: &mut Store) -> Result<()> {
+pub fn load_sessions(conn: &Connection, store: &mut Store) -> Result<()> {
     let table = if open::table_columns(conn, "SessionTable").is_empty() {
         let candidates = open::table_names(conn, 50);
         match candidates
@@ -169,7 +170,7 @@ fn load_sessions_from(conn: &Connection, table: &str, store: &mut Store) -> Resu
 }
 
 /// Parse the `contact` table of `contact.db`.
-fn load_contacts(conn: &Connection, store: &mut Store) -> Result<()> {
+pub fn load_contacts(conn: &Connection, store: &mut Store) -> Result<()> {
     let cols = open::table_columns(conn, "contact");
     let c_username = pick(&cols, CONTACT_COLUMNS[0]);
     let c_remark = pick(&cols, CONTACT_COLUMNS[1]);
@@ -524,38 +525,68 @@ fn max_watermark(a: Watermark, b: Watermark) -> Watermark {
     }
 }
 
-/// Build the full index for one account from its decrypted mirror.
-pub fn build_all(mirror_root: &Path, my_wxid: &str, db_files: &[DbFile]) -> Result<Store> {
+/// Build the full index for one account by reading its live databases
+/// directly through the pooled read-only connections.
+pub fn build_all_live(
+    pool: &mut LivePool,
+    keys: &KeyMap,
+    my_wxid: &str,
+    db_files: &[DbFile],
+) -> Result<Store> {
     let mut store = Store {
         my_wxid: my_wxid.to_string(),
         ..Default::default()
     };
 
     // 1) session.db
-    if let Some(f) = db_files.iter().find(|f| f.kind == DbKind::Session)
-        && let Ok(conn) = open::open_snapshot(&mirror_root.join(&f.rel))
-            .and_then(|c| open::quick_check(&c).map(|_| c))
-            && let Err(e) = load_sessions(&conn, &mut store) {
-                tracing::warn!("session table unreadable: {e}");
+    if let Some(f) = db_files.iter().find(|f| f.kind == DbKind::Session) {
+        let Some(key) = keys.key_for(&f.rel) else {
+            tracing::warn!("no key for session.db");
+            return Ok(store);
+        };
+        match pool.get_or_open(f, key) {
+            Ok(conn) => {
+                if let Err(e) = load_sessions(conn, &mut store) {
+                    tracing::warn!("session table unreadable: {e}");
+                }
             }
+            Err(e) => tracing::warn!("session.db live open failed: {e}"),
+        }
+    }
 
     // 2) contact.db
-    if let Some(f) = db_files.iter().find(|f| f.kind == DbKind::Contact)
-        && let Ok(conn) = open::open_snapshot(&mirror_root.join(&f.rel))
-            && let Err(e) = load_contacts(&conn, &mut store) {
-                tracing::warn!("contact table unreadable: {e}");
+    if let Some(f) = db_files.iter().find(|f| f.kind == DbKind::Contact) {
+        let Some(key) = keys.key_for(&f.rel) else {
+            tracing::warn!("no key for contact.db");
+            return Ok(store);
+        };
+        match pool.get_or_open(f, key) {
+            Ok(conn) => {
+                if let Err(e) = load_contacts(conn, &mut store) {
+                    tracing::warn!("contact table unreadable: {e}");
+                }
             }
+            Err(e) => tracing::warn!("contact.db live open failed: {e}"),
+        }
+    }
 
     // 3) message databases (contacts snapshot is immutable during build)
     let contacts = store.contacts.clone();
     for f in db_files.iter().filter(|f| f.kind == DbKind::Message) {
-        let snap = mirror_root.join(&f.rel);
-        let Ok(conn) = open::open_snapshot(&snap) else {
+        let Some(key) = keys.key_for(&f.rel) else {
+            tracing::warn!("no key for {}", f.rel);
             continue;
         };
-        let uid_map = load_uid_map(&conn, name2id_table(&conn).as_deref());
+        let conn = match pool.get_or_open(f, key) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("{} live open failed: {e}", f.rel);
+                continue;
+            }
+        };
+        let uid_map = load_uid_map(conn, name2id_table(conn).as_deref());
         for (table, md5_suffix) in message_tables(&conn) {
-            match load_message_table(&conn, &table, &uid_map, &contacts, my_wxid) {
+            match load_message_table(conn, &table, &uid_map, &contacts, my_wxid) {
                 Ok((records, watermark)) => {
                     let session = table_session(&md5_suffix, &store);
                     let conv = store.convs.entry(session).or_default();
@@ -576,11 +607,20 @@ pub fn build_all(mirror_root: &Path, my_wxid: &str, db_files: &[DbFile]) -> Resu
     }
 
     // 4) sns.db — moments timeline
-    if let Some(f) = db_files.iter().find(|f| f.kind == DbKind::Sns)
-        && let Ok(conn) = open::open_snapshot(&mirror_root.join(&f.rel))
-            && let Err(e) = load_sns(&conn, &mut store) {
-                tracing::warn!("sns timeline unreadable: {e}");
+    if let Some(f) = db_files.iter().find(|f| f.kind == DbKind::Sns) {
+        let Some(key) = keys.key_for(&f.rel) else {
+            tracing::warn!("no key for {}", f.rel);
+            return Ok(store);
+        };
+        match pool.get_or_open(f, key) {
+            Ok(conn) => {
+                if let Err(e) = load_sns(conn, &mut store) {
+                    tracing::warn!("sns timeline unreadable: {e}");
+                }
             }
+            Err(e) => tracing::warn!("{} live open failed: {e}", f.rel),
+        }
+    }
 
     // 5) fill session message counts from convs
     for (username, s) in store.sessions.iter_mut() {

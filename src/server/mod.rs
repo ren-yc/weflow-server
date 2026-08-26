@@ -19,7 +19,6 @@ use tokio::sync::broadcast;
 
 use crate::config::Config;
 use crate::db::scan::AccountInfo;
-use crate::keystore::DbKey;
 use crate::server::error::ApiError;
 use crate::store::Store;
 use crate::sync::{watch::WatchConfig, AccountSync, Event};
@@ -413,7 +412,6 @@ pub fn register_account(
     let sync = Arc::new(Mutex::new(AccountSync::with_channel(
         &info.wxid,
         &info.db_storage,
-        &state.cfg.mirror_dir,
         keys,
         store.clone(),
         events.clone(),

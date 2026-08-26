@@ -6,7 +6,7 @@ mod common;
 use std::path::Path;
 
 use rusqlite::Connection;
-use weflow_server::keystore::ImgCode;
+use weflow_server::keystore::ImageKeys;
 use weflow_server::media::export::{export_batch, ExportCtx};
 use weflow_server::media::{decrypt_dat, detect_format, DatFormat};
 
@@ -48,7 +48,7 @@ fn build_v1_dat(jpeg: &[u8]) -> Vec<u8> {
     data
 }
 
-fn setup(dir: &Path) -> ExportCtx {
+fn setup(dir: &Path) -> (ExportCtx, std::collections::HashMap<String, Connection>) {
     let account = dir.join("account");
     let session_md5 = format!("{:x}", {
         use md5::Digest;
@@ -104,19 +104,22 @@ fn setup(dir: &Path) -> ExportCtx {
     )
     .unwrap();
 
-    ExportCtx {
-        account_dir: account,
-        snapshot_root: snap,
+    let mut aux = std::collections::HashMap::new();
+    aux.insert("hardlink/hardlink.db".to_string(), hl);
+    aux.insert("message/media_0.db".to_string(), md);
+
+    let ctx = ExportCtx {
+        account_dir: account.clone(),
         export_dir: dir.join("api-media"),
         media_keys: Some(weflow_server::keystore::ImageKeys { aes: *weflow_server::media::V1_FIXED_AES_KEY, xor: 0 }),
-        wxid: common::FAKE_WXID.to_string(),
-    }
+    };
+    (ctx, aux)
 }
 
 #[test]
 fn exports_image_voice_video() {
     let dir = common::tmp_dir("mediaexport");
-    let ctx = setup(&dir);
+    let (ctx, aux) = setup(&dir);
 
     let jobs = vec![
         (
@@ -141,7 +144,7 @@ fn exports_image_voice_video() {
             TALKER.to_string(),
         ),
     ];
-    let out = export_batch(&ctx, &jobs, 10);
+    let out = weflow_server::media::export::export_batch(&ctx, &aux, &jobs, 10);
     assert_eq!(out.len(), 3, "all three kinds exported: {out:?}");
 
     let img = out.get(&1).unwrap();
@@ -160,14 +163,14 @@ fn exports_image_voice_video() {
     assert!(vid.local_path.is_file());
 
     // idempotent: re-running yields the same paths without error
-    let out2 = export_batch(&ctx, &jobs, 10);
+    let out2 = weflow_server::media::export::export_batch(&ctx, &aux, &jobs, 10);
     assert_eq!(out2.get(&1).unwrap().local_path, img.local_path);
 }
 
 #[test]
 fn image_missing_source_is_none_but_others_succeed() {
     let dir = common::tmp_dir("mediaexport-miss");
-    let ctx = setup(&dir);
+    let (ctx, aux) = setup(&dir);
     let jobs = vec![(
         9i64,
         weflow_server::parser::MediaKind::Image,
@@ -175,7 +178,7 @@ fn image_missing_source_is_none_but_others_succeed() {
         1i64,
         TALKER.to_string(),
     )];
-    let out = export_batch(&ctx, &jobs, 10);
+    let out = weflow_server::media::export::export_batch(&ctx, &aux, &jobs, 10);
     assert!(out.is_empty(), "unknown md5 must resolve to nothing");
 
     // decrypt sanity: the V1 sample really decodes through the public API too

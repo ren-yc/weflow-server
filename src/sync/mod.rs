@@ -1,13 +1,23 @@
 //! Real-time sync engine (+ event broadcasting) for one account.
 //!
-//! Modeled on qqflow-server's two-phase design, WeChat-flavored:
-//! - a watcher (notify, see `watch.rs`) or a slow fallback timer triggers
-//!   `poll_once()`
-//! - `poll_once` refreshes the mirror (only changed files re-decrypt), then
-//!   reads new rows past each table watermark, applies them to the shared
-//!   `Store` and broadcasts `message.new` / `message.revoke` events
-//! - read phase never touches the store; apply phase takes the write lock
-//!   once, so a failed read leaves the store untouched (no duplicates)
+//! qqflow-style **live acquisition**: long-lived read-only SQLCipher
+//! connections straight to WeChat's encrypted databases (no mirror, no
+//! plaintext on disk). A watcher (`watch.rs`) or a slow fallback timer
+//! triggers `poll_once()`:
+//!
+//! 1. re-enumerate source files; detect changed `(db, wal)` stamp pairs
+//! 2. for each changed database, read rows past its table watermarks
+//!    directly through the pooled live connection
+//! 3. apply to the shared `Store` under one write lock and broadcast
+//!    `message.new` / `message.revoke` events
+//!
+//! Read phase never touches the store; apply phase takes the write lock
+//! once, so a failed read leaves the store untouched (no duplicates).
+//!
+//! Concurrency contract with the live WeChat client: connections are
+//! READ_ONLY + `query_only`, WAL lets readers run while WeChat writes, and
+//! we never hold transactions across polls (so checkpoints are never blocked
+//! by us).
 
 pub mod watch;
 
@@ -18,10 +28,9 @@ use anyhow::Result;
 use parking_lot::RwLock;
 use tokio::sync::broadcast;
 
-use crate::db::mirror::Mirror;
-use crate::db::open;
+use crate::db::live::{AcquireError, LivePool};
 use crate::db::scan::{self, DbFile, DbKind};
-use crate::keystore::{DbKey, KeyMap};
+use crate::keystore::KeyMap;
 use crate::store::index::{self, read_new};
 use crate::store::{MessageRecord, Store, Watermark};
 
@@ -56,47 +65,79 @@ pub struct RevokeEvent {
     pub timestamp: i64,
 }
 
+/// Source fingerprint for one database: main file + wal sibling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SrcStamp {
+    mtime_ns: i128,
+    size: u64,
+}
+
+/// Paired source fingerprint: main db + optional wal sibling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct DbStamps {
+    main: Option<SrcStamp>,
+    wal: Option<SrcStamp>,
+}
+
+fn src_stamp(path: &Path) -> Option<SrcStamp> {
+    let md = std::fs::metadata(path).ok()?;
+    let mtime_ns = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i128)
+        .unwrap_or(0);
+    Some(SrcStamp { mtime_ns, size: md.len() })
+}
+
+enum Work {
+    Messages(DbFile),
+    Sessions(DbFile),
+    Sns(DbFile),
+    Contacts(DbFile),
+}
+
+impl Work {
+    fn file(&self) -> &DbFile {
+        match self {
+            Work::Messages(f) | Work::Sessions(f) | Work::Sns(f) | Work::Contacts(f) => f,
+        }
+    }
+}
+
 /// One account's sync engine.
 pub struct AccountSync {
     pub wxid: String,
     pub store: Arc<RwLock<Store>>,
     pub events: broadcast::Sender<Event>,
-    mirror: Mirror,
+    pool: LivePool,
     keys: KeyMap,
     /// Live source databases root (`<account>/db_storage`).
     pub storage: PathBuf,
     /// Live source files (re-scanned on each poll; cheap metadata only).
     last_files: Vec<DbFile>,
-    /// rel paths that are known to be unopenable (e.g. no key registered) —
-    /// reported once, then skipped by polling.
-    keyless: std::collections::HashSet<String>,
+    /// rel -> (main stamp, wal stamp) as of the last successful poll.
+    stamps: std::collections::HashMap<String, DbStamps>,
 }
 
 impl AccountSync {
-    pub fn new(
-        wxid: &str,
-        storage: &Path,
-        mirror_root: &Path,
-        keys: KeyMap,
-        store: Arc<RwLock<Store>>,
-    ) -> Self {
+    pub fn new(wxid: &str, storage: &Path, keys: KeyMap, store: Arc<RwLock<Store>>) -> Self {
         let (events, _) = broadcast::channel(1024);
         AccountSync {
             wxid: wxid.to_string(),
             store,
             events,
-            mirror: Mirror::new(mirror_root, wxid),
+            pool: LivePool::new(),
             keys,
             storage: storage.to_path_buf(),
             last_files: Vec::new(),
-            keyless: std::collections::HashSet::new(),
+            stamps: std::collections::HashMap::new(),
         }
     }
 
     pub fn with_channel(
         wxid: &str,
         storage: &Path,
-        mirror_root: &Path,
         keys: KeyMap,
         store: Arc<RwLock<Store>>,
         events: broadcast::Sender<Event>,
@@ -105,38 +146,35 @@ impl AccountSync {
             wxid: wxid.to_string(),
             store,
             events,
-            mirror: Mirror::new(mirror_root, wxid),
+            pool: LivePool::new(),
             keys,
             storage: storage.to_path_buf(),
             last_files: Vec::new(),
-            keyless: std::collections::HashSet::new(),
+            stamps: std::collections::HashMap::new(),
         }
     }
 
-    /// Decrypted snapshot root for this account (`<mirror>/<wxid>/`).
-    pub fn snapshot_root(&self) -> PathBuf {
-        self.mirror.root.clone()
-    }
-
-    /// Full build: refresh everything, rebuild the index from scratch.
-    /// Returns the number of (re)decrypted files.
+    /// Full build: read every database through the live pool and rebuild the
+    /// index from scratch. Returns the number of databases processed.
     pub fn full_sync(&mut self) -> Result<usize> {
         let files = self.rescan();
-        let (changed, errors) = self.mirror.refresh(&files, &self.keys);
-        for (rel, e) in &errors {
-            tracing::warn!("mirror error for {rel}: {e}");
-        }
-        if errors
-            .iter()
-            .any(|(rel, _)| rel.contains("session.db") || rel.starts_with("session/"))
-        {
-            tracing::warn!(
-                "session db failed to decrypt; check that the registered key matches this account"
+        let keys = self.keys.clone();
+        let store = index::build_all_live(&mut self.pool, &keys, &self.wxid, &files)?;
+        *self.store.write() = store;
+        // seed stamps so the next poll starts from a clean baseline
+        self.stamps.clear();
+        for f in &files {
+            let main = src_stamp(&f.abs);
+            let wal = f.wal.as_deref().and_then(src_stamp);
+            self.stamps.insert(
+                f.rel.clone(),
+                DbStamps {
+                    main: Some(main.unwrap_or(SrcStamp { mtime_ns: 0, size: 0 })),
+                    wal,
+                },
             );
         }
-        let store = index::build_all(&self.mirror.root, &self.wxid, &files)?;
-        *self.store.write() = store;
-        Ok(changed.len())
+        Ok(files.len())
     }
 
     /// Re-enumerate the live source databases.
@@ -150,95 +188,100 @@ impl AccountSync {
         &self.last_files
     }
 
-    /// Incremental poll: re-decrypt changed files, read new rows past the
-    /// watermarks, apply to the store, emit events. Returns the number of new
-    /// messages applied.
-    pub fn poll_once(&mut self) -> Result<(usize, usize)> {
-        let files = self
-            .rescan()
-            .into_iter()
-            .filter(|f| !self.keyless.contains(&f.rel))
-            .collect::<Vec<_>>();
-        // phase 1: mirror refresh (read-only wrt the store)
-        let (changed, errors) = self.mirror.refresh(&files, &self.keys);
-        for (rel, e) in &errors {
-            // report a per-file problem only once (e.g. keyless dbs), then
-            // stop hammering it on every poll
-            if self.keyless.insert(rel.clone()) {
-                tracing::warn!("mirror error for {rel}: {e}");
-            } else {
-                tracing::trace!("mirror error (repeated) for {rel}: {e}");
+    fn classify_changed(&mut self) -> Vec<Work> {
+        let files = self.rescan();
+        let mut work: Vec<Work> = Vec::new();
+        for f in &files {
+            let main = src_stamp(&f.abs);
+            let wal = f.wal.as_deref().and_then(src_stamp);
+            let cur = DbStamps {
+                main,
+                wal,
+            };
+            let unchanged = self
+                .stamps
+                .get(&f.rel)
+                .map(|prev| *prev == cur)
+                .unwrap_or(false);
+            if unchanged {
+                continue;
+            }
+            match f.kind {
+                DbKind::Message => work.push(Work::Messages(f.clone())),
+                DbKind::Session => work.push(Work::Sessions(f.clone())),
+                DbKind::Sns => work.push(Work::Sns(f.clone())),
+                DbKind::Contact => work.push(Work::Contacts(f.clone())),
+                _ => {}
             }
         }
-        if changed.is_empty() {
+        work
+    }
+
+    /// Incremental poll: for databases whose (db, wal) stamps changed, run
+    /// watermark-increment reads on their live connections, apply to the
+    /// store and broadcast events. Returns (new_messages, revokes).
+    pub fn poll_once(&mut self) -> Result<(usize, usize)> {
+        let work = self.classify_changed();
+        if work.is_empty() {
             return Ok((0, 0));
         }
 
-        // phase 1.5: moments timeline refresh when the sns snapshot changed
-        if let Some(f) = files
-            .iter()
-            .find(|f| f.kind == DbKind::Sns && changed.iter().any(|c| c == &f.rel))
-        {
-            let snap = self.mirror.snapshot_path(&f.rel);
-            if let Ok(conn) = open::open_snapshot(&snap) {
-                let mut store = self.store.write();
-                let _ = index::load_sns(&conn, &mut store);
-            }
-        }
-
-        // phase 2: incremental reads per changed message/session database
+        // phase 1: incremental reads (read-only wrt the store)
         let mut new_rows: Vec<(String, MessageRecord)> = Vec::new();
         let mut new_watermarks: Vec<(String, Watermark)> = Vec::new();
         let mut revoke_rows: Vec<(String, MessageRecord)> = Vec::new();
-        for f in files.iter().filter(|f| f.kind == DbKind::Message || f.kind == DbKind::Session) {
-            if !changed.iter().any(|c| c == &f.rel) {
-                continue;
-            }
-            let snap = self.mirror.snapshot_path(&f.rel);
-            let Ok(conn) = open::open_snapshot(&snap) else {
-                continue;
-            };
-            let name2id = index::name2id_table(&conn);
-            for (table, md5_suffix) in index::message_tables(&conn) {
-                let wm_key = format!("{}:{table}", f.rel);
-                let wm = {
-                    let guard = self.store.read();
-                    guard.watermarks.get(&wm_key).copied().unwrap_or_default()
-                };
-                let rows = read_new(&conn, &table, &wm, name2id.as_deref())?;
-                if rows.is_empty() {
-                    continue;
-                }
-                // find the session username for this table
-                let session_username = {
-                    let guard = self.store.read();
-                    index::resolve_table_session(&guard, &md5_suffix)
-                };
-                for row in rows {
-                    if matches!(row.local_type, 10000 | 10002)
-                        || row.parsed.revoke.is_some()
-                    {
-                        revoke_rows.push((session_username.clone(), row));
-                    } else {
-                        new_rows.push((session_username.clone(), row));
+
+        for w in &work {
+            match w {
+                Work::Sessions(_) | Work::Contacts(_) | Work::Sns(_) => {}
+                Work::Messages(f) => {
+                    let Some(key) = self.keys.key_for(&f.rel) else {
+                        continue;
+                    };
+                    let conn = match self.pool.get_or_open(f, key) {
+                        Ok(c) => c,
+                        Err(AcquireError::WrongKey) => {
+                            tracing::warn!("live open failed for {} (wrong key?)", f.rel);
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::debug!("live open deferred for {}: {e}", f.rel);
+                            continue;
+                        }
+                    };
+                    let name2id = index::name2id_table(conn);
+                    for (table, md5_suffix) in index::message_tables(conn) {
+                        let wm_key = format!("{}:{table}", f.rel);
+                        let wm = {
+                            let guard = self.store.read();
+                            guard.watermarks.get(&wm_key).copied().unwrap_or_default()
+                        };
+                        let rows = read_new(conn, &table, &wm, name2id.as_deref())?;
+                        for row in rows {
+                            let session_username = {
+                                let guard = self.store.read();
+                                index::resolve_table_session(&guard, &md5_suffix)
+                            };
+                            let wm = Watermark {
+                                create_time: row.create_time,
+                                sort_seq: row.sort_seq,
+                                local_id: row.local_id,
+                            };
+                            if matches!(row.local_type, 10000 | 10002)
+                                || row.parsed.revoke.is_some()
+                            {
+                                revoke_rows.push((session_username.clone(), row));
+                            } else {
+                                new_rows.push((session_username.clone(), row));
+                            }
+                            new_watermarks.push((wm_key.clone(), wm));
+                        }
                     }
                 }
-                let last = new_rows
-                    .iter()
-                    .chain(revoke_rows.iter())
-                    .filter(|(s, _)| *s == session_username)
-                    .map(|(_, r)| Watermark {
-                        create_time: r.create_time,
-                        sort_seq: r.sort_seq,
-                        local_id: r.local_id,
-                    })
-                    .max()
-                    .unwrap_or(wm);
-                new_watermarks.push((wm_key, last));
             }
         }
 
-        // phase 3: apply (single write lock)
+        // phase 2: apply (single write lock) and emit events
         let mut applied_new = 0usize;
         let mut applied_revoke = 0usize;
         {
@@ -249,7 +292,6 @@ impl AccountSync {
             }
             for (session, row) in new_rows {
                 let is_send = !row.sender_username.is_empty() && row.sender_username == my_wxid;
-                // resolve display name
                 let sender_name = guard
                     .contacts
                     .get(&row.sender_username)
@@ -262,7 +304,6 @@ impl AccountSync {
                     is_send,
                     ..row
                 });
-                // only push incoming messages
                 if !is_send {
                     applied_new += 1;
                     let ev = NewMessageEvent {
@@ -303,24 +344,14 @@ impl AccountSync {
                 }
             }
             for (session, row) in revoke_rows {
-                if row.parsed.revoke.is_none() {
-                    // still a system message; skip push
+                if row.parsed.revoke.is_none() || row.create_time == 0 {
                     continue;
                 }
-                if row.create_time == 0 {
-                    continue;
-                }
-                // find the withdrawn original
                 let original = find_original(&guard, &session, &row);
                 let rawid = original
                     .as_ref()
                     .map(|o| o.server_id.to_string())
-                    .or_else(|| {
-                        row.parsed
-                            .revoke
-                            .as_ref()
-                            .and_then(|r| r.msg_id.clone())
-                    })
+                    .or_else(|| row.parsed.revoke.as_ref().and_then(|r| r.msg_id.clone()))
                     .unwrap_or_default();
                 let original_content = original
                     .as_ref()
@@ -333,9 +364,7 @@ impl AccountSync {
                         .and_then(|r| r.replace_msg.clone())
                         .unwrap_or_else(|| "对方撤回了一条消息".to_string())
                 } else {
-                    format!(
-                        "对方撤回了一条消息（rawid：{rawid}） 内容为\"{original_content}\""
-                    )
+                    format!("对方撤回了一条消息（rawid：{rawid}） 内容为\"{original_content}\"")
                 };
                 applied_revoke += 1;
                 let ev = RevokeEvent {
@@ -360,18 +389,86 @@ impl AccountSync {
                 let _ = self.events.send(Event::Revoke(ev));
             }
         }
+
+        // phase 3: dependent section reloads over warm live connections
+        let keys = self.keys.clone();
+        for w in &work {
+            match w {
+                Work::Sessions(f) => {
+                        let Some(k) = keys.key_for(&f.rel) else { continue };
+                     if let Ok(conn) = self.pool.get_or_open(f, k) {
+                        let mut store = self.store.write();
+                        if let Err(e) = index::load_sessions(conn, &mut store) {
+                            tracing::warn!("sessions reload failed: {e}");
+                        }
+                    }
+                }
+                Work::Contacts(f) => {
+                        let Some(k) = keys.key_for(&f.rel) else { continue };
+                     if let Ok(conn) = self.pool.get_or_open(f, k) {
+                        let mut store = self.store.write();
+                        if let Err(e) = index::load_contacts(conn, &mut store) {
+                            tracing::warn!("contacts reload failed: {e}");
+                        }
+                    }
+                }
+                Work::Sns(f) => {
+                        let Some(k) = keys.key_for(&f.rel) else { continue };
+                     if let Ok(conn) = self.pool.get_or_open(f, k) {
+                        let mut store = self.store.write();
+                        if let Err(e) = index::load_sns(conn, &mut store) {
+                            tracing::warn!("sns reload failed: {e}");
+                        }
+                    }
+                }
+                Work::Messages(_) => {}
+            }
+        }
+
+        // phase 4: remember stamps for everything we processed
+        for w in &work {
+            let f = w.file();
+            let main = src_stamp(&f.abs);
+            let wal = f.wal.as_deref().and_then(src_stamp);
+            self.stamps.insert(
+                f.rel.clone(),
+                DbStamps { main, wal },
+            );
+        }
+
         Ok((applied_new, applied_revoke))
+    }
+
+    /// Run the media export batch against this account.
+    ///
+    /// Auxiliary databases (`hardlink`, `media_*`, `emoticon`) are opened
+    /// fresh read-only per batch via the raw-key path — cheap (no KDF), and
+    /// it keeps the long-lived warm pool exclusively for index/poll traffic.
+    pub fn export_media_batch(
+        &mut self,
+        account_dir: &Path,
+        media_keys: Option<crate::keystore::ImageKeys>,
+        export_dir: &Path,
+        jobs: &[(i64, crate::parser::MediaKind, Option<String>, i64, String)],
+        max_items: usize,
+    ) -> std::collections::HashMap<i64, crate::media::export::ExportedMedia> {
+        crate::media::export::export_batch_live(
+            &self.storage,
+            &self.keys,
+            account_dir,
+            export_dir,
+            media_keys,
+            &self.wxid,
+            jobs,
+            max_items,
+        )
     }
 }
 
 /// Locate the withdrawn original message inside a conversation.
 /// Candidates: server_id == msgid/newmsgid, else local_id == msgid,
 /// else the nearest preceding row within 5 minutes.
-fn find_original(
-    store: &Store,
-    session: &str,
-    revoke: &MessageRecord,
-) -> Option<MessageRecord> {
+fn find_original(store: &Store, session: &str, revoke: &MessageRecord) -> Option<MessageRecord> {
     let ids: Vec<String> = [
         revoke.parsed.revoke.as_ref()?.msg_id.clone(),
         revoke.parsed.revoke.as_ref()?.new_msg_id.clone(),
@@ -450,3 +547,4 @@ mod tests {
         assert_eq!(found.unwrap().server_id, 100);
     }
 }
+// touch

@@ -215,27 +215,27 @@ pub async fn handler(
         (count, has_more, export_jobs, messages)
     };
 
+    let mut export_jobs = export_jobs;
     let exported: std::collections::HashMap<i64, crate::media::export::ExportedMedia> =
         if export_jobs.is_empty() {
             Default::default()
         } else {
-            // NOTE: bind the sync lock result first — a MutexGuard temporary
-            // must never be alive across the `.await` below.
-            let snapshot_root = account.sync.lock().snapshot_root();
-            let ctx = crate::media::export::ExportCtx {
-                account_dir: account.info.dir.clone(),
-                snapshot_root,
-                export_dir: state.cfg.media_export_dir.clone(),
-                media_keys: account.media_keys.clone(),
-                wxid: account.info.wxid.clone(),
-            };
+            let account_dir = account.info.dir.clone();
+            let export_dir = state.cfg.media_export_dir.clone();
+            let mk = account.media_keys.clone();
+            let sync = account.sync.clone();
             tokio::task::spawn_blocking(move || {
-                crate::media::export::export_batch(&ctx, &export_jobs, 200)
+                sync.lock().export_media_batch(
+                    &account_dir,
+                    mk,
+                    std::path::Path::new(&export_dir),
+                    &mut export_jobs,
+                    200,
+                )
             })
             .await
             .unwrap_or_default()
         };
-
     let base_url = state
         .cfg
         .base_url

@@ -15,8 +15,6 @@ pub struct Config {
     pub watch_debounce_ms: u64,
     /// Slow fallback poll interval in milliseconds (0 disables it).
     pub watch_fallback_ms: u64,
-    /// Decrypted mirror root (`<data-dir>/mirror` by default).
-    pub mirror_dir: PathBuf,
     /// Media export root (`<data-dir>/api-media` by default).
     pub media_export_dir: PathBuf,
     /// Heuristic base URL for media links; falls back to `http://<host>:<port>`.
@@ -56,7 +54,6 @@ impl Default for Config {
             log: "info".to_string(),
             watch_debounce_ms: 350,
             watch_fallback_ms: 30_000,
-            mirror_dir: dir.join("mirror"),
             media_export_dir: dir.join("api-media"),
             base_url: None,
             data_dir: dir,
@@ -91,7 +88,6 @@ pub fn parse_args() -> anyhow::Result<Option<Config>> {
             "--log" => cfg.log = value("info"),
             "--watch-debounce-ms" => cfg.watch_debounce_ms = value("350").parse()?,
             "--watch-fallback-ms" => cfg.watch_fallback_ms = value("30000").parse()?,
-            "--mirror-dir" => cfg.mirror_dir = PathBuf::from(value("")),
             "--media-export-dir" => cfg.media_export_dir = PathBuf::from(value("")),
             "--base-url" => cfg.base_url = Some(value("")),
             "-h" | "--help" => {
@@ -104,9 +100,6 @@ pub fn parse_args() -> anyhow::Result<Option<Config>> {
             }
             other => anyhow::bail!("unknown argument: {other}"),
         }
-    }
-    if cfg.mirror_dir.as_os_str().is_empty() {
-        cfg.mirror_dir = cfg.data_dir.join("mirror");
     }
     if cfg.media_export_dir.as_os_str().is_empty() {
         cfg.media_export_dir = cfg.data_dir.join("api-media");
@@ -126,7 +119,6 @@ fn print_help() {
          \x20   --log <LEVEL>              error|warn|info|debug (default info)\n\
          \x20   --watch-debounce-ms <MS>   Watch event debounce (default 350)\n\
          \x20   --watch-fallback-ms <MS>   Slow fallback poll (default 30000, 0 disables)\n\
-         \x20   --mirror-dir <DIR>         Decrypted mirror root\n\
          \x20   --media-export-dir <DIR>   Media export root\n\
          \x20   --base-url <URL>           Base URL for media links\n\
          \x20   -h, --help                 Print this help\n\

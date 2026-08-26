@@ -16,7 +16,10 @@
 
 pub mod export;
 
-use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
+use aes::cipher::{BlockDecrypt, KeyInit};
+
+#[cfg(test)]
+use aes::cipher::BlockEncrypt;
 use aes::Aes128;
 
 pub const MAGIC_V1: [u8; 6] = [0x07, 0x08, 0x56, 0x31, 0x08, 0x07];
@@ -134,6 +137,7 @@ pub fn decrypt_dat(data: &[u8], img_code: Option<&crate::keystore::ImgCode>, wxi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aes::cipher::BlockEncrypt;
     use crate::keystore::ImgCode;
 
     fn build_v2_sample(aes_key: &[u8; 16], xor_key: u8, raw: &[u8]) -> Vec<u8> {

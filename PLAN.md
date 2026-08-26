@@ -14,7 +14,7 @@ Kanxue/cn-sec 分析、DeepWiki 镜像（wechat-dump-rs 已 DMCA 下架）交叉
 默认端口 **5033**（避免与 WeFlow 5031 / qqflow-server 5032 冲突）。
 
 ### v1 做
-账号发现、密钥 API 注册（每库独立 enc_key 或统一 key 均可）、WCDB 解密快照、
+账号发现、密钥 API 注册（每库独立 enc_key 或统一 key 均可）、WCDB 页密码、
 实时监控与增量提取（含撤回）、消息/会话/联系人/群成员解析、媒体（图片 dat / 语音 silk / 视频）与导出、
 HTTP+SSE API（health / accounts / messages / sessions / sessions/:id/messages / contacts /
 group-members / media / push/messages）、四层测试与文档。
@@ -35,7 +35,7 @@ group-members / media / push/messages）、四层测试与文档。
 - 密钥校验：对任一库计算 page1 HMAC 比对即确定性验证（无假阳性）
 - WAL：预分配固定 4MB（**不能按 size 检测变化，只能 mtime/last_write**）；帧 = `[24B 头][4096B 加密页]`；
   帧头 salt1/salt2（BE @8/@12）必须匹配 WAL 头 salt（BE @16/@20），否则为旧周期遗留帧跳过；
-  有效帧按帧头 pgno 解密后写入快照 `(pgno-1)*4096`
+  有效帧按帧头 pgno 解密后写回页 `(pgno-1)*4096`
 - 内存特征（仅存档参考，v1 不实现）：`x'<64hex_key><32hex_salt>'`（96/64/>96 hex），进程 Weixin.exe
 
 ### 2.2 微信 4.0 数据布局与表结构
@@ -122,8 +122,8 @@ weflow-server/
 │  │  ├─ mod.rs
 │  │  ├─ scan.rs        # xwechat_files 账号发现 + db_storage 库枚举（含 -wal 标注）
 │  │  ├─ wcdb.rs        # 页密码：encrypt_page/decrypt_page/verify_page1/decrypt_db/decrypt_wal
-│  │  ├─ mirror.rs      # 解密快照 <data-dir>/mirror/<wxid>/<rel>；变更文件重解密 + WAL patch
-│  │  └─ open.rs        # rusqlite 打开快照、PRAGMA 探测、优雅降级
+│  │  ├─ live.rs       # 活库只读连接池（qqflow 式；无明文落盘）
+│  │  └─ open.rs        # rusqlite 打开/PRAGMA 探测辅助
 │  ├─ parser/           # 消息行→结构体：show/lastMsgType/summary、XML 内容解析（zstd 解压）、
 │  │                    #   媒体名提取、引用、撤回；结构化优先 + 启发式兜底
 │  ├─ store/            # RwLock<Store>：sessions/convs/contacts/group_cards/names/watermark；
@@ -152,10 +152,10 @@ weflow-server/
 
 ### 3.3 解密管线（4.x）
 1. `db/wcdb.rs`：按 §2.1 实现页密码（decrypt_page / verify_page1 / decrypt_db / decrypt_wal_full）；
-2. `db/mirror.rs`：注册时对 db_storage 下所有 `.db` 解密到 `<data-dir>/mirror/<wxid>/<rel>`（跳过 -wal/-shm），
-   并 patch 已存在 -wal；之后仅对变更的 `session.db`/`message_*.db` 重解密 + WAL patch（增量重解密）；
+2. `db/live.rs`：对 db_storage 下各库持只读长连接（qqflow 式；注册时页1 HMAC 预校验），
+   之后以 (db,wal) 指纹识别变更库，做水位增量查询（无整库重解密）。
 3. `db/open.rs`：rusqlite 打开快照；`PRAGMA table_info` 值驱动探测列；缺列/坏库降级不崩溃；
-4. 会话/索引构建只读快照，查询路径永不再碰原生加密文件。
+4. 会话/索引构建为活库直读；查询路径不再依赖任何镜像中间层。
 
 ### 3.4 实时监控
 - watch（notify）`<账号>/db_storage/session/` 与 `message/`（含 -wal 文件 mtime 变化——
@@ -168,11 +168,11 @@ weflow-server/
 ### 3.5 查询与索引
 - sessions（Session 表 + 消息统计合并）、contacts（contact.db）、群成员（Name2Id + 群表）、
   消息按会话入内存；显示名优先级：备注 > 昵称 > wxid；群内：群名片 > 备注 > 昵称；
-- queries：快照排序、(ts,sort_seq,local_id)、keyword、日历边界、ChatLab 输出、media 导出标记。
+- queries：(ts,sort_seq,local_id)、keyword、日历边界、ChatLab 输出、media 导出标记。
 
 ## 4. CLI 与配置
 `--port 5033 / --host 127.0.0.1 / --log info / --watch-debounce-ms 350 / --watch-fallback-ms 30000 /
---mirror-dir <data-dir>/mirror / --media-export-dir <data-dir>/api-media / --base-url`
+--media-export-dir <data-dir>/api-media / --base-url`
 数据目录：Windows `%LOCALAPPDATA%\weflow-server`、Linux `~/.local/share/weflow-server`、
 macOS `~/Library/Application Support/weflow-server`；token 自动生成持久化 `token.txt`（日志只打路径）。
 
@@ -192,7 +192,7 @@ macOS `~/Library/Application Support/weflow-server`；token 自动生成持久�
 
 ## 7. 里程碑
 1. M1：cargo 骨架 + config/logging + keystore + WCDB 页密码 + roundtrip 测试 ✅
-2. M2：scan + mirror + open + 全量索引 + names（假库夹具驱动）✅
+2. M2：scan + live + open + 全量索引 + names（假库夹具驱动）✅
 3. M3：sync（watch/增量/撤回）+ SSE 推送 ✅
 4. M4：server API 全端点 ✅
 5. M5：media 解密导出 ✅（dat V1/V2/XOR + hardlink/media库定位 + messages media=1 集成；wxgf 转码器与 ISAAC-64 视频为 M5.7）

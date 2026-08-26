@@ -22,7 +22,11 @@ async fn file_event_triggers_sync_and_message_event() {
     let storage = common::build_wechat_account(&dir, &key.0);
 
     let store = Arc::new(RwLock::new(Store::default()));
-    let mut sync = AccountSync::new(common::FAKE_WXID, &storage, &dir.join("mirror"), weflow_server::keystore::KeyMap::from(key), store.clone(),
+    let mut sync = AccountSync::new(
+        common::FAKE_WXID,
+        &storage,
+        weflow_server::keystore::KeyMap::from(key),
+        store.clone(),
     );
     sync.full_sync().unwrap();
     assert_eq!(store.read().convs.len(), 2);

@@ -22,9 +22,14 @@ const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
 fn test_state(dir: &std::path::Path) -> Arc<server::AppState> {
     let key = keystore::parse_db_key(common::FAKE_KEY_HEX).unwrap();
-    let storage = common::build_wechat_account(dir, &key.0);
+    let key_bytes = key.0;
+    let storage = common::build_wechat_account(dir, &key_bytes);
     let store = Arc::new(RwLock::new(Store::default()));
-    let sync = Arc::new(Mutex::new(AccountSync::new(common::FAKE_WXID, &storage, &dir.join("mirror"), weflow_server::keystore::KeyMap::from(key), store.clone(),
+    let sync = Arc::new(Mutex::new(AccountSync::new(
+        common::FAKE_WXID,
+        &storage,
+        weflow_server::keystore::KeyMap::from(key),
+        store.clone(),
     )));
     sync.lock().full_sync().unwrap();
 
@@ -52,7 +57,6 @@ fn test_state(dir: &std::path::Path) -> Arc<server::AppState> {
         log: "info".into(),
         watch_debounce_ms: 20,
         watch_fallback_ms: 0,
-        mirror_dir: dir.join("mirror"),
         media_export_dir: dir.join("api-media"),
         base_url: None,
         data_dir: dir.join("data"),

@@ -14,7 +14,6 @@ mod common;
 use std::fs;
 
 use rusqlite::Connection;
-use weflow_server::db::mirror::Mirror;
 use weflow_server::db::scan;
 use weflow_server::db::wcdb;
 use weflow_server::keystore;
@@ -97,16 +96,20 @@ fn live_wal_frames_patch_the_snapshot() {
     let wal_path = format!("{}-wal", msg_path.display());
     assert!(fs::metadata(&wal_path).is_ok(), "wal file must exist");
 
-    // mirror refresh must bake the WAL frames in
+    // decrypt main + wal frames with our pure-Rust page cipher, then merge
     let files = scan::enum_db_files(&storage);
     assert_eq!(files.len(), 1);
     assert!(files[0].wal.is_some(), "wal sibling must be discovered");
-    let mut mirror = Mirror::new(&dir.join("mirror"), common::FAKE_WXID);
-    let (changed, errors) = mirror.refresh(&files, &weflow_server::keystore::KeyMap::from(weflow_server::keystore::DbKey(key)));
-    assert!(errors.is_empty(), "{errors:?}");
-    assert_eq!(changed, vec!["message/message_0.db"]);
+    let enc = fs::read(&files[0].abs).unwrap();
+    let wal_bytes = fs::read(files[0].wal.as_ref().unwrap()).unwrap();
+    let mut plain = wcdb::decrypt_db(&key, &enc).unwrap();
+    common::assert_wechat_layout(&plain);
+    let frames = wcdb::decrypt_wal_frames(&key, &wal_bytes);
+    assert!(!frames.is_empty(), "wal frames must decrypt");
+    wcdb::apply_wal_frames(&mut plain, &frames);
 
-    let snapshot = mirror.snapshot_path("message/message_0.db");
+    let snapshot = dir.join("patched.db");
+    fs::write(&snapshot, &plain).unwrap();
     let conn = Connection::open(&snapshot).unwrap();
     let integrity: String = conn
         .query_row("PRAGMA integrity_check", [], |r| r.get(0))
@@ -125,7 +128,7 @@ fn live_wal_frames_patch_the_snapshot() {
     assert_eq!(count, 2, "wal rows must be present after patching");
     drop(conn); // release the snapshot handle before re-decrypting it
 
-    // writer still alive: another row lands in the wal; re-refresh picks it up
+    // writer still alive: another row lands in the wal; re-decrypt picks it up
     // (read-while-writing is exactly the production pattern — WeChat keeps
     // its databases open)
     writer
@@ -138,9 +141,12 @@ fn live_wal_frames_patch_the_snapshot() {
             [],
         )
         .unwrap();
-    let files = scan::enum_db_files(&storage);
-    let (_, errors) = mirror.refresh(&files, &weflow_server::keystore::KeyMap::from(weflow_server::keystore::DbKey(key)));
-    assert!(errors.is_empty(), "{errors:?}");
+    let enc = fs::read(&files[0].abs).unwrap();
+    let wal_bytes = fs::read(files[0].wal.as_ref().unwrap()).unwrap();
+    let mut plain = wcdb::decrypt_db(&key, &enc).unwrap();
+    let frames = wcdb::decrypt_wal_frames(&key, &wal_bytes);
+    wcdb::apply_wal_frames(&mut plain, &frames);
+    fs::write(&snapshot, &plain).unwrap();
     let conn = Connection::open(&snapshot).unwrap();
     let count: i64 = conn
         .query_row(
