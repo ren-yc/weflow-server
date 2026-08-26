@@ -21,7 +21,7 @@ impl From<[u8; 32]> for DbKey {
 /// Per-database key resolution: WeChat 4.x keeps an independent `enc_key` per
 /// database file (`all_keys.json` style: relative path -> 64-hex key), while
 /// some accounts accept a single uniform key. `KeyMap` supports both and is
-/// the runtime key source for the mirror/sync layers.
+/// the runtime key source for the live/sync layers.
 #[derive(Debug, Clone, Default)]
 pub enum KeyMap {
     #[default]

@@ -1,0 +1,213 @@
+# weflow-server HTTP API（v2 参考）
+
+> 本文档以源码（`src/server/`）为准，描述当前实现的全部接口。
+> 与 WeFlow 安装版 `HTTP-API.md` 契约对齐的部分在原文处标注。
+
+- 服务默认监听 `127.0.0.1:5033`（`--port` 可改）
+- 数据目录 = `%LOCALAPPDATA%\weflow-server`；token 文件 = 同目录 `token.txt`（自动生成/校验）
+- 所有 `/api/v1/*` 端点需要鉴权；`/health` 与 `/api/v1/health` 不需要
+
+## 鉴权
+
+三种方式等价（源码 `server/auth.rs` 三通道）：
+
+| 方式 | 示例 |
+|---|---|
+| HTTP 头 | `Authorization: Bearer <token>` |
+| HTTP 头 | `X-Api-Key: <token>`（如已实现） |
+| 查询参数 | `?access_token=<token>` 或 `?token=<token>` |
+
+## 错误信封
+
+```json
+{ "success": false, "code": 400, "message": "..." }
+```
+- `success` 布尔；`code` 为 HTTP 状态码；`message` 人类可读描述。
+- 鉴权失败：`401`；拒绝访问：`403`；参数错误：`400`；未找到：`404`；服务异常：`500`。
+
+## 通用查询参数
+
+| 参数 | 说明 |
+|---|---|
+| `limit` | 条数上限（默认 100，上限 10000） |
+| `offset` | 偏移量（默认 0） |
+| `start` / `end` | 时间边界（Unix 秒；可用于 `now-3600` 形式相对时间，见 `parse_time_bound`） |
+| `keyword` | 关键词过滤（小写匹配；sessions/contacts/messages 通用） |
+| `format=chatlab` / `chatlab=1` | 输出 ChatLab 风格形状 |
+| 导出开关 | `media=1`（或 `meiti=1`）开启媒体导出；再按类型 `image=1`/`voice=1`/`video=1`/`emoji=1`（兼容拼音别名 `tupian=1`、`vioce=1`） |
+
+## 端点
+
+### GET/POST `/health`、`/api/v1/health`（免鉴权）
+
+```json
+{ "status": "ok" }
+```
+
+### POST `/api/v1/accounts` — 注册账号（客户端驱动启动）
+
+请求体（JSON）：
+
+```json
+{
+  "wxid": "wxid_xxxxxxxxxxxxxxxx_1234",
+  "db_path": "D:\\AppData\\xwechat_files\\wxid_xxxx_xxxx",
+  "keys": { "session/session.db": "<64-hex enc_key>", "message/message_0.db": "<64-hex>" },
+  "img_aes_key": "ce1ddac1d2ed49fe",
+  "img_xor_key": "0x64"
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `wxid` | 账号标识（必填） |
+| `db_path` | 账号根目录（含 `db_storage/`；默认按 wxid 推导） |
+| `key` | 可选：每库统一 enc_key（`keys` 缺省时的单一密钥） |
+| `keys` | 可选：`db_storage` 相对路径 → 64-hex enc_key 映射（微信 4.x 每库独立密钥） |
+| `img_code` | 可选：WeFlow 兼容的图片密钥代号（由服务端派生 aes/xor） |
+| `img_aes_key` / `img_xor_key` | 可选：直接指定图片解密密钥（优先于 `img_code`） |
+
+响应：
+
+```json
+{ "success": true, "wxid": "...", "status": "ready" }
+```
+
+行为契约：
+- **密钥仅存进程内存，不落盘**；服务重启后需重新注册。
+- 注册时对目标库做页 1 HMAC 预校验（`wcdb::verify_page1`），错钥立即拒绝（`400`）。
+- 成功后启动阻塞式全量构建 + 文件事件监视任务；构建完成前账号状态为 `building`。
+
+### GET/POST `/api/v1/messages` — 消息查询 + 媒体导出
+
+参数：`talker`（会话标识，必填，为空返回空结果）、`limit`、`offset`、`start`、`end`、
+`keyword`、`format/chatlab`、`media` 及类型开关（见通用参数）。
+
+消息对象键（节选）：
+
+```json
+{
+  "localId": 1,
+  "serverId": "8280000000000000001",
+  "localType": 1,
+  "createTime": 1700000100,
+  "isSend": false,
+  "sender": "wxid_friend_a",
+  "senderName": "客户张三",
+  "content": "你好",
+  "parsed": { "text": "你好", "display": "你好" },
+  "quote": { "reversed": false, "senderName": "...", "text": "..." } | null,
+  "revoke": { "msgId": "...", "newMsgId": "...", "replaceMsg": "..." } | null,
+  "media": { "kind": "image|voice|video|emoji|file", "md5": "...", "file_name": "...", "width": 0, "height": 0, "duration": 0 } | null
+}
+```
+
+响应：
+
+```json
+{ "count": 20, "hasMore": true, "messages": [ ... ] }
+```
+
+媒体导出：当 `media=1` 且类型开关开启，响应附 `media` 数组，每项：
+
+```json
+{ "localId": 7, "kind": "image", "file": "images/2025-08/aabb....jpg", "url": "/api/v1/media/<talker>/images/<file>" }
+```
+
+`kind`→目录映射：`images / voices / videos / emojis / files`。
+
+### GET/POST `/api/v1/sessions` — 会话列表
+
+参数：`limit`、`offset`、`keyword`、`format/chatlab`。
+
+```json
+{ "count": 315, "sessions": [
+  { "sessionId": "wxid_xxx@chatroom", "kind": "group", "displayName": "项目群",
+    "unreadCount": 2, "messageCount": 4, "latestText": "...", "latestTime": 1700000100 }
+] }
+```
+
+### GET `/api/v1/sessions/{id}/messages` — ChatLab 拉取（消息游标）
+
+参数同 `/api/v1/messages`（`talker` 由路径段 `{id}` 提供）；返回 ChatLab 契约形状
+（`platformMessageId` 等键在 ChatLab 模式启用时输出）。
+
+### GET/POST `/api/v1/contacts` — 联系人
+
+参数：`limit`、`offset`、`keyword`。
+
+```json
+{ "success": true, "count": 4533, "contacts": [
+  { "username": "wxid_friend_a", "nickname": "...", "remark": "客户张三", "alias": null, "avatar": null }
+] }
+```
+
+### GET/POST `/api/v1/group-members` — 群成员
+
+参数：`chatroomId`（或 `talker` 别名）、`includeMessageCounts=1`、`forceRefresh=1`
+（先跑一次增量同步保证成员集合最新）。
+
+```json
+{ "count": 81, "refreshed": true, "members": [
+  { "username": "wxid_member_b", "nickname": "..." }
+] }
+```
+
+### GET/POST `/api/v1/media/{talker}/{media_type}/{file}` — 导出媒体直服
+
+- `media_type` ∈ `images|voices|videos|emojis|files`
+- 双重防穿越：路径段拒绝 `..`/`./`/`\`，且 `canonicalize` 后必须落在导出目录内
+- 404 信封返回 `{ "error": "Media not found" }`；内容按扩展名推断 MIME 输出
+
+### GET/POST `/api/v1/push/messages` — SSE 事件流（免轮询推送）
+
+事件（`event:` 名）：
+
+| 事件 | data 形状 |
+|---|---|
+| `ready` | `{"status":"ok"}`（连接建立基线） |
+| `message.new` | `{"event":"message.new","sessionId":"...","sessionType":"group","rawid":"...","sourceName":"...","groupName":"...","content":"...","timestamp":1700000100}` |
+| `message.revoke` | 同上（`event` 为 `message.revoke`） |
+| `sync` | `{"rebased":true}`（水位重基） |
+
+- 帧携带 `id:` 序号；`Last-Event-ID` 头（或查询参数）可回放最近 **1000 条 / 10 分钟**
+- 每 25 秒发送 `ping` 注释帧保活
+
+### GET/POST `/api/v1/sync` — 手动增量同步
+
+```json
+{ "newMessages": 3, "revoked": 0 }
+```
+
+### SNS（朋友圈，本地缓存只读）
+
+| 端点 | 参数 | 响应键 |
+|---|---|---|
+| `/api/v1/sns/timeline` | `limit`、`offset`、`username`、`start`、`end` | `{count,total,feeds:[...]}` |
+| `/api/v1/sns/usernames` | — | `{success,count,usernames:[...]}` |
+| `/api/v1/sns/stats` | — | `{feeds, ...}` |
+| `/api/v1/sns/export` | `format=json\|html`、`username` | `{count, entries/...}` |
+| `/api/v1/sns/export/stats` | — | `{data:{totalPosts: N, ...}}` |
+| `/api/v1/sns/media/proxy` | `url`、`referer`、`user_agent` | 媒体字节流（CDN 鉴权墙时返回明确错误） |
+
+feeds 条目字段（以源码 `sns.rs` 为准）：`tid/userName/content(明文XML 解析后)/likes/comments/mediaList/location/rawXml` 的等效 JSON 键
+（`mediaList` 每项含 `url/thumb/md5/width/height`）。
+
+## 数据获取与安全模型
+
+- **活库直读**：对微信加密库持只读长连接（`db/live.rs`，qqflow 式），`PRAGMA query_only`，
+  全程不写源库、**不在磁盘生成明文镜像/快照**。
+- **变更检测**：轮询以 (主文件 mtime/size, wal mtime/size) 双指纹判断变化，仅对变化库做
+  水位增量查询 `(create_time, sort_seq, local_id) > watermark`。
+- **密钥策略**：注册入内存、重启失效需重注册；日志、导出、响应均不打码密钥值。
+- **媒体**：图片 dat(V1/V2/XOR) 解密、语音 silk 合并、视频明文直通、wxgf(HEVC)→PNG 需
+  ffmpeg（环境变量 `WEFLOW_SERVER_FFMPEG` → WeFlow 内置 ffmpeg → PATH）。
+
+## 启动示例
+
+```powershell
+weflow-server.exe --port 5033 --watch-fallback-ms 5000 --log info
+```
+
+参数：`--port`、`--host`、`--data-dir`、`--log`、`--watch-debounce-ms`、`--watch-fallback-ms`、
+`--media-export-dir`、`--base-url`（全部仅命令行，无配置文件）。

@@ -41,7 +41,7 @@ pub struct MediaHint {
     pub aes_key: Option<String>,
 }
 
-/// Quote snapshot (referenced message).
+/// Quote: the referenced message copy embedded in an appmsg.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuoteInfo {
     pub platform_message_id: String,

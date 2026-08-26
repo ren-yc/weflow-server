@@ -397,7 +397,7 @@ pub fn export_batch_live(
         let key = keys.key_for(rel)?;
         crate::db::live::open_read_only(&f.abs, &hex::encode(key.0)).ok()
     };
-    // pre-open what this batch needs (mirrors the lazy logic below)
+    // pre-open what this batch needs (keyed by actual job kinds)
     let want_image = jobs.iter().take(max_items)
         .any(|(_, k, _, _, _)| matches!(k, crate::parser::MediaKind::Image));
     let want_video = jobs.iter().take(max_items)

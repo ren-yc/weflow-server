@@ -1,6 +1,6 @@
 /target
 /_fetch_wechat
 /reference
-/all_keys.json
+/weflow-server.json
 *.bak
 *.json.tmp

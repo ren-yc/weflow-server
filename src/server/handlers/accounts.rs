@@ -2,7 +2,7 @@
 //!
 //! Body: `{wxid, key?, keys?: {rel: hex}, img_code?, db_path?}`.
 //! The key is validated deterministically against the account's session.db
-//! (page-1 HMAC). On success the mirror + in-memory index are built in a
+//! (page-1 HMAC). On success the live acquisition + in-memory index
 //! blocking task and a watcher task is spawned.
 
 use std::sync::Arc;
@@ -18,6 +18,8 @@ use crate::server::AppState;
 
 use super::require_auth;
 
+/// Registration payload. Keys live in memory only and must be re-supplied
+/// after a server restart.
 #[derive(Clone, Deserialize, Default)]
 pub struct AccountBody {
     pub wxid: Option<String>,
@@ -28,10 +30,10 @@ pub struct AccountBody {
     pub img_aes_key: Option<String>,
     pub img_xor_key: Option<String>,
     pub db_path: Option<String>,
-    /// Persist the registration payload to <data_dir>/accounts/? Default
-    /// false: keys stay in memory only and must be re-supplied on restart.
-    #[serde(default)]
-    pub persist: bool,
+    // (persist option removed: keys stay in memory only and
+    //  must be re-supplied on restart)
+
+
 }
 
 pub async fn handler(
@@ -70,11 +72,11 @@ pub async fn handler(
             img_aes_key: params.get("img_aes_key").cloned(),
             img_xor_key: params.get("img_xor_key").cloned(),
             db_path: params.get("db_path").cloned(),
-            persist: false,
+
         },
     };
-    // delegate to the shared registration path (persists the spec, spawns
-    // the async build/watcher)
+    // delegate to the shared registration path (spawns the async
+    // build/watcher)
     let handle = crate::server::start_account(state.clone(), body).await?;
 
     Ok(Json(json!({

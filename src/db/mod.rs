@@ -5,7 +5,7 @@
 //!   acquisition — the source of truth for index/poll; no plaintext mirror)
 //! - `wcdb`: page-cipher primitives, kept as verification utilities
 //!   (`verify_page1` is used by registration pre-validation)
-//! - `open`: snapshot/open helpers shared by tests and legacy paths
+//! - `open`: read-only connection/probing helpers (value-driven column
 
 pub mod live;
 pub mod open;

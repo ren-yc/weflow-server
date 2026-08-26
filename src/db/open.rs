@@ -1,5 +1,5 @@
-//! Open decrypted mirror snapshots with rusqlite (read-only) and probe them
-//! defensively: every schema assumption is verified at runtime via
+//! Read-only connection/probing helpers over decrypted database content.
+//! Everything is defensive: every schema assumption is verified at runtime via
 //! `PRAGMA table_info` and degrades gracefully (never panics on drift).
 
 use std::path::Path;
@@ -7,14 +7,15 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
-/// Open a snapshot read-only, with a busy timeout. Fails fast on missing file.
+/// Open a decrypted database file read-only with a busy timeout;
+/// fails fast on a missing file.
 pub fn open_snapshot(path: &Path) -> Result<Connection> {
     let conn = Connection::open_with_flags(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
             | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .with_context(|| format!("open snapshot: {}", path.display()))?;
+    .with_context(|| format!("open {}: {}", "decrypted db", path.display()))?;
     conn.busy_timeout(std::time::Duration::from_millis(3000))?;
     Ok(conn)
 }
