@@ -1,0 +1,158 @@
+# Release pipeline: pushing a tag like `v0.1.1` builds release binaries on
+# Windows / Linux / macOS and publishes them as a GitHub Release.
+#
+# Single source of truth for the version remains Cargo.toml. The `guard` job
+# reads it via `cargo metadata` and fails the run if the tag does not match
+# (e.g. tag v0.1.1 but Cargo.toml says 0.1.2), so releases can never drift.
+#
+# Usage:
+#   cargo set-version 0.1.1        # or edit Cargo.toml
+#   git commit -am "chore: release v0.1.1"
+#   git tag v0.1.1 && git push origin master --tags
+#
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # create GitHub Release + upload artifacts
+
+jobs:
+  guard:
+    name: Guard version/tag consistency
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup show
+
+      - name: Read package version from Cargo.toml
+        id: version
+        run: |
+          VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "weflow-server") | .version')"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "cargo version: ${VERSION}"
+          echo "tag: ${{ github.ref_name }}"
+
+      - name: Verify tag matches version
+        run: |
+          TAG="${{ github.ref_name }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          if [ "${TAG#v}" != "${VERSION}" ]; then
+            echo "::error::Tag '${TAG}' does not match Cargo.toml version '${VERSION}'."
+            echo "::error::Run 'cargo set-version' (or edit Cargo.toml), commit, then tag."
+            exit 1
+          fi
+          echo "OK: tag ${TAG} matches Cargo.toml version ${VERSION}"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: guard
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90 # bundled SQLCipher/OpenSSL compile is slow
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup show
+
+      # Windows: reuse scripts/build.ps1 — it locates vcvars64.bat and puts
+      # Strawberry Perl / nasm on PATH (GitHub's windows runners ship them).
+      - name: Build release (Windows)
+        if: runner.os == 'Windows'
+        run: powershell -File scripts/build.ps1 build --release --locked
+
+      - name: Build release (Unix)
+        if: runner.os != 'Windows'
+        run: bash scripts/build.sh build --release --locked
+
+      - name: Smoke test --version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.guard.outputs.version }}"
+          BIN="target/release/weflow-server"
+          [ "${{ runner.os }}" = "Windows" ] && BIN="${BIN}.exe"
+          OUT="$("${BIN}" --version)"
+          echo "${OUT}"
+          case "${OUT}" in
+            "weflow-server ${VERSION}"*) ;;
+            *)
+              echo "::error::unexpected --version output: ${OUT}"
+              exit 1
+              ;;
+          esac
+
+      - name: Stage package
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.guard.outputs.version }}"
+          BIN="target/release/weflow-server"
+          [ "${{ runner.os }}" = "Windows" ] && BIN="${BIN}.exe"
+          PKG="weflow-server-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/${PKG}"
+          cp "${BIN}" "dist/${PKG}/"
+          cp README.md LICENSE "dist/${PKG}/"
+          echo "PKG=${PKG}" >> "${GITHUB_ENV}"
+          ls -l "dist/${PKG}"
+
+      - name: Create archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = "dist/${env:PKG}.zip"
+          Compress-Archive -Path "dist/${env:PKG}" -DestinationPath $archive
+          Write-Host $archive
+
+      - name: Create archive (Unix)
+        if: runner.os != 'Windows'
+        run: tar -czf "dist/${PKG}.${{ matrix.archive }}" -C dist "${PKG}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: weflow-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        working-directory: artifacts
+        run: sha256sum * > SHA256SUMS
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

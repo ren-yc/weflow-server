@@ -1,4 +1,5 @@
 /target
+/dist
 /_fetch_wechat
 /reference
 /weflow-server.json
