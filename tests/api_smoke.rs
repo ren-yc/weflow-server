@@ -59,6 +59,7 @@ fn test_state(dir: &std::path::Path) -> Arc<server::AppState> {
         watch_fallback_ms: 0,
         media_export_dir: dir.join("api-media"),
         base_url: None,
+        show_token: false,
         data_dir: dir.join("data"),
     };
     

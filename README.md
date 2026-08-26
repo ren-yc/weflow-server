@@ -45,10 +45,10 @@ MSVC 环境与 Perl/nasm（Windows 专属），透传全部 cargo 参数（`test
 .\weflow-server.exe --port 5033 --host 127.0.0.1 --log info
 ```
 
-命令行参数：`--port`（默认 5033）/ `--host`（默认 127.0.0.1）/ `--log`（默认 info）/
+命令行参数：`--show-token`（打印已存 token 后退出）/ `--port`（默认 5033）/ `--host`（默认 127.0.0.1）/ `--log`（默认 info）/
 `--watch-debounce-ms`（默认 350）/ `--watch-fallback-ms`（默认 30000，0 关闭）/
 `--media-export-dir`（默认 `<data-dir>/api-media`）/ `--base-url`。
-数据目录：Windows `%LOCALAPPDATA%\weflow-server`；token 自动生成于 `token.txt`（启动日志只打印路径）。
+数据目录：Windows `%LOCALAPPDATA%\weflow-server`；访问 token 生成后存入**系统凭据库**（Windows 凭据管理器 / macOS 钥匙串 / Linux Secret Service；无凭据库平台为会话级并在启动日志打印）。token **仅在首次生成时**打印到启动日志，之后可用 `--show-token` 随时获取。
 **账号为客户端驱动**：启动后无账号，密钥由客户端注册（仅内存保存，不落盘）：
 
 ```bash
@@ -117,5 +117,5 @@ tests/
 ## 免责声明
 
 仅供个人学习、研究与本地数据备份。API 仅监听 127.0.0.1；密钥经 HTTP 传入且仅内存保存
-（不落盘），鉴权依赖本地 token.txt，均非安全机制；微信升级可能导致列名/消息格式解析退化
+（不落盘）；鉴权 token 存 OS 凭据库（本地回环场景，非防泄密机制）；微信升级可能导致列名/消息格式解析退化
 （值驱动探测 + 优雅降级，天然容错）。请遵守法律法规，仅解密**自己**的微信数据。

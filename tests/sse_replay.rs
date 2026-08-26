@@ -65,6 +65,7 @@ async fn start(dir: &std::path::Path) -> TestServer {
         watch_fallback_ms: 0,
         media_export_dir: dir.join("api-media"),
         base_url: None,
+        show_token: false,
         data_dir: dir.join("data"),
     };
     let state = Arc::new(server::AppState {

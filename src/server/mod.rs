@@ -168,19 +168,60 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-/// Load (or generate) the access token from `<data-dir>/token.txt`.
-pub fn load_token(data_dir: &std::path::Path) -> Result<String> {
-    std::fs::create_dir_all(data_dir)?;
-    let path = data_dir.join("token.txt");
-    if let Ok(t) = std::fs::read_to_string(&path) {
-        let t = t.trim().to_string();
-        if t.len() >= 16 {
-            return Ok(t);
+const TOKEN_SERVICE: &str = "weflow-server";
+const TOKEN_USER: &str = "http-api-token";
+
+/// Access token kept in the OS credential store (Windows Credential
+/// Manager / macOS Keychain / Linux Secret Service). Never written to a
+/// token file.
+///
+/// The token is printed to the log **only when it is first generated**
+/// (or when the credential store is unavailable and the token is
+/// per-session). On subsequent launches it is fetched silently; use the
+/// `--show-token` flag to retrieve it on demand.
+pub fn load_token() -> Result<String> {
+    let entry = keyring::Entry::new(TOKEN_SERVICE, TOKEN_USER)
+        .map_err(|e| anyhow::anyhow!("credential store init failed: {e}"))?;
+    match entry.get_password() {
+        Ok(t) if t.len() >= 16 => Ok(t),
+        Ok(_) => {
+            // short/corrupt value: regenerate and overwrite
+            let t = new_token();
+            entry
+                .set_password(&t)
+                .map_err(|e| anyhow::anyhow!("credential store write failed: {e}"))?;
+            tracing::info!("generated new API token: {t}");
+            Ok(t)
+        }
+        Err(keyring::Error::NoEntry) => {
+            let t = new_token();
+            entry
+                .set_password(&t)
+                .map_err(|e| anyhow::anyhow!("credential store write failed: {e}"))?;
+            tracing::info!("generated new API token: {t}");
+            Ok(t)
+        }
+        Err(e) => {
+            // no credential store available: per-session token, log only
+            let t = new_token();
+            tracing::warn!(
+                "credential store unavailable ({e}); API token is per-session (regenerated on restart): {t}"
+            );
+            Ok(t)
         }
     }
-    let token = new_token();
-    std::fs::write(&path, &token)?;
-    Ok(token)
+}
+
+/// Read the stored token without generating one; `None` when none exists.
+/// Used by `--show-token`.
+pub fn show_token() -> Result<Option<String>> {
+    let entry = keyring::Entry::new(TOKEN_SERVICE, TOKEN_USER)
+        .map_err(|e| anyhow::anyhow!("credential store init failed: {e}"))?;
+    match entry.get_password() {
+        Ok(t) if !t.is_empty() => Ok(Some(t)),
+        Ok(_) | Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(anyhow::anyhow!("credential store read failed: {e}")),
+    }
 }
 
 fn new_token() -> String {

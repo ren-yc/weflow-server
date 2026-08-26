@@ -4,7 +4,7 @@
 > 与 WeFlow 安装版 `HTTP-API.md` 契约对齐的部分在原文处标注。
 
 - 服务默认监听 `127.0.0.1:5033`（`--port` 可改）
-- 数据目录 = `%LOCALAPPDATA%\weflow-server`；token 文件 = 同目录 `token.txt`（自动生成/校验）
+- 数据目录 = `%LOCALAPPDATA%\weflow-server`；访问 token 存于**系统凭据库**（Windows 凭据管理器 / macOS 钥匙串 / Linux Secret Service；无凭据库平台为会话级 token，随启动日志打印）
 - 所有 `/api/v1/*` 端点需要鉴权；`/health` 与 `/api/v1/health` 不需要
 
 ## 鉴权

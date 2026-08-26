@@ -16,6 +16,7 @@ chrono = "0.4"
 dirs = "6"
 futures-util = "0.3"
 hex = "0.4"
+keyring = { version = "3", default-features = false, features = ["windows-native", "apple-native", "linux-native"] }
 hmac = "0.12"
 md-5 = "0.10"
 notify = "8.2"

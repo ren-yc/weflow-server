@@ -146,6 +146,7 @@ mod tests {
             media_export_dir: std::path::PathBuf::from("target/test-tmp/auth"),
             base_url: None,
             data_dir: std::path::PathBuf::from("target/test-tmp/auth-data"),
+            show_token: false,
         };
         let (shutdown, _) = tokio::sync::watch::channel(false);
         Arc::new(crate::server::AppState {

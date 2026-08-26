@@ -24,6 +24,17 @@ use crate::config::Config;
 
 /// Parse CLI and run the service.
 pub fn run(cfg: Config) -> Result<()> {
+    if cfg.show_token {
+        return match server::show_token()? {
+            Some(t) => {
+                println!("{t}");
+                Ok(())
+            }
+            None => anyhow::bail!(
+                "no API token stored yet (start the service once to generate it)"
+            ),
+        };
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -31,11 +42,11 @@ pub fn run(cfg: Config) -> Result<()> {
 }
 
 async fn serve(cfg: Config) -> Result<()> {
-    let token = server::load_token(&cfg.data_dir)?;
+    let token = server::load_token()?;
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
     let state = Arc::new(server::AppState {
         cfg: cfg.clone(),
-        token,
+        token: token.clone(),
         accounts: Mutex::new(HashMap::new()),
         shutdown: shutdown_tx,
     });
@@ -43,10 +54,10 @@ async fn serve(cfg: Config) -> Result<()> {
     let addr = format!("{}:{}", cfg.host, cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!(
-        "weflow-server {} listening on http://{addr}  (token: {})",
-        env!("CARGO_PKG_VERSION"),
-        cfg.data_dir.join("token.txt").display()
+        "weflow-server {} listening on http://{addr}  (api token held in OS credential store; retrieve with --show-token)",
+        env!("CARGO_PKG_VERSION")
     );
+    let _ = token;
     axum::serve(listener, app).await?;
     Ok(())
 }
