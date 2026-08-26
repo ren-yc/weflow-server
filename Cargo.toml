@@ -1,0 +1,44 @@
+[package]
+name = "weflow-server"
+version = "0.1.0"
+edition = "2024"
+description = "Headless HTTP API + SSE service for reading local WeChat 4.x chat records (WCDB/SQLCipher-4 decryption, real-time monitoring)"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+aes = "0.8"
+async-stream = "0.3"
+axum = { version = "0.8", features = ["macros"] }
+base64 = "0.22"
+cbc = { version = "0.1", features = ["alloc"] }
+chrono = "0.4"
+dirs = "6"
+futures-util = "0.3"
+hex = "0.4"
+hmac = "0.12"
+md-5 = "0.10"
+notify = "8.2"
+notify-debouncer-mini = "0.7"
+parking_lot = "0.12"
+pbkdf2 = { version = "0.12", features = ["hmac"] }
+rand = "0.8"
+rusqlite = { version = "0.39", features = ["bundled-sqlcipher-vendored-openssl"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "io-util", "fs"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zstd = "0.13"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"

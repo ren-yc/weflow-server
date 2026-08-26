@@ -1,0 +1,6 @@
+# Pinned toolchain: version-locked stable so clippy lint sets and behavior
+# are reproducible across machines (rustup auto-installs this toolchain).
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
