@@ -271,6 +271,55 @@ async fn sessions_contacts_group_members() {
     }
 }
 
+/// `/api/v1/contacts` pages by `offset` with a deterministic order and reports
+/// `total` / `hasMore`, so a client can walk the whole address book instead of
+/// silently receiving only the first `limit` rows (the default is 100).
+#[tokio::test]
+async fn contacts_paginate_by_offset() {
+    let dir = common::tmp_dir("smoke-contactpage");
+    let state = test_state(&dir);
+    let app = server::build_router(state);
+
+    // full page: 3 fixture contacts, nothing more to fetch
+    let uri = format!("/api/v1/contacts?access_token={TOKEN}");
+    let (status, body) = json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"].as_i64().unwrap(), 3);
+    assert_eq!(body["total"].as_i64().unwrap(), 3);
+    assert_eq!(body["hasMore"], false);
+
+    // walk it one row at a time and collect the usernames
+    let mut seen: Vec<String> = Vec::new();
+    let mut offset = 0;
+    loop {
+        let uri = format!("/api/v1/contacts?limit=1&offset={offset}&access_token={TOKEN}");
+        let (status, body) =
+            json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total"].as_i64().unwrap(), 3, "total is offset-independent");
+        let page = body["contacts"].as_array().unwrap();
+        assert_eq!(page.len(), 1, "limit is honoured");
+        seen.push(page[0]["username"].as_str().unwrap().to_string());
+        if !body["hasMore"].as_bool().unwrap() {
+            break;
+        }
+        offset += 1;
+        assert!(offset < 10, "pagination must terminate");
+    }
+    assert_eq!(seen.len(), 3, "every contact reachable via offset: {seen:?}");
+    let mut unique = seen.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), 3, "no row repeated across pages: {seen:?}");
+
+    // offset past the end: empty page, no phantom hasMore
+    let uri = format!("/api/v1/contacts?offset=99&access_token={TOKEN}");
+    let (status, body) = json_body(app.oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"].as_i64().unwrap(), 0);
+    assert_eq!(body["hasMore"], false);
+}
+
 /// Real WeChat 4.x `SessionTable` has no session-name column (probed against
 /// a live account: 315 rows, zero matches for every name alias the index
 /// looks for). The session list must still emit human names by falling back

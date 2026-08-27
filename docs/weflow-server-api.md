@@ -154,13 +154,21 @@
 
 ### GET/POST `/api/v1/contacts` — 联系人
 
-参数：`limit`、`offset`、`keyword`。
+参数：`limit`（默认 100，上限 10000）、`offset`、`keyword`。
 
 ```json
-{ "success": true, "count": 4533, "contacts": [
+{ "success": true, "count": 100, "total": 4533, "hasMore": true, "contacts": [
   { "username": "wxid_friend_a", "nickname": "...", "remark": "客户张三", "alias": null, "avatar": null }
 ] }
 ```
+
+**必须翻页**：`limit` 默认 100，不传就只拿到前 100 条（实测真实账号 4533 条），
+截断外的联系人在下游会退化为显示 UID。按 `offset` 递增直到 `hasMore=false`：
+
+- `total` 为过滤后总数，与 `offset` 无关；`count` 是本页条数；
+- 排序键为 `(displayName, username)`——显示名不唯一，仅按显示名排序时并列项
+  在多次请求间顺序不定，offset 翻页会漏行/重复行；加 username 次键保证全序稳定；
+- `offset` 超出末尾返回空页且 `hasMore=false`。
 
 ### GET/POST `/api/v1/group-members` — 群成员
 
