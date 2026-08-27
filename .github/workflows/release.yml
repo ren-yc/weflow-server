@@ -27,7 +27,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install pinned toolchain (rust-toolchain.toml)
         run: rustup show
@@ -70,7 +70,7 @@ jobs:
             target: aarch64-apple-darwin
             archive: tar.gz
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install pinned toolchain (rust-toolchain.toml)
         run: rustup show
@@ -129,7 +129,7 @@ jobs:
         run: tar -czf "dist/${PKG}.${{ matrix.archive }}" -C dist "${PKG}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: weflow-${{ matrix.target }}
           path: dist/*
@@ -141,18 +141,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Collect all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: artifacts
           merge-multiple: true
 
       - name: Generate SHA256SUMS
         working-directory: artifacts
-        run: sha256sum * > SHA256SUMS
+        # artifacts/ also contains the unpacked staging directories
+        # (weflow-server-<v>-<target>/), so hash only the archives.
+        run: |
+          shopt -s nullglob
+          sha256sum *.zip *.tar.gz > SHA256SUMS
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*
+          files: |
+            artifacts/*.zip
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS
           generate_release_notes: true
           fail_on_unmatched_files: true
