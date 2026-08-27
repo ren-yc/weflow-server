@@ -35,13 +35,6 @@ fn test_state_with(
     let storage = common::build_wechat_account(dir, &key_bytes);
     mutate(&storage, &key_bytes);
     let store = Arc::new(RwLock::new(Store::default()));
-    let sync = Arc::new(Mutex::new(AccountSync::new(
-        common::FAKE_WXID,
-        &storage,
-        weflow_server::keystore::KeyMap::from(key),
-        store.clone(),
-    )));
-    sync.lock().full_sync().unwrap();
 
     let info = AccountInfo {
         wxid: common::FAKE_WXID.to_string(),
@@ -49,18 +42,6 @@ fn test_state_with(
         db_storage: storage.clone(),
         session_db: Some(storage.join("session/session.db")),
     };
-    let events = sync.lock().events.clone();
-    let handle = Arc::new(AccountHandle {
-        info,
-        status: AtomicU8::new(2), // Ready
-        error: Mutex::new(None),
-        store,
-        events,
-        sync,
-        media_keys: None,
-        history: Arc::new(Mutex::new(weflow_server::server::HistoryBuf::default())),
-        watcher: Mutex::new(None),
-    });
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
     let cfg = weflow_server::config::Config {
         host: "127.0.0.1".into(),
@@ -73,15 +54,33 @@ fn test_state_with(
         show_token: false,
         data_dir: dir.join("data"),
     };
-    
-    Arc::new(server::AppState {
-        cfg,
-        token: TOKEN.to_string(),
-        accounts: parking_lot::Mutex::new(
-            [(common::FAKE_WXID.to_string(), handle)].into_iter().collect(),
-        ),
-        shutdown: shutdown_tx,
-    })
+    // State first: the event bus lives there and the sync engine publishes onto
+    // it (mirrors `register_account`).
+    let state = Arc::new(server::AppState::new(cfg, TOKEN.to_string(), shutdown_tx));
+
+    let sync = Arc::new(Mutex::new(AccountSync::with_channel(
+        common::FAKE_WXID,
+        &storage,
+        weflow_server::keystore::KeyMap::from(key),
+        store.clone(),
+        state.events.clone(),
+    )));
+    sync.lock().full_sync().unwrap();
+
+    let handle = Arc::new(AccountHandle {
+        info,
+        status: AtomicU8::new(2), // Ready
+        error: Mutex::new(None),
+        store,
+        sync,
+        media_keys: None,
+        watcher: Mutex::new(None),
+    });
+    state
+        .accounts
+        .lock()
+        .insert(common::FAKE_WXID.to_string(), handle);
+    state
 }
 
 fn request(method: &str, uri: &str, token: Option<&str>) -> Request<Body> {
@@ -108,6 +107,59 @@ async fn health_is_open() {
         let resp = app.clone().oneshot(request("GET", uri, None)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
+}
+
+/// The SSE endpoint has no readiness gate (qqflow-server parity): with zero
+/// accounts it answers 200 and streams, while *business* endpoints still 503
+/// because there is genuinely no index to query yet. Auth is still enforced.
+#[tokio::test]
+async fn sse_has_no_readiness_gate_but_business_endpoints_do() {
+    let dir = common::tmp_dir("smoke-ssegate");
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let state = Arc::new(server::AppState::new(
+        weflow_server::config::Config {
+            host: "127.0.0.1".into(),
+            port: 0,
+            log: "info".into(),
+            watch_debounce_ms: 10,
+            watch_fallback_ms: 0,
+            media_export_dir: dir.join("api-media"),
+            base_url: None,
+            show_token: false,
+            data_dir: dir.join("data"),
+        },
+        TOKEN.to_string(),
+        shutdown_tx,
+    ));
+    assert!(state.accounts.lock().is_empty());
+    let app = server::build_router(state);
+
+    // unauthenticated SSE is still rejected
+    let resp = app
+        .clone()
+        .oneshot(request("GET", "/api/v1/push/messages", None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // authenticated SSE with zero accounts: 200, not 503
+    let resp = app
+        .clone()
+        .oneshot(request("GET", "/api/v1/push/messages", Some(TOKEN)))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "SSE must not gate on account readiness"
+    );
+
+    // business endpoints keep their 503 gate (no index to serve)
+    let resp = app
+        .oneshot(request("GET", "/api/v1/sessions", Some(TOKEN)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]
@@ -371,8 +423,8 @@ fn register_account_is_idempotent_at_registry_level() {
         session_db: Some(storage.join("session/session.db")),
     };
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
-    let state = Arc::new(server::AppState {
-        cfg: weflow_server::config::Config {
+    let state = Arc::new(server::AppState::new(
+        weflow_server::config::Config {
             host: "127.0.0.1".into(),
             port: 0,
             log: "info".into(),
@@ -383,10 +435,9 @@ fn register_account_is_idempotent_at_registry_level() {
             show_token: false,
             data_dir: dir.join("data"),
         },
-        token: TOKEN.to_string(),
-        accounts: parking_lot::Mutex::new(Default::default()),
-        shutdown: shutdown_tx,
-    });
+        TOKEN.to_string(),
+        shutdown_tx,
+    ));
 
     let keymap = weflow_server::keystore::KeyMap::from(key);
     let (h1, is_new1) =

@@ -149,12 +149,11 @@ mod tests {
             show_token: false,
         };
         let (shutdown, _) = tokio::sync::watch::channel(false);
-        Arc::new(crate::server::AppState {
+        Arc::new(crate::server::AppState::new(
             cfg,
-            token: "0123456789abcdef".to_string(),
-            accounts: parking_lot::Mutex::new(HashMap::new()),
+            "0123456789abcdef".to_string(),
             shutdown,
-        })
+        ))
     }
 
     #[test]

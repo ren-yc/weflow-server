@@ -40,18 +40,21 @@ impl AccountStatus {
 }
 
 /// One registered account's runtime state.
+///
+/// The SSE event bus and replay history deliberately live on [`AppState`], not
+/// here (qqflow-server parity): they must outlive any individual registration
+/// so `/api/v1/push/messages` can be subscribed before the first account
+/// exists, and so re-registering a corrected account does not orphan the
+/// clients already streaming.
 pub struct AccountHandle {
     pub info: AccountInfo,
     pub status: AtomicU8, // AccountStatus as u8
     /// Last initialization failure reason (None while healthy).
     pub error: Mutex<Option<String>>,
     pub store: Arc<RwLock<Store>>,
-    pub events: broadcast::Sender<Event>,
     pub sync: Arc<Mutex<AccountSync>>,
     /// Precomputed image keys (V2/legacy dat decryption)
     pub media_keys: Option<crate::keystore::ImageKeys>,
-    /// SSE event history for Last-Event-ID replay (1000 items / 10 min TTL).
-    pub history: Arc<Mutex<HistoryBuf>>,
     /// Watch task handle (started on registration; dropped on re-register).
     pub watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -126,6 +129,39 @@ pub struct AppState {
     pub token: String,
     pub accounts: Mutex<HashMap<String, Arc<AccountHandle>>>,
     pub shutdown: tokio::sync::watch::Sender<bool>,
+    /// Process-wide SSE event bus (qqflow-server parity). Global rather than
+    /// per-account so that `/api/v1/push/messages` needs no ready account to
+    /// subscribe (clients connect at startup and receive events once an
+    /// account finishes indexing), and so replacing an `error` account keeps
+    /// existing subscribers attached to the same sender.
+    pub events: broadcast::Sender<Event>,
+    /// SSE replay history for Last-Event-ID (1000 items / 10 min TTL).
+    /// Global for the same reason as `events` — and necessarily so: the frame
+    /// `id` is a bus-level monotonic sequence, which a per-account buffer
+    /// could not keep consistent across registrations.
+    pub history: Arc<Mutex<HistoryBuf>>,
+}
+
+impl AppState {
+    /// Bus capacity: one slow subscriber lagging past this many events gets a
+    /// `sync` re-baseline frame rather than silently missing messages.
+    pub const EVENT_BUS_CAPACITY: usize = 1024;
+
+    /// Build state with a fresh global event bus and empty replay history.
+    pub fn new(
+        cfg: Config,
+        token: String,
+        shutdown: tokio::sync::watch::Sender<bool>,
+    ) -> Self {
+        AppState {
+            cfg,
+            token,
+            accounts: Mutex::new(HashMap::new()),
+            shutdown,
+            events: broadcast::channel(Self::EVENT_BUS_CAPACITY).0,
+            history: Arc::new(Mutex::new(HistoryBuf::default())),
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -403,6 +439,9 @@ pub async fn start_account(
     // async build: full_sync then mark ready and spawn the watcher
     let handle2 = handle.clone();
     let handle3 = handle.clone();
+    // The watermark baseline is published on the global bus, so the task needs
+    // the state (not just the handle) to reach it.
+    let state2 = state.clone();
     let watch_cfg = watch_config(&state.cfg);
     let shutdown_rx = state.shutdown.subscribe();
     tokio::spawn(async move {
@@ -426,7 +465,9 @@ pub async fn start_account(
                     let guard = handle2.store.read();
                     guard.watermarks.clone().into_iter().collect()
                 };
-                let _ = handle2.events.send(crate::sync::Event::Sync(wms));
+                // Global bus: clients already streaming (possibly since before
+                // this account existed) get the watermark baseline here.
+                let _ = state2.events.send(crate::sync::Event::Sync(wms));
                 let acct = handle2.sync.clone();
                 let dir = handle2.info.db_storage.clone();
                 let h = tokio::spawn(async move {
@@ -477,22 +518,23 @@ pub fn register_account(
     }
 
     let store = Arc::new(RwLock::new(Store::default()));
-    let (events, _) = broadcast::channel(1024);
+    // Publish onto the process-wide bus (never a fresh per-account channel):
+    // subscribers attached before this registration — including ones that
+    // connected with zero accounts, or before a corrected re-registration —
+    // must keep receiving events without reconnecting.
     let sync = Arc::new(Mutex::new(AccountSync::with_channel(
         &info.wxid,
         &info.db_storage,
         keys,
         store.clone(),
-        events.clone(),
+        state.events.clone(),
     )));
     let handle = Arc::new(AccountHandle {
         info,
         status: AtomicU8::new(1), // indexing
         error: Mutex::new(None),
         store,
-        events,
         sync,
-        history: Arc::new(Mutex::new(HistoryBuf::default())),
         media_keys,
         watcher: Mutex::new(None),
     });

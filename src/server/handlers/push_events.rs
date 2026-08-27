@@ -15,7 +15,7 @@ use futures_util::StreamExt;
 use serde_json::json;
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::server::error::{ApiError, ApiResult};
+use crate::server::error::ApiResult;
 use crate::server::handlers::require_auth;
 use crate::server::AppState;
 
@@ -25,18 +25,14 @@ pub async fn handler(
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     require_auth(&state, &query, &headers)?;
-    let account = {
-        let accounts = state.accounts.lock();
-        match query.get("wxid").and_then(|w| accounts.get(w).cloned()) {
-            Some(a) => a,
-            None => accounts
-                .values()
-                .find(|a| a.status().is_ready())
-                .cloned()
-                .ok_or_else(|| ApiError::service_unavailable("no ready account"))?,
-        }
-    };
 
+    // No readiness gate (qqflow-server parity): the bus and replay history are
+    // process-wide, so a client may connect before any account is registered
+    // and starts receiving events once indexing completes. Gating here forced
+    // downstream clients into a reconnect-backoff loop through the whole cold
+    // start, and — with the bus previously living per account — replacing an
+    // `error` account silently orphaned every live subscriber.
+    //
     // Last-Event-ID replay (header or query param; WeFlow contract)
     let last_id = headers
         .get(HeaderName::from_static("last-event-id"))
@@ -45,10 +41,10 @@ pub async fn handler(
         .or_else(|| query.get("lastEventId").and_then(|s| s.parse::<u64>().ok()))
         .unwrap_or(0);
     let replay: Vec<(u64, &'static str, serde_json::Value)> =
-        account.history.lock().replay_since(last_id);
+        state.history.lock().replay_since(last_id);
 
-    let rx = account.events.subscribe();
-    let history = account.history.clone();
+    let rx = state.events.subscribe();
+    let history = state.history.clone();
     let stream = async_stream::stream!({
         yield Ok::<_, std::convert::Infallible>(
             Event::default().event("ready").data("{\"status\":\"ok\"}"),

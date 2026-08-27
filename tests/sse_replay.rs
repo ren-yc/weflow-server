@@ -14,7 +14,6 @@ use tokio::net::{TcpListener, TcpStream};
 
 use weflow_server::db::scan::AccountInfo;
 use weflow_server::keystore;
-use weflow_server::server::handlers::*;
 use weflow_server::server::{self, AccountHandle};
 use weflow_server::store::Store;
 use weflow_server::sync::AccountSync;
@@ -23,40 +22,28 @@ const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
 struct TestServer {
     addr: String,
-    handle: Arc<AccountHandle>,
+    #[allow(dead_code)] // held so the account outlives the server in `start`
+    handle: Option<Arc<AccountHandle>>,
     state: Arc<server::AppState>,
+    /// Built fixture's `db_storage`, so a test can register the account later.
+    storage: std::path::PathBuf,
 }
 
-async fn start(dir: &std::path::Path) -> TestServer {
+/// Serve `state` on an ephemeral port.
+async fn serve(state: Arc<server::AppState>) -> String {
+    let app: Router = server::build_router(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr.to_string()
+}
+
+/// State + built fixture, with **no account registered** — the cold-start shape.
+fn bare_state(dir: &std::path::Path) -> (Arc<server::AppState>, std::path::PathBuf) {
     let key = keystore::parse_db_key(common::FAKE_KEY_HEX).unwrap();
     let storage = common::build_wechat_account(dir, &key.0);
-    let store = Arc::new(RwLock::new(Store::default()));
-    let sync = Arc::new(Mutex::new(AccountSync::new(
-        common::FAKE_WXID,
-        &storage,
-        keystore::KeyMap::from(key),
-        store.clone(),
-    )));
-    sync.lock().full_sync().unwrap();
-
-    let info = AccountInfo {
-        wxid: common::FAKE_WXID.to_string(),
-        dir: dir.to_path_buf(),
-        db_storage: storage.clone(),
-        session_db: Some(storage.join("session/session.db")),
-    };
-    let events = sync.lock().events.clone();
-    let handle = Arc::new(AccountHandle {
-        info,
-        status: AtomicU8::new(2), // Ready
-        error: Mutex::new(None),
-        store,
-        events,
-        sync,
-        media_keys: None,
-        history: Arc::new(Mutex::new(server::HistoryBuf::default())),
-        watcher: Mutex::new(None),
-    });
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
     let cfg = weflow_server::config::Config {
         host: "127.0.0.1".into(),
@@ -69,21 +56,55 @@ async fn start(dir: &std::path::Path) -> TestServer {
         show_token: false,
         data_dir: dir.join("data"),
     };
-    let state = Arc::new(server::AppState {
-        cfg,
-        token: TOKEN.to_string(),
-        accounts: parking_lot::Mutex::new(
-            [(common::FAKE_WXID.to_string(), handle.clone())].into_iter().collect(),
-        ),
-        shutdown: shutdown_tx,
+    let state = Arc::new(server::AppState::new(cfg, TOKEN.to_string(), shutdown_tx));
+    (state, storage)
+}
+
+/// Server with a ready account registered.
+async fn start(dir: &std::path::Path) -> TestServer {
+    // State first: the event bus now lives here, and the account's sync engine
+    // publishes onto it (mirrors `register_account`).
+    let (state, storage) = bare_state(dir);
+    let key = keystore::parse_db_key(common::FAKE_KEY_HEX).unwrap();
+    let store = Arc::new(RwLock::new(Store::default()));
+
+    let sync = Arc::new(Mutex::new(AccountSync::with_channel(
+        common::FAKE_WXID,
+        &storage,
+        keystore::KeyMap::from(key),
+        store.clone(),
+        state.events.clone(),
+    )));
+    sync.lock().full_sync().unwrap();
+
+    let info = AccountInfo {
+        wxid: common::FAKE_WXID.to_string(),
+        dir: dir.to_path_buf(),
+        db_storage: storage.clone(),
+        session_db: Some(storage.join("session/session.db")),
+    };
+    let handle = Arc::new(AccountHandle {
+        info,
+        status: AtomicU8::new(2), // Ready
+        error: Mutex::new(None),
+        store,
+        sync,
+        media_keys: None,
+        watcher: Mutex::new(None),
     });
-    let app: Router = server::build_router(state.clone());
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    TestServer { addr: addr.to_string(), handle, state }
+    state
+        .accounts
+        .lock()
+        .insert(common::FAKE_WXID.to_string(), handle.clone());
+    let addr = serve(state.clone()).await;
+    TestServer { addr, handle: Some(handle), state, storage }
+}
+
+/// Server with the fixture built but **no account registered** (cold start).
+async fn start_without_account(dir: &std::path::Path) -> TestServer {
+    let (state, storage) = bare_state(dir);
+    let addr = serve(state.clone()).await;
+    TestServer { addr, handle: None, state, storage }
 }
 
 /// One SSE connection; returns parsed frames (id, event, data).
@@ -185,9 +206,9 @@ async fn sse_replay_after_reconnect() {
     let reader = sse_frames(&server, None, Duration::from_secs(8), 2);
     let sender = async {
         tokio::time::sleep(Duration::from_millis(300)).await;
-        server.handle.events.send(event1).ok();
+        server.state.events.send(event1).ok();
         tokio::time::sleep(Duration::from_millis(300)).await;
-        server.handle.events.send(event2).ok();
+        server.state.events.send(event2).ok();
     };
     let f2 = tokio::join!(reader, sender).0;
     let new_events: Vec<_> = f2.iter().filter(|(_, e, _)| e == "message.new").collect();
@@ -208,5 +229,79 @@ async fn sse_replay_after_reconnect() {
     assert!(
         !f4.iter().any(|(_, e, _)| e == "message.new"),
         "no replay past id2: {f4:?}"
+    );
+}
+
+/// Cold start (qqflow-server parity): with **no account registered at all**,
+/// `/api/v1/push/messages` must still hand back a live stream — HTTP 200 plus
+/// the `ready` baseline — instead of the old `503 no ready account`. Gating
+/// here used to push downstream clients into a full reconnect-backoff cycle
+/// for the entire registration + indexing window.
+#[tokio::test]
+async fn sse_connects_with_zero_accounts() {
+    let dir = common::tmp_dir("ssezeroacct");
+    let server = start_without_account(&dir).await;
+    assert!(
+        server.state.accounts.lock().is_empty(),
+        "fixture must have no registered account"
+    );
+
+    let frames = sse_frames(&server, None, Duration::from_secs(2), 0).await;
+    assert!(
+        frames.iter().any(|(_, e, _)| e == "ready"),
+        "zero-account stream still yields the ready baseline: {frames:?}"
+    );
+}
+
+/// A client that connected before any account existed keeps receiving events
+/// once one registers — and a *later* registration (the `error` -> corrected
+/// path) does not orphan it. Both rely on the bus being global: when it lived
+/// on `AccountHandle`, `register_account` minted a fresh channel and every
+/// live subscriber silently stopped receiving anything, with no disconnect to
+/// trigger a reconnect.
+#[tokio::test]
+async fn subscriber_survives_account_registration() {
+    let dir = common::tmp_dir("ssesurvive");
+    let server = start_without_account(&dir).await;
+
+    let event = weflow_server::sync::Event::New(weflow_server::sync::NewMessageEvent {
+        session_id: common::FAKE_GROUP.to_string(),
+        session_type: "group",
+        rawid: "333".into(),
+        source_name: "c".into(),
+        group_name: Some("g".into()),
+        content: "after registration".into(),
+        timestamp: 1700000003,
+    });
+
+    // Subscribe first (zero accounts), then register an account and publish.
+    let reader = sse_frames(&server, None, Duration::from_secs(8), 1);
+    let key = keystore::parse_db_key(common::FAKE_KEY_HEX).unwrap();
+    let storage = server.storage.clone();
+    let state = server.state.clone();
+    let dir_owned = dir.clone();
+    let writer = async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let info = AccountInfo {
+            wxid: common::FAKE_WXID.to_string(),
+            dir: dir_owned,
+            db_storage: storage.clone(),
+            session_db: Some(storage.join("session/session.db")),
+        };
+        let (_h, is_new) = server::register_account(
+            &state,
+            info,
+            keystore::KeyMap::from(key),
+            None,
+        );
+        assert!(is_new, "first registration for this wxid");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Published on the global bus — the pre-registration subscriber must see it.
+        state.events.send(event).ok();
+    };
+    let frames = tokio::join!(reader, writer).0;
+    assert!(
+        frames.iter().any(|(_, e, _)| e == "message.new"),
+        "pre-registration subscriber receives post-registration events: {frames:?}"
     );
 }

@@ -181,6 +181,17 @@
 
 ### GET/POST `/api/v1/push/messages` — SSE 事件流（免轮询推送）
 
+**无就绪门控**（对齐 qqflow-server）：事件总线与重放历史挂在进程级状态上，不属于
+任何单个账号。因此——
+
+- **零账号时连接返回 200**（不是 503），先收到 `ready` 基线；账号注册并建索引完成后
+  事件自然流入同一条连接，客户端无需在冷启动期退避重连；
+- **替换 `error` 态账号不会孤儿化订阅者**：改正密钥后重注册，已连接的客户端继续收到
+  新账号的事件（旧实现每次注册新建总线，订阅者会静默失聪且不断线）；
+- 业务端点（`messages`/`sessions`/…）**仍有** 503 门控——索引未建完确实无法查询，
+  与此处语义不同；
+- `wxid` 查询参数仅作语义提示，不影响订阅内容（总线为进程级，非按账号隔离）。
+
 事件（`event:` 名）：
 
 | 事件 | data 形状 |
@@ -188,9 +199,10 @@
 | `ready` | `{"status":"ok"}`（连接建立基线） |
 | `message.new` | `{"event":"message.new","sessionId":"...","sessionType":"group","rawid":"...","sourceName":"...","groupName":"...","content":"...","timestamp":1700000100}` |
 | `message.revoke` | 同上（`event` 为 `message.revoke`） |
-| `sync` | `{"rebased":true}`（水位重基） |
+| `sync` | `{"event":"sync","watermarks":[...]}`（水位基线/重基）；订阅端滞后时为 `{"rebased":true}` |
 
 - 帧携带 `id:` 序号；`Last-Event-ID` 头（或查询参数）可回放最近 **1000 条 / 10 分钟**
+  （序号为总线级单调值，跨账号注册保持连续）
 - 每 25 秒发送 `ping` 注释帧保活
 
 ### GET/POST `/api/v1/sync` — 手动增量同步

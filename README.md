@@ -87,6 +87,12 @@ SSE 推送（token 任一通道：`Authorization: Bearer` / `X-Api-Key` / 查询
 curl -N "http://127.0.0.1:5033/api/v1/push/messages?access_token=<token>"
 ```
 
+推送端点**无就绪门控**（对齐 qqflow-server）：事件总线与重放历史为进程级，
+零账号时连接同样返回 200 并先发 `ready` 基线，账号注册并建索引完成后事件自然流入——
+客户端不必在冷启动期反复重连。同理，替换 `error` 态账号（改正密钥后重注册）
+**不会掉线或静默中断**已连接的订阅者。业务端点（messages/sessions/…）仍按账号
+就绪与否返回 503，因为索引未建完确实无法查询。
+
 完整接口文档见 [docs/weflow-server-api.md](docs/weflow-server-api.md)（与 WeFlow `docs/HTTP-API.md` 契约对齐）。
 
 ## 测试

@@ -14,11 +14,9 @@ pub mod server;
 pub mod store;
 pub mod sync;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
-use parking_lot::Mutex;
 
 use crate::config::Config;
 
@@ -44,12 +42,11 @@ pub fn run(cfg: Config) -> Result<()> {
 async fn serve(cfg: Config) -> Result<()> {
     let token = server::load_token()?;
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
-    let state = Arc::new(server::AppState {
-        cfg: cfg.clone(),
-        token: token.clone(),
-        accounts: Mutex::new(HashMap::new()),
-        shutdown: shutdown_tx,
-    });
+    let state = Arc::new(server::AppState::new(
+        cfg.clone(),
+        token.clone(),
+        shutdown_tx,
+    ));
     let app = server::build_router(state);
     let addr = format!("{}:{}", cfg.host, cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
