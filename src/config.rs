@@ -102,7 +102,7 @@ pub fn parse_args() -> anyhow::Result<Option<Config>> {
                 println!("weflow-server {}", env!("CARGO_PKG_VERSION"));
                 return Ok(None);
             }
-            other => anyhow::bail!("unknown argument: {other}"),
+            other => anyhow::bail!("未知参数: {other}"),
         }
     }
     if cfg.media_export_dir.as_os_str().is_empty() {
@@ -113,21 +113,21 @@ pub fn parse_args() -> anyhow::Result<Option<Config>> {
 
 fn print_help() {
     println!(
-        "weflow-server {} - headless WeChat 4.x database monitor + decrypt/extract service\n\
+        "weflow-server {} — 本地微信 4.x 数据库监控 + 解密/导出服务\n\
          \n\
-         USAGE:\n    weflow-server [OPTIONS]\n\
+         用法: weflow-server [选项]\n\
          \n\
-         OPTIONS:\n\
-         \x20   --port <PORT>              Listen port (default 5033)\n\
-         \x20   --host <HOST>              Bind host (default 127.0.0.1)\n\
-         \x20   --log <LEVEL>              error|warn|info|debug (default info)\n\
-         \x20   --watch-debounce-ms <MS>   Watch event debounce (default 350)\n\
-         \x20   --watch-fallback-ms <MS>   Slow fallback poll (default 30000, 0 disables)\n\
-         \x20   --media-export-dir <DIR>   Media export root\n\
-         \x20   --base-url <URL>           Base URL for media links\n\
-         \x20   --show-token               Print the stored API token and exit\n\
-         \x20   -h, --help                 Print this help\n\
-         \x20   -V, --version              Print version",
+         选项:\n\
+         \x20   --port <PORT>              监听端口（默认 5033）\n\
+         \x20   --host <HOST>              绑定地址（默认 127.0.0.1）\n\
+         \x20   --log <LEVEL>              日志级别: error|warn|info|debug（默认 info）\n\
+         \x20   --watch-debounce-ms <MS>   文件事件防抖（默认 350）\n\
+         \x20   --watch-fallback-ms <MS>   慢速兜底轮询，0 关闭（默认 30000）\n\
+         \x20   --media-export-dir <DIR>   媒体导出根目录\n\
+         \x20   --base-url <URL>           媒体导出链接 base URL\n\
+         \x20   --show-token               打印已存的 API token 并退出\n\
+         \x20   -h, --help                 显示本帮助\n\
+         \x20   -V, --version              打印版本号",
         env!("CARGO_PKG_VERSION")
     );
 }

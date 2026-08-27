@@ -181,7 +181,7 @@ const TOKEN_USER: &str = "http-api-token";
 /// `--show-token` flag to retrieve it on demand.
 pub fn load_token() -> Result<String> {
     let entry = keyring::Entry::new(TOKEN_SERVICE, TOKEN_USER)
-        .map_err(|e| anyhow::anyhow!("credential store init failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("凭据库初始化失败: {e}"))?;
     match entry.get_password() {
         Ok(t) if t.len() >= 16 => Ok(t),
         Ok(_) => {
@@ -189,23 +189,23 @@ pub fn load_token() -> Result<String> {
             let t = new_token();
             entry
                 .set_password(&t)
-                .map_err(|e| anyhow::anyhow!("credential store write failed: {e}"))?;
-            tracing::info!("generated new API token: {t}");
+                .map_err(|e| anyhow::anyhow!("凭据库写入失败: {e}"))?;
+            tracing::info!("[init] 生成新 API token: {t}（已存入系统凭据库）");
             Ok(t)
         }
         Err(keyring::Error::NoEntry) => {
             let t = new_token();
             entry
                 .set_password(&t)
-                .map_err(|e| anyhow::anyhow!("credential store write failed: {e}"))?;
-            tracing::info!("generated new API token: {t}");
+                .map_err(|e| anyhow::anyhow!("凭据库写入失败: {e}"))?;
+            tracing::info!("[init] 生成新 API token: {t}（已存入系统凭据库）");
             Ok(t)
         }
         Err(e) => {
             // no credential store available: per-session token, log only
             let t = new_token();
             tracing::warn!(
-                "credential store unavailable ({e}); API token is per-session (regenerated on restart): {t}"
+                "[init] 凭据库不可用 ({e})；API token 为会话级（重启后变化）: {t}"
             );
             Ok(t)
         }
@@ -216,11 +216,11 @@ pub fn load_token() -> Result<String> {
 /// Used by `--show-token`.
 pub fn show_token() -> Result<Option<String>> {
     let entry = keyring::Entry::new(TOKEN_SERVICE, TOKEN_USER)
-        .map_err(|e| anyhow::anyhow!("credential store init failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("凭据库初始化失败: {e}"))?;
     match entry.get_password() {
         Ok(t) if !t.is_empty() => Ok(Some(t)),
         Ok(_) | Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(anyhow::anyhow!("credential store read failed: {e}")),
+        Err(e) => Err(anyhow::anyhow!("凭据库读取失败: {e}")),
     }
 }
 
@@ -405,11 +405,7 @@ pub async fn start_account(
         match result {
             Ok(Ok(n)) => {
                 handle2.set_status(crate::server::AccountStatus::Ready);
-                tracing::info!(
-                    "account {} indexed ({} files), watcher started",
-                    handle2.info.wxid,
-                    n
-                );
+                tracing::info!("[init] 账号 {} 索引完成: {} 条消息", handle2.info.wxid, n);
                 let wms: Vec<(String, crate::store::Watermark)> = {
                     let guard = handle2.store.read();
                     guard.watermarks.clone().into_iter().collect()
@@ -428,11 +424,11 @@ pub async fn start_account(
             }
             Ok(Err(e)) => {
                 handle2.set_status(crate::server::AccountStatus::Error);
-                tracing::error!("account {} init failed: {e:#}", handle2.info.wxid);
+                tracing::warn!("[init] 账号 {} 初始化失败（重新注册可恢复）: {e:#}", handle2.info.wxid);
             }
             Err(e) => {
                 handle2.set_status(crate::server::AccountStatus::Error);
-                tracing::error!("account {} init task panicked: {e}", handle2.info.wxid);
+                tracing::error!("[init] 账号 {} 初始化任务异常: {e}", handle2.info.wxid);
             }
         }
     });

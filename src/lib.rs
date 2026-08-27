@@ -31,7 +31,7 @@ pub fn run(cfg: Config) -> Result<()> {
                 Ok(())
             }
             None => anyhow::bail!(
-                "no API token stored yet (start the service once to generate it)"
+                "尚未生成 API token（先启动一次服务以生成）"
             ),
         };
     }
@@ -54,9 +54,9 @@ async fn serve(cfg: Config) -> Result<()> {
     let addr = format!("{}:{}", cfg.host, cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!(
-        "weflow-server {} listening on http://{addr}  (api token held in OS credential store; retrieve with --show-token)",
-        env!("CARGO_PKG_VERSION")
+        "[init] 服务启动: http://{addr}  (API token 存于系统凭据库; 仅首次生成时打印; --show-token 获取)"
     );
+    tracing::info!("[init] 等待客户端注册账号: POST /api/v1/accounts {{\"wxid\", \"key\", \"db_path\"}}");
     let _ = token;
     axum::serve(listener, app).await?;
     Ok(())

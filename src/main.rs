@@ -1,9 +1,15 @@
 use anyhow::Result;
 
-fn main() -> Result<()> {
-    let cfg = match weflow_server::config::parse_args()? {
-        Some(c) => c,
-        None => return Ok(()), // --help / --version already printed
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("[fatal] {e:#}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
+    let Some(cfg) = weflow_server::config::parse_args()? else {
+        return Ok(()); // --help / --version already printed
     };
     weflow_server::logging::init(&cfg.log);
     weflow_server::run(cfg)
