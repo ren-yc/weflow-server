@@ -43,6 +43,8 @@ impl AccountStatus {
 pub struct AccountHandle {
     pub info: AccountInfo,
     pub status: AtomicU8, // AccountStatus as u8
+    /// Last initialization failure reason (None while healthy).
+    pub error: Mutex<Option<String>>,
     pub store: Arc<RwLock<Store>>,
     pub events: broadcast::Sender<Event>,
     pub sync: Arc<Mutex<AccountSync>>,
@@ -392,7 +394,11 @@ pub async fn start_account(
             .map(|code| crate::keystore::ImageKeys::from_img_code(&crate::keystore::ImgCode(code.clone()), &info.wxid))
     };
 
-    let handle = register_account(&state, info.clone(), key_map, media_keys);
+    let (handle, is_new) = register_account(&state, info.clone(), key_map, media_keys);
+    if !is_new {
+        // A ready/indexing account was re-registered: reuse it, no rebuild.
+        return Ok(handle);
+    }
 
     // async build: full_sync then mark ready and spawn the watcher
     let handle2 = handle.clone();
@@ -405,7 +411,17 @@ pub async fn start_account(
         match result {
             Ok(Ok(n)) => {
                 handle2.set_status(crate::server::AccountStatus::Ready);
-                tracing::info!("[init] 账号 {} 索引完成: {} 条消息", handle2.info.wxid, n);
+                *handle2.error.lock() = None;
+                let msg_total = {
+                    let guard = handle2.store.read();
+                    guard.total_messages()
+                };
+                tracing::info!(
+                    "[init] 账号 {} 索引完成: {} 个数据库, 共 {} 条消息",
+                    handle2.info.wxid,
+                    n,
+                    msg_total
+                );
                 let wms: Vec<(String, crate::store::Watermark)> = {
                     let guard = handle2.store.read();
                     guard.watermarks.clone().into_iter().collect()
@@ -424,10 +440,12 @@ pub async fn start_account(
             }
             Ok(Err(e)) => {
                 handle2.set_status(crate::server::AccountStatus::Error);
+                *handle2.error.lock() = Some(format!("{e:#}"));
                 tracing::warn!("[init] 账号 {} 初始化失败（重新注册可恢复）: {e:#}", handle2.info.wxid);
             }
             Err(e) => {
                 handle2.set_status(crate::server::AccountStatus::Error);
+                *handle2.error.lock() = Some(format!("index task panicked: {e}"));
                 tracing::error!("[init] 账号 {} 初始化任务异常: {e}", handle2.info.wxid);
             }
         }
@@ -436,13 +454,27 @@ pub async fn start_account(
     Ok(handle)
 }
 
-/// Insert the account's live sync when a new message event broadcast happens.
+/// Register the account handle in the registry.
+///
+/// Idempotent (qqflow-server parity): if a handle for the same `wxid`
+/// already exists and is not in the `error` state, the existing handle is
+/// returned (`is_new == false`) — no rebuild, no watcher aborted. Only
+/// `error` (or awaiting-key) accounts are replaced, giving a corrected
+/// registration a clean recovery path.
 pub fn register_account(
     state: &Arc<AppState>,
     info: AccountInfo,
     keys: crate::keystore::KeyMap,
     media_keys: Option<crate::keystore::ImageKeys>,
-) -> Arc<AccountHandle> {
+) -> (Arc<AccountHandle>, bool) {
+    // Idempotent guard before allocating anything: re-registration of an
+    // already ready/indexing account returns the live handle as-is.
+    if let Some(old) = { state.accounts.lock().get(&info.wxid).cloned() } {
+        match old.status() {
+            AccountStatus::Ready | AccountStatus::Indexing => return (old, false),
+            _ => {} // awaiting_key / error -> fall through to replace below
+        }
+    }
 
     let store = Arc::new(RwLock::new(Store::default()));
     let (events, _) = broadcast::channel(1024);
@@ -456,6 +488,7 @@ pub fn register_account(
     let handle = Arc::new(AccountHandle {
         info,
         status: AtomicU8::new(1), // indexing
+        error: Mutex::new(None),
         store,
         events,
         sync,
@@ -469,7 +502,7 @@ pub fn register_account(
         && let Some(task) = old.watcher.lock().take() {
             task.abort();
         }
-    handle
+    (handle, true)
 }
 
 /// Build the watch config from CLI.

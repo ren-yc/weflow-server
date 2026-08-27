@@ -49,6 +49,7 @@ async fn start(dir: &std::path::Path) -> TestServer {
     let handle = Arc::new(AccountHandle {
         info,
         status: AtomicU8::new(2), // Ready
+        error: Mutex::new(None),
         store,
         events,
         sync,

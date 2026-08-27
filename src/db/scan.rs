@@ -196,6 +196,9 @@ pub fn find_session_db(account_dir: &Path) -> Option<PathBuf> {
 
 pub fn classify_rel(rel: &str) -> DbKind {
     let lower = rel.to_ascii_lowercase();
+    if lower == "migrate" || lower.starts_with("migrate/") {
+        return DbKind::Other;
+    }
     if lower.starts_with("session") || lower.contains("session.db") {
         DbKind::Session
     } else if lower.starts_with("message") || lower.contains("msg") {
@@ -225,6 +228,13 @@ pub fn enum_db_files(storage: &Path) -> Vec<DbFile> {
         for e in entries.flatten() {
             let p = e.path();
             if p.is_dir() {
+                // Skip migration-tool droplet directories entirely.
+                if p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n == "migrate")
+                {
+                    continue;
+                }
                 walk(&p, storage, out);
             } else if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
                 if name.ends_with("-wal") || name.ends_with("-shm") || name.ends_with("-journal") {
@@ -272,6 +282,8 @@ mod tests {
         assert_eq!(classify_rel("contact/contact.db"), DbKind::Contact);
         assert_eq!(classify_rel("media_1/media_1.db"), DbKind::Media);
         assert_eq!(classify_rel("emoticon/emoticon.db"), DbKind::Other);
+        assert_eq!(classify_rel("migrate/unspportmsg.db"), DbKind::Other);
+        assert_eq!(classify_rel("migrate"), DbKind::Other);
     }
 
     #[test]
@@ -288,6 +300,19 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert!(files.iter().all(|f| f.wal.is_some()));
         assert!(files.iter().all(|f| !f.rel.contains("-wal")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enum_skips_migrate_dir() {
+        let dir = std::env::temp_dir().join(format!("wf-scan-migrate-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("migrate")).unwrap();
+        std::fs::create_dir_all(dir.join("message")).unwrap();
+        std::fs::write(dir.join("migrate/unspportmsg.db"), b"x").unwrap();
+        std::fs::write(dir.join("message/message_0.db"), b"x").unwrap();
+        let files = enum_db_files(&dir);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].rel, "message/message_0.db");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

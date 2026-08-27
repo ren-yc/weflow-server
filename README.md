@@ -76,6 +76,11 @@ curl -X POST http://127.0.0.1:5033/api/v1/accounts \
 aesKey=MD5(code+wxid)[:16]），或直接指定 `img_aes_key`/`img_xor_key`（推荐）。
 密钥错误时账号进入 `error` 状态，重新注册即可恢复。
 
+注册响应带真实状态：`{"state":"accepted","status":"indexing",...}`（后随 `ready`）。**注册幂等**
+（对齐 qqflow-server）：重复注册已就绪/索引中的账号返回 `already_ready`/`in_progress` 且
+**不会重建索引**；`/health` 与 `/api/v1/health`（免鉴权）返回每账号状态列表
+（`state`/`message_count`/`error`），客户端可据此健康检查，避免「503 → 重注册 → 再重建」风暴。
+
 SSE 推送（token 任一通道：`Authorization: Bearer` / `X-Api-Key` / 查询或 POST body 参数 `access_token`/`token`，比对为常时比较）：
 
 ```bash

@@ -224,6 +224,11 @@ impl Store {
     pub fn conv_count(&self, username: &str) -> usize {
         self.convs.get(username).map_or(0, |v| v.len())
     }
+
+    /// Total number of indexed messages across all conversations.
+    pub fn total_messages(&self) -> usize {
+        self.convs.values().map(|v| v.len()).sum()
+    }
 }
 
 #[cfg(test)]

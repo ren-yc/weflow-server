@@ -43,6 +43,7 @@ fn test_state(dir: &std::path::Path) -> Arc<server::AppState> {
     let handle = Arc::new(AccountHandle {
         info,
         status: AtomicU8::new(2), // Ready
+        error: Mutex::new(None),
         store,
         events,
         sync,
@@ -249,4 +250,97 @@ async fn media_and_sync_endpoints() {
     assert_eq!(status, StatusCode::OK);
     assert!(body["success"] == true);
     assert_eq!(body["newMessages"], 0, "nothing changed -> zero new");
+}
+
+#[tokio::test]
+async fn accounts_registration_is_idempotent_and_health_lists_state() {
+    let dir = common::tmp_dir("smoke-acct");
+    let state = test_state(&dir);
+    let app = server::build_router(state);
+
+    // Re-registering the already-ready fake account must answer
+    // `already_ready` (with real status) instead of rebuilding.
+    let body = serde_json::json!({ "wxid": common::FAKE_WXID, "access_token": TOKEN });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/accounts")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["success"], true);
+    assert_eq!(body["state"], "already_ready");
+    assert_eq!(body["status"], "ready");
+
+    // /health (unauthenticated) now carries the per-account state list.
+    let (status, body) = json_body(app.oneshot(request("GET", "/health", None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "ok", "all accounts ready");
+    let acc = body["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["wxid"] == common::FAKE_WXID)
+        .expect("fake account listed");
+    assert_eq!(acc["state"], "ready");
+    assert!(acc["message_count"].as_i64().unwrap() >= 1);
+}
+
+/// Direct `register_account` idempotency (the lock-level guard that also
+/// covers the concurrent re-registration window): the second call returns
+/// the same handle with `is_new == false`, and no watcher/rebuild happens.
+#[test]
+fn register_account_is_idempotent_at_registry_level() {
+    let dir = std::env::temp_dir().join(format!("regacct-{}", std::process::id()));
+    let key = weflow_server::keystore::parse_db_key(common::FAKE_KEY_HEX).unwrap();
+    let key_bytes = key.0;
+    let storage = common::build_wechat_account(&dir, &key_bytes);
+    let info = AccountInfo {
+        wxid: "wxid_fake_reg_acct".into(),
+        dir: dir.clone(),
+        db_storage: storage.clone(),
+        session_db: Some(storage.join("session/session.db")),
+    };
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let state = Arc::new(server::AppState {
+        cfg: weflow_server::config::Config {
+            host: "127.0.0.1".into(),
+            port: 0,
+            log: "info".into(),
+            watch_debounce_ms: 10,
+            watch_fallback_ms: 0,
+            media_export_dir: dir.join("api-media"),
+            base_url: None,
+            show_token: false,
+            data_dir: dir.join("data"),
+        },
+        token: TOKEN.to_string(),
+        accounts: parking_lot::Mutex::new(Default::default()),
+        shutdown: shutdown_tx,
+    });
+
+    let keymap = weflow_server::keystore::KeyMap::from(key);
+    let (h1, is_new1) =
+        server::register_account(&state, info.clone(), keymap.clone(), None);
+    assert!(is_new1, "first registration creates the handle");
+    assert_eq!(h1.status(), weflow_server::server::AccountStatus::Indexing);
+
+    // second registration (still indexing) -> same handle, no replacement
+    let (h2, is_new2) = server::register_account(&state, info.clone(), keymap.clone(), None);
+    assert!(!is_new2, "re-registration reuses the live handle");
+    assert!(Arc::ptr_eq(&h1, &h2), "same handle object, never rebuilt");
+
+    // once ready, re-registration still reuses (no downgrade to indexing)
+    h1.set_status(weflow_server::server::AccountStatus::Ready);
+    let (h3, is_new3) = server::register_account(&state, info.clone(), keymap, None);
+    assert!(!is_new3, "ready account stays ready on re-registration");
+    assert!(Arc::ptr_eq(&h1, &h3));
+    let _ = std::fs::remove_dir_all(&dir);
 }

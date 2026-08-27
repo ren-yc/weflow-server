@@ -42,9 +42,20 @@
 
 ### GET/POST `/health`、`/api/v1/health`（免鉴权）
 
+全局就绪状态 + 每账号状态列表（客户端可据此健康检查，无需轮询注册端点）：
+
 ```json
-{ "status": "ok" }
+{
+  "status": "ok",
+  "version": "0.2.0",
+  "accounts": [
+    { "wxid": "wxid_xxxx_1234", "state": "ready", "message_count": 217272 }
+  ]
+}
 ```
+
+- `status`：`ok`（至少一个账号且全部 `ready`）或 `starting`（无账号 / 仍在 indexing / 有 error）。
+- `accounts[].state` ∈ `awaiting_key | indexing | ready | error`（与账号状态机一致）；账号处于 `error` 时附 `error` 字符串（错误原因）。
 
 ### POST `/api/v1/accounts` — 注册账号（客户端驱动启动）
 
@@ -72,13 +83,18 @@
 响应：
 
 ```json
-{ "success": true, "wxid": "...", "status": "ready" }
+{ "success": true, "wxid": "wxid_xxxx_1234", "state": "accepted", "status": "indexing", "db_storage": "D:\\AppData\\xwechat_files\\wxid_xxxx_1234\\db_storage" }
 ```
+
+- `state`：注册结果语义（qqflow-server 风格）——`accepted`（已接受，开始后台构建）/ `already_ready`（重复注册，账号已就绪）/ `in_progress`（重复注册，正在构建中）；
+- `status`：账号当前状态机值 ∈ `awaiting_key | indexing | ready | error`；
+- `db_storage`：实际使用的库目录。
 
 行为契约：
 - **密钥仅存进程内存，不落盘**；服务重启后需重新注册。
 - 注册时对目标库做页 1 HMAC 预校验（`wcdb::verify_page1`），错钥立即拒绝（`400`）。
-- 成功后启动阻塞式全量构建 + 文件事件监视任务；构建完成前账号状态为 `building`。
+- 成功后启动阻塞式全量构建 + 文件事件监视任务；构建完成前账号状态为 `indexing`。
+- **注册幂等**（对齐 qqflow-server）：重复注册已 `ready`/`indexing` 的账号**不会重建索引**、不会中止 watcher，直接返回现有句柄（`state` 为 `already_ready`/`in_progress`）；仅 `error`（或 `awaiting_key`）状态的账号会被替换重建——密钥 / 路径填错后重新注册即可自愈。
 
 ### GET/POST `/api/v1/messages` — 消息查询 + 媒体导出
 

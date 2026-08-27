@@ -4,6 +4,13 @@
 //! The key is validated deterministically against the account's session.db
 //! (page-1 HMAC). On success the live acquisition + in-memory index
 //! blocking task and a watcher task is spawned.
+//!
+//! Registration is **idempotent** (qqflow-server parity): re-registering an
+//! account that is already `ready` (or still `indexing`) answers
+//! `already_ready` / `in_progress` from the live handle — no index rebuild,
+//! no watcher abort. Only `error` (or awaiting-key) accounts are replaced,
+//! so a corrected registration recovers cleanly. `GET /health` / `/api/v1/health`
+//! expose the per-account state list for client-side health checks.
 
 use std::sync::Arc;
 
@@ -14,7 +21,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::server::error::{ApiError, ApiResult};
-use crate::server::AppState;
+use crate::server::{AccountStatus, AppState};
 
 use super::require_auth;
 
@@ -71,6 +78,38 @@ pub async fn handler(
 
         },
     };
+    // Idempotent guards for accounts already past the waiting stage
+    // (qqflow-server parity): re-registering a ready/indexing account
+    // answers from the live handle instead of rebuilding the index.
+    let existing = body
+        .wxid
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .and_then(|w| state.accounts.lock().get(w).cloned());
+    if let Some(h) = &existing {
+        match h.status() {
+            AccountStatus::Ready => {
+                return Ok(Json(json!({
+                    "success": true,
+                    "wxid": h.info.wxid,
+                    "state": "already_ready",
+                    "status": AccountStatus::Ready,
+                    "db_storage": h.info.db_storage.to_string_lossy(),
+                })));
+            }
+            AccountStatus::Indexing => {
+                return Ok(Json(json!({
+                    "success": true,
+                    "wxid": h.info.wxid,
+                    "state": "in_progress",
+                    "status": AccountStatus::Indexing,
+                    "db_storage": h.info.db_storage.to_string_lossy(),
+                })));
+            }
+            _ => {} // awaiting_key / error -> accept a (corrected) registration
+        }
+    }
+
     // delegate to the shared registration path (spawns the async
     // build/watcher)
     let handle = crate::server::start_account(state.clone(), body).await?;
@@ -78,7 +117,8 @@ pub async fn handler(
     Ok(Json(json!({
         "success": true,
         "wxid": handle.info.wxid,
-        "status": "indexing",
+        "state": "accepted",
+        "status": handle.status(),
         "db_storage": handle.info.db_storage.to_string_lossy(),
     })))
 }
