@@ -187,6 +187,42 @@ pub fn build_wechat_account(dir: &Path, key: &Key) -> PathBuf {
     storage
 }
 
+/// Rebuild `session.db` with the column set a real WeChat 4.x client ships:
+/// `SessionTable` carries NO session-name column at all (the only name-ish
+/// column is `last_sender_display_name`, i.e. the *sender* of the last
+/// message, and `session_title` lives in a separate table). Probed against a
+/// real 4.x account: none of the name aliases the index looks for match, so
+/// `Session.display_name` stays empty and display has to fall back to
+/// contacts.
+pub fn rewrite_session_db_without_name_column(storage: &Path, key: &Key) {
+    let path = storage.join("session/session.db");
+    let _ = fs::remove_file(&path);
+    let conn = wx_conn(&path, key, false);
+    conn.execute_batch(
+        "CREATE TABLE SessionTable (
+            username TEXT PRIMARY KEY,
+            type INTEGER NOT NULL DEFAULT 0,
+            unread_count INTEGER NOT NULL DEFAULT 0,
+            is_hidden INTEGER NOT NULL DEFAULT 0,
+            summary TEXT,
+            status INTEGER NOT NULL DEFAULT 0,
+            last_timestamp INTEGER NOT NULL DEFAULT 0,
+            sort_timestamp INTEGER NOT NULL DEFAULT 0,
+            last_msg_type INTEGER NOT NULL DEFAULT 0,
+            last_msg_sender TEXT,
+            last_sender_display_name TEXT
+         );
+         INSERT INTO SessionTable
+            (username, type, unread_count, summary, last_timestamp, sort_timestamp, last_msg_type, last_sender_display_name)
+         VALUES
+            ('wxid_friend_a', 0, 0, '你好', 1700000010, 1700000010, 1, '张三'),
+            ('wxid_fake_group@chatroom', 2, 2, '[图片]', 1700000015, 1700000015, 3, '李四');
+         CREATE TABLE SessionNoContactInfoTable (username TEXT PRIMARY KEY, session_title TEXT);",
+    )
+    .unwrap();
+    drop(conn);
+}
+
 /// Add one more message row to the group conversation (a simulated WeChat
 /// write). If `keep_open`, the connection stays alive so DELETE-mode data
 /// lands in the main file (default); WAL-mode tests keep their own conn.

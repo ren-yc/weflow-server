@@ -84,6 +84,8 @@ async fn file_event_triggers_sync_and_message_event() {
             assert_eq!(m.content, "新消息");
             assert_eq!(m.timestamp, 1_700_000_200);
             assert!(!m.source_name.is_empty());
+            // group events carry the resolved group name (not the raw id)
+            assert_eq!(m.group_name.as_deref(), Some("项目群"));
         }
         other => panic!("unexpected event: {other:?}"),
     }

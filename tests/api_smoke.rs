@@ -21,9 +21,19 @@ use weflow_server::sync::AccountSync;
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
 fn test_state(dir: &std::path::Path) -> Arc<server::AppState> {
+    test_state_with(dir, |_, _| {})
+}
+
+/// `test_state`, but `mutate(storage, key)` runs against the freshly built
+/// fixture before the first sync — used to reshape a database schema.
+fn test_state_with(
+    dir: &std::path::Path,
+    mutate: impl FnOnce(&std::path::Path, &[u8; 32]),
+) -> Arc<server::AppState> {
     let key = keystore::parse_db_key(common::FAKE_KEY_HEX).unwrap();
     let key_bytes = key.0;
     let storage = common::build_wechat_account(dir, &key_bytes);
+    mutate(&storage, &key_bytes);
     let store = Arc::new(RwLock::new(Store::default()));
     let sync = Arc::new(Mutex::new(AccountSync::new(
         common::FAKE_WXID,
@@ -207,6 +217,58 @@ async fn sessions_contacts_group_members() {
         assert!(m["messageCount"].as_i64().unwrap() >= 1);
         assert!(m["wxid"].is_string());
     }
+}
+
+/// Real WeChat 4.x `SessionTable` has no session-name column (probed against
+/// a live account: 315 rows, zero matches for every name alias the index
+/// looks for). The session list must still emit human names by falling back
+/// to contacts instead of leaking the raw wxid, and keyword search by name
+/// must keep working.
+#[tokio::test]
+async fn session_names_fall_back_to_contacts_without_a_name_column() {
+    let dir = common::tmp_dir("smoke-noname");
+    let state = test_state_with(&dir, |storage, key| {
+        common::rewrite_session_db_without_name_column(storage, key);
+    });
+    let app = server::build_router(state);
+
+    // default shape
+    let uri = format!("/api/v1/sessions?access_token={TOKEN}");
+    let (status, body) = json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    let sessions = body["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 2);
+    let group = sessions.iter().find(|s| s["username"] == common::FAKE_GROUP).unwrap();
+    assert_eq!(group["displayName"], "项目群", "group name via contact nickname");
+    let friend = sessions.iter().find(|s| s["username"] == common::FAKE_FRIEND).unwrap();
+    assert_eq!(friend["displayName"], "客户张三", "remark beats nickname");
+    // the session row still carries its own data
+    assert_eq!(group["unreadCount"], 2);
+    assert_eq!(group["summary"], "[图片]");
+
+    // chatlab shape
+    let uri = format!("/api/v1/sessions?chatlab=1&access_token={TOKEN}");
+    let (status, body) = json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    let group = body["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == common::FAKE_GROUP)
+        .unwrap();
+    assert_eq!(group["name"], "项目群");
+
+    // keyword search by human name (was a guaranteed 0-hit before)
+    let uri = format!("/api/v1/sessions?keyword=项目群&access_token={TOKEN}");
+    let (status, body) = json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"].as_i64().unwrap(), 1, "name search must hit");
+    assert_eq!(body["sessions"][0]["username"], common::FAKE_GROUP);
+
+    // a session with no contact entry keeps the username as the last resort
+    let uri = format!("/api/v1/sessions?keyword=nope-nobody&access_token={TOKEN}");
+    let (_, body) = json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(body["count"].as_i64().unwrap(), 0);
 }
 
 #[tokio::test]

@@ -320,9 +320,9 @@ impl AccountSync {
                             .map(|r| r.server_id.to_string())
                             .unwrap_or_default(),
                         source_name: sender_name,
-                        group_name: guard.sessions.get(&session).map(|s| {
-                            if s.kind.as_str() == "group" {
-                                s.display_name.clone()
+                        group_name: guard.sessions.get(&session).map(|s| s.kind.as_str()).map(|kind| {
+                            if kind == "group" {
+                                guard.session_display_opt(&session).unwrap_or_default()
                             } else {
                                 String::new()
                             }
@@ -376,9 +376,9 @@ impl AccountSync {
                         .unwrap_or("other"),
                     rawid,
                     source_name: row.sender_name.clone(),
-                    group_name: guard.sessions.get(&session).map(|s| {
-                        if s.kind.as_str() == "group" {
-                            s.display_name.clone()
+                    group_name: guard.sessions.get(&session).map(|s| s.kind.as_str()).map(|kind| {
+                        if kind == "group" {
+                            guard.session_display_opt(&session).unwrap_or_default()
                         } else {
                             String::new()
                         }

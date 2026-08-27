@@ -193,15 +193,24 @@ impl Store {
     /// Best display name for a session: session display name, else the
     /// contact's display name, else the raw username.
     pub fn session_display(&self, username: &str) -> String {
+        self.session_display_opt(username)
+            .unwrap_or_else(|| username.to_string())
+    }
+
+    /// Like `session_display`, but `None` when no *name* is known (rather
+    /// than echoing the username back). Callers whose empty value means
+    /// "unknown" to a downstream client use this, so a raw wxid is never
+    /// presented as if it were a name — real accounts do contain groups that
+    /// were never named and have no contact entry to borrow a name from.
+    pub fn session_display_opt(&self, username: &str) -> Option<String> {
         if let Some(s) = self.sessions.get(username)
             && !s.display_name.is_empty() {
-                return s.display_name.clone();
+                return Some(s.display_name.clone());
             }
         self.contacts
             .get(username)
             .map(|c| c.display_name())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| username.to_string())
+            .filter(|s| !s.is_empty() && s != username)
     }
 
     /// Best display name for a message sender inside a chatroom context.
@@ -257,5 +266,54 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(c2.display_name(), "李四");
+    }
+
+    /// `session_display` echoes the username as a last resort (a list needs
+    /// *something* to show); `session_display_opt` reports the same case as
+    /// `None` so an SSE field whose empty value means "unknown" never ships a
+    /// raw wxid dressed up as a group name.
+    #[test]
+    fn session_display_opt_separates_unknown_from_id_fallback() {
+        let mut store = Store::default();
+        // a session with no name column value and no contact row
+        store.sessions.insert(
+            "room@chatroom".into(),
+            Session {
+                username: "room@chatroom".into(),
+                display_name: String::new(),
+                kind: SessionKind::Group,
+                last_timestamp: 0,
+                last_msg_type: None,
+                summary: None,
+                unread_count: 0,
+                message_count: 0,
+            },
+        );
+        assert_eq!(store.session_display("room@chatroom"), "room@chatroom");
+        assert_eq!(store.session_display_opt("room@chatroom"), None);
+
+        // contacts supply the name -> both agree
+        store.contacts.insert(
+            "room@chatroom".into(),
+            Contact {
+                username: "room@chatroom".into(),
+                nickname: Some("项目群".into()),
+                kind: SessionKind::Group,
+                ..Default::default()
+            },
+        );
+        assert_eq!(store.session_display("room@chatroom"), "项目群");
+        assert_eq!(store.session_display_opt("room@chatroom"), Some("项目群".into()));
+
+        // a contact whose only "name" is the username itself is not a name
+        store.contacts.insert(
+            "wxid_bare".into(),
+            Contact {
+                username: "wxid_bare".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(store.session_display("wxid_bare"), "wxid_bare");
+        assert_eq!(store.session_display_opt("wxid_bare"), None);
     }
 }

@@ -30,7 +30,7 @@ pub async fn handler(
     if let Some(kw) = &keyword {
         sessions.retain(|s| {
             s.username.to_lowercase().contains(kw)
-                || s.display_name.to_lowercase().contains(kw)
+                || store.session_display(&s.username).to_lowercase().contains(kw)
         });
     }
     sessions.sort_by(|a, b| b.last_timestamp.cmp(&a.last_timestamp).then(a.username.cmp(&b.username)));
@@ -42,7 +42,7 @@ pub async fn handler(
             .map(|s| {
                 json!({
                     "id": s.username,
-                    "name": s.display_name,
+                    "name": store.session_display(&s.username),
                     "platform": "wechat",
                     "type": if s.kind == crate::store::SessionKind::Group { "group" } else { "private" },
                     "messageCount": store.conv_count(&s.username),
@@ -58,7 +58,7 @@ pub async fn handler(
         .map(|s| {
             json!({
                 "username": s.username,
-                "displayName": s.display_name,
+                "displayName": store.session_display(&s.username),
                 "type": s.kind as i64,
                 "sessionType": s.kind.as_str(),
                 "lastTimestamp": s.last_timestamp,
