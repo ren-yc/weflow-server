@@ -100,7 +100,7 @@
   "parsed": { "text": "你好", "display": "你好" },
   "quote": { "reversed": false, "senderName": "...", "text": "..." } | null,
   "revoke": { "msgId": "...", "newMsgId": "...", "replaceMsg": "..." } | null,
-  "media": { "kind": "image|voice|video|emoji|file", "md5": "...", "file_name": "...", "width": 0, "height": 0, "duration": 0 } | null
+  "media": { "kind": "image|voice|video|emoji", "md5": "...", "file_name": "...", "width": 0, "height": 0, "duration": 0 } | null
 }
 ```
 
@@ -116,7 +116,9 @@
 { "localId": 7, "kind": "image", "file": "images/2025-08/aabb....jpg", "url": "/api/v1/media/<talker>/images/<file>" }
 ```
 
-`kind`→目录映射：`images / voices / videos / emojis / files`。
+`kind`→目录映射：`images / voices / videos / emojis`。
+
+> 文件附件（`file`）暂不参与导出：与 WeFlow 官方契约一致，媒体导出仅覆盖图片/语音/视频/表情四类。
 
 ### GET/POST `/api/v1/sessions` — 会话列表
 
@@ -157,7 +159,7 @@
 
 ### GET/POST `/api/v1/media/{talker}/{media_type}/{file}` — 导出媒体直服
 
-- `media_type` ∈ `images|voices|videos|emojis|files`
+- `media_type` ∈ `images|voices|videos|emojis`
 - 双重防穿越：路径段拒绝 `..`/`./`/`\`，且 `canonicalize` 后必须落在导出目录内
 - 404 信封返回 `{ "error": "Media not found" }`；内容按扩展名推断 MIME 输出
 
