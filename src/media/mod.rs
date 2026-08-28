@@ -8,11 +8,24 @@
 //!   from the registered `img_code`: aesKey = MD5(code+wxid) hex string chars
 //!   used as 16 ASCII bytes; xorKey = code & 0xff
 //!
-//! Layout: `[6B magic][aesSize int32LE @6][xorSize int32LE @10][1B pad @14]`
-//! followed by: AES-128-ECB encrypted segment (length = aesSize, padded to a
-//! multiple of 16 with PKCS7), then `rawSize` plaintext bytes, then the XOR
-//! segment (xorKey applied bytewise). Segment lengths are all relative to the
-//! *original* payload within the first AES block (WeFlow/wechat-decrypt).
+//! Header (15 bytes): `[6B magic][aesSize u32LE @6][xorSize u32LE @10][flag u8 @14]`
+//!
+//! The payload (everything after the header) is three segments, in order:
+//!   1. AES-128-ECB ciphertext of the first `aesSize` plaintext bytes. PKCS7
+//!      *always* appends 1..=16 bytes, so the ciphertext is
+//!      `aesSize + (16 - aesSize % 16)` long — a full extra block whenever
+//!      `aesSize` is already 16-aligned. Real files have `aesSize == 1024`
+//!      almost without exception, making that extra block the common case.
+//!   2. `rawSize` verbatim plaintext bytes. Not stored in the header: derive it
+//!      as `payloadLen - ciphertextLen - xorSize`. Zero for most files, but
+//!      non-zero once `xorSize` saturates (observed cap: 1 MiB) — for large
+//!      images WeChat leaves the middle in the clear.
+//!   3. The trailing `xorSize` bytes, each XORed with `xorKey`.
+//!
+//! The XOR segment is thus anchored at the *end* of the payload and is never
+//! measured forward from the AES segment. Cross-checked against 21 624 real
+//! `.dat` files: decoding this way reproduces WeChat's own image md5
+//! byte-for-byte, including the large `rawSize > 0` shape.
 
 pub mod export;
 
@@ -78,6 +91,15 @@ fn aes128_ecb_encrypt(key: &[u8; 16], pt: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Ciphertext length of a PKCS7-padded plaintext of `plain_len` bytes.
+///
+/// PKCS7 appends 1..=16 bytes — never zero — so a 16-aligned plaintext grows by
+/// a whole extra block. `div_ceil(16) * 16` gets this wrong for exactly the
+/// alignment real `.dat` files always hit (`aesSize == 1024`).
+fn pkcs7_ct_len(plain_len: usize) -> Option<usize> {
+    plain_len.checked_add(16 - plain_len % 16)
+}
+
 /// Decrypt a V1/V2 `.dat` payload (after the 15-byte header) into image bytes.
 /// `aes_key` is the 16-ASCII-byte key; `xor_key` the XOR byte.
 pub fn decrypt_dat_payload(data: &[u8], aes_key: &[u8; 16], xor_key: u8) -> Option<Vec<u8>> {
@@ -87,24 +109,21 @@ pub fn decrypt_dat_payload(data: &[u8], aes_key: &[u8; 16], xor_key: u8) -> Opti
     let aes_size = u32::from_le_bytes(data[6..10].try_into().ok()?) as usize;
     let xor_size = u32::from_le_bytes(data[10..14].try_into().ok()?) as usize;
     let payload = &data[15..];
-    let aes_len = aes_size.div_ceil(16) * 16; // PKCS7-padded AES part
-    if aes_len > payload.len() {
+    let ct_len = pkcs7_ct_len(aes_size)?;
+    if ct_len.checked_add(xor_size)? > payload.len() {
         return None;
     }
-    let mut out = Vec::with_capacity(aes_size + xor_size + payload.len() - aes_len);
-    // AES-128-ECB segment (strip PKCS7 padding)
-    let aes_ct = &payload[..aes_len];
-    let aes_pt = aes128_ecb_decrypt(aes_key, aes_ct);
-    let aes_pt = &aes_pt[..aes_size.min(aes_pt.len())];
-    out.extend_from_slice(aes_pt);
-    // raw segment (xor_size counts the raw bytes between AES and XOR segments)
-    let raw_start = aes_len;
-    let raw_end = (raw_start + xor_size).min(payload.len());
-    out.extend_from_slice(&payload[raw_start..raw_end]);
-    // XOR segment
-    for b in &payload[raw_end..] {
-        out.push(b ^ xor_key);
-    }
+    // The XOR segment is anchored at the end; whatever sits between it and the
+    // ciphertext is the (headerless) raw plaintext segment.
+    let xor_start = payload.len() - xor_size;
+    let mut out = Vec::with_capacity(aes_size + (xor_start - ct_len) + xor_size);
+    // 1. AES-128-ECB segment (drop the PKCS7 padding by truncating to aes_size)
+    let aes_pt = aes128_ecb_decrypt(aes_key, &payload[..ct_len]);
+    out.extend_from_slice(&aes_pt[..aes_size.min(aes_pt.len())]);
+    // 2. raw plaintext middle (empty unless xor_size saturated)
+    out.extend_from_slice(&payload[ct_len..xor_start]);
+    // 3. XOR tail
+    out.extend(payload[xor_start..].iter().map(|b| b ^ xor_key));
     Some(out)
 }
 
@@ -139,26 +158,45 @@ mod tests {
     use super::*;
     use crate::keystore::ImgCode;
 
-    fn build_v2_sample(aes_key: &[u8; 16], xor_key: u8, raw: &[u8]) -> Vec<u8> {
-        // layout: [magic][aesSize@6][xorSize@10][pad@14] + aes(pt) + raw + xor
-        let aes_pt = b"\xff\xd8\xff\xe0jpeg-ish-image-bytes-0123456789";
+    /// Build a V2 sample exactly the way WeChat lays one out:
+    /// `[header] + aes(pkcs7(head)) + mid + xor(tail)`, with `xorSize` counting
+    /// the *trailing* segment and `mid` carried only implicitly.
+    fn build_v2_sample(
+        aes_key: &[u8; 16],
+        xor_key: u8,
+        head: &[u8],
+        mid: &[u8],
+        tail: &[u8],
+    ) -> Vec<u8> {
         let mut data = Vec::new();
         data.extend_from_slice(&MAGIC_V2);
-        data.extend_from_slice(&(aes_pt.len() as u32).to_le_bytes());
-        data.extend_from_slice(&(raw.len() as u32).to_le_bytes());
-        data.push(0);
-        let padded: Vec<u8> = {
-            let rem = aes_pt.len() % 16;
-            let mut v = aes_pt.to_vec();
-            if rem != 0 {
-                v.extend(std::iter::repeat_n(0u8, 16 - rem));
-            }
+        data.extend_from_slice(&(head.len() as u32).to_le_bytes());
+        data.extend_from_slice(&(tail.len() as u32).to_le_bytes());
+        data.push(1); // flag: 1 in every real file observed
+        let padded = {
+            // real PKCS7: 1..=16 bytes, so a 16-aligned head gains a whole block
+            let pad = 16 - head.len() % 16;
+            let mut v = head.to_vec();
+            v.extend(std::iter::repeat_n(pad as u8, pad));
             v
         };
         data.extend_from_slice(&aes128_ecb_encrypt(aes_key, &padded));
-        data.extend_from_slice(raw);
-        data.extend(raw.iter().map(|b| b ^ xor_key).collect::<Vec<_>>());
+        data.extend_from_slice(mid);
+        data.extend(tail.iter().map(|b| b ^ xor_key));
         data
+    }
+
+    /// 32 bytes: 16-aligned, so PKCS7 appends a full extra block. This is the
+    /// shape of every real file (`aesSize == 1024`) and the one a
+    /// `div_ceil(16) * 16` ciphertext length gets wrong.
+    const ALIGNED_HEAD: &[u8; 32] = b"\xff\xd8\xff\xe0jpeg-ish-header-bytes-012345";
+
+    /// Both keys as the decrypt path derives them, so a fixture built with these
+    /// is guaranteed to be self-consistent (`xor_key` is the code's first byte,
+    /// not a value the test gets to pick).
+    fn v2_keys(code: &ImgCode, wxid: &str) -> ([u8; 16], u8) {
+        let aes = code.aes_key_hex(wxid).as_bytes().try_into().unwrap();
+        (aes, code.xor_key())
     }
 
     #[test]
@@ -167,17 +205,14 @@ mod tests {
         // will use (aesKey = MD5(code + wxid) hex chars as ASCII bytes)
         let code = ImgCode("x".to_string());
         let wxid = "wxid_t";
-        let key_bytes = code.aes_key_hex(wxid);
-        let key: [u8; 16] = key_bytes.as_bytes().try_into().unwrap();
-        let xor = 0x5A;
-        let raw = b"raw-segment-bytes";
-        let sample = build_v2_sample(&key, xor, raw);
+        let (key, xor) = v2_keys(&code, wxid);
+        let tail = b"xor-segment-bytes";
+        let sample = build_v2_sample(&key, xor, ALIGNED_HEAD, &[], tail);
         assert_eq!(detect_format(&sample), Some(DatFormat::V2));
         let (out, fmt) = decrypt_dat(&sample, Some(&code), wxid)
             .expect("decrypt must succeed with matching key");
         assert_eq!(fmt, DatFormat::V2);
-        assert!(out.starts_with(b"\xff\xd8\xff\xe0"));
-        assert!(out.windows(raw.len()).any(|w| w == raw), "raw segment present");
+        assert_eq!(out, [ALIGNED_HEAD.as_slice(), tail].concat());
         // wrong code must fail to produce the magic
         assert!(!decrypt_dat(&sample, Some(&ImgCode("y".into())), wxid)
             .map(|(b, _)| b.starts_with(b"\xff\xd8\xff\xe0"))
@@ -186,14 +221,74 @@ mod tests {
         assert!(decrypt_dat(&sample, None, wxid).is_none());
     }
 
+    /// The 16-aligned `aesSize` case: PKCS7 adds a whole block, so the
+    /// ciphertext is `aesSize + 16`. Reading it as `aesSize` shifts everything
+    /// after the AES segment by 16 bytes and splices the padding block into the
+    /// output as if it were image data — head and tail still look right, the
+    /// middle is destroyed. Regression guard for exactly that.
+    #[test]
+    fn v2_aligned_aes_size_consumes_the_extra_pkcs7_block() {
+        let code = ImgCode("x".to_string());
+        let wxid = "wxid_t";
+        let (key, xor) = v2_keys(&code, wxid);
+        let tail: Vec<u8> = (0..200u32).map(|i| (i % 251) as u8).collect();
+        let sample = build_v2_sample(&key, xor, ALIGNED_HEAD, &[], &tail);
+        assert_eq!(ALIGNED_HEAD.len() % 16, 0, "fixture must be 16-aligned");
+        // payload = ciphertext(48) + tail(200): the extra block must be consumed
+        assert_eq!(sample.len(), 15 + ALIGNED_HEAD.len() + 16 + tail.len());
+        let (out, _) = decrypt_dat(&sample, Some(&code), wxid).unwrap();
+        assert_eq!(out, [ALIGNED_HEAD.as_slice(), &tail].concat());
+        assert_eq!(out.len(), sample.len() - 15 - 16);
+    }
+
+    /// `xorSize` saturates (1 MiB in the wild) and the remainder stays raw, so
+    /// the payload holds all three segments. The XOR segment is anchored at the
+    /// end — measuring it forward from the AES segment corrupts the raw middle.
+    #[test]
+    fn v2_three_segments_when_xor_size_saturates() {
+        let code = ImgCode("x".to_string());
+        let wxid = "wxid_t";
+        let (key, xor) = v2_keys(&code, wxid);
+        let mid: Vec<u8> = (0..500u32).map(|i| (i % 253) as u8).collect();
+        let tail: Vec<u8> = (0..300u32).map(|i| (i % 247) as u8).collect();
+        let sample = build_v2_sample(&key, xor, ALIGNED_HEAD, &mid, &tail);
+        let (out, _) = decrypt_dat(&sample, Some(&code), wxid).unwrap();
+        assert_eq!(out, [ALIGNED_HEAD.as_slice(), &mid, &tail].concat());
+    }
+
+    /// A non-aligned `aesSize` pads to the next block, so PKCS7 and
+    /// `div_ceil` agree there — keep that path covered.
+    #[test]
+    fn v2_unaligned_aes_size_pads_to_next_block() {
+        let code = ImgCode("x".to_string());
+        let wxid = "wxid_t";
+        let (key, xor) = v2_keys(&code, wxid);
+        let head = b"\xff\xd8\xff\xe0unaligned-head"; // 18 bytes -> ct 32
+        let tail = b"tail";
+        let sample = build_v2_sample(&key, xor, head, &[], tail);
+        assert_eq!(sample.len(), 15 + 32 + tail.len());
+        let (out, _) = decrypt_dat(&sample, Some(&code), wxid).unwrap();
+        assert_eq!(out, [head.as_slice(), tail].concat());
+    }
+
+    #[test]
+    fn truncated_payload_is_rejected() {
+        let code = ImgCode("x".to_string());
+        let wxid = "wxid_t";
+        let (key, xor) = v2_keys(&code, wxid);
+        let mut sample = build_v2_sample(&key, xor, ALIGNED_HEAD, &[], b"tail-bytes");
+        sample.truncate(15 + 32); // less than the 48-byte ciphertext
+        assert!(decrypt_dat(&sample, Some(&code), wxid).is_none());
+    }
+
     #[test]
     fn v1_uses_fixed_key() {
         let key = V1_FIXED_AES_KEY;
-        let mut sample = build_v2_sample(key, 0, b"raw");
+        let mut sample = build_v2_sample(key, 0, ALIGNED_HEAD, &[], b"tail");
         sample[0..6].copy_from_slice(&MAGIC_V1);
         let (out, fmt) = decrypt_dat(&sample, None, "wxid_t").expect("v1 needs no img code");
         assert_eq!(fmt, DatFormat::V1);
-        assert!(out.starts_with(b"\xff\xd8\xff\xe0"));
+        assert_eq!(out, [ALIGNED_HEAD.as_slice(), b"tail"].concat());
     }
 
     #[test]

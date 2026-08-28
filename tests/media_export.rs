@@ -6,13 +6,33 @@ mod common;
 use std::path::Path;
 
 use rusqlite::Connection;
-use weflow_server::media::export::{export_batch, ExportCtx};
+use weflow_server::media::export::ExportCtx;
 use weflow_server::media::{decrypt_dat, detect_format, DatFormat};
 
 const TALKER: &str = "000000000000@chatroom";
-const IMG_MD5: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1";
 const VID_MD5: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2";
 const SVR_ID: i64 = 8523931155911769344;
+
+fn md5_hex(bytes: &[u8]) -> String {
+    use md5::Digest;
+    format!("{:x}", {
+        let mut h = md5::Md5::new();
+        h.update(bytes);
+        h.finalize()
+    })
+}
+
+/// The fixture image, in plaintext.
+fn fixture_jpeg() -> Vec<u8> {
+    [vec![0xFF, 0xD8, 0xFF, 0xE0], vec![0xAB; 40]].concat()
+}
+
+/// The image's WeChat-side md5. It has to be the real md5 of the plaintext:
+/// the export path verifies the decoded bytes against it before writing, so a
+/// placeholder would (correctly) be rejected as a corrupt decode.
+fn img_md5() -> String {
+    md5_hex(&fixture_jpeg())
+}
 
 fn aes128_ecb_encrypt(key: &[u8; 16], pt: &[u8]) -> Vec<u8> {
     use aes::cipher::{BlockEncrypt, KeyInit};
@@ -29,35 +49,43 @@ fn aes128_ecb_encrypt(key: &[u8; 16], pt: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Build a V1 `.dat` sample: [magic][aesSize][xorSize][pad] + aes(pt) + raw + xor
+/// Build a V1 `.dat` sample the way WeChat lays one out:
+/// `[magic][aesSize][xorSize][flag] + aes(pkcs7(head)) + mid + xor(tail)`.
+///
+/// `xorSize` counts the *trailing* segment; the raw middle is implied by
+/// `payloadLen - ciphertextLen - xorSize`. The head is 16 bytes — already
+/// 16-aligned — so PKCS7 appends a whole extra block, the same shape real files
+/// have (`aesSize == 1024`).
 fn build_v1_dat(jpeg: &[u8]) -> Vec<u8> {
-    let (aes_pt, xor_part) = jpeg.split_at(16.min(jpeg.len()));
-    let raw_part: &[u8] = &[];
+    let (head, tail) = jpeg.split_at(16.min(jpeg.len()));
+    let mid: &[u8] = &[];
     let mut data = vec![0x07, 0x08, 0x56, 0x31, 0x08, 0x07];
-    data.extend_from_slice(&(aes_pt.len() as u32).to_le_bytes());
-    data.extend_from_slice(&(xor_part.len() as u32).to_le_bytes());
-    data.push(0);
+    data.extend_from_slice(&(head.len() as u32).to_le_bytes());
+    data.extend_from_slice(&(tail.len() as u32).to_le_bytes());
+    data.push(1);
+    let padded = {
+        let pad = 16 - head.len() % 16;
+        let mut v = head.to_vec();
+        v.extend(std::iter::repeat_n(pad as u8, pad));
+        v
+    };
     data.extend_from_slice(&aes128_ecb_encrypt(
         weflow_server::media::V1_FIXED_AES_KEY,
-        aes_pt,
+        &padded,
     ));
-    // no raw segment in this sample: raw goes straight after AES
-    data.extend_from_slice(raw_part);
-    data.extend_from_slice(xor_part);
+    data.extend_from_slice(mid);
+    // V1 decrypts with xorKey 0, so the tail is stored as-is
+    data.extend_from_slice(tail);
     data
 }
 
 fn setup(dir: &Path) -> (ExportCtx, std::collections::HashMap<String, Connection>) {
     let account = dir.join("account");
-    let session_md5 = format!("{:x}", {
-        use md5::Digest;
-        let mut h = md5::Md5::new();
-        h.update(TALKER.as_bytes());
-        h.finalize()
-    });
+    let session_md5 = md5_hex(TALKER.as_bytes());
+    let img_md5 = img_md5();
 
     // --- image source: msg/attach/<md5(session)>/2025-08/Img/<md5>.dat (V1)
-    let jpeg: Vec<u8> = [vec![0xFF, 0xD8, 0xFF, 0xE0], vec![0xAB; 40]].concat();
+    let jpeg = fixture_jpeg();
     let dat = build_v1_dat(&jpeg);
     assert_eq!(detect_format(&dat), Some(DatFormat::V1));
     let img_dir = account
@@ -67,7 +95,7 @@ fn setup(dir: &Path) -> (ExportCtx, std::collections::HashMap<String, Connection
         .join("2025-08")
         .join("Img");
     std::fs::create_dir_all(&img_dir).unwrap();
-    std::fs::write(img_dir.join(format!("{IMG_MD5}.dat")), &dat).unwrap();
+    std::fs::write(img_dir.join(format!("{img_md5}.dat")), &dat).unwrap();
 
     // --- video source: msg/video/2022-05/<md5>.mp4 (plaintext)
     let mp4 = [b' ', b'f', b't', b'y', b'p', b'i', b's', b'o', b'm', 0, 0, 0].to_vec();
@@ -82,7 +110,7 @@ let snap = dir.join("aux").join(common::FAKE_WXID);
     let hl = Connection::open(hl_dir.join("hardlink.db")).unwrap();
     hl.execute_batch(&format!(
         "CREATE TABLE image_hardlink_info_v4 (md5 TEXT, file_name TEXT);
-         INSERT INTO image_hardlink_info_v4 VALUES ('{IMG_MD5}', '{IMG_MD5}.dat');
+         INSERT INTO image_hardlink_info_v4 VALUES ('{img_md5}', '{img_md5}.dat');
          CREATE TABLE video_hardlink_info_v4 (md5 TEXT, file_name TEXT);
          INSERT INTO video_hardlink_info_v4 VALUES ('{VID_MD5}', '{VID_MD5}.mp4');"
     ))
@@ -124,7 +152,7 @@ fn exports_image_voice_video() {
         (
             1i64,
             weflow_server::parser::MediaKind::Image,
-            Some(IMG_MD5.to_string()),
+            Some(img_md5()),
             111i64,
             TALKER.to_string(),
         ),
@@ -185,18 +213,55 @@ fn image_missing_source_is_none_but_others_succeed() {
         ctx.account_dir
             .join("msg")
             .join("attach")
-            .join(format!("{:x}", {
-                use md5::Digest;
-                let mut h = md5::Md5::new();
-                h.update(TALKER.as_bytes());
-                h.finalize()
-            }))
+            .join(md5_hex(TALKER.as_bytes()))
             .join("2025-08")
             .join("Img")
-            .join(format!("{IMG_MD5}.dat")),
+            .join(format!("{}.dat", img_md5())),
     )
     .unwrap();
     let (bytes, fmt) = decrypt_dat(&src, None, common::FAKE_WXID).unwrap();
     assert_eq!(fmt, DatFormat::V1);
-    assert!(bytes.starts_with(&[0xFF, 0xD8, 0xFF]));
+    // exact roundtrip, not just the magic: a mis-segmented decode keeps the head
+    // (and often the tail) intact while destroying everything in between
+    assert_eq!(bytes, fixture_jpeg());
+    assert_eq!(md5_hex(&bytes), img_md5());
+}
+
+/// The export path verifies decoded bytes against WeChat's own md5. Without that
+/// gate a bad key or a mis-parsed layout still produces a file, and only some of
+/// those fail to decode downstream — the rest become silent garbage.
+#[test]
+fn image_failing_md5_verification_is_not_exported() {
+    let dir = common::tmp_dir("mediaexport-md5");
+    let (ctx, aux) = setup(&dir);
+    let img_md5 = img_md5();
+
+    // corrupt the source's XOR tail in place: the header still parses, the jpeg
+    // magic still decodes, but the plaintext no longer hashes to `img_md5`
+    let src = ctx
+        .account_dir
+        .join("msg")
+        .join("attach")
+        .join(md5_hex(TALKER.as_bytes()))
+        .join("2025-08")
+        .join("Img")
+        .join(format!("{img_md5}.dat"));
+    let mut dat = std::fs::read(&src).unwrap();
+    let last = dat.len() - 1;
+    dat[last] ^= 0xFF;
+    std::fs::write(&src, &dat).unwrap();
+
+    let jobs = vec![(
+        1i64,
+        weflow_server::parser::MediaKind::Image,
+        Some(img_md5.clone()),
+        111i64,
+        TALKER.to_string(),
+    )];
+    let out = weflow_server::media::export::export_batch(&ctx, &aux, &jobs, 10);
+    assert!(out.is_empty(), "md5 mismatch must not be exported: {out:?}");
+    assert!(
+        !ctx.export_dir.join(TALKER).join("images").join(format!("{img_md5}.jpg")).exists(),
+        "no file may be written when verification fails"
+    );
 }

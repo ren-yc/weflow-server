@@ -255,10 +255,42 @@ pub fn export_one(
             if decoded.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
                 return None; // still compressed — wrong key, refuse garbage
             }
+            // Integrity gate: `img_md5` is WeChat's md5 of the *original* image,
+            // so the decoded plaintext must hash to it. A mismatch means the key
+            // or the segmentation is wrong; without this check such files are
+            // written out and only some of them fail to decode downstream, so
+            // the rest become silent garbage. Checked before any transcode,
+            // which by definition changes the bytes.
+            let actual_md5 = format!("{:x}", {
+                use md5::Digest;
+                let mut h = md5::Md5::new();
+                h.update(&decoded);
+                h.finalize()
+            });
+            if !actual_md5.eq_ignore_ascii_case(img_md5) {
+                tracing::warn!(
+                    "image {img_md5} decoded to md5 {actual_md5} ({} bytes from {}): \
+                     refusing to export corrupt bytes",
+                    decoded.len(),
+                    src.display(),
+                );
+                return None;
+            }
             let (bytes, ext) = if decoded.starts_with(b"wxgf") {
                 match wxgf_to_png(&decoded) {
                     Some(png) => (png, "png"),
-                    None => (decoded, "wxgf"),
+                    None => {
+                        // raw HEVC still: no common image decoder handles it, so
+                        // say so rather than shipping an undecodable `.wxgf`
+                        // silently. `wxgf_to_png` also returns None when ffmpeg
+                        // exists but the decode fails, so don't claim a cause.
+                        tracing::warn!(
+                            "image {img_md5}: wxgf → png conversion failed \
+                             (ffmpeg missing or decode error); exporting raw \
+                             wxgf, which most clients cannot decode"
+                        );
+                        (decoded, "wxgf")
+                    }
                 }
             } else {
                 let e = sniff_image_ext(&decoded);
