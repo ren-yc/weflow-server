@@ -4,14 +4,13 @@
 
 mod common;
 
-use std::sync::{Arc};
+use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use weflow_server::db::scan;
 use weflow_server::db::wcdb;
 use weflow_server::keystore;
-use weflow_server::store::{SessionKind, Store, Watermark};
+use weflow_server::store::{SessionKind, Store};
 use weflow_server::sync::AccountSync;
 
 fn fake_key() -> wcdb::Key {

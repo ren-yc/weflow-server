@@ -31,18 +31,42 @@ pub async fn handler(
         .get(&id)
         .ok_or_else(|| ApiError::not_found(format!("session '{id}' not found")))?;
 
+    // Upper bound of this pull, echoed as `watermark`: a client that has
+    // drained the session resumes from here. It is a TIME BOUND, not the
+    // newest message's timestamp, so an idle session still reports progress.
+    let watermark = end.unwrap_or_else(|| chrono::Utc::now().timestamp());
+
+    // Chronological messages within (since, end] — `since` is EXCLUSIVE, so a
+    // client resuming with `nextSince` never re-fetches the boundary second
+    // and can neither loop nor see duplicates (qqflow-server parity).
     let mut ascending: Vec<&crate::store::MessageRecord> = conv
         .iter()
-        .filter(|m| since.is_none_or(|s| m.create_time >= s) && end.is_none_or(|e| m.create_time <= e))
+        .filter(|m| since.is_none_or(|s| m.create_time > s) && end.is_none_or(|e| m.create_time <= e))
         .collect();
     ascending.sort_by(|a, b| {
         (a.create_time, a.sort_seq, a.local_id).cmp(&(b.create_time, b.sort_seq, b.local_id))
     });
 
-    let page: Vec<&crate::store::MessageRecord> =
-        ascending.iter().skip(offset).take(limit).copied().collect();
-    let has_more = offset + page.len() < ascending.len();
-    let watermark = ascending.last().map(|m| m.create_time).unwrap_or(0);
+    let total = ascending.len();
+    // Page from `offset`, extending to the end of the last second's ts group:
+    // pages never split a second, which is what lets `nextSince` (the page's
+    // last timestamp) advance without dropping the rest of that second.
+    let start = offset.min(total);
+    let mut page_end = start;
+    let mut prev_ts = None;
+    while page_end < total {
+        let ts = ascending[page_end].create_time;
+        if prev_ts.is_some_and(|p| p != ts) && page_end - start >= limit {
+            break;
+        }
+        prev_ts = Some(ts);
+        page_end += 1;
+    }
+    let page: Vec<&crate::store::MessageRecord> = ascending[start..page_end].to_vec();
+    let has_more = page_end < total;
+    // The page's OWN last timestamp. Using the whole set's maximum here would
+    // tell the client to resume past everything it has not seen yet.
+    let next_since = page.last().map(|m| m.create_time).unwrap_or(since.unwrap_or(0));
 
     // members = senders in this page (dedup)
     let mut seen = std::collections::HashSet::new();
@@ -88,8 +112,18 @@ pub async fn handler(
         "messages": messages,
         "sync": {
             "hasMore": has_more,
-            "nextSince": watermark,
-            "nextOffset": offset + page.len(),
+            "nextSince": if has_more { next_since } else { watermark },
+            // Both cursors are meant to be echoed back verbatim, so they must
+            // not skip the same rows twice. `nextSince` is exclusive and the
+            // page ends on a complete ts group, so re-filtering with it drops
+            // exactly the rows already served — leaving the next unseen row at
+            // offset 0. `nextOffset` therefore only carries weight in the
+            // degenerate case where the timestamp could not advance at all.
+            "nextOffset": if has_more && next_since <= since.unwrap_or(i64::MIN) {
+                start.saturating_add(page.len())
+            } else {
+                0
+            },
             "watermark": watermark,
         },
     })))

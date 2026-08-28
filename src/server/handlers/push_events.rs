@@ -45,6 +45,11 @@ pub async fn handler(
 
     let rx = state.events.subscribe();
     let history = state.history.clone();
+    // An SSE stream never ends on its own, so it would hold graceful shutdown
+    // open for the whole grace period. Watching the shutdown channel lets the
+    // stream close itself and the drain finish promptly.
+    let mut shutdown = state.shutdown.subscribe();
+    let lag_state = state.clone();
     let stream = async_stream::stream!({
         yield Ok::<_, std::convert::Infallible>(
             Event::default().event("ready").data("{\"status\":\"ok\"}"),
@@ -57,12 +62,30 @@ pub async fn handler(
                 .unwrap_or_else(|_| Event::default().event("message.new").data("{}")));
         }
         let mut bstream = BroadcastStream::new(rx);
-        while let Some(item) = bstream.next().await {
+        loop {
+            let item = tokio::select! {
+                biased;
+                _ = shutdown.changed() => break,
+                item = bstream.next() => match item {
+                    Some(item) => item,
+                    None => break,
+                },
+            };
             let ev = match item {
                 Ok(ev) => ev,
                 Err(_lagged) => {
-                    // subscriber fell behind: re-baseline
-                    yield Ok(Event::default().event("sync").data("{\"rebased\":true}"));
+                    // Subscriber fell behind. Re-baseline with the CURRENT
+                    // watermarks: a bare `{"rebased":true}` tells the client
+                    // it lost events but gives it nothing to resync from.
+                    let wms = current_watermarks(&lag_state);
+                    let (name, payload) = serialize_event(crate::sync::Event::Sync(wms));
+                    // No history id: this frame is specific to this lagging
+                    // subscriber, so it must not consume a bus-level
+                    // sequence number that other clients would then skip.
+                    yield Ok(Event::default()
+                        .event(name)
+                        .json_data(payload)
+                        .unwrap_or_else(|_| Event::default().event("sync").data("{}")));
                     continue;
                 }
             };
@@ -81,6 +104,29 @@ pub async fn handler(
         .into_response())
 }
 
+/// Current watermarks across every ready account, for a lag re-baseline.
+///
+/// Collected from all ready accounts because the bus — and therefore the
+/// `sync` frame — is process-wide, matching what the post-index baseline in
+/// `server::start_account` publishes.
+fn current_watermarks(state: &AppState) -> Vec<(String, crate::store::Watermark)> {
+    let handles: Vec<_> = {
+        let accounts = state.accounts.lock();
+        accounts
+            .values()
+            .filter(|h| h.status().is_ready())
+            .cloned()
+            .collect()
+    };
+    handles
+        .iter()
+        .flat_map(|h| {
+            let guard = h.store.read();
+            guard.watermarks.clone().into_iter().collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 fn serialize_event(ev: crate::sync::Event) -> (&'static str, serde_json::Value) {
     match ev {
         crate::sync::Event::New(m) => (
@@ -94,6 +140,14 @@ fn serialize_event(ev: crate::sync::Event) -> (&'static str, serde_json::Value) 
                 "groupName": m.group_name,
                 "content": m.content,
                 "timestamp": m.timestamp,
+                // Same shape as the REST `media` object minus `url`/`localPath`:
+                // bytes are fetched via /api/v1/messages?media=1, so this is
+                // metadata only (and never the aes key).
+                "media": m.media.as_ref().map(|md| json!({
+                    "type": md.kind,
+                    "fileName": md.file_name,
+                    "md5": md.md5,
+                })),
             }),
         ),
         crate::sync::Event::Revoke(r) => (

@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use anyhow::Result;
+
 /// Runtime configuration resolved from CLI arguments.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -64,36 +66,36 @@ impl Default for Config {
     }
 }
 
-/// Parse CLI arguments (unknown flags are fatal).
-pub fn parse_args() -> anyhow::Result<Option<Config>> {
+/// Parse the process command line (skipping the program name).
+/// `Ok(None)` when `--help` / `--version` was handled and the caller should
+/// exit 0.
+pub fn load() -> anyhow::Result<Option<Config>> {
+    parse_args(std::env::args().skip(1).collect())
+}
+
+/// Parse `--flag value` / `--flag=value` pairs (unknown flags are fatal).
+///
+/// Separate from [`load`] so tests can drive it with an explicit argv instead
+/// of the process environment.
+pub fn parse_args(args: Vec<String>) -> anyhow::Result<Option<Config>> {
+    const LOG_LEVELS: [&str; 4] = ["error", "warn", "info", "debug"];
     let mut cfg = Config::default();
-    let mut it = std::env::args().skip(1).peekable();
-    while let Some(arg) = it.next() {
-        let mut flag = arg.as_str();
-        let mut inline: Option<&str> = None;
-        if let Some((f, v)) = flag.split_once('=') {
-            flag = f;
-            inline = Some(v);
-        }
-        let mut value = |default: &str| -> String {
-            if let Some(v) = inline {
-                return v.to_string();
-            }
-            if it.peek().is_some() {
-                it.next().unwrap()
-            } else {
-                default.to_string()
-            }
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let (flag, inline) = match arg.split_once('=') {
+            Some((f, v)) => (f, Some(v.to_string())),
+            None => (arg, None),
         };
+
+        // Value-less switches first, so `--show-token` never consumes the
+        // following argument.
         match flag {
-            "--port" => cfg.port = value("5033").parse()?,
-            "--host" => cfg.host = value("127.0.0.1"),
-            "--log" => cfg.log = value("info"),
-            "--watch-debounce-ms" => cfg.watch_debounce_ms = value("350").parse()?,
-            "--watch-fallback-ms" => cfg.watch_fallback_ms = value("30000").parse()?,
-            "--media-export-dir" => cfg.media_export_dir = PathBuf::from(value("")),
-            "--base-url" => cfg.base_url = Some(value("")),
-            "--show-token" => cfg.show_token = true,
+            "--show-token" => {
+                cfg.show_token = true;
+                i += 1;
+                continue;
+            }
             "-h" | "--help" => {
                 print_help();
                 return Ok(None);
@@ -102,11 +104,61 @@ pub fn parse_args() -> anyhow::Result<Option<Config>> {
                 println!("weflow-server {}", env!("CARGO_PKG_VERSION"));
                 return Ok(None);
             }
+            _ => {}
+        }
+
+        // Everything else takes a value. A missing value is an error rather
+        // than a silent fall back to the default: `--port` with nothing after
+        // it used to start the server on 5033 as if nothing were wrong.
+        let value = match inline {
+            Some(v) => {
+                if v.is_empty() {
+                    anyhow::bail!("参数 {flag} 的值为空");
+                }
+                i += 1;
+                v
+            }
+            None => {
+                let Some(next) = args.get(i + 1) else {
+                    anyhow::bail!("参数 {flag} 缺少值");
+                };
+                // A flag-shaped value almost always means the real value was
+                // forgotten (`--host --log debug` would set host="--log").
+                if next.starts_with("--") {
+                    anyhow::bail!("参数 {flag} 缺少值（其后紧跟的是另一个参数 {next}）");
+                }
+                i += 2;
+                next.clone()
+            }
+        };
+
+        match flag {
+            "--port" => {
+                cfg.port = value
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("--port 需为 0-65535 的整数: {value}"))?
+            }
+            "--host" => cfg.host = value,
+            "--log" => {
+                if !LOG_LEVELS.contains(&value.as_str()) {
+                    anyhow::bail!("--log 需为 error|warn|info|debug: {value}");
+                }
+                cfg.log = value;
+            }
+            "--watch-debounce-ms" => {
+                cfg.watch_debounce_ms = value
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("--watch-debounce-ms 需为非负整数: {value}"))?
+            }
+            "--watch-fallback-ms" => {
+                cfg.watch_fallback_ms = value
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("--watch-fallback-ms 需为非负整数: {value}"))?
+            }
+            "--media-export-dir" => cfg.media_export_dir = PathBuf::from(value),
+            "--base-url" => cfg.base_url = Some(value),
             other => anyhow::bail!("未知参数: {other}"),
         }
-    }
-    if cfg.media_export_dir.as_os_str().is_empty() {
-        cfg.media_export_dir = cfg.data_dir.join("api-media");
     }
     Ok(Some(cfg))
 }
@@ -132,30 +184,175 @@ fn print_help() {
     );
 }
 
+// ---- API access token (OS credential store) ----------------------------
+//
+// Lives here rather than in `server` so the token source sits next to the
+// rest of the process configuration (qqflow-server parity).
+
+const TOKEN_SERVICE: &str = "weflow-server";
+const TOKEN_USER: &str = "http-api-token";
+
+/// Access token kept in the OS credential store (Windows Credential
+/// Manager / macOS Keychain / Linux Secret Service). Never written to a
+/// token file.
+///
+/// The token is printed to the log **only when it is first generated**
+/// (or when the credential store is unavailable and the token is
+/// per-session). On subsequent launches it is fetched silently; use the
+/// `--show-token` flag to retrieve it on demand.
+pub fn load_token() -> Result<String> {
+    let entry = keyring::Entry::new(TOKEN_SERVICE, TOKEN_USER)
+        .map_err(|e| anyhow::anyhow!("凭据库初始化失败: {e}"))?;
+    match entry.get_password() {
+        Ok(t) if t.len() >= 16 => Ok(t),
+        Ok(_) => {
+            // short/corrupt value: regenerate and overwrite
+            let t = new_token();
+            entry
+                .set_password(&t)
+                .map_err(|e| anyhow::anyhow!("凭据库写入失败: {e}"))?;
+            tracing::info!("[init] 生成新 API token: {t}（已存入系统凭据库）");
+            Ok(t)
+        }
+        Err(keyring::Error::NoEntry) => {
+            let t = new_token();
+            entry
+                .set_password(&t)
+                .map_err(|e| anyhow::anyhow!("凭据库写入失败: {e}"))?;
+            tracing::info!("[init] 生成新 API token: {t}（已存入系统凭据库）");
+            Ok(t)
+        }
+        Err(e) => {
+            // no credential store available: per-session token, log only
+            let t = new_token();
+            tracing::warn!(
+                "[init] 凭据库不可用 ({e})；API token 为会话级（重启后变化）: {t}"
+            );
+            Ok(t)
+        }
+    }
+}
+
+/// Read the stored token without generating one; `None` when none exists.
+/// Used by `--show-token`.
+pub fn show_token() -> Result<Option<String>> {
+    let entry = keyring::Entry::new(TOKEN_SERVICE, TOKEN_USER)
+        .map_err(|e| anyhow::anyhow!("凭据库初始化失败: {e}"))?;
+    match entry.get_password() {
+        Ok(t) if !t.is_empty() => Ok(Some(t)),
+        Ok(_) | Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(anyhow::anyhow!("凭据库读取失败: {e}")),
+    }
+}
+
+fn new_token() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
 
     #[test]
     fn defaults_are_sane() {
         let c = Config::default();
         assert_eq!(c.port, 5033);
         assert_eq!(c.host, "127.0.0.1");
+        assert_eq!(c.log, "info");
         assert_eq!(c.watch_debounce_ms, 350);
+        assert_eq!(c.watch_fallback_ms, 30_000);
         assert!(!c.show_token);
+        assert_eq!(c.media_export_dir, c.data_dir.join("api-media"));
     }
 
     #[test]
-    fn show_token_flag_parses() {
-        // parse_args reads env args; emulate by checking the flag arm compiles:
-        // --show-token is a standalone switch (no value consumed)
-        let yes = ["--show-token".to_string()];
-        let mut cfg = Config::default();
-        for a in yes {
-            if a == "--show-token" {
-                cfg.show_token = true;
-            }
-        }
-        assert!(cfg.show_token);
+    fn defaults_with_no_args() {
+        let cfg = parse_args(vec![]).unwrap().expect("config");
+        assert_eq!(cfg.port, 5033);
+        assert_eq!(cfg.host, "127.0.0.1");
+        assert_eq!(cfg.log, "info");
+    }
+
+    #[test]
+    fn flags_override_defaults() {
+        let cfg = parse_args(args(&[
+            "--port", "5999", "--host", "0.0.0.0", "--log", "debug",
+            "--watch-debounce-ms", "500", "--watch-fallback-ms", "0",
+            "--base-url", "http://192.168.1.10:5999",
+        ]))
+        .unwrap()
+        .expect("config");
+        assert_eq!(cfg.port, 5999);
+        assert_eq!(cfg.host, "0.0.0.0");
+        assert_eq!(cfg.log, "debug");
+        assert_eq!(cfg.watch_debounce_ms, 500);
+        assert_eq!(cfg.watch_fallback_ms, 0);
+        assert_eq!(cfg.base_url.as_deref(), Some("http://192.168.1.10:5999"));
+    }
+
+    #[test]
+    fn inline_value_syntax_supported() {
+        let cfg = parse_args(args(&["--port=6001", "--log=warn"]))
+            .unwrap()
+            .expect("config");
+        assert_eq!(cfg.port, 6001);
+        assert_eq!(cfg.log, "warn");
+    }
+
+    #[test]
+    fn show_token_switch_parses_without_value() {
+        // The switch must not swallow the argument that follows it.
+        let cfg = parse_args(args(&["--show-token", "--port", "6002"]))
+            .unwrap()
+            .expect("config");
+        assert!(cfg.show_token, "--show-token must set the flag");
+        assert_eq!(cfg.port, 6002, "--show-token must not consume --port");
+        // and normal startup keeps it off
+        assert!(!parse_args(vec![]).unwrap().expect("config").show_token);
+    }
+
+    #[test]
+    fn help_and_version_print_and_return_none() {
+        assert!(parse_args(args(&["--help"])).unwrap().is_none());
+        assert!(parse_args(args(&["-h"])).unwrap().is_none());
+        assert!(parse_args(args(&["--version"])).unwrap().is_none());
+        assert!(parse_args(args(&["-V"])).unwrap().is_none());
+    }
+
+    #[test]
+    fn invalid_values_rejected() {
+        assert!(parse_args(args(&["--port", "abc"])).is_err());
+        assert!(parse_args(args(&["--watch-debounce-ms", "abc"])).is_err());
+
+        let err = parse_args(args(&["--log", "verbose"])).unwrap_err();
+        assert!(format!("{err:#}").contains("--log"), "log level is validated");
+
+        let err = parse_args(args(&["--nope", "1"])).unwrap_err();
+        assert!(format!("{err:#}").contains("未知参数"));
+    }
+
+    #[test]
+    fn missing_value_is_an_error_not_a_silent_default() {
+        // Trailing flag with nothing after it.
+        let err = parse_args(args(&["--port"])).unwrap_err();
+        assert!(format!("{err:#}").contains("缺少值"));
+        // Empty inline value.
+        assert!(parse_args(args(&["--host="])).is_err());
+    }
+
+    #[test]
+    fn flag_shaped_value_is_rejected() {
+        // `--host --log debug` must not silently set host to "--log".
+        let err = parse_args(args(&["--host", "--log", "debug"])).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("缺少值"), "got: {msg}");
     }
 }

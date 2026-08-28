@@ -67,11 +67,17 @@ async fn file_event_triggers_sync_and_message_event() {
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }
-    // rx tokens may have been consumed; drain any others
-    let got = got.or_else(|| loop {
-        match rx.try_recv() {
-            Ok(ev) if matches!(ev, Event::New(_)) => break Some(ev),
-            _ => break None,
+    // The loop above may have consumed non-New events (sync/ready) while the
+    // one we want was already queued behind them, so drain whatever is left.
+    // This must keep going past non-matching events: breaking on the first one
+    // would make a leading sync frame look like "no message arrived".
+    let got = got.or_else(|| {
+        loop {
+            match rx.try_recv() {
+                Ok(ev) if matches!(ev, Event::New(_)) => return Some(ev),
+                Ok(_) => continue, // not the event we want; keep draining
+                Err(_) => return None, // empty, lagged or closed
+            }
         }
     });
     let got = got.expect("must receive a message.new event after the file write");

@@ -1,7 +1,36 @@
+# Rust build artifacts
 /target
 /dist
+
+# Build logs
+*.log
+
+# Local data (keys/token created at runtime)
+# weflow-server.json carries real DB keys; the all_keys.json/keys.json names
+# are the shapes WEFLOW_TEST_KEYS_JSON accepts, ignored here so a copy dropped
+# in the repo root can never be committed.
+/weflow-server.json
+all_keys.json
+keys.json
+
+# Scratch trees used while probing a real account
 /_fetch_wechat
 /reference
-/weflow-server.json
+
+# IDE / editor
+.idea/
+.vscode/
+*.iml
+
+# OS noise
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Local overrides
+*.local
+.env
+
+# Editor/tool leftovers
 *.bak
 *.json.tmp

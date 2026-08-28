@@ -193,6 +193,7 @@ async fn sse_replay_after_reconnect() {
         group_name: Some("g".into()),
         content: "hello".into(),
         timestamp: 1700000001,
+        media: None,
     });
     let event2 = weflow_server::sync::Event::New(weflow_server::sync::NewMessageEvent {
         session_id: common::FAKE_GROUP.to_string(),
@@ -202,6 +203,7 @@ async fn sse_replay_after_reconnect() {
         group_name: Some("g".into()),
         content: "world".into(),
         timestamp: 1700000002,
+        media: None,
     });
     let reader = sse_frames(&server, None, Duration::from_secs(8), 2);
     let sender = async {
@@ -272,6 +274,7 @@ async fn subscriber_survives_account_registration() {
         group_name: Some("g".into()),
         content: "after registration".into(),
         timestamp: 1700000003,
+        media: None,
     });
 
     // Subscribe first (zero accounts), then register an account and publish.

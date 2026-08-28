@@ -5,6 +5,7 @@
 //! follow qqflow-server conventions. Default port 5033 (WeFlow 5031 /
 //! qqflow-server 5032).
 
+pub mod auth;
 pub mod error;
 pub mod handlers;
 
@@ -123,11 +124,47 @@ impl AccountHandle {
     }
 }
 
+/// Resolve the base URL used in exported-media links.
+///
+/// `--base-url` overrides everything verbatim; otherwise it is derived from
+/// `--host`/`--port`. Bind-all addresses (`0.0.0.0` / `::`) are not reachable
+/// as URLs, so they fall back to 127.0.0.1 with a warning — LAN clients must
+/// pass `--base-url` explicitly. IPv6 hosts are bracketed: `[::1]:5033`.
+pub fn derive_base_url(host: &str, port: u16, override_url: Option<&str>) -> String {
+    if let Some(url) = override_url {
+        return url.trim_end_matches('/').to_string();
+    }
+    let host = match host {
+        "0.0.0.0" | "::" => {
+            tracing::warn!(
+                "[init] 绑定地址 {host} 不可作为 URL，媒体链接回退 127.0.0.1；局域网客户端请用 --base-url 显式指定"
+            );
+            "127.0.0.1".to_string()
+        }
+        h => h.to_string(),
+    };
+    if host.contains(':') && !host.starts_with('[') {
+        format!("http://[{host}]:{port}")
+    } else {
+        format!("http://{host}:{port}")
+    }
+}
+
 /// Shared application state.
 pub struct AppState {
     pub cfg: Config,
     pub token: String,
+    /// Base URL for exported-media links, resolved once at startup by
+    /// [`derive_base_url`] (never re-derived per request).
+    pub base_url: String,
     pub accounts: Mutex<HashMap<String, Arc<AccountHandle>>>,
+    /// Accounts found by the startup platform scan, for discovery only.
+    ///
+    /// Reported by `/health` as `awaiting_key` when not yet registered, so a
+    /// client can see which accounts exist before registering any. These
+    /// deliberately never enter `accounts` and never gate readiness — see
+    /// [`AppState::set_discovered`].
+    pub discovered: Mutex<Vec<AccountInfo>>,
     pub shutdown: tokio::sync::watch::Sender<bool>,
     /// Process-wide SSE event bus (qqflow-server parity). Global rather than
     /// per-account so that `/api/v1/push/messages` needs no ready account to
@@ -153,14 +190,65 @@ impl AppState {
         token: String,
         shutdown: tokio::sync::watch::Sender<bool>,
     ) -> Self {
+        let base_url = derive_base_url(&cfg.host, cfg.port, cfg.base_url.as_deref());
         AppState {
             cfg,
             token,
+            base_url,
             accounts: Mutex::new(HashMap::new()),
+            discovered: Mutex::new(Vec::new()),
             shutdown,
             events: broadcast::channel(Self::EVENT_BUS_CAPACITY).0,
             history: Arc::new(Mutex::new(HistoryBuf::default())),
         }
+    }
+
+    /// Record the startup scan results (discovery only — no keys, no build).
+    ///
+    /// Kept out of `accounts` on purpose: readiness must consider ONLY
+    /// registered accounts. Folding scanned-but-unregistered accounts into the
+    /// readiness set would pin `/health` at `starting` forever whenever a
+    /// client never registers one of them.
+    pub fn set_discovered(&self, found: Vec<AccountInfo>) {
+        *self.discovered.lock() = found;
+    }
+
+    /// Per-account views for `/health`: every registered account, plus each
+    /// discovered-but-unregistered one as `awaiting_key`. Sorted by wxid.
+    ///
+    /// The second return value is the readiness flag, computed over the
+    /// registered accounts alone (see [`AppState::set_discovered`]).
+    pub fn account_views(&self) -> (Vec<AccountStateView>, bool) {
+        let mut views: Vec<AccountStateView> = {
+            let accounts = self.accounts.lock();
+            accounts
+                .values()
+                .map(|h| AccountStateView {
+                    wxid: h.info.wxid.clone(),
+                    state: h.status(),
+                    message_count: h.store.read().total_messages(),
+                    error: h.error.lock().clone(),
+                })
+                .collect()
+        };
+        // Readiness over registered accounts only, BEFORE the discovered
+        // entries are appended.
+        let all_ready = !views.is_empty() && views.iter().all(|v| v.state.is_ready());
+
+        let registered: std::collections::HashSet<String> =
+            views.iter().map(|v| v.wxid.clone()).collect();
+        for info in self.discovered.lock().iter() {
+            if !registered.contains(&info.wxid) {
+                views.push(AccountStateView {
+                    wxid: info.wxid.clone(),
+                    state: AccountStatus::AwaitingKey,
+                    message_count: 0,
+                    error: None,
+                });
+            }
+        }
+        views.sort_by(|a, b| a.wxid.cmp(&b.wxid));
+        (views, all_ready)
     }
 }
 
@@ -198,75 +286,26 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/v1/push/messages",
             axum::routing::get(push_events::handler).post(push_events::handler),
         )
-        .route("/api/v1/sync", axum::routing::get(sync::handler).post(sync::handler))        .route("/api/v1/sns/timeline", axum::routing::get(sns::timeline).post(sns::timeline))
-        .route("/api/v1/sns/usernames", axum::routing::get(sns::usernames).post(sns::usernames))
-        .route("/api/v1/sns/stats", axum::routing::get(sns::stats).post(sns::stats))        .route("/api/v1/sns/export", axum::routing::get(sns::export).post(sns::export))
-        .route("/api/v1/sns/export/stats", axum::routing::get(sns::export_stats).post(sns::export_stats))
-        .route("/api/v1/sns/media/proxy", axum::routing::get(sns::media_proxy).post(sns::media_proxy))
+        .route("/api/v1/sync", axum::routing::get(sync::handler).post(sync::handler))
+        .route(
+            "/api/v1/sns/timeline",
+            axum::routing::get(sns::timeline).post(sns::timeline),
+        )
+        .route(
+            "/api/v1/sns/usernames",
+            axum::routing::get(sns::usernames).post(sns::usernames),
+        )
+        .route("/api/v1/sns/stats", axum::routing::get(sns::stats).post(sns::stats))
+        .route("/api/v1/sns/export", axum::routing::get(sns::export).post(sns::export))
+        .route(
+            "/api/v1/sns/export/stats",
+            axum::routing::get(sns::export_stats).post(sns::export_stats),
+        )
+        .route(
+            "/api/v1/sns/media/proxy",
+            axum::routing::get(sns::media_proxy).post(sns::media_proxy),
+        )
         .with_state(state)
-}
-
-const TOKEN_SERVICE: &str = "weflow-server";
-const TOKEN_USER: &str = "http-api-token";
-
-/// Access token kept in the OS credential store (Windows Credential
-/// Manager / macOS Keychain / Linux Secret Service). Never written to a
-/// token file.
-///
-/// The token is printed to the log **only when it is first generated**
-/// (or when the credential store is unavailable and the token is
-/// per-session). On subsequent launches it is fetched silently; use the
-/// `--show-token` flag to retrieve it on demand.
-pub fn load_token() -> Result<String> {
-    let entry = keyring::Entry::new(TOKEN_SERVICE, TOKEN_USER)
-        .map_err(|e| anyhow::anyhow!("凭据库初始化失败: {e}"))?;
-    match entry.get_password() {
-        Ok(t) if t.len() >= 16 => Ok(t),
-        Ok(_) => {
-            // short/corrupt value: regenerate and overwrite
-            let t = new_token();
-            entry
-                .set_password(&t)
-                .map_err(|e| anyhow::anyhow!("凭据库写入失败: {e}"))?;
-            tracing::info!("[init] 生成新 API token: {t}（已存入系统凭据库）");
-            Ok(t)
-        }
-        Err(keyring::Error::NoEntry) => {
-            let t = new_token();
-            entry
-                .set_password(&t)
-                .map_err(|e| anyhow::anyhow!("凭据库写入失败: {e}"))?;
-            tracing::info!("[init] 生成新 API token: {t}（已存入系统凭据库）");
-            Ok(t)
-        }
-        Err(e) => {
-            // no credential store available: per-session token, log only
-            let t = new_token();
-            tracing::warn!(
-                "[init] 凭据库不可用 ({e})；API token 为会话级（重启后变化）: {t}"
-            );
-            Ok(t)
-        }
-    }
-}
-
-/// Read the stored token without generating one; `None` when none exists.
-/// Used by `--show-token`.
-pub fn show_token() -> Result<Option<String>> {
-    let entry = keyring::Entry::new(TOKEN_SERVICE, TOKEN_USER)
-        .map_err(|e| anyhow::anyhow!("凭据库初始化失败: {e}"))?;
-    match entry.get_password() {
-        Ok(t) if !t.is_empty() => Ok(Some(t)),
-        Ok(_) | Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(anyhow::anyhow!("凭据库读取失败: {e}")),
-    }
-}
-
-fn new_token() -> String {
-    use rand::RngCore;
-    let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    hex::encode(bytes)
 }
 
 /// Merge query params and JSON body into one param map (body wins).
@@ -348,10 +387,12 @@ pub async fn start_account(
     let info = match &body.db_path {
         Some(p) if !p.is_empty() => {
             let p = std::path::PathBuf::from(p);
+            // Accept either the account root (which contains `db_storage`) or
+            // the storage dir itself. A path that is neither passes through
+            // unchanged so the `is_dir` check below reports it against the
+            // value the client actually sent.
             let storage = if p.join("db_storage").is_dir() {
                 p.join("db_storage")
-            } else if p.is_dir() {
-                p.clone()
             } else {
                 p.clone()
             };
@@ -552,5 +593,128 @@ pub fn watch_config(cfg: &Config) -> WatchConfig {
     WatchConfig {
         debounce: std::time::Duration::from_millis(cfg.watch_debounce_ms),
         fallback: (cfg.watch_fallback_ms > 0).then(|| std::time::Duration::from_millis(cfg.watch_fallback_ms)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state() -> Arc<AppState> {
+        let cfg = Config {
+            host: "127.0.0.1".into(),
+            port: 0,
+            log: "info".into(),
+            watch_debounce_ms: 10,
+            watch_fallback_ms: 0,
+            media_export_dir: std::path::PathBuf::from("target/test-tmp/state"),
+            base_url: None,
+            data_dir: std::path::PathBuf::from("target/test-tmp/state-data"),
+            show_token: false,
+        };
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        Arc::new(AppState::new(cfg, "0123456789abcdef".into(), shutdown))
+    }
+
+    fn info(wxid: &str) -> AccountInfo {
+        AccountInfo {
+            wxid: wxid.into(),
+            dir: std::path::PathBuf::from("/nonexistent").join(wxid),
+            db_storage: std::path::PathBuf::from("/nonexistent").join(wxid).join("db_storage"),
+            session_db: None,
+        }
+    }
+
+    /// Discovered-but-unregistered accounts are reported, never gate readiness.
+    ///
+    /// Guards the (ii) choice: folding them into the readiness set would pin
+    /// `/health` at `starting` forever when a client never registers one.
+    #[test]
+    fn discovered_accounts_are_reported_but_never_gate_readiness() {
+        let state = test_state();
+        state.set_discovered(vec![info("wxid_scanned")]);
+
+        // Nothing registered yet: listed as awaiting_key, and NOT ready
+        // (there is no registered account at all).
+        let (views, ready) = state.account_views();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].wxid, "wxid_scanned");
+        assert_eq!(views[0].state, AccountStatus::AwaitingKey);
+        assert_eq!(views[0].message_count, 0);
+        assert!(!ready, "no registered account means not ready");
+
+        // Register a DIFFERENT account and mark it ready. The still-unregistered
+        // scanned account must not hold readiness back.
+        let (handle, is_new) = register_account(
+            &state,
+            info("wxid_registered"),
+            crate::keystore::KeyMap::default(),
+            None,
+        );
+        assert!(is_new);
+        handle.set_status(AccountStatus::Ready);
+
+        let (views, ready) = state.account_views();
+        assert!(ready, "an unregistered scanned account must not block readiness");
+        assert_eq!(views.len(), 2, "both are reported");
+        // Sorted by wxid: registered < scanned.
+        assert_eq!(views[0].wxid, "wxid_registered");
+        assert_eq!(views[0].state, AccountStatus::Ready);
+        assert_eq!(views[1].wxid, "wxid_scanned");
+        assert_eq!(views[1].state, AccountStatus::AwaitingKey);
+    }
+
+    /// A registered account that is still indexing DOES gate readiness.
+    #[test]
+    fn registered_not_ready_account_gates_readiness() {
+        let state = test_state();
+        let (a, _) = register_account(&state, info("wxid_a"), crate::keystore::KeyMap::default(), None);
+        let (b, _) = register_account(&state, info("wxid_b"), crate::keystore::KeyMap::default(), None);
+        a.set_status(AccountStatus::Ready);
+        b.set_status(AccountStatus::Indexing);
+        assert!(!state.account_views().1, "indexing account blocks readiness");
+        b.set_status(AccountStatus::Ready);
+        assert!(state.account_views().1, "all registered ready -> ready");
+    }
+
+    /// Registering a scanned account replaces its discovery entry rather than
+    /// listing the same wxid twice.
+    #[test]
+    fn registering_a_discovered_account_does_not_duplicate_it() {
+        let state = test_state();
+        state.set_discovered(vec![info("wxid_dup")]);
+        let (h, _) = register_account(&state, info("wxid_dup"), crate::keystore::KeyMap::default(), None);
+        h.set_status(AccountStatus::Ready);
+        let (views, ready) = state.account_views();
+        assert_eq!(views.len(), 1, "wxid must not appear twice");
+        assert_eq!(views[0].state, AccountStatus::Ready);
+        assert!(ready);
+    }
+
+    #[test]
+    fn base_url_derivation() {
+        assert_eq!(
+            derive_base_url("127.0.0.1", 5033, None),
+            "http://127.0.0.1:5033"
+        );
+        // A real --host must be honoured (the old hardcoded 127.0.0.1 ignored it).
+        assert_eq!(
+            derive_base_url("192.168.1.10", 5033, None),
+            "http://192.168.1.10:5033"
+        );
+        // Bind-all addresses are not reachable as URLs -> 127.0.0.1.
+        assert_eq!(derive_base_url("0.0.0.0", 5033, None), "http://127.0.0.1:5033");
+        assert_eq!(derive_base_url("::", 5033, None), "http://127.0.0.1:5033");
+        // IPv6 hosts get brackets.
+        assert_eq!(derive_base_url("::1", 5033, None), "http://[::1]:5033");
+        // --base-url overrides everything, minus any trailing slash.
+        assert_eq!(
+            derive_base_url("0.0.0.0", 5033, Some("http://192.168.1.10:5033")),
+            "http://192.168.1.10:5033"
+        );
+        assert_eq!(
+            derive_base_url("0.0.0.0", 5033, Some("http://example.test/")),
+            "http://example.test"
+        );
     }
 }

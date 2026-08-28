@@ -6,7 +6,6 @@ mod common;
 use std::path::Path;
 
 use rusqlite::Connection;
-use weflow_server::keystore::ImageKeys;
 use weflow_server::media::export::{export_batch, ExportCtx};
 use weflow_server::media::{decrypt_dat, detect_format, DatFormat};
 

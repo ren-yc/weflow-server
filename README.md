@@ -33,6 +33,27 @@ WCDB/SQLCipher-4 风格加密）。独立纯 Rust 实现，架构参考同目录
 SQLCipher 与 OpenSSL 为源码编译（测试夹具互操作需要），故要求 C 工具链与 perl；wrapper 自动定位
 MSVC 环境与 Perl/nasm（Windows 专属），透传全部 cargo 参数（`test`/`clippy`/`build --release` 同理）。
 
+## 隐私检查钩子
+
+本仓库的隐私扫描通过 git pre-commit 钩子执行。`.git/hooks/` 不受版本控制，
+因此**克隆后需手动装一次**（可重复执行，幂等）：
+
+```powershell
+powershell -File scripts\install-hooks.ps1   # Windows
+bash scripts/install-hooks.sh                # Linux/macOS
+```
+
+钩子在每次 `git commit` 前运行 `scripts/check-privacy.sh`，扫描暂存内容中的
+本机特定信息（wxid、数据库密钥、账号路径、用户名）。命中即中止提交并列出文件。
+手动单次执行：
+
+```bash
+bash scripts/check-privacy.sh
+```
+
+若 bash 不可用，钩子会**报错并阻止提交**（而非放行），以免扫描被静默跳过。
+确有需要绕过时用 `git commit --no-verify`。
+
 ## 发布
 
 版本号以 `Cargo.toml` 为唯一来源：`-V`/`--version` 与运行时版本信息均编译自 `env!("CARGO_PKG_VERSION")`，
@@ -102,9 +123,21 @@ powershell -File scripts\build.ps1 test   # Windows
 bash scripts/build.sh test                 # Linux/macOS
 ```
 
-真库验证（ground-truth 探针与下游客户端模拟）默认跳过，需真实微信数据：
-`WEFLOW_TEST_DB_ROOT`（指向 `db_storage` 所在账号目录）+ 密钥文件/环境变量，见
-`tests/real_db_groundtruth.rs`。
+真库验证（ground-truth 探针与下游客户端模拟）默认跳过，需真实微信数据，见
+`tests/real_db_groundtruth.rs` 与 `tests/downstream_client.rs`。两种输入源，按优先级：
+
+1. 仓库根目录的 `weflow-server.json`（已被 `.gitignore` 忽略），扁平字段
+   `wxid` / `db_path` / `keys`（每库密钥映射）或 `key`（统一密钥）；
+2. 环境变量 `WEFLOW_TEST_WXID` / `WEFLOW_TEST_DB_ROOT`（指向 `db_storage` 所在账号目录）
+   加 `WEFLOW_TEST_KEYS_JSON`（`all_keys.json` 形式的映射文件）或 `WEFLOW_TEST_KEY`。
+
+```bash
+bash scripts/build.sh test --test downstream_client -- --ignored --nocapture
+```
+
+下游客户端模拟走真实 HTTP 层：零账号启动 → `POST /api/v1/accounts` 注册 → 等待索引
+就绪 → 覆盖五种鉴权传输、GET/POST 参数、ChatLab Pull 全量翻页排空、联系人分页、
+群成员、媒体导出与取回、SNS、SSE。
 
 ## 目录结构
 
@@ -120,7 +153,7 @@ src/
 ├─ parser/                     # 消息内容解析（XML / zstd / 类型占位符 / 引用 / 撤回）
 ├─ store/                      # 内存索引（会话/联系人/消息/水位）+ 查询
 ├─ sync/                       # 实时同步引擎（poll + 事件）+ watch（notify 防抖/兜底）
-└─ server/                     # axum：鉴权三通道、账号注册、HTTP 端点、SSE、媒体直服
+└─ server/                     # axum：鉴权五通道、账号注册、HTTP 端点、SSE、媒体直服
 tests/
 ├─ common/                     # SQLCipher 假库夹具（微信同构布局 + 造数 + WAL）
 ├─ wcdb_roundtrip.rs           # 互操作仲裁：sqlcipher 造库 → 本实现解密 → SQLite 重开

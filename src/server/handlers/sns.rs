@@ -133,11 +133,7 @@ pub async fn timeline(
         })
         .collect();
     let total = matched.len();
-    let base_url = state
-        .cfg
-        .base_url
-        .clone()
-        .unwrap_or_else(|| format!("http://127.0.0.1:{}", state.cfg.port));
+    let base_url = &state.base_url;
     let slice: Vec<serde_json::Value> = matched
         .iter()
         .skip(offset)
@@ -328,11 +324,7 @@ pub async fn export(
         .collect();
     let feed_owned: Vec<crate::store::SnsFeed> = feeds.iter().map(|f| (*f).clone()).collect();
     let stats = aggregate(&feed_owned);
-    let base_url = state
-        .cfg
-        .base_url
-        .clone()
-        .unwrap_or_else(|| format!("http://127.0.0.1:{}", state.cfg.port));
+    let base_url = &state.base_url;
     let entries: Vec<serde_json::Value> = feeds
         .iter()
         .map(|f| sns_feed_json(&store, f, &base_url, &state.token))

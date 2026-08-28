@@ -236,11 +236,7 @@ pub async fn handler(
             .await
             .unwrap_or_default()
         };
-    let base_url = state
-        .cfg
-        .base_url
-        .clone()
-        .unwrap_or_else(|| format!("http://127.0.0.1:{}", state.cfg.port));
+    let base_url = &state.base_url;
     let mut exported_count = 0usize;
     for mv in &mut messages {
         let Some(local_id) = mv.get("localId").and_then(|v| v.as_i64()) else {

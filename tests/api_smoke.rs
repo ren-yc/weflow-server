@@ -394,6 +394,68 @@ async fn chatlab_pull_contract() {
     assert!(m["sender"].is_string());
 }
 
+/// Paginating with the cursors the server hands back must serve every message
+/// exactly once.
+///
+/// Regression: `nextSince` used to be the newest timestamp in the WHOLE
+/// conversation rather than the page's own last timestamp, and `since` was
+/// inclusive. Feeding the pair back therefore jumped straight to the end —
+/// page 2 came back empty and every message in between was silently dropped.
+/// The single-page `chatlab_pull_contract` above cannot see this: it never
+/// takes a second page.
+#[tokio::test]
+async fn chatlab_pull_pagination_drains_every_message() {
+    let dir = common::tmp_dir("smoke-pullpage");
+    let state = test_state(&dir);
+    let app = server::build_router(state);
+
+    // The group fixture holds 4 messages, one per second, so limit=1 forces a
+    // page per message (a page always covers a whole second).
+    let mut ids: Vec<String> = Vec::new();
+    let mut uri = format!(
+        "/api/v1/sessions/{}/messages?limit=1&access_token={}",
+        common::FAKE_GROUP, TOKEN
+    );
+    let mut pages = 0;
+    loop {
+        let (status, body) =
+            json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        let page = body["messages"].as_array().unwrap();
+        assert_eq!(page.len(), 1, "one message per second-group at limit=1");
+        ids.push(page[0]["platformMessageId"].as_str().unwrap().to_string());
+        pages += 1;
+        assert!(pages <= 4, "must not loop past the 4 fixture messages");
+        if !body["sync"]["hasMore"].as_bool().unwrap() {
+            assert_eq!(body["sync"]["nextOffset"], 0, "drained cursor resets offset");
+            break;
+        }
+        let since = body["sync"]["nextSince"].as_i64().unwrap();
+        let offset = body["sync"]["nextOffset"].as_i64().unwrap();
+        uri = format!(
+            "/api/v1/sessions/{}/messages?since={since}&offset={offset}&limit=1&access_token={}",
+            common::FAKE_GROUP, TOKEN
+        );
+    }
+    assert_eq!(pages, 4, "4 messages at limit=1 means 4 pages");
+    assert_eq!(ids.len(), 4);
+    let unique: std::collections::BTreeSet<&String> = ids.iter().collect();
+    assert_eq!(unique.len(), 4, "no message served twice: {ids:?}");
+
+    // `since` is exclusive: resuming from a message's own timestamp must not
+    // hand that message back again.
+    let uri = format!(
+        "/api/v1/sessions/{}/messages?since=1700000100&limit=5000&access_token={}",
+        common::FAKE_GROUP, TOKEN
+    );
+    let (_, body) = json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(
+        body["messages"].as_array().unwrap().len(),
+        3,
+        "exclusive since drops the boundary second"
+    );
+}
+
 #[tokio::test]
 async fn media_and_sync_endpoints() {
     let dir = common::tmp_dir("smoke-media");

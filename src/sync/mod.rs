@@ -43,6 +43,30 @@ pub enum Event {
     Revoke(RevokeEvent),
 }
 
+/// Media metadata pushed over SSE.
+///
+/// Deliberately excludes:
+/// - `aes_key` — a decryption secret, never a metadata field
+/// - `url` / `localPath` — media BYTES go through the REST export path
+///   (`/api/v1/messages?media=1`), so pushing empty placeholders here would
+///   only make clients think a fetchable link exists
+#[derive(Debug, Clone)]
+pub struct PushMedia {
+    pub kind: &'static str,
+    pub file_name: String,
+    pub md5: Option<String>,
+}
+
+impl From<&crate::parser::MediaHint> for PushMedia {
+    fn from(m: &crate::parser::MediaHint) -> Self {
+        Self {
+            kind: m.kind.as_str(),
+            file_name: m.file_name.clone(),
+            md5: m.md5.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NewMessageEvent {
     pub session_id: String,
@@ -52,6 +76,8 @@ pub struct NewMessageEvent {
     pub group_name: Option<String>,
     pub content: String,
     pub timestamp: i64,
+    /// Media metadata when the message carries any (image/voice/video/…).
+    pub media: Option<PushMedia>,
 }
 
 #[derive(Debug, Clone)]
@@ -339,6 +365,15 @@ impl AccountSync {
                             .and_then(|v| v.last())
                             .map(|r| r.create_time)
                             .unwrap_or_default(),
+                        // Metadata only — see `PushMedia`. Without this the
+                        // push path gave no media hint at all and clients had
+                        // to re-query REST just to learn a message had media.
+                        media: guard
+                            .convs
+                            .get(&session)
+                            .and_then(|v| v.last())
+                            .and_then(|r| r.parsed.media.as_ref())
+                            .map(PushMedia::from),
                     };
                     let _ = self.events.send(Event::New(ev));
                 }

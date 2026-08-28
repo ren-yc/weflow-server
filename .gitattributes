@@ -1,0 +1,25 @@
+# Normalize text to LF in the repository AND in the working tree.
+#
+# Why this is not cosmetic: a global `core.autocrlf=true` (the common Windows
+# setting) checks files out with CRLF. That breaks the shell scripts in two
+# ways — bash reports "bad interpreter" when the shebang ends in `\r`, and a
+# trailing `\r` silently changes string comparisons inside
+# scripts/check-privacy.sh, so a secret pattern stops matching and the
+# pre-commit hook would report a clean tree while a key is being committed.
+* text=auto eol=lf
+
+# PowerShell's native convention is CRLF and it reads both.
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Never let end-of-line conversion touch binary payloads.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.db binary
+*.dat binary
+*.silk binary
