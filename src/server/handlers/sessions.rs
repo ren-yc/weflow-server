@@ -22,6 +22,7 @@ pub async fn handler(
     let account = ready_account(&state, &params)?;
     let keyword = params.get("keyword").filter(|s| !s.is_empty()).map(|s| s.to_lowercase());
     let limit = crate::server::parse_limit(&params, "limit", 100, 10000);
+    let offset = crate::server::parse_offset(&params, "offset");
     let chatlab = crate::server::flex_bool(&params, "chatlab")
         || params.get("format").map(|f| f.eq_ignore_ascii_case("chatlab")).unwrap_or(false);
 
@@ -34,7 +35,12 @@ pub async fn handler(
         });
     }
     sessions.sort_by(|a, b| b.last_timestamp.cmp(&a.last_timestamp).then(a.username.cmp(&b.username)));
-    sessions.truncate(limit);
+    // Offset paging (qqflow-server parity): keyword filter + stable sort happen
+    // BEFORE the page slice, so `offset` walks the filtered, sorted set. An
+    // `offset` past the end yields an empty page (count=0, success=true); both
+    // the native and chatlab shapes below page from the same slice.
+    let sessions: Vec<&crate::store::Session> =
+        sessions.into_iter().skip(offset).take(limit).collect();
 
     if chatlab {
         let items: Vec<serde_json::Value> = sessions

@@ -320,6 +320,80 @@ async fn contacts_paginate_by_offset() {
     assert_eq!(body["hasMore"], false);
 }
 
+/// `/api/v1/sessions` pages by `offset` like `/api/v1/contacts`: the fixture
+/// holds 2 sessions (group newer than friend), so `limit=1` splits them into
+/// two disjoint pages whose union is the whole list; an `offset` past the end
+/// returns an empty page (count=0, success=true). `offset` applies AFTER the
+/// keyword filter and the stable sort, and to the chatlab shape too.
+#[tokio::test]
+async fn sessions_paginate_by_offset() {
+    let dir = common::tmp_dir("smoke-sesspage");
+    let state = test_state(&dir);
+    let app = server::build_router(state);
+
+    // walk one row at a time; the two pages must be disjoint and cover all
+    let mut seen: Vec<String> = Vec::new();
+    for offset in 0..2 {
+        let uri = format!("/api/v1/sessions?limit=1&offset={offset}&access_token={TOKEN}");
+        let (status, body) = json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["success"], true);
+        assert_eq!(body["count"].as_i64().unwrap(), 1, "limit honoured at offset {offset}");
+        seen.push(body["sessions"][0]["username"].as_str().unwrap().to_string());
+    }
+    assert_eq!(seen.len(), 2, "both fixture sessions reachable via offset: {seen:?}");
+    let mut unique = seen.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), 2, "no session repeated across pages: {seen:?}");
+    // newest first: the group (1700000015) precedes the friend (1700000010)
+    assert_eq!(seen[0], common::FAKE_GROUP);
+    assert_eq!(seen[1], common::FAKE_FRIEND);
+
+    // offset past the end: empty page, success stays true
+    let uri = format!("/api/v1/sessions?offset=99&access_token={TOKEN}");
+    let (status, body) = json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["success"], true);
+    assert_eq!(body["count"].as_i64().unwrap(), 0);
+    assert!(body["sessions"].as_array().unwrap().is_empty());
+
+    // chatlab shape pages the same way
+    let uri = format!("/api/v1/sessions?limit=1&offset=1&chatlab=1&access_token={TOKEN}");
+    let (status, body) = json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = body["sessions"].as_array().unwrap();
+    assert_eq!(page.len(), 1, "chatlab honours limit+offset");
+    assert_eq!(page[0]["id"], common::FAKE_FRIEND, "chatlab page 2 is the friend");
+    let uri = format!("/api/v1/sessions?offset=99&chatlab=1&access_token={TOKEN}");
+    let (_, body) = json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert!(body["sessions"].as_array().unwrap().is_empty(), "chatlab offset past the end is empty");
+
+    // offset is relative to the FILTERED set: keyword first, then the page
+    let uri = format!("/api/v1/sessions?keyword=项目群&offset=1&access_token={TOKEN}");
+    let (status, body) = json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"].as_i64().unwrap(), 0, "offset counts filtered rows only");
+
+    // POST body transport carries offset too (merged params, body wins)
+    let body = serde_json::json!({ "limit": 1, "offset": 1, "access_token": TOKEN });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/sessions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["sessions"][0]["username"], common::FAKE_FRIEND, "POST body offset honoured");
+}
+
 /// Real WeChat 4.x `SessionTable` has no session-name column (probed against
 /// a live account: 315 rows, zero matches for every name alias the index
 /// looks for). The session list must still emit human names by falling back

@@ -367,6 +367,28 @@ async fn downstream_client_real_db() {
     let ts: Vec<i64> = sessions.iter().map(|s| s["lastTimestamp"].as_i64().unwrap()).collect();
     assert!(ts.windows(2).all(|w| w[0] >= w[1]), "sessions must be newest first");
 
+    // offset paging: a single row at offset 0, and an empty page past the end
+    // (stable properties even with a live DB that grows between requests).
+    let (s, v1) = client_get(
+        app.clone(),
+        &format!("/api/v1/sessions?limit=1&offset=0&access_token={token}"),
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v1["count"].as_i64().unwrap(), 1, "limit=1&offset=0 returns exactly one session");
+    assert_eq!(v1["sessions"].as_array().unwrap().len(), 1);
+    let (s, v2) = client_get(
+        app.clone(),
+        &format!("/api/v1/sessions?limit=1&offset=999999&access_token={token}"),
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v2["count"], json!(0), "offset past the end returns an empty page");
+    assert!(v2["sessions"].as_array().unwrap().is_empty());
+    println!("[CLIENT] sessions offset: page-1 size=1, offset-past-end empty");
+
     // Pick conversations that actually carry indexed messages. A session row
     // can exist with `messageCount == 0` (an empty or not-yet-indexed talker),
     // and `/api/v1/messages` answers 404 for those — correct behaviour, but

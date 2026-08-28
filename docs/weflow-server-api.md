@@ -51,7 +51,7 @@
 ```json
 {
   "status": "ok",
-  "version": "0.3.0",
+  "version": "<version>",
   "accounts": [
     { "wxid": "wxid_xxxx_1234", "state": "ready", "message_count": 217272 }
   ]
