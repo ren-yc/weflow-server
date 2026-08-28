@@ -99,29 +99,61 @@ pub fn placeholder_for(local_type: i64) -> Option<&'static str> {
 /// (zstd-compressed) or directly in `message_content` — which may itself be a
 /// raw zstd frame (`28 B5 2F FD …`). Both are handled here; anything else is
 /// treated as lossy UTF-8 text.
-pub fn decode_content(compress_content: Option<&[u8]>, message_content: Option<&[u8]>) -> Option<String> {
+///
+/// `sender_username` is the row's own sender id, used to strip the group-chat
+/// sender prefix (see [`strip_sender_prefix`]). Pass `""` when unknown.
+pub fn decode_content(
+    compress_content: Option<&[u8]>,
+    message_content: Option<&[u8]>,
+    sender_username: &str,
+) -> Option<String> {
     if let Some(cc) = compress_content
         && let Some(xml) = zstd_decompress(cc)
     {
-        return Some(strip_sender_prefix(xml));
+        return Some(strip_sender_prefix(xml, sender_username));
     }
     let mc = message_content?;
     if let Some(xml) = zstd_decompress(mc) {
-        return Some(strip_sender_prefix(xml));
+        return Some(strip_sender_prefix(xml, sender_username));
     }
-    Some(String::from_utf8_lossy(mc).into_owned())
+    // Plain text (`local_type == 1`) carries the same prefix and needs the same
+    // treatment — it is not exempt just because it was never compressed.
+    Some(strip_sender_prefix(
+        String::from_utf8_lossy(mc).into_owned(),
+        sender_username,
+    ))
 }
 
-/// WeChat 4.1.x prefixes decompressed payloads with a `sender:\n` line before
-/// the XML body; media hints depend on the payload starting with `<`.
-fn strip_sender_prefix(xml: String) -> String {
-    if let Some(pos) = xml.find('\n') {
-        let (first, rest) = xml.split_at(pos);
-        if first.ends_with(':') && rest.trim_start().starts_with('<') {
-            return rest.trim_start().to_string();
-        }
+/// Strip WeChat's group-chat sender prefix (`<sender>:\n`) from a payload.
+///
+/// In `@chatroom` conversations WeChat prepends the sender's id and a newline to
+/// the stored body, for both XML and plain text. Private chats have no prefix,
+/// so stripping any `word:\n` opener unconditionally would eat real message
+/// text. Two shapes are accepted instead:
+///
+/// - the first line is exactly `{sender_username}:` — an identity match against
+///   the row's own sender, so it cannot collide with body text;
+/// - the body starts with `<` — an XML payload never legitimately begins with a
+///   `something:` line, and this keeps media hints working when the sender could
+///   not be resolved.
+///
+/// The XML branch trims leading whitespace (media detection requires the payload
+/// to start with `<`); the plain-text branch removes only the prefix and its
+/// single newline, since leading blank lines can be part of the message.
+fn strip_sender_prefix(body: String, sender_username: &str) -> String {
+    let Some((first, rest)) = body.split_once('\n') else {
+        return body;
+    };
+    let Some(id) = first.strip_suffix(':') else {
+        return body;
+    };
+    if rest.trim_start().starts_with('<') {
+        return rest.trim_start().to_string();
     }
-    xml
+    if !sender_username.is_empty() && id == sender_username {
+        return rest.to_string();
+    }
+    body
 }
 
 fn zstd_decompress(data: &[u8]) -> Option<String> {
@@ -457,15 +489,70 @@ mod tests {
     fn zstd_compress_content_wins() {
         let xml = "<msg>zstd content</msg>";
         let compressed = zstd::stream::encode_all(xml.as_bytes(), 3).unwrap();
-        let out = decode_content(Some(&compressed), Some(b"stale"));
+        let out = decode_content(Some(&compressed), Some(b"stale"), "");
         assert_eq!(out.as_deref(), Some(xml));
         // plain fallback
         assert_eq!(
-            decode_content(Some(b"garbage-not-zstd"), Some(b"plain")).as_deref(),
+            decode_content(Some(b"garbage-not-zstd"), Some(b"plain"), "").as_deref(),
             Some("plain")
         );
     }
 
+    /// Group-chat plain text (`local_type == 1`) is stored uncompressed and
+    /// carries the same `sender:\n` prefix as the XML payloads. Leaving it in
+    /// leaks the sender id into the head of every group message body.
+    #[test]
+    fn plain_text_group_prefix_is_stripped() {
+        let raw = "wxid_sender_a:\n你好啊".as_bytes();
+        assert_eq!(
+            decode_content(None, Some(raw), "wxid_sender_a").as_deref(),
+            Some("你好啊")
+        );
+        // the prefix line ends with the sender id, so a wrong id must not match
+        assert_eq!(
+            decode_content(None, Some(raw), "wxid_someone_else").as_deref(),
+            Some("wxid_sender_a:\n你好啊")
+        );
+        // unknown sender: no identity to match, so nothing is stripped
+        assert_eq!(
+            decode_content(None, Some(raw), "").as_deref(),
+            Some("wxid_sender_a:\n你好啊")
+        );
+    }
+
+    /// Private-chat bodies have no prefix, so a message that merely *opens* with
+    /// `word:\n` must survive intact.
+    #[test]
+    fn plain_text_without_sender_match_is_untouched() {
+        let raw = "注意:\n明天九点开会".as_bytes();
+        assert_eq!(
+            decode_content(None, Some(raw), "wxid_sender_a").as_deref(),
+            Some("注意:\n明天九点开会")
+        );
+    }
+
+    /// Only the prefix and its single newline go away — leading blank lines are
+    /// part of the message body.
+    #[test]
+    fn plain_text_strip_preserves_leading_blank_lines() {
+        let raw = b"wxid_sender_a:\n\n  indented";
+        assert_eq!(
+            decode_content(None, Some(raw), "wxid_sender_a").as_deref(),
+            Some("\n  indented")
+        );
+    }
+
+    /// The XML shape is accepted without an identity match (media hints need the
+    /// payload to start with `<`), and leading whitespace is trimmed there.
+    #[test]
+    fn xml_prefix_is_stripped_without_sender() {
+        let xml = "wxid_sender_a:\n  <msg><img md5=\"abc\" /></msg>";
+        let compressed = zstd::stream::encode_all(xml.as_bytes(), 3).unwrap();
+        assert_eq!(
+            decode_content(Some(&compressed), None, "").as_deref(),
+            Some("<msg><img md5=\"abc\" /></msg>")
+        );
+    }
 }
 /// Parsed SNS (朋友圈) media item.
 #[derive(Debug, Clone, PartialEq, Eq)]

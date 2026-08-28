@@ -408,10 +408,14 @@ struct OwnedMsgRow {
 }
 
 fn row_to_record(row: OwnedMsgRow, my_wxid: &str, contacts: &std::collections::HashMap<String, Contact>) -> MessageRecord {
-    let content_str = parser::decode_content(row.compress.as_deref(), row.content.as_deref())
-        .unwrap_or_else(|| {
-            String::from_utf8_lossy(row.content.as_deref().unwrap_or_default()).into_owned()
-        });
+    let content_str = parser::decode_content(
+        row.compress.as_deref(),
+        row.content.as_deref(),
+        &row.sender_username,
+    )
+    .unwrap_or_else(|| {
+        String::from_utf8_lossy(row.content.as_deref().unwrap_or_default()).into_owned()
+    });
     let parsed = parser::parse_message(row.local_type, row.server_id, row.local_id, &content_str);
     let is_send = !row.sender_username.is_empty() && row.sender_username == my_wxid;
     let sender_name = contacts
