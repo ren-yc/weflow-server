@@ -845,13 +845,9 @@ fn purge_exported_media(root: &std::path::Path, talkers: &[String]) -> usize {
     let mut removed = 0usize;
     for talker in talkers {
         // Talkers come from the database, not the request, but they end up as
-        // a path segment — same containment rule as the media route.
-        let bad = talker.is_empty()
-            || talker == "."
-            || talker == ".."
-            || talker.contains('/')
-            || talker.contains('\\');
-        if bad {
+        // a path segment — same containment rule as the media route. This one
+        // deletes, so a bad segment is worse here than anywhere else.
+        if !crate::pathsafe::safe_segment(talker) {
             tracing::warn!("[deregister] 跳过异常 talker 目录名: {talker:?}");
             continue;
         }

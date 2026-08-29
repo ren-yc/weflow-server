@@ -10,6 +10,7 @@ pub mod keystore;
 pub mod logging;
 pub mod media;
 pub mod parser;
+pub mod pathsafe;
 pub mod server;
 pub mod store;
 pub mod sync;

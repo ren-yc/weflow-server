@@ -337,8 +337,20 @@ pub async fn export(
         .map_err(|e| ApiError::internal(format!("create exports dir: {e}")))?;
     let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
     let scope = username.as_deref().unwrap_or("all");
-    let file_name = format!("sns-{scope}-{stamp}.{format}");
+    // `username` is a free-form request parameter — it is only ever matched
+    // against feed contents above, never validated against the store — so it
+    // cannot go into a file name verbatim. Note the `sns-` prefix does NOT make
+    // that safe: Win32 strips trailing dots, so `sns-..` normalizes to a literal
+    // `sns-` directory and the rest of the payload keeps traversing. Slugify,
+    // then assert containment (see `pathsafe`).
+    let file_name = format!(
+        "sns-{}-{stamp}.{format}",
+        crate::pathsafe::slugify(scope, "scope")
+    );
     let path = exports_dir.join(&file_name);
+    if !crate::pathsafe::is_contained(&exports_dir, &path) {
+        return Err(ApiError::internal("export path escaped the exports dir"));
+    }
 
     let bytes: Vec<u8> = if format == "html" {
         let mut body_html = String::new();
@@ -492,6 +504,15 @@ pub async fn export_stats(
 
 const PROXY_HOST_SUFFIXES: [&str; 3] = ["qpic.cn", "qpic.com", "qq.com"];
 
+/// Redirect hops this endpoint will follow. Each one is re-checked against the
+/// allow-list before it is issued, so this only bounds the work, not the trust.
+const PROXY_MAX_REDIRECTS: usize = 5;
+
+#[cfg(windows)]
+const CURL_BIN: &str = "curl.exe";
+#[cfg(not(windows))]
+const CURL_BIN: &str = "curl";
+
 pub async fn media_proxy(
     State(state): State<Arc<AppState>>,
     Query(query): Query<std::collections::HashMap<String, String>>,
@@ -510,56 +531,37 @@ pub async fn media_proxy(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| ApiError::bad_request("url is required"))?;
-    let lower = url.to_ascii_lowercase();
-    if !lower.starts_with("http://") && !lower.starts_with("https://") {
-        return Err(ApiError::bad_request("url must be http(s)"));
-    }
-    let host_ok = PROXY_HOST_SUFFIXES
-        .iter()
-        .any(|suffix| host_matches(&lower, suffix));
-    if !host_ok {
-        return Err(ApiError::bad_request(
-            "url host is not an allowed SNS media host",
-        ));
+    if let Err(reason) = check_proxy_url(&url) {
+        return Err(ApiError::bad_request(reason));
     }
 
-    // relay via the system curl (no extra dependencies; Windows/macOS/linux all ship one)
-    let tmp = std::env::temp_dir().join(format!(
-        "wfs_sns_proxy_{:?}.bin",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    let mut cmd = std::process::Command::new("curl.exe");
-    cmd.args(["-sS", "-L", "-m", "30", "-o"])
-        .arg(&tmp)
-        .arg("-w")
-        .arg("%{http_code}")
-        .arg(&url);
-    if let Some(referer) = params.get("referer").filter(|s| !s.is_empty()) {
-        cmd.arg("-e").arg(referer);
-    }
-    if let Some(ua) = params.get("user_agent").filter(|s| !s.is_empty()) {
-        cmd.arg("-A").arg(ua);
-    }
-    let output = match cmd.output() {
-        Ok(o) => o,
-        Err(e) => {
+    let referer = params.get("referer").filter(|s| !s.is_empty()).cloned();
+    let user_agent = params.get("user_agent").filter(|s| !s.is_empty()).cloned();
+
+    // Spawning curl and waiting up to 30s per hop is blocking IO; on a tokio
+    // worker a handful of concurrent proxy calls would stall unrelated requests.
+    let fetched = tokio::task::spawn_blocking(move || {
+        proxy_fetch(&url, referer.as_deref(), user_agent.as_deref())
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("proxy task failed: {e}")))?;
+
+    let (code, bytes) = match fetched {
+        Ok(v) => v,
+        Err(ProxyFetchError::Spawn(detail)) => {
             return Ok((
                 StatusCode::BAD_GATEWAY,
-                axum::Json(json!({"error":"proxy_spawn_failed","detail":e.to_string()})),
+                axum::Json(json!({"error":"proxy_spawn_failed","detail":detail})),
             )
                 .into_response())
         }
+        // A redirect off the allow-list is the SSRF attempt itself, so it is
+        // reported as a rejected request rather than an upstream failure.
+        Err(ProxyFetchError::Redirect(detail)) => {
+            return Err(ApiError::bad_request(detail));
+        }
     };
-    let code = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<u16>()
-        .unwrap_or(502);
-    let bytes = std::fs::read(&tmp).unwrap_or_default();
-    let _ = std::fs::remove_file(&tmp);
-    if !output.status.success() || code >= 400 || bytes.is_empty() {
+    if code >= 400 || bytes.is_empty() {
         return Ok((
             StatusCode::BAD_GATEWAY,
             axum::Json(json!({
@@ -599,14 +601,192 @@ pub async fn media_proxy(
         .into_response())
 }
 
-fn host_matches(lower_url: &str, suffix: &str) -> bool {
-    // extract host between scheme:// and next '/'
-    let rest = match lower_url.split_once("://") {
-        Some((_, r)) => r,
-        None => return false,
+enum ProxyFetchError {
+    /// curl could not be started at all.
+    Spawn(String),
+    /// The upstream tried to redirect somewhere the allow-list does not cover.
+    Redirect(String),
+}
+
+/// Scheme + allow-list gate, applied to the caller's URL *and* to every redirect
+/// target before it is followed.
+fn check_proxy_url(url: &str) -> Result<(), String> {
+    let lower = url.to_ascii_lowercase();
+    if !lower.starts_with("http://") && !lower.starts_with("https://") {
+        return Err("url must be http(s)".to_string());
+    }
+    if !PROXY_HOST_SUFFIXES
+        .iter()
+        .any(|suffix| host_matches(&lower, suffix))
+    {
+        return Err("url host is not an allowed SNS media host".to_string());
+    }
+    Ok(())
+}
+
+/// One CDN fetch, following redirects by hand.
+///
+/// Redirects are deliberately NOT delegated to `curl -L`: the allow-list is
+/// checked once, in this process, against the URL we are about to request. With
+/// `-L`, curl follows 3xx hops itself, so any open redirect under an allowed
+/// host — and `qq.com` is a large surface — turns this endpoint into an
+/// arbitrary-target fetcher, including loopback and link-local addresses. The
+/// gate has to sit on every hop, which means owning the redirect loop.
+///
+/// Residual, and not fixable here: a hostname under an allowed suffix that
+/// resolves to a private address still passes. Closing that needs resolution to
+/// happen where the result can be inspected before connecting.
+fn proxy_fetch(
+    url: &str,
+    referer: Option<&str>,
+    user_agent: Option<&str>,
+) -> Result<(u16, Vec<u8>), ProxyFetchError> {
+    let mut current = url.to_string();
+
+    for _ in 0..=PROXY_MAX_REDIRECTS {
+        let mut cmd = std::process::Command::new(CURL_BIN);
+        // Body to stdout, metadata to stderr: keeping them on separate streams
+        // means a binary payload can never be confused for the status line, and
+        // avoids a predictable temp file under a world-writable directory.
+        cmd.args([
+            "-sS",
+            "--proto",
+            "=http,https",
+            "-m",
+            "30",
+            "-o",
+            "-",
+            "-w",
+            "%{stderr}wfs-meta %{http_code} %{redirect_url}",
+        ]);
+        if let Some(referer) = referer {
+            cmd.arg("-e").arg(referer);
+        }
+        if let Some(ua) = user_agent {
+            cmd.arg("-A").arg(ua);
+        }
+        cmd.arg(&current);
+
+        let output = cmd
+            .output()
+            .map_err(|e| ProxyFetchError::Spawn(e.to_string()))?;
+
+        // Diagnostics from -sS share stderr with the metadata, so match the
+        // tagged line instead of assuming it is the only thing there.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let meta = stderr
+            .lines()
+            .rev()
+            .find_map(|line| line.trim().strip_prefix("wfs-meta "));
+        let (code, redirect) = match meta {
+            Some(meta) => {
+                let mut parts = meta.split_whitespace();
+                let code = parts.next().unwrap_or("").parse::<u16>().unwrap_or(502);
+                (code, parts.next().unwrap_or("").trim().to_string())
+            }
+            // No metadata line means the transfer never completed (DNS, TLS,
+            // timeout). Report it as a gateway failure, not a redirect.
+            None => return Ok((502, Vec::new())),
+        };
+
+        let is_redirect = (300..400).contains(&code) && !redirect.is_empty();
+        if !is_redirect {
+            return Ok((code, output.stdout));
+        }
+
+        check_proxy_url(&redirect).map_err(|reason| {
+            ProxyFetchError::Redirect(format!("upstream redirect rejected: {reason}"))
+        })?;
+        current = redirect;
+    }
+
+    Err(ProxyFetchError::Redirect(
+        "too many upstream redirects".to_string(),
+    ))
+}
+
+/// Host of `lower_url`, or None when there is no authority to speak of.
+///
+/// The authority ends at the first `/`, `?` or `#` — stopping only at `/` reads
+/// a query string as part of the host.
+///
+/// Userinfo precedes the host (`scheme://user:pw@host/`), so it is removed by
+/// taking the segment after the LAST `@`. Splitting forward instead returns the
+/// *userinfo* as the host, which is the wrong end: `https://qq.com@evil.com/`
+/// then "matches" the allow-list while curl connects to `evil.com`.
+fn url_host(lower_url: &str) -> Option<&str> {
+    let (_, rest) = lower_url.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return None;
+    }
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    // Strip the port. An IPv6 literal keeps its brackets, so it never collides
+    // with the allow-list's suffix comparison.
+    let host = match host.strip_prefix('[') {
+        Some(v6) => return v6.split(']').next().filter(|h| !h.is_empty()),
+        None => host.split(':').next().unwrap_or(host),
     };
-    let host = rest.split('/').next().unwrap_or("");
-    let host = host.split('@').next().unwrap_or(host); // strip userinfo
-    let host = host.split(':').next().unwrap_or(host); // strip port
+    (!host.is_empty()).then_some(host)
+}
+
+fn host_matches(lower_url: &str, suffix: &str) -> bool {
+    let Some(host) = url_host(lower_url) else {
+        return false;
+    };
     host == suffix || host.ends_with(&format!(".{suffix}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn url_host_reads_the_authority_not_the_userinfo() {
+        assert_eq!(url_host("https://mmsns.qpic.cn/a/b.jpg"), Some("mmsns.qpic.cn"));
+        assert_eq!(url_host("https://mmsns.qpic.cn:8443/a"), Some("mmsns.qpic.cn"));
+        assert_eq!(url_host("https://qpic.cn"), Some("qpic.cn"));
+        // userinfo sits before the host: the host is after the LAST '@'
+        assert_eq!(url_host("https://qq.com@evil.example/a"), Some("evil.example"));
+        assert_eq!(url_host("https://u:p@evil.example/a"), Some("evil.example"));
+        assert_eq!(url_host("https://a@b@evil.example/a"), Some("evil.example"));
+        // authority ends at '?' and '#', not only at '/'
+        assert_eq!(url_host("https://evil.example?x=.qq.com"), Some("evil.example"));
+        assert_eq!(url_host("https://evil.example#.qq.com"), Some("evil.example"));
+        // ipv6 keeps its brackets stripped but stays a single host
+        assert_eq!(url_host("http://[::1]:8080/x"), Some("::1"));
+        // nothing that can be called a host
+        assert_eq!(url_host("https:///a"), None);
+        assert_eq!(url_host("not a url"), None);
+    }
+
+    #[test]
+    fn proxy_gate_rejects_the_userinfo_bypass() {
+        // legitimate CDN references still pass
+        assert!(check_proxy_url("https://mmsns.qpic.cn/mmsns/abc/0").is_ok());
+        assert!(check_proxy_url("https://shmmsns.qpic.cn/x.jpg").is_ok());
+        assert!(check_proxy_url("https://res.qq.com/x.png").is_ok());
+        assert!(check_proxy_url("HTTPS://MMSNS.QPIC.CN/X.JPG").is_ok());
+
+        // the bypass this gate previously accepted: forward-split userinfo made
+        // the allow-list read "qq.com" while curl would connect to evil.example
+        for probe in [
+            "https://qq.com@evil.example/x",
+            "https://qpic.cn@169.254.169.254/latest/meta-data/",
+            "https://user:pw@qq.com.evil.example/x",
+            "https://evil.example?ref=.qq.com",
+            "https://evil.example#.qq.com",
+            "https://notqq.com/x",
+            "https://qq.com.evil.example/x",
+            "http://127.0.0.1:9000/admin",
+            "file:///c:/windows/win.ini",
+            "gopher://qq.com/x",
+        ] {
+            assert!(check_proxy_url(probe).is_err(), "{probe} must be rejected");
+        }
+
+        // suffix matching is on a label boundary, not a substring
+        assert!(check_proxy_url("https://xqpic.cn/x").is_err());
+        assert!(check_proxy_url("https://sub.mmsns.qpic.cn/x").is_ok());
+    }
 }

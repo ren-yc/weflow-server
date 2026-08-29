@@ -1,7 +1,7 @@
 //! GET/POST /api/v1/media/{talker}/{media_type}/{file} — serve exported media
 //! from the export directory with traversal protection (WeFlow contract).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -29,36 +29,37 @@ pub async fn handler(
     if !ALLOWED_TYPES.contains(&media_type.as_str()) {
         return Err(ApiError::bad_request("unknown media type"));
     }
-    if talker.is_empty() || media_type.is_empty() || file.is_empty() {
-        return Err(ApiError::bad_request("empty path segment"));
-    }
-    if [talker.as_str(), media_type.as_str(), file.as_str()]
+    // One shared rule for every path component in this service (`pathsafe`):
+    // it also covers the cases a separator-only filter misses — a trailing dot
+    // or space, which Win32 strips, and `:`, which names an NTFS alternate data
+    // stream without carrying a separator at all.
+    if ![talker.as_str(), media_type.as_str(), file.as_str()]
         .iter()
-        .any(|s| s.contains('/') || s.contains('\\') || *s == "." || *s == "..")
+        .all(|s| crate::pathsafe::safe_segment(s))
     {
         return Err(ApiError::bad_request("path traversal attempt"));
     }
 
-    let file_path = state
-        .cfg
-        .media_export_dir
-        .join(&talker)
-        .join(&media_type)
-        .join(&file);
+    // canonicalize is real file IO: it must run on the blocking pool, never on a
+    // tokio worker, or concurrent media reads starve every other request
+    // (including the SSE keep-alives).
+    let root_dir = state.cfg.media_export_dir.clone();
+    let (canonical, canonical_root) = tokio::task::spawn_blocking(move || {
+        let joined = root_dir.join(&talker).join(&media_type).join(&file);
+        (joined.canonicalize(), root_dir.canonicalize())
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("media path resolution task failed: {e}")))?;
 
-    // canonicalize + prefix check (double traversal protection)
-    let root = state
-        .cfg
-        .media_export_dir
-        .canonicalize()
-        .unwrap_or_else(|_| state.cfg.media_export_dir.clone());
     // Same envelope as `serve_file`'s 404 below: "path does not exist" and
     // "path exists but cannot be opened" are one failure mode to the caller,
     // so they must not come back as two different response shapes.
-    let canonical = file_path
-        .canonicalize()
-        .map_err(|_| ApiError::not_found("media not found"))?;
-    if !canonical.starts_with(&root) {
+    let canonical = canonical.map_err(|_| ApiError::not_found("media not found"))?;
+    // Fails closed on an unresolvable root: comparing a verbatim-prefixed
+    // canonical path against a raw one would never match anyway, so this must
+    // not fall back to the non-canonical root.
+    let canonical_root = canonical_root.map_err(|_| ApiError::not_found("media not found"))?;
+    if !canonical.starts_with(&canonical_root) {
         return Err(ApiError::bad_request("path traversal attempt"));
     }
 
@@ -103,9 +104,4 @@ fn content_type(path: &Path) -> &'static str {
         Some("silk") => "audio/x-silk",
         _ => "application/octet-stream",
     }
-}
-
-#[allow(dead_code)]
-fn _path_buf(s: &str) -> PathBuf {
-    PathBuf::from(s)
 }

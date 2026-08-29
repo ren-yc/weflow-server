@@ -147,6 +147,20 @@ fn write_out(
     file_name: &str,
     bytes: &[u8],
 ) -> Option<ExportedMedia> {
+    // Both of these become path components. `talker` reaches here from the
+    // store (external data — the WeChat database), and `file_name` is derived
+    // from the message's own `md5` XML attribute, which the *sender* controls
+    // and `parser::attr` does not validate. Today a traversal payload is stopped
+    // further up by accident rather than by design — the image path's md5
+    // integrity gate cannot match a non-digest string, and `walk_find` compares
+    // against `file_name()`, which never holds a separator — so nothing here
+    // depends on those staying true. Enforce containment at the join instead.
+    if !crate::pathsafe::safe_segment(talker) || !crate::pathsafe::safe_segment(file_name) {
+        tracing::warn!(
+            "[media-export] 拒绝异常路径分量: talker={talker:?} file_name={file_name:?}"
+        );
+        return None;
+    }
     let dir = export_dir.join(talker).join(kind_dir);
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join(file_name);

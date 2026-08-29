@@ -2,6 +2,54 @@
 
 本文件从 0.5.0 起维护。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [未发布]
+
+### 安全
+
+- **修复 SNS 导出的路径遍历（任意文件写入）**。`GET|POST /api/v1/sns/export` 的产物名原为
+  `format!("sns-{scope}-{stamp}.{format}")`，其中 `scope` 是原始 `username` 请求参数——该参数
+  只用作动态过滤条件，从不与 store 校验（传未知值得到空导出而非 404），因此以自由文本形式
+  抵达 `exports_dir.join()` + `std::fs::write`。`sns-` 前缀**不构成防护**：Win32 会剥掉路径
+  分量末尾的点，`sns-..` 因而规范化成一个名为 `sns-` 的普通目录，剩余载荷继续上穿；
+  Windows 的规范化还是词法的、在用户态完成，中间目录无需存在即可折叠 `..`（同一载荷在
+  Linux 上会 `ENOENT`）。扩展名由 `format` 控制、内容由 feed 控制，故为写原语。已实测确认。
+  修复：`username` 先经 `pathsafe::slugify` 折叠，再对规范化后的根断言包含关系。
+- **修复媒体代理的 SSRF（主机白名单可绕过）**。两处独立缺陷：`host_matches` 剥 userinfo 时
+  对 `@` 做正向切分、取前段，而 URL 中 userinfo 在前，于是 `https://qq.com@evil.example/`
+  递给白名单的是 `qq.com`、curl 连的是 `evil.example`；authority 又只在 `/` 处结束，`?x=.qq.com`
+  同样可混过。此外 `curl -L` 由 curl 自行跟随跳转，发生在那次一锤子检查**之后**——白名单内
+  任一开放重定向（`qq.com` 面积很大）即可将该端点变为任意目标抓取器，含回环与
+  `169.254.169.254`。修复：`check_proxy_url` 同时作用于调用方 URL 与**每一跳**重定向目标
+  （故去掉 `-L`、自行接管重定向循环，上限 5 跳）；`url_host` 改为从右侧切分 userinfo，并在
+  `/`、`?`、`#` 三者最先出现处结束 authority。
+- **导出写入方补齐包含性校验**。`media::export::write_out` 原先对 `talker` / `file_name`
+  两个路径分量零校验，而 `file_name` 派生自消息自带的 `md5` XML 属性、`parser::attr` 亦零校验，
+  即**发送方可控**。此前拦住它的是两处巧合（图片路径的 md5 完整性校验无法与非摘要字符串相等；
+  `walk_find` 比对 `file_name()`，其中永不含分隔符），且无任何地方记录这两条性质是承重的。
+- 新增 `pathsafe` 模块，收敛为全仓唯一的路径分量语义（`safe_segment` / `slugify` /
+  `is_contained`），四处拼路径的调用点（SNS 导出、媒体路由、注销清理、导出写入方）全部改走它。
+  原先四者各自漂移出不同的检查子集，均未覆盖末尾点、`:`（NTFS 备用数据流 `name.jpg:hidden`，
+  压根不含分隔符）与控制字符。规则是**先派生名字，再对规范化根断言包含关系**——仅过滤输入
+  正是 SNS 导出得以逃逸的原因。`is_contained` 失败时关闭，不退化为拿非规范化根做词法比较
+  （verbatim 前缀与裸路径混比会静默永不匹配）。
+
+### 修复
+
+- 媒体路由的 `canonicalize` 与代理的 curl 子进程原先在 tokio worker 上做阻塞 IO，并发媒体读取
+  会拖住无关请求（含 SSE 心跳），改入 `spawn_blocking`。
+- 媒体代理原先把响应体写到共享临时目录下一个以纳秒时间戳命名的可预测路径，改为经 stdout
+  管道回传、元数据走 stderr 带标签行（二进制载荷不可能被误读为状态行）。
+- 媒体代理硬编码 `curl.exe`，与其"Windows/macOS/linux 都自带"的注释矛盾，改为按平台取二进制名。
+
+### 说明
+
+- 已知残留：白名单后缀下的主机名若**解析到**内网地址仍可通过。堵住它需把 DNS 解析放到能在
+  连接前检查结果的位置，属抓取方式的实质改动而非校验层微调，已在 `proxy_fetch` 处注明。
+- SNS 导出的产物**文件名**形状随之变化：`username` 中的非 `[A-Za-z0-9-_]` 字节折叠为 `_`
+  （如 `12345678@chatroom` → `sns-12345678_chatroom-<stamp>.json`）。响应内容与导出语义不变。
+- 遍历写入位于鉴权之后（`require_auth` 守着该端点）。若该 token 是共享的或强度不足，应按
+  远程任意写入对待。
+
 ## [0.5.0] - 2026-08-28
 
 账号面（注册 / 健康检查 / 注销）重新设计。**不兼容 0.4.x**：`/health` 响应形状变更，
