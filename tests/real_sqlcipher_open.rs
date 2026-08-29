@@ -65,7 +65,7 @@ fn open_with_stock_sqlcipher() {
     ];
     for (name, extra) in variants {
         let conn = Connection::open(&probe);
-        let mut conn = match conn {
+        let conn = match conn {
             Ok(c) => c,
             Err(e) => {
                 println!("{name}: open failed {e}");

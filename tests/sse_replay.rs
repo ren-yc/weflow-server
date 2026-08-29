@@ -152,12 +152,12 @@ async fn sse_frames(
             }
             Ok(Ok(_)) => {
                 let l = line.trim_end();
-                if l.starts_with("id:") {
-                    cur_id = l[3..].trim().parse().unwrap_or(0);
-                } else if l.starts_with("event:") {
-                    cur_ev = l[7..].trim().to_string();
-                } else if l.starts_with("data:") {
-                    cur_data.push_str(&l[5..].trim());
+                if let Some(v) = l.strip_prefix("id:") {
+                    cur_id = v.trim().parse().unwrap_or(0);
+                } else if let Some(v) = l.strip_prefix("event:") {
+                    cur_ev = v.trim().to_string();
+                } else if let Some(v) = l.strip_prefix("data:") {
+                    cur_data.push_str(v.trim());
                 } else if l.is_empty() {
                     if !cur_ev.is_empty() {
                         frames.push((cur_id, cur_ev.clone(), cur_data.clone()));

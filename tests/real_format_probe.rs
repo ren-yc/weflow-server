@@ -6,12 +6,11 @@
 
 use std::env;
 use std::fs;
-use std::sync::OnceLock;
 
 use aes::cipher::{block_padding::NoPadding, BlockDecryptMut, KeyIvInit};
 
 fn try_decrypt_aes256(key: &[u8; 32], iv: &[u8], ct: &[u8]) -> Option<Vec<u8>> {
-    if ct.len() % 16 != 0 || iv.len() != 16 {
+    if !ct.len().is_multiple_of(16) || iv.len() != 16 {
         return None;
     }
     let dec = cbc::Decryptor::<aes::Aes256>::new(key.into(), iv.into());
@@ -21,7 +20,7 @@ fn try_decrypt_aes256(key: &[u8; 32], iv: &[u8], ct: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn try_decrypt_aes128(key: &[u8; 16], iv: &[u8], ct: &[u8]) -> Option<Vec<u8>> {
-    if ct.len() % 16 != 0 || iv.len() != 16 {
+    if !ct.len().is_multiple_of(16) || iv.len() != 16 {
         return None;
     }
     let dec = cbc::Decryptor::<aes::Aes128>::new(key.into(), iv.into());
@@ -51,53 +50,51 @@ fn probe_one(db_path: &str, key_full: &[u8; 32]) -> usize {
             }
             let ct_start = salt_offset;
             let ct_end = iv_end;
-            if ct_start >= ct_end || (ct_end - ct_start) % 16 != 0 {
+            if ct_start >= ct_end || !(ct_end - ct_start).is_multiple_of(16) {
                 continue;
             }
             let iv = &page[iv_end..iv_end + 16];
             let ct = &page[ct_start..ct_end];
-            if let Some(pt) = try_decrypt_aes256(key_full, iv, ct) {
-                if pt.starts_with(b"SQLite format 3\0") {
-                    found += 1;
-                    println!(
-                        "FOUND256 [{}]: reserve={reserve} salt_offset={salt_offset} iv@end pgsz={} hdr20={}",
-                        db_path,
-                        u16::from_be_bytes([pt[16], pt[17]]),
-                        pt[20]
-                    );
-                }
+            if let Some(pt) = try_decrypt_aes256(key_full, iv, ct)
+                && pt.starts_with(b"SQLite format 3\0")
+            {
+                found += 1;
+                println!(
+                    "FOUND256 [{}]: reserve={reserve} salt_offset={salt_offset} iv@end pgsz={} hdr20={}",
+                    db_path,
+                    u16::from_be_bytes([pt[16], pt[17]]),
+                    pt[20]
+                );
             }
             let iv2_start = salt_offset + 16;
             if iv2_start + 16 <= iv_end {
                 let iv2 = &page[salt_offset..iv2_start];
                 let ct2 = &page[iv2_start..iv_end];
-                if let Some(pt) = try_decrypt_aes256(key_full, iv2, ct2) {
-                    if pt.starts_with(b"SQLite format 3\0") {
-                        found += 1;
-                        println!(
-                            "FOUND256 [{}]: reserve={reserve} salt_offset={salt_offset} iv@start",
-                            db_path
-                        );
-                    }
+                if let Some(pt) = try_decrypt_aes256(key_full, iv2, ct2)
+                    && pt.starts_with(b"SQLite format 3\0")
+                {
+                    found += 1;
+                    println!(
+                        "FOUND256 [{}]: reserve={reserve} salt_offset={salt_offset} iv@start",
+                        db_path
+                    );
                 }
             }
             let iv3 = &page[iv_end..iv_end + 16];
             let ct3 = &page[ct_start..ct_end];
-            if let Some(pt) = try_decrypt_aes128(&key128, iv3, ct3) {
-                if pt.starts_with(b"SQLite format 3\0") {
-                    found += 1;
-                    println!(
-                        "FOUND128 [{}]: reserve={reserve} salt_offset={salt_offset} iv@end",
-                        db_path
-                    );
-                }
+            if let Some(pt) = try_decrypt_aes128(&key128, iv3, ct3)
+                && pt.starts_with(b"SQLite format 3\0")
+            {
+                found += 1;
+                println!(
+                    "FOUND128 [{}]: reserve={reserve} salt_offset={salt_offset} iv@end",
+                    db_path
+                );
             }
         }
     }
     found
 }
-
-static KEY: OnceLock<[u8; 32]> = OnceLock::new();
 
 #[test]
 #[ignore = "requires a real WeChat 4.0 account (WEFLOW_TEST_DB_ROOT/WEFLOW_TEST_KEY)"]
