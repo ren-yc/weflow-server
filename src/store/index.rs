@@ -589,7 +589,7 @@ pub fn build_all_live(
             }
         };
         let uid_map = load_uid_map(conn, name2id_table(conn).as_deref());
-        for (table, md5_suffix) in message_tables(&conn) {
+        for (table, md5_suffix) in message_tables(conn) {
             match load_message_table(conn, &table, &uid_map, &contacts, my_wxid) {
                 Ok((records, watermark)) => {
                     let session = table_session(&md5_suffix, &store);

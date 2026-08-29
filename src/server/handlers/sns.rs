@@ -138,7 +138,7 @@ pub async fn timeline(
         .iter()
         .skip(offset)
         .take(limit)
-        .map(|f| sns_feed_json(&store, f, &base_url, &state.token))
+        .map(|f| sns_feed_json(&store, f, base_url, &state.token))
         .collect();
     Ok(Json(json!({
         "success": true,
@@ -327,7 +327,7 @@ pub async fn export(
     let base_url = &state.base_url;
     let entries: Vec<serde_json::Value> = feeds
         .iter()
-        .map(|f| sns_feed_json(&store, f, &base_url, &state.token))
+        .map(|f| sns_feed_json(&store, f, base_url, &state.token))
         .collect();
     let display = store.session_display(username.as_deref().unwrap_or(""));
     drop(store);
@@ -373,7 +373,7 @@ pub async fn export(
             body_html.push_str(&format!(
                 "<article><header><b>{}</b> <time>{}</time></header><p>{}</p>{}</article>\n",
                 e["displayName"].as_str().unwrap_or(""),
-                e["createTime"].to_string(),
+                e["createTime"],
                 html_escape(e["content"].as_str().unwrap_or("")),
                 media_html,
             ));

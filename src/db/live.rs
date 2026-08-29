@@ -43,7 +43,7 @@ impl std::fmt::Display for AcquireError {
 }
 
 fn io_err(e: &rusqlite::Error) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+    std::io::Error::other(e.to_string())
 }
 
 fn map_open_error(e: &rusqlite::Error, _path: &Path) -> AcquireError {
@@ -57,7 +57,7 @@ fn map_open_error(e: &rusqlite::Error, _path: &Path) -> AcquireError {
     } else if msg.contains("unable to open database file") {
         AcquireError::Missing
     } else {
-        AcquireError::Io(std::io::Error::new(std::io::ErrorKind::Other, msg))
+        AcquireError::Io(std::io::Error::other(msg))
     }
 }
 

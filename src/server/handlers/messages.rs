@@ -240,21 +240,20 @@ pub async fn handler(
         (count, has_more, export_jobs, messages)
     };
 
-    let mut export_jobs = export_jobs;
     let exported: std::collections::HashMap<i64, crate::media::export::ExportedMedia> =
         if export_jobs.is_empty() {
             Default::default()
         } else {
             let account_dir = account.info.dir.clone();
             let export_dir = state.cfg.media_export_dir.clone();
-            let mk = account.media_keys.clone();
+            let mk = account.media_keys;
             let sync = account.sync.clone();
             tokio::task::spawn_blocking(move || {
                 sync.lock().export_media_batch(
                     &account_dir,
                     mk,
                     std::path::Path::new(&export_dir),
-                    &mut export_jobs,
+                    &export_jobs,
                     200,
                 )
             })

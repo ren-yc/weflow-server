@@ -165,15 +165,15 @@ fn write_out(
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join(file_name);
     // idempotent: identical content already exported
-    if let Ok(existing) = std::fs::read(&path) {
-        if existing == bytes {
-            return Some(ExportedMedia {
-                file_name: file_name.to_string(),
-                kind_dir,
-                local_path: path,
-                external_url: None,
-            });
-        }
+    if let Ok(existing) = std::fs::read(&path)
+        && existing == bytes
+    {
+        return Some(ExportedMedia {
+            file_name: file_name.to_string(),
+            kind_dir,
+            local_path: path,
+            external_url: None,
+        });
     }
     let tmp = dir.join(format!(".{file_name}.tmp"));
     std::fs::write(&tmp, bytes).ok()?;
@@ -247,7 +247,7 @@ pub fn export_one(
                     } else {
                         ctx.media_keys
                     };
-                    let Some(keys) = keys else { return None };
+                    let keys = keys?;
                     media::decrypt_dat_payload(&raw, &keys.aes, keys.xor)?
                 }
                 Some(DatFormat::LegacyXor) => {
@@ -380,15 +380,15 @@ pub fn export_one(
                 )) else {
                     continue;
                 };
-                if let Ok(url) = stmt.query_row([emoji_md5], |r| r.get::<_, String>(0)) {
-                    if !url.is_empty() {
-                        return Some(ExportedMedia {
-                            file_name: format!("{emoji_md5}.gif"),
-                            kind_dir: "emojis",
-                            local_path: PathBuf::new(),
-                            external_url: Some(url),
-                        });
-                    }
+                if let Ok(url) = stmt.query_row([emoji_md5], |r| r.get::<_, String>(0))
+                    && !url.is_empty()
+                {
+                    return Some(ExportedMedia {
+                        file_name: format!("{emoji_md5}.gif"),
+                        kind_dir: "emojis",
+                        local_path: PathBuf::new(),
+                        external_url: Some(url),
+                    });
                 }
             }
             None
@@ -421,6 +421,11 @@ pub fn export_batch(
 /// Live-mode batch export: the sync layer supplies `storage` (db_storage
 /// root) and registration keys; auxiliary databases are opened fresh
 /// read-only (raw-key path, no KDF) exactly when a job needs them.
+// Eight arguments against a threshold of seven. Every one is an independent
+// input the caller genuinely has to supply, and they are already grouped into
+// `ExportCtx` immediately below; bundling them into a second parameter struct
+// would move the argument list rather than shorten it.
+#[allow(clippy::too_many_arguments)]
 pub fn export_batch_live(
     storage: &Path,
     keys: &crate::keystore::KeyMap,
@@ -452,10 +457,10 @@ pub fn export_batch_live(
         .any(|(_, k, _, _, _)| matches!(k, crate::parser::MediaKind::Voice));
     let want_emoji = jobs.iter().take(max_items)
         .any(|(_, k, _, _, _)| matches!(k, crate::parser::MediaKind::Emoji));
-    if want_image || want_video {
-        if let Some(c) = open_aux("hardlink/hardlink.db") {
-            aux.insert("hardlink/hardlink.db".into(), c);
-        }
+    if (want_image || want_video)
+        && let Some(c) = open_aux("hardlink/hardlink.db")
+    {
+        aux.insert("hardlink/hardlink.db".into(), c);
     }
     if want_voice {
         for rel in ["message/media_0.db", "message/media_1.db"] {
