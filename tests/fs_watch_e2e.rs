@@ -96,14 +96,22 @@ async fn file_event_triggers_sync_and_message_event() {
         other => panic!("unexpected event: {other:?}"),
     }
 
-    // the store must contain the new row
-    let guard = store.read();
-    let conv = guard.convs.get(common::FAKE_GROUP).unwrap();
-    assert_eq!(conv.len(), 5, "group conversation grew by one");
-    assert!(
-        conv.iter().any(|m| m.parsed.parsed_text == "新消息"),
-        "new message indexed into the store"
-    );
+    // the store must contain the new row.
+    //
+    // Scoped so the read guard is dropped before the await below: a
+    // `std::sync` guard is not Send, so holding one across an await point makes
+    // the future unable to migrate between workers — harmless in this
+    // current-thread test, a deadlock waiting to happen in anything copied from
+    // it.
+    {
+        let guard = store.read();
+        let conv = guard.convs.get(common::FAKE_GROUP).unwrap();
+        assert_eq!(conv.len(), 5, "group conversation grew by one");
+        assert!(
+            conv.iter().any(|m| m.parsed.parsed_text == "新消息"),
+            "new message indexed into the store"
+        );
+    }
 
     shutdown_tx.send(true).ok();
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;

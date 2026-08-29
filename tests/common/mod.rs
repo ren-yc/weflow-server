@@ -3,6 +3,12 @@
 //! page 1) using the bundled rusqlite-sqlcipher, then feed them through
 //! `db::wcdb::decrypt_db` — the ground-truth interop arbitration.
 
+// Every integration-test binary compiles its own copy of this module, so any
+// fixture not used by *all* of them reads as dead there. That is the test
+// harness's compilation model, not an unused-code problem — suppressing it here
+// is what keeps `-D warnings` usable as a gate.
+#![allow(dead_code)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
