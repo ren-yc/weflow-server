@@ -649,6 +649,15 @@ fn chatlab_type_table_matches_the_published_enum() {
          </appmsg></msg>",
     );
     assert_eq!(chatlab_type(49, &reply), 25, "REPLY");
+    // Quoting a FILE stays a REPLY. The refermsg carries the quoted message's
+    // own <type>6</type>, so a lookup that is not scope-aware reads the inner 6
+    // and downgrades the reply to FILE.
+    let reply_to_file = plain(
+        "<msg><appmsg><type>57</type><title>收到</title>\
+         <refermsg><type>6</type><svrid>8100000000000000002</svrid>\
+         <content>报表.xlsx</content></refermsg></appmsg></msg>",
+    );
+    assert_eq!(chatlab_type(49, &reply_to_file), 25, "REPLY over FILE");
 
     // 10000/10002 split on whether a revoke payload actually decoded, not on
     // the code: a plain sysmsg is SYSTEM even when it arrives as 10002.

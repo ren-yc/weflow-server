@@ -248,6 +248,14 @@ DELETE 的客户端用。
 
 > 文件附件（`file`）暂不参与导出：与 WeFlow 官方契约一致，媒体导出仅覆盖图片/语音/视频/表情四类。
 
+`local_type=49` 的文件附件会带 `media` 对象（`type: "file"`），但 `exported` **恒为假**
+—— 这类消息没有 md5，被上面第一条的闸门跳过。SSE 推送的 `media` 元数据同形。判断字节
+是否可取始终看 `exported`，不要看 `media` 是否存在。
+
+> 注意 `media.fileName` 对文件类**目前恒为 `file_<localId>` 这样的回落名**，取不到真实
+> 文件名：`title` 只按属性形式读取，而微信写的是元素形式且带 CDATA 包裹。这是已知缺口，
+> 与 `type` 的识别是同一类问题但独立修复（`fileName` 是下游可见字段）。
+
 `format=chatlab` / `chatlab=1` 时改为输出 ChatLab 信封（消息按时间**正序**）：
 `chatlab` / `meta`（含 `ownerId`）/ `members` / `messages`，外层保留
 `success` / `talker` / `count` / `hasMore`。字段语义同 ChatLab Pull（见下节），并按

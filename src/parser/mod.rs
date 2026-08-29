@@ -180,10 +180,34 @@ fn attr(xml: &str, name: &str) -> Option<String> {
 ///
 /// 只读访问器：ChatLab 类型映射用它而不用媒体提示 —— 后者的 `File` 判定为了
 /// 导出目的故意放宽（`mmreader`/`webview` 也算），不能当作类型依据。
+///
+/// 先剔除 `<refermsg>` 整段再找：被引用消息自带一个 `<type>`，而 `elem_text`
+/// 取的是全文档第一个匹配、不分层级。引用一条文件消息时，不剔除就会读到
+/// `<refermsg><type>6</type>` 并把这条回复误判成文件。真实微信把 appmsg 自己的
+/// `<type>` 写在 refermsg 之前（靠文档顺序也能对），但顺序不该被依赖。
 pub fn appmsg_type(xml: &str) -> Option<i64> {
-    elem_text(xml, "type")
-        .or_else(|| attr(xml, "type"))
+    let own = strip_elem(xml, "refermsg");
+    elem_text(&own, "type")
+        .or_else(|| attr(&own, "type"))
         .and_then(|s| s.trim().parse::<i64>().ok())
+}
+
+/// Remove the first `<name>…</name>` span (inclusive) so nested lookups cannot
+/// reach into it. Returns the input unchanged when the element is absent or
+/// unterminated.
+fn strip_elem(xml: &str, name: &str) -> String {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let Some(s) = xml.find(&open) else {
+        return xml.to_string();
+    };
+    let Some(e) = xml[s..].find(&close) else {
+        return xml.to_string();
+    };
+    let mut out = String::with_capacity(xml.len());
+    out.push_str(&xml[..s]);
+    out.push_str(&xml[s + e + close.len()..]);
+    out
 }
 
 /// Extract the text of the first element with `name` (self-closing or not).
@@ -312,14 +336,20 @@ pub fn parse_message(
             49 => {
                 // appmsg: file/link/miniapp; a refermsg makes it a quote
                 let title = attr(content, "title").unwrap_or_default();
-                let app_type = attr(content, "type").unwrap_or_default();
                 if let Some(refer) = extract_refermsg(content) {
                     quote = Some(refer);
                     reply_to = quote
                         .as_ref()
                         .map(|q| q.platform_message_id.clone());
                 }
-                if app_type == "6" || content.contains("<mmreader") || content.contains("webview") {
+                // 微信写的是元素形式 `<type>6</type>`，而 `attr` 只认属性形式
+                // `type="6"`，所以旧的 `app_type == "6"` 判断从不成立，真实文件
+                // 附件一直没被识别成文件。`appmsg_type` 两种形式都认，并且会
+                // 剔除 `<refermsg>` 段，不会把"引用一条文件消息"误判成文件。
+                if appmsg_type(content) == Some(6)
+                    || content.contains("<mmreader")
+                    || content.contains("webview")
+                {
                     let file_name = if title.is_empty() {
                         format!("file_{local_id}")
                     } else {
@@ -487,6 +517,41 @@ mod tests {
         assert_eq!(r.new_msg_id.as_deref(), Some("9900000000000000002"));
         assert!(p.display.contains("撤回"));
         assert_eq!(p.parsed_text, "对方撤回了一条消息");
+    }
+
+    /// WeChat writes the appmsg subtype as the element `<type>6</type>`, not the
+    /// attribute `type="6"`. The old attribute-only test never fired, so real
+    /// file attachments were never classified as files at all.
+    #[test]
+    fn appmsg_file_is_detected_from_the_element_form() {
+        // Real captured shape: elements (not attributes), CDATA on text fields,
+        // bare digits on <type>.
+        let xml = r#"<msg><appmsg appid="" sdkver="0"><title><![CDATA[报表.xlsx]]></title><des><![CDATA[]]></des><type>6</type></appmsg></msg>"#;
+        assert_eq!(appmsg_type(xml), Some(6));
+        let p = parse_message(49, 1, 1, xml);
+        let m = p.media.expect("a type-6 appmsg is a file attachment");
+        assert_eq!(m.kind, MediaKind::File);
+        // Export still refuses it: no md5 and not voice, so the export gate in
+        // the messages handler skips it. Classification changed, bytes did not.
+        assert!(m.md5.is_none());
+        // KNOWN GAP, deliberately pinned rather than fixed here: `title` is read
+        // with `attr()` only, and the parser strips no CDATA, so the real name is
+        // never recovered and the fallback name is used. Same root cause as the
+        // `<type>` bug this test covers, but a separate fix with its own blast
+        // radius (`media.fileName` is downstream-visible).
+        assert_eq!(m.file_name, "file_1");
+    }
+
+    /// Quoting a file must stay a quote. `<refermsg>` carries the *quoted*
+    /// message's `<type>`, and `elem_text` takes the first match document-wide,
+    /// so a naive lookup reads the inner `6` and mislabels the reply as a file.
+    #[test]
+    fn quoting_a_file_is_not_itself_a_file() {
+        let xml = r#"<msg><appmsg title="引用" type="57"><refermsg><type>6</type><svrid>777</svrid><chatusr>wxid_other</chatusr><content>报表.xlsx</content></refermsg></appmsg></msg>"#;
+        assert_eq!(appmsg_type(xml), Some(57), "must read appmsg's own type");
+        let p = parse_message(49, 5, 5, xml);
+        assert_eq!(p.reply_to.as_deref(), Some("777"));
+        assert!(p.media.is_none(), "a quote reply is not a file: {:?}", p.media);
     }
 
     #[test]
