@@ -76,8 +76,54 @@ pub struct ParsedMsg {
     pub revoke: Option<RevokeInfo>,
 }
 
+/// Split a WeChat 4.x `local_type` into `(base_type, appmsg_subtype)`.
+///
+/// WeChat 4.x packs two values into the single `local_type` column:
+/// `local_type = (appmsg_subtype << 32) | base_type`. A file attachment is
+/// stored as `(6 << 32) | 49` = 25769803825, not as 49. Every table that keys
+/// off the base type must therefore mask first, or it silently matches nothing
+/// — which is exactly what happened to the whole `49` branch.
+///
+/// The mask is unconditional, not "only when the base is 49": the real database
+/// also contains `(17 << 32) | 11000`, so a base-specific guard would leave
+/// those rows packed and unmatchable.
+///
+/// The subtype is `None` when the high half is zero (the common case) and when
+/// the base is not 49 — 11000's high half is not an appmsg subtype, and handing
+/// it out as one would invite downstream to read it as if it were.
+///
+/// Negative values cannot be a packed pair (the high half would have to have the
+/// sign bit set, which WeChat never writes); they are passed through untouched
+/// so a corrupt row degrades to "unknown type" instead of a nonsense base.
+pub fn split_local_type(local_type: i64) -> (i64, Option<i64>) {
+    if local_type < 0 {
+        return (local_type, None);
+    }
+    let base = local_type & 0xFFFF_FFFF;
+    let high = local_type >> 32;
+    let sub = if high != 0 && base == 49 { Some(high) } else { None };
+    (base, sub)
+}
+
+/// The appmsg subtype for a row, preferring the packed high half of
+/// `local_type` over the XML `<type>`.
+///
+/// Both sources exist. On a real 218558-message database they agree on 62493 of
+/// 62494 appmsg rows, the packed half is never absent, and the XML is present
+/// everywhere but wrong once — so the packed value is the better authority. The
+/// XML remains the fallback for rows that are not packed (hand-written payloads,
+/// older writers).
+pub fn subtype_of(local_type: i64, xml: &str) -> Option<i64> {
+    let (_, packed) = split_local_type(local_type);
+    packed.or_else(|| appmsg_type(xml))
+}
+
 /// WeChat local_type → display placeholder (WeFlow `getMessageDisplayContent`).
+///
+/// Takes the raw (possibly packed) value and masks internally, so callers cannot
+/// forget to. See [`split_local_type`].
 pub fn placeholder_for(local_type: i64) -> Option<&'static str> {
+    let (local_type, _) = split_local_type(local_type);
     match local_type {
         1 => None, // text: display the content itself
         3 => Some("[图片]"),
@@ -219,6 +265,29 @@ fn elem_text(xml: &str, name: &str) -> Option<String> {
     Some(xml[s..e].to_string())
 }
 
+/// [`elem_text`] with the CDATA wrapper removed.
+///
+/// WeChat writes appmsg text fields as `<title><![CDATA[报表.xlsx]]></title>`;
+/// 52.0% of appmsg titles in the real database are wrapped this way. `elem_text`
+/// returns the wrapper verbatim, so a name read through it would come out as
+/// `<![CDATA[报表.xlsx]]>` — and then get mangled by file-name sanitising, which
+/// maps `<`, `>` and `:` to `_`. Unwrapping here keeps the raw accessor honest
+/// (it really does return the element body) while giving callers the value.
+///
+/// Returns `None` for an empty result so callers can use `unwrap_or_default`
+/// and `is_empty` interchangeably: `<title><![CDATA[]]></title>` means "no
+/// title", not "a title that is the empty string".
+fn elem_text_unwrapped(xml: &str, name: &str) -> Option<String> {
+    let raw = elem_text(xml, name)?;
+    let t = raw.trim();
+    let inner = t
+        .strip_prefix("<![CDATA[")
+        .and_then(|r| r.strip_suffix("]]>"))
+        .unwrap_or(t)
+        .trim();
+    if inner.is_empty() { None } else { Some(inner.to_string()) }
+}
+
 /// Strip all XML tags, keeping inner text segments joined by a space.
 fn strip_tags(xml: &str) -> String {
     let mut out = String::with_capacity(xml.len());
@@ -259,18 +328,21 @@ pub fn parse_message(
     local_id: i64,
     content: &str,
 ) -> ParsedMsg {
+    // `local_type` arrives packed (see `split_local_type`). Everything below
+    // branches on `base`; the caller keeps the raw value for the API field.
+    let (base, _) = split_local_type(local_type);
     let raw = content.to_string();
     let parsed_text = if is_xml(content) { strip_tags(content) } else { content.to_string() };
     let display = match placeholder_for(local_type) {
         Some(p) => p.to_string(),
-        None => match local_type {
+        None => match base {
             1 => parsed_text.clone(),
             10000 | 10002 => parse_system_text(content),
             _ => parsed_text.clone(),
         },
     };
     // For system/revoke messages the parsed text is the human-readable text.
-    let parsed_text = if matches!(local_type, 10000 | 10002) {
+    let parsed_text = if matches!(base, 10000 | 10002) {
         display.clone()
     } else {
         parsed_text
@@ -282,7 +354,7 @@ pub fn parse_message(
     let mut revoke = None;
 
     if is_xml(content) {
-        match local_type {
+        match base {
             3 => {
                 let md5 = attr(content, "md5").or_else(|| attr(content, "cdnthumbmd5"));
                 let aes_key = attr(content, "aeskey");
@@ -334,32 +406,36 @@ pub fn parse_message(
                 });
             }
             49 => {
-                // appmsg: file/link/miniapp; a refermsg makes it a quote
-                let title = attr(content, "title").unwrap_or_default();
+                // appmsg: link card / file / quote reply / miniapp / …
                 if let Some(refer) = extract_refermsg(content) {
                     quote = Some(refer);
                     reply_to = quote
                         .as_ref()
                         .map(|q| q.platform_message_id.clone());
                 }
-                // 微信写的是元素形式 `<type>6</type>`，而 `attr` 只认属性形式
-                // `type="6"`，所以旧的 `app_type == "6"` 判断从不成立，真实文件
-                // 附件一直没被识别成文件。`appmsg_type` 两种形式都认，并且会
-                // 剔除 `<refermsg>` 段，不会把"引用一条文件消息"误判成文件。
-                if appmsg_type(content) == Some(6)
-                    || content.contains("<mmreader")
-                    || content.contains("webview")
-                {
-                    let file_name = if title.is_empty() {
-                        format!("file_{local_id}")
-                    } else {
-                        sanitize_file_name(&title)
+                // Only subtype 6 is a file. The previous `contains("<mmreader")`
+                // / `contains("webview")` fallbacks were far too broad:
+                // `<mmreader>` is what marks a subtype-5 *article card*, so they
+                // would relabel 36629 article cards as file attachments on the
+                // real database.
+                if subtype_of(local_type, content) == Some(6) {
+                    // Read the file's own fields, not the quoted message's: a
+                    // reply that quotes a file carries a second md5/title inside
+                    // `<refermsg>`, and these accessors take the first
+                    // document-wide match regardless of nesting.
+                    let own = strip_elem(content, "refermsg");
+                    let title = elem_text_unwrapped(&own, "title")
+                        .or_else(|| attr(&own, "title"));
+                    let file_name = match title {
+                        Some(t) => sanitize_file_name(&t),
+                        None => format!("file_{local_id}"),
                     };
                     media = Some(MediaHint {
                         kind: MediaKind::File,
                         file_name,
-                        md5: None,
-                        aes_key: None,
+                        md5: elem_text_unwrapped(&own, "md5").or_else(|| attr(&own, "md5")),
+                        aes_key: elem_text_unwrapped(&own, "aeskey")
+                            .or_else(|| attr(&own, "aeskey")),
                     });
                 }
             }
@@ -531,20 +607,113 @@ mod tests {
         let p = parse_message(49, 1, 1, xml);
         let m = p.media.expect("a type-6 appmsg is a file attachment");
         assert_eq!(m.kind, MediaKind::File);
-        // Export still refuses it: no md5 and not voice, so the export gate in
-        // the messages handler skips it. Classification changed, bytes did not.
-        assert!(m.md5.is_none());
-        // KNOWN GAP, deliberately pinned rather than fixed here: `title` is read
-        // with `attr()` only, and the parser strips no CDATA, so the real name is
-        // never recovered and the fallback name is used. Same root cause as the
-        // `<type>` bug this test covers, but a separate fix with its own blast
-        // radius (`media.fileName` is downstream-visible).
-        assert_eq!(m.file_name, "file_1");
+        // CDATA is now unwrapped, so the real name survives. Previously this
+        // asserted the `file_1` fallback: `title` was read with `attr()` only,
+        // which never matches the element form WeChat actually writes.
+        assert_eq!(m.file_name, "报表.xlsx");
     }
 
-    /// Quoting a file must stay a quote. `<refermsg>` carries the *quoted*
-    /// message's `<type>`, and `elem_text` takes the first match document-wide,
-    /// so a naive lookup reads the inner `6` and mislabels the reply as a file.
+    /// The real database stores a file attachment as `(6 << 32) | 49`, never as
+    /// a bare 49. Matching the raw value against 49 matches nothing, which left
+    /// the entire appmsg branch dead: no placeholder, no quote, no media hint.
+    #[test]
+    fn packed_local_type_is_unmasked_before_dispatch() {
+        let packed = (6 << 32) | 49;
+        assert_eq!(split_local_type(packed), (49, Some(6)));
+        let xml = r#"<msg><appmsg appid="" sdkver="0"><title><![CDATA[季度报表.xlsx]]></title><type>6</type><appattach><totallen>20480</totallen><fileext>xlsx</fileext><aeskey>1a2b3c</aeskey><md5>d4e5f6</md5></appattach></appmsg></msg>"#;
+        let p = parse_message(packed, 1, 41287, xml);
+        assert_eq!(p.display, "[链接/文件]", "was the [消息] catch-all");
+        let m = p.media.expect("packed type-6 must still be a file");
+        assert_eq!(m.kind, MediaKind::File);
+        assert_eq!(m.file_name, "季度报表.xlsx");
+        assert_eq!(m.md5.as_deref(), Some("d4e5f6"));
+        assert_eq!(m.aes_key.as_deref(), Some("1a2b3c"));
+    }
+
+    /// The packed high half is the authority for the subtype: on the real
+    /// database it is never absent, whereas the XML `<type>` disagrees once.
+    #[test]
+    fn packed_subtype_wins_over_the_xml_type() {
+        let xml = r#"<msg><appmsg><type>2</type><title><![CDATA[x]]></title></appmsg></msg>"#;
+        assert_eq!(appmsg_type(xml), Some(2), "xml still reads as written");
+        assert_eq!(subtype_of((36 << 32) | 49, xml), Some(36), "packed wins");
+        assert_eq!(subtype_of(49, xml), Some(2), "unpacked falls back to xml");
+    }
+
+    /// The mask cannot be gated on "base == 49": the real database also holds
+    /// `(17 << 32) | 11000`, and a base-specific guard would leave those packed
+    /// and unmatchable. 11000 has no mapping either way, but it must reach the
+    /// catch-all as 11000, not as a 12-digit number.
+    #[test]
+    fn non_appmsg_rows_are_masked_but_expose_no_subtype() {
+        let packed = (17 << 32) | 11000;
+        assert_eq!(
+            split_local_type(packed),
+            (11000, None),
+            "17 is not an appmsg subtype and must not be published as one"
+        );
+        assert_eq!(placeholder_for(packed), Some("[消息]"));
+    }
+
+    /// A negative `local_type` cannot be a packed pair — WeChat never sets the
+    /// sign bit — so it passes through and degrades to the unknown-type
+    /// placeholder rather than being masked into a plausible-looking base.
+    #[test]
+    fn negative_local_type_is_not_treated_as_packed() {
+        assert_eq!(split_local_type(-1), (-1, None));
+        assert_eq!(placeholder_for(-1), Some("[消息]"));
+    }
+
+    /// `<mmreader>` marks a subtype-5 article card, not a file. The old
+    /// `contains("<mmreader")` / `contains("webview")` fallbacks would relabel
+    /// 36629 article cards as file attachments once the branch became reachable.
+    #[test]
+    fn article_cards_are_links_not_files() {
+        let xml = r#"<msg><appmsg><title><![CDATA[标题]]></title><type>5</type><url><![CDATA[https://example.com/a]]></url><mmreader><category><item><webview>x</webview></item></category></mmreader></appmsg></msg>"#;
+        let p = parse_message((5 << 32) | 49, 1, 41295, xml);
+        assert_eq!(p.display, "[链接/文件]");
+        assert!(p.media.is_none(), "an article card is not a file: {:?}", p.media);
+    }
+
+    /// Quoting a file must read the *reply's* fields, not the quoted file's.
+    /// `<refermsg>` carries its own title/md5/aeskey, and the accessors take the
+    /// first document-wide match, so failing to strip it would attach the quoted
+    /// file's media hint to the reply.
+    #[test]
+    fn quoting_a_file_borrows_none_of_its_fields() {
+        let xml = r#"<msg><appmsg><type>57</type><title><![CDATA[收到]]></title><refermsg><type>6</type><svrid>8100000000000000123</svrid><chatusr>wxid_example</chatusr><content><![CDATA[报表.xlsx]]></content><md5>deadbeef</md5></refermsg></appmsg></msg>"#;
+        let p = parse_message((57 << 32) | 49, 1, 41290, xml);
+        assert_eq!(p.reply_to.as_deref(), Some("8100000000000000123"));
+        assert!(p.media.is_none(), "a quote reply is not a file: {:?}", p.media);
+    }
+
+    #[test]
+    fn cdata_is_unwrapped_and_empty_cdata_reads_as_absent() {
+        let xml = r#"<msg><a><![CDATA[值]]></a><b><![CDATA[]]></b><c>裸值</c></msg>"#;
+        assert_eq!(elem_text_unwrapped(xml, "a").as_deref(), Some("值"));
+        assert_eq!(elem_text_unwrapped(xml, "b"), None, "empty means absent");
+        assert_eq!(elem_text_unwrapped(xml, "c").as_deref(), Some("裸值"));
+        assert_eq!(elem_text_unwrapped(xml, "missing"), None);
+        // The raw accessor keeps returning the element body verbatim.
+        assert_eq!(elem_text(xml, "a").as_deref(), Some("<![CDATA[值]]>"));
+    }
+
+    /// A file with no usable title still gets a name. CDATA-empty counts as no
+    /// title, and the sanitiser would otherwise turn the raw `<![CDATA[]]>`
+    /// wrapper into a row of underscores.
+    #[test]
+    fn file_without_a_title_falls_back_to_a_stable_name() {
+        let xml = r#"<msg><appmsg><title><![CDATA[]]></title><type>6</type><appattach><md5>aa</md5></appattach></appmsg></msg>"#;
+        let m = parse_message((6 << 32) | 49, 1, 77, xml)
+            .media
+            .expect("still a file");
+        assert_eq!(m.file_name, "file_77");
+        assert_eq!(m.md5.as_deref(), Some("aa"));
+    }
+
+    /// Same guarantee as [`quoting_a_file_borrows_none_of_its_fields`] but on an
+    /// **unpacked** row in attribute form — the path where the subtype has to
+    /// come from the XML because there is no packed high half to prefer.
     #[test]
     fn quoting_a_file_is_not_itself_a_file() {
         let xml = r#"<msg><appmsg title="引用" type="57"><refermsg><type>6</type><svrid>777</svrid><chatusr>wxid_other</chatusr><content>报表.xlsx</content></refermsg></appmsg></msg>"#;

@@ -326,7 +326,14 @@ impl AccountSync {
                                 sort_seq: row.sort_seq,
                                 local_id: row.local_id,
                             };
-                            if matches!(row.local_type, 10000 | 10002)
+                            // Mask before matching: `local_type` is packed
+                            // (`(subtype << 32) | base`). System codes carry a
+                            // zero high half in practice, so this is a no-op on
+                            // today's data, but the bare comparison is the same
+                            // latent bug that killed the parser's appmsg branch.
+                            let (base_type, _) =
+                                crate::parser::split_local_type(row.local_type);
+                            if matches!(base_type, 10000 | 10002)
                                 || row.parsed.revoke.is_some()
                             {
                                 revoke_rows.push((session_username.clone(), row));

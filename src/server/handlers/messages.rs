@@ -29,10 +29,17 @@ fn message_json(store: &Store, _conv: &str, m: &crate::store::MessageRecord, _in
             "localPath": "",
         })
     });
+    // `localType` stays the raw packed value downstream already pins. WeChat 4.x
+    // packs `(appmsgSubtype << 32) | baseType` into it, so the two halves are
+    // published as separate read-only fields rather than making every consumer
+    // hardcode packed constants like 21474836529 to recognise a link card.
+    let (base_type, appmsg_subtype) = crate::parser::split_local_type(m.local_type);
     json!({
         "localId": m.local_id,
         "serverId": m.server_id.to_string(),
         "localType": m.local_type,
+        "baseType": base_type,
+        "appmsgSubtype": appmsg_subtype,
         "createTime": m.create_time,
         "sortSeq": m.sort_seq,
         "isSend": if m.is_send { 1 } else { 0 },
@@ -182,10 +189,21 @@ pub async fn handler(
                 .iter()
                 .any(|k| crate::server::flex_bool(&params, k));
             let want = |kind: crate::parser::MediaKind| -> bool {
+                use crate::parser::MediaKind as K;
+                // Files never export: the documented contract covers image /
+                // voice / video / emoji only. This test must come *before* the
+                // `!any_sub` shortcut — a bare `media=1` leaves `any_sub` false
+                // and would otherwise wave every kind through, never reaching
+                // the `K::File => false` arm below. Until now that path was
+                // closed only by accident, because file hints carried no md5 and
+                // tripped the md5 gate; now that the md5 is populated, this is
+                // the only thing keeping 3530 file payloads off disk.
+                if kind == K::File {
+                    return false;
+                }
                 if !any_sub {
                     return true;
                 }
-                use crate::parser::MediaKind as K;
                 match kind {
                     K::Image => {
                         crate::server::flex_bool(&params, "image")

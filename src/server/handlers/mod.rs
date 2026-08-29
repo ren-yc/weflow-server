@@ -84,11 +84,16 @@ pub fn ready_account(
 ///
 /// `parsed` is needed because one WeChat code covers several ChatLab types:
 /// 49 (appmsg) is a quote reply, a file, or a link depending on its payload.
+/// `local_type` arrives packed (`(subtype << 32) | base`) and is masked here so
+/// the arms below can match. Without the mask every appmsg row — 28.6% of the
+/// real database — fell through to 99 OTHER.
+///
 /// This is the ChatLab code space only; the native `localType` on
 /// `/api/v1/messages` is a separate space that downstream pins, so the two
 /// must not be conflated.
 pub fn chatlab_type(local_type: i64, parsed: &crate::parser::ParsedMsg) -> i64 {
-    match local_type {
+    let (base, _) = crate::parser::split_local_type(local_type);
+    match base {
         1 => 0,   // TEXT
         3 => 1,   // IMAGE
         34 => 2,  // VOICE
@@ -103,7 +108,7 @@ pub fn chatlab_type(local_type: i64, parsed: &crate::parser::ParsedMsg) -> i64 {
         49 => {
             if parsed.reply_to.is_some() {
                 25 // REPLY
-            } else if crate::parser::appmsg_type(&parsed.raw_content) == Some(6) {
+            } else if crate::parser::subtype_of(local_type, &parsed.raw_content) == Some(6) {
                 4 // FILE
             } else {
                 7 // LINK
