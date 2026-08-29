@@ -229,6 +229,23 @@ impl Store {
         fallback.to_string()
     }
 
+    /// The sender's per-chatroom group card (群昵称) alone, empty when they
+    /// have none or the chat is not a group.
+    ///
+    /// This is the other half of [`Store::sender_display`], which merges the
+    /// card and the contact name into one value. ChatLab keeps them apart
+    /// (`accountName` vs `groupNickname`), so its faces need the card on its
+    /// own — a contact's 备注 is NOT a group nickname and must not be served
+    /// as one.
+    pub fn group_card(&self, chatroom: Option<&str>, sender: &str) -> String {
+        chatroom
+            .and_then(|room| self.group_cards.get(room))
+            .and_then(|cards| cards.get(sender))
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Estimate the total message count of a conversation.
     pub fn conv_count(&self, username: &str) -> usize {
         self.convs.get(username).map_or(0, |v| v.len())

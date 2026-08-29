@@ -480,6 +480,258 @@ async fn chatlab_pull_contract() {
     assert!(m["sender"].is_string());
 }
 
+/// ChatLab's `accountName` and `groupNickname` are two different names: the
+/// contact's own display name, and their per-chatroom card (群昵称). Serving the
+/// contact's 备注 as `groupNickname` made the two identical for anyone with a
+/// remark and wrong for everyone else.
+#[tokio::test]
+async fn chatlab_splits_account_name_from_group_nickname() {
+    let dir = common::tmp_dir("smoke-pullnames");
+    let state = test_state(&dir);
+    // The fixture has no chatroom card table; inject one for a real group
+    // sender (wxid_member_b, nickname 李四, no remark).
+    {
+        let accounts = state.accounts.lock();
+        let handle = accounts.get(common::FAKE_WXID).unwrap();
+        handle
+            .store
+            .write()
+            .group_cards
+            .entry(common::FAKE_GROUP.to_string())
+            .or_default()
+            .insert("wxid_member_b".to_string(), "四哥".to_string());
+    }
+    let app = server::build_router(state);
+
+    let uri = format!(
+        "/api/v1/sessions/{}/messages?limit=5000&access_token={}",
+        common::FAKE_GROUP, TOKEN
+    );
+    let (status, body) =
+        json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let member = body["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["platformId"] == "wxid_member_b")
+        .expect("wxid_member_b in members");
+    assert_eq!(member["accountName"], "李四", "the contact's own name");
+    assert_eq!(member["groupNickname"], "四哥", "the chatroom card, not the 备注");
+
+    let msg = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["sender"] == "wxid_member_b")
+        .expect("a message from wxid_member_b");
+    assert_eq!(msg["accountName"], "李四");
+    assert_eq!(msg["groupNickname"], "四哥", "messages carry the card too");
+
+    // A private chat has no cards at all: `groupNickname` is empty rather than
+    // a copy of the remark (客户张三 is wxid_friend_a's 备注).
+    let uri = format!(
+        "/api/v1/sessions/{}/messages?limit=5000&access_token={}",
+        common::FAKE_FRIEND, TOKEN
+    );
+    let (status, body) =
+        json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    let m = body["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["platformId"] == common::FAKE_FRIEND)
+        .expect("the friend in members");
+    assert_eq!(m["accountName"], "客户张三", "remark wins for the display name");
+    assert_eq!(m["groupNickname"], "", "a 备注 is not a group nickname");
+
+    // Same split on the chatlab branch of /api/v1/messages.
+    let uri = format!(
+        "/api/v1/messages?talker={}&chatlab=1&access_token={}",
+        common::FAKE_GROUP, TOKEN
+    );
+    let (status, body) = json_body(app.oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    let msg = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["sender"] == "wxid_member_b")
+        .expect("a message from wxid_member_b");
+    assert_eq!(msg["accountName"], "李四");
+    assert_eq!(msg["groupNickname"], "四哥");
+}
+
+/// `messages[].type` is the canonical ChatLab 0.0.2 code, a different space
+/// from the native `localType`: an image is 1 there and 3 natively, and the
+/// unassigned code 6 must never appear.
+#[tokio::test]
+async fn chatlab_type_uses_the_canonical_enum() {
+    let dir = common::tmp_dir("smoke-pulltype");
+    let state = test_state(&dir);
+    let app = server::build_router(state);
+
+    // The friend conversation holds text (1), an image (3) and a revoke
+    // sysmsg (10002).
+    let uri = format!(
+        "/api/v1/sessions/{}/messages?limit=5000&access_token={}",
+        common::FAKE_FRIEND, TOKEN
+    );
+    let (status, body) =
+        json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    let pull = body["messages"].as_array().unwrap().clone();
+
+    // Pair each ChatLab type with the native localType of the same serverId.
+    let uri = format!(
+        "/api/v1/messages?talker={}&limit=5000&access_token={}",
+        common::FAKE_FRIEND, TOKEN
+    );
+    let (_, native) =
+        json_body(app.oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    let native = native["messages"].as_array().unwrap().clone();
+    let local_of = |server_id: &str| -> i64 {
+        native
+            .iter()
+            .find(|m| m["serverId"] == server_id)
+            .and_then(|m| m["localType"].as_i64())
+            .unwrap_or_else(|| panic!("no native row for {server_id}"))
+    };
+
+    let mut seen = std::collections::BTreeMap::new();
+    for m in &pull {
+        let t = m["type"].as_i64().unwrap();
+        assert_ne!(t, 6, "6 is unassigned in ChatLab 0.0.2: {m:?}");
+        seen.insert(local_of(m["platformMessageId"].as_str().unwrap()), t);
+    }
+    assert_eq!(seen.get(&1), Some(&0), "text 1 -> TEXT 0");
+    assert_eq!(seen.get(&3), Some(&1), "image 3 -> IMAGE 1, not 3");
+    assert_eq!(
+        seen.get(&10002),
+        Some(&81),
+        "a sysmsg that decoded a revoke -> RECALL 81"
+    );
+}
+
+/// Every WeChat code the parser recognizes maps into the published ChatLab
+/// enum, and the appmsg code (49) resolves by payload rather than collapsing
+/// to one type.
+#[test]
+fn chatlab_type_table_matches_the_published_enum() {
+    use weflow_server::server::handlers::chatlab_type;
+
+    let plain = |xml: &str| weflow_server::parser::parse_message(49, 1, 1, xml);
+    let none = weflow_server::parser::parse_message(1, 1, 1, "hi");
+
+    // Basic types (0-19); 6 is unassigned.
+    assert_eq!(chatlab_type(1, &none), 0); // TEXT
+    assert_eq!(chatlab_type(3, &none), 1); // IMAGE
+    assert_eq!(chatlab_type(34, &none), 2); // VOICE
+    assert_eq!(chatlab_type(43, &none), 3); // VIDEO
+    assert_eq!(chatlab_type(47, &none), 5); // EMOJI
+    assert_eq!(chatlab_type(48, &none), 8); // LOCATION — was 7 (LINK)
+    // Interactive types (20-39).
+    assert_eq!(chatlab_type(50, &none), 24); // SHARE — was the unassigned 6
+    assert_eq!(chatlab_type(42, &none), 27); // CONTACT — was 99
+    // Unknown codes fall through to OTHER.
+    assert_eq!(chatlab_type(9999, &none), 99);
+
+    // 49 by payload: a link/card, a file attachment, a quote reply.
+    let link = plain("<msg><appmsg><type>5</type><title>某文章</title></appmsg></msg>");
+    assert_eq!(chatlab_type(49, &link), 7, "LINK");
+    let file = plain("<msg><appmsg><type>6</type><title>报表.xlsx</title></appmsg></msg>");
+    assert_eq!(chatlab_type(49, &file), 4, "FILE");
+    let reply = plain(
+        "<msg><appmsg><type>57</type><title>好的</title>\
+         <refermsg><svrid>8100000000000000001</svrid><content>原文</content></refermsg>\
+         </appmsg></msg>",
+    );
+    assert_eq!(chatlab_type(49, &reply), 25, "REPLY");
+
+    // 10000/10002 split on whether a revoke payload actually decoded, not on
+    // the code: a plain sysmsg is SYSTEM even when it arrives as 10002.
+    let revoke = weflow_server::parser::parse_message(
+        10002,
+        1,
+        1,
+        "<sysmsg type=\"revokemsg\"><revokemsg><msgid>1</msgid>\
+         <replacemsg>对方撤回了一条消息</replacemsg></revokemsg></sysmsg>",
+    );
+    assert_eq!(chatlab_type(10002, &revoke), 81, "RECALL");
+    let notice = weflow_server::parser::parse_message(10002, 1, 1, "<sysmsg>群公告</sysmsg>");
+    assert_eq!(chatlab_type(10002, &notice), 80, "SYSTEM");
+    assert_eq!(chatlab_type(10000, &notice), 80);
+}
+
+/// WeFlow (安装版) documents `messages[].replyToMessageId` on
+/// `/api/v1/messages?format=chatlab` but NOT in the Pull payload — the Pull
+/// face must not invent it.
+#[tokio::test]
+async fn pull_omits_reply_to_message_id_but_messages_keeps_it() {
+    let dir = common::tmp_dir("smoke-pullreply");
+    let state = test_state(&dir);
+    let app = server::build_router(state);
+
+    let uri = format!(
+        "/api/v1/sessions/{}/messages?limit=5000&access_token={}",
+        common::FAKE_GROUP, TOKEN
+    );
+    let (status, body) =
+        json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    for m in body["messages"].as_array().unwrap() {
+        assert!(
+            m.get("replyToMessageId").is_none(),
+            "not in WeFlow's Pull field list: {m:?}"
+        );
+    }
+
+    let uri = format!(
+        "/api/v1/messages?talker={}&chatlab=1&access_token={}",
+        common::FAKE_GROUP, TOKEN
+    );
+    let (status, body) = json_body(app.oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    for m in body["messages"].as_array().unwrap() {
+        assert!(
+            m.get("replyToMessageId").is_some(),
+            "WeFlow documents it here: {m:?}"
+        );
+    }
+}
+
+/// `end=YYYYMMDD` is an INCLUSIVE upper bound, so it must cover the whole day
+/// rather than stopping at midnight. The lower bound keeps start-of-day.
+#[tokio::test]
+async fn pull_end_date_covers_the_whole_day() {
+    let dir = common::tmp_dir("smoke-pullend");
+    let state = test_state(&dir);
+    let app = server::build_router(state);
+
+    // The group fixture sits at 1700000100..1700000103 = 2023-11-14 UTC.
+    let uri = format!(
+        "/api/v1/sessions/{}/messages?end=20231114&limit=5000&access_token={}",
+        common::FAKE_GROUP, TOKEN
+    );
+    let (status, body) =
+        json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["messages"].as_array().unwrap().len(),
+        4,
+        "end-of-day bound keeps that day's messages"
+    );
+    // The day before excludes them all, so the bound is still a real filter.
+    let uri = format!(
+        "/api/v1/sessions/{}/messages?end=20231113&limit=5000&access_token={}",
+        common::FAKE_GROUP, TOKEN
+    );
+    let (_, body) = json_body(app.oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert!(body["messages"].as_array().unwrap().is_empty());
+}
+
 /// Paginating with the cursors the server hands back must serve every message
 /// exactly once.
 ///

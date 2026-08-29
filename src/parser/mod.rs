@@ -172,6 +172,20 @@ fn attr(xml: &str, name: &str) -> Option<String> {
     Some(xml[start..end].to_string())
 }
 
+/// The `<appmsg>` subtype of a `local_type` 49 payload (1 文本, 5 链接,
+/// 6 文件, 19 合并转发, 33/36 小程序, 51 视频号, 57 引用回复……).
+///
+/// 微信实际写的是元素形式 `<type>6</type>`；属性形式 `type="6"` 只出现在手写
+/// 样例里。两种都接受，因为只用 `attr` 会漏掉所有真实的文件消息。
+///
+/// 只读访问器：ChatLab 类型映射用它而不用媒体提示 —— 后者的 `File` 判定为了
+/// 导出目的故意放宽（`mmreader`/`webview` 也算），不能当作类型依据。
+pub fn appmsg_type(xml: &str) -> Option<i64> {
+    elem_text(xml, "type")
+        .or_else(|| attr(xml, "type"))
+        .and_then(|s| s.trim().parse::<i64>().ok())
+}
+
 /// Extract the text of the first element with `name` (self-closing or not).
 fn elem_text(xml: &str, name: &str) -> Option<String> {
     let open = format!("<{name}>");

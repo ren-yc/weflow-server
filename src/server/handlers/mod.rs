@@ -73,3 +73,52 @@ pub fn ready_account(
     }
     Ok(handle)
 }
+
+/// WeChat `local_type` → canonical ChatLab 0.0.2 `messages[].type`.
+///
+/// The authority is the published enum (docs.chatlab.fun/standard/chatlab-format),
+/// NOT the platform's own numbering: 0 TEXT, 1 IMAGE, 2 VOICE, 3 VIDEO,
+/// 4 FILE, 5 EMOJI, 7 LINK, 8 LOCATION, 20-27 interactive (24 SHARE,
+/// 25 REPLY, 27 CONTACT), 80 SYSTEM, 81 RECALL, 99 OTHER. **6 is unassigned**
+/// — never emit it.
+///
+/// `parsed` is needed because one WeChat code covers several ChatLab types:
+/// 49 (appmsg) is a quote reply, a file, or a link depending on its payload.
+/// This is the ChatLab code space only; the native `localType` on
+/// `/api/v1/messages` is a separate space that downstream pins, so the two
+/// must not be conflated.
+pub fn chatlab_type(local_type: i64, parsed: &crate::parser::ParsedMsg) -> i64 {
+    match local_type {
+        1 => 0,   // TEXT
+        3 => 1,   // IMAGE
+        34 => 2,  // VOICE
+        43 => 3,  // VIDEO
+        47 => 5,  // EMOJI
+        42 => 27, // CONTACT (名片)
+        48 => 8,  // LOCATION (位置)
+        50 => 24, // SHARE (视频号)
+        // appmsg: most specific first. A refermsg makes the message a quote
+        // reply whatever else it carries; otherwise an attachment payload
+        // makes it a file; anything else left is a link/card.
+        49 => {
+            if parsed.reply_to.is_some() {
+                25 // REPLY
+            } else if crate::parser::appmsg_type(&parsed.raw_content) == Some(6) {
+                4 // FILE
+            } else {
+                7 // LINK
+            }
+        }
+        // Both WeChat codes carry system notices; only the ones that actually
+        // decoded a revoke payload are recalls. Splitting on the code alone
+        // mislabels a 10002 sysmsg that is not a revoke.
+        10000 | 10002 => {
+            if parsed.revoke.is_some() {
+                81 // RECALL
+            } else {
+                80 // SYSTEM
+            }
+        }
+        _ => 99, // OTHER
+    }
+}

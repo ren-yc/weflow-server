@@ -20,8 +20,12 @@ pub async fn handler(
 ) -> ApiResult<Json<serde_json::Value>> {
     require_auth(&state, &query, &headers)?;
     let account = ready_account(&state, &query)?;
-    let since = query.get("since").and_then(|s| s.parse::<i64>().ok());
-    let end = query.get("end").and_then(|s| s.parse::<i64>().ok());
+    // WeFlow (安装版) documents both as unix seconds; accepting "YYYYMMDD" too
+    // is a superset that cannot change the meaning of a numeric cursor (an
+    // 8-digit unix second is 1970-04-26, far below any real message), and it
+    // keeps this face consistent with `/api/v1/messages`'s time bounds.
+    let since = query.get("since").and_then(|s| crate::server::parse_time_bound(s));
+    let end = query.get("end").and_then(|s| crate::server::parse_time_bound_end(s));
     let limit = crate::server::parse_limit(&query, "limit", 5000, 5000);
     let offset = crate::server::parse_offset(&query, "offset");
 
@@ -68,6 +72,12 @@ pub async fn handler(
     // tell the client to resume past everything it has not seen yet.
     let next_since = page.last().map(|m| m.create_time).unwrap_or(since.unwrap_or(0));
 
+    // `groupNickname` is the sender's per-chatroom card, which lives in
+    // `group_cards` — NOT the contact's 备注. The two are different things and
+    // serving the remark here made `groupNickname` wrong for every group
+    // member who had a remark but no card (and for every private chat).
+    let chatroom = id.ends_with("@chatroom").then_some(id.as_str());
+
     // members = senders in this page (dedup)
     let mut seen = std::collections::HashSet::new();
     let members: Vec<serde_json::Value> = page
@@ -78,7 +88,7 @@ pub async fn handler(
             json!({
                 "platformId": m.sender_username,
                 "accountName": m.sender_name,
-                "groupNickname": c.and_then(|c| c.remark.clone()).unwrap_or_default(),
+                "groupNickname": store.group_card(chatroom, &m.sender_username),
                 "avatar": c.and_then(|c| c.avatar_url.clone()).unwrap_or_default(),
             })
         })
@@ -90,11 +100,11 @@ pub async fn handler(
             json!({
                 "sender": m.sender_username,
                 "accountName": m.sender_name,
+                "groupNickname": store.group_card(chatroom, &m.sender_username),
                 "timestamp": m.create_time,
-                "type": chatlab_type(m.local_type),
+                "type": crate::server::handlers::chatlab_type(m.local_type, &m.parsed),
                 "content": m.parsed.display,
                 "platformMessageId": m.server_id.to_string(),
-                "replyToMessageId": m.parsed.reply_to,
             })
         })
         .collect();
@@ -129,18 +139,3 @@ pub async fn handler(
     })))
 }
 
-fn chatlab_type(t: i64) -> i64 {
-    match t {
-        1 => 0,
-        3 => 1,
-        34 => 2,
-        43 => 3,
-        49 => 4,
-        47 => 5,
-        50 => 6,
-        48 => 7,
-        10000 => 80,
-        10002 => 81,
-        _ => 99,
-    }
-}

@@ -463,17 +463,34 @@ pub fn parse_offset(params: &HashMap<String, String>, key: &str) -> usize {
     params.get(key).and_then(|v| v.parse::<usize>().ok()).unwrap_or(0)
 }
 
-/// Resolve a "YYYYMMDD" or unix-seconds timestamp to seconds.
+/// Resolve a "YYYYMMDD" or unix-seconds timestamp to seconds (start of day).
 pub fn parse_time_bound(s: &str) -> Option<i64> {
+    parse_time_bound_inner(s, false)
+}
+
+/// Like [`parse_time_bound`], but a bare "YYYYMMDD" resolves to the LAST
+/// second of that day (23:59:59) instead of its first.
+///
+/// Only for inclusive upper bounds: `end=20250101` reads as "through Jan 1",
+/// and start-of-day would silently return an empty range for that whole day.
+/// Kept separate from `parse_time_bound` so the lower-bound callers — and the
+/// endpoints downstream already consumes — keep their exact current behavior.
+pub fn parse_time_bound_end(s: &str) -> Option<i64> {
+    parse_time_bound_inner(s, true)
+}
+
+fn parse_time_bound_inner(s: &str, end_of_day: bool) -> Option<i64> {
     let s = s.trim();
     if s.len() == 8 && s.bytes().all(|b| b.is_ascii_digit()) {
         let y: i64 = s[0..4].parse().ok()?;
         let m: i64 = s[4..6].parse().ok()?;
         let d: i64 = s[6..8].parse().ok()?;
         let naive = chrono::NaiveDate::from_ymd_opt(y as i32, m as u32, d as u32)?;
-        let dt = naive
-            .and_hms_opt(0, 0, 0)?
-            .and_utc();
+        let dt = if end_of_day {
+            naive.and_hms_opt(23, 59, 59)?.and_utc()
+        } else {
+            naive.and_hms_opt(0, 0, 0)?.and_utc()
+        };
         return Some(dt.timestamp());
     }
     s.parse::<i64>().ok()

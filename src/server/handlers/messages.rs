@@ -113,6 +113,9 @@ pub async fn handler(
             let mut asc = slice.to_vec();
             asc.reverse();
             let (group_id, owner_id) = (talker.clone(), store.my_wxid.clone());
+            // `groupNickname` is the per-chatroom card from `group_cards`, not
+            // the contact's 备注 — see the same note in `chatlab_pull`.
+            let chatroom = talker.ends_with("@chatroom").then_some(talker.as_str());
             let members: Vec<serde_json::Value> = {
                 let sender_ids: Vec<&str> = asc.iter().map(|m| m.sender_username.as_str()).collect();
                 let mut seen = std::collections::HashSet::new();
@@ -124,7 +127,7 @@ pub async fn handler(
                         json!({
                             "platformId": s,
                             "accountName": c.map(|c| c.display_name()).unwrap_or_else(|| s.to_string()),
-                            "groupNickname": c.and_then(|c| c.remark.clone()).unwrap_or_default(),
+                            "groupNickname": store.group_card(chatroom, s),
                             "avatar": c.and_then(|c| c.avatar_url.clone()).unwrap_or_default(),
                         })
                     })
@@ -136,8 +139,9 @@ pub async fn handler(
                     json!({
                         "sender": m.sender_username,
                         "accountName": m.sender_name,
+                        "groupNickname": store.group_card(chatroom, &m.sender_username),
                         "timestamp": m.create_time,
-                        "type": chatlab_type(m.local_type),
+                        "type": crate::server::handlers::chatlab_type(m.local_type, &m.parsed),
                         "content": m.parsed.display,
                         "platformMessageId": m.server_id.to_string(),
                         "replyToMessageId": m.parsed.reply_to,
@@ -273,19 +277,3 @@ pub async fn handler(
     })))
 }
 
-/// WeChat local_type -> ChatLab type id (WeFlow table).
-fn chatlab_type(t: i64) -> i64 {
-    match t {
-        1 => 0,
-        3 => 1,
-        34 => 2,
-        43 => 3,
-        49 => 4,
-        47 => 5,
-        50 => 6,
-        48 => 7,
-        10000 => 80,
-        10002 => 81,
-        _ => 99,
-    }
-}
