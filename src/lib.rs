@@ -80,18 +80,21 @@ pub async fn serve_with_shutdown(
     ));
     // Platform scan for discovery only: zero accounts is a valid start state,
     // and a client registers them with keys via POST /api/v1/accounts.
+    //
+    // Only the COUNT is logged, never the wxids. `/health` and `account_views`
+    // pay a type-level price to avoid enumerating accounts without a token
+    // (`AccountPhase` has no `AwaitingKey` variant precisely so a discovered
+    // account cannot leak through the unauthenticated endpoint) — printing the
+    // full list here would route around that for anyone who can read the log.
+    // The list itself stays available to authenticated callers via
+    // `GET /api/v1/accounts`, which merges `discovered` into its response.
     let found = db::scan::scan_all(&db::scan::default_roots());
     if found.is_empty() {
         tracing::info!("[init] 未发现本机微信账号目录（客户端可显式传 db_path 注册）");
     } else {
         tracing::info!(
-            "[init] 发现 {} 个账号目录，等待注册: {}",
-            found.len(),
-            found
-                .iter()
-                .map(|a| a.wxid.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
+            "[init] 发现 {} 个账号目录，等待注册（清单见 GET /api/v1/accounts，需鉴权）",
+            found.len()
         );
     }
     state.set_discovered(found);

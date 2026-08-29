@@ -22,6 +22,7 @@
 pub mod watch;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -144,6 +145,13 @@ pub struct AccountSync {
     last_files: Vec<DbFile>,
     /// rel -> (main stamp, wal stamp) as of the last successful poll.
     stamps: std::collections::HashMap<String, DbStamps>,
+    /// Set when this account is deregistered: every remaining store write in
+    /// the current pass is skipped and no further events are emitted.
+    ///
+    /// Shared with the owning `AccountHandle` as an `Arc` so deregistration can
+    /// set it WITHOUT taking this struct's mutex, which a `full_sync` on a real
+    /// account holds for minutes.
+    stopped: Arc<AtomicBool>,
 }
 
 impl AccountSync {
@@ -158,6 +166,7 @@ impl AccountSync {
             storage: storage.to_path_buf(),
             last_files: Vec::new(),
             stamps: std::collections::HashMap::new(),
+            stopped: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -177,7 +186,21 @@ impl AccountSync {
             storage: storage.to_path_buf(),
             last_files: Vec::new(),
             stamps: std::collections::HashMap::new(),
+            stopped: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Handle on the retirement flag, for the owning `AccountHandle`.
+    ///
+    /// There is deliberately no `stop()` here: deregistration sets the flag
+    /// through this `Arc` precisely BECAUSE it must not take this struct's
+    /// mutex, which a `full_sync` can hold for minutes.
+    pub fn stop_flag(&self) -> Arc<AtomicBool> {
+        self.stopped.clone()
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
     }
 
     /// Full build: read every database through the live pool and rebuild the
@@ -186,6 +209,13 @@ impl AccountSync {
         let files = self.rescan();
         let keys = self.keys.clone();
         let store = index::build_all_live(&mut self.pool, &keys, &self.wxid, &files)?;
+        // A build on a real account runs for minutes; a deregistration in that
+        // window already cleared the store, so installing this index would
+        // resurrect it. The caller checks the same flag before flipping to
+        // `ready`, so reporting success here is harmless.
+        if self.is_stopped() {
+            return Ok(files.len());
+        }
         *self.store.write() = store;
         // seed stamps so the next poll starts from a clean baseline
         self.stamps.clear();
@@ -247,6 +277,9 @@ impl AccountSync {
     /// watermark-increment reads on their live connections, apply to the
     /// store and broadcast events. Returns (new_messages, revokes).
     pub fn poll_once(&mut self) -> Result<(usize, usize)> {
+        if self.is_stopped() {
+            return Ok((0, 0));
+        }
         let work = self.classify_changed();
         if work.is_empty() {
             return Ok((0, 0));
@@ -312,6 +345,13 @@ impl AccountSync {
         let mut applied_revoke = 0usize;
         {
             let mut guard = self.store.write();
+            // Deregistered while phase 1 was reading: discard the rows instead
+            // of writing them into the just-cleared store, and emit nothing —
+            // the bus is process-wide, so events for a gone account would
+            // reach every subscriber.
+            if self.stopped.load(Ordering::SeqCst) {
+                return Ok((0, 0));
+            }
             let my_wxid = guard.my_wxid.clone();
             for (wm_key, wm) in new_watermarks {
                 guard.watermarks.insert(wm_key, wm);
@@ -428,6 +468,11 @@ impl AccountSync {
         // phase 3: dependent section reloads over warm live connections
         let keys = self.keys.clone();
         for w in &work {
+            // Each arm takes its own write lock, so the flag is re-checked per
+            // item rather than once for the whole loop.
+            if self.is_stopped() {
+                return Ok((applied_new, applied_revoke));
+            }
             match w {
                 Work::Sessions(f) => {
                         let Some(k) = keys.key_for(&f.rel) else { continue };

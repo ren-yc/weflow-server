@@ -52,16 +52,12 @@ pub async fn handler(
         .media_export_dir
         .canonicalize()
         .unwrap_or_else(|_| state.cfg.media_export_dir.clone());
-    let canonical = match file_path.canonicalize() {
-        Ok(p) => p,
-        Err(_) => {
-            return Ok((
-                StatusCode::NOT_FOUND,
-                axum::Json(serde_json::json!({ "error": "Media not found" })),
-            )
-                .into_response())
-        }
-    };
+    // Same envelope as `serve_file`'s 404 below: "path does not exist" and
+    // "path exists but cannot be opened" are one failure mode to the caller,
+    // so they must not come back as two different response shapes.
+    let canonical = file_path
+        .canonicalize()
+        .map_err(|_| ApiError::not_found("media not found"))?;
     if !canonical.starts_with(&root) {
         return Err(ApiError::bad_request("path traversal attempt"));
     }

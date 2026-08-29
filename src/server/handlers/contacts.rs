@@ -48,13 +48,18 @@ pub async fn handler(
         .skip(offset)
         .take(limit)
         .map(|c| {
+            // Absent fields serialize as `""`, matching group-members,
+            // chatlab pull and messages. `store::Contact` keeps them as
+            // `Option<String>` because `display_name()` needs to tell "no
+            // remark" apart from "empty remark" for its remark > nickname >
+            // username fallback — only the JSON boundary flattens them.
             json!({
                 "username": c.username,
                 "displayName": c.display_name(),
-                "remark": c.remark,
-                "nickname": c.nickname,
-                "alias": c.alias,
-                "avatarUrl": c.avatar_url,
+                "remark": c.remark.clone().unwrap_or_default(),
+                "nickname": c.nickname.clone().unwrap_or_default(),
+                "alias": c.alias.clone().unwrap_or_default(),
+                "avatarUrl": c.avatar_url.clone().unwrap_or_default(),
                 "type": c.kind.as_str(),
             })
         })

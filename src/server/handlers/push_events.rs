@@ -77,7 +77,7 @@ pub async fn handler(
                     // Subscriber fell behind. Re-baseline with the CURRENT
                     // watermarks: a bare `{"rebased":true}` tells the client
                     // it lost events but gives it nothing to resync from.
-                    let wms = current_watermarks(&lag_state);
+                    let wms = crate::server::current_watermarks(&lag_state);
                     let (name, payload) = serialize_event(crate::sync::Event::Sync(wms));
                     // No history id: this frame is specific to this lagging
                     // subscriber, so it must not consume a bus-level
@@ -102,29 +102,6 @@ pub async fn handler(
     Ok(Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(25)).text("ping"))
         .into_response())
-}
-
-/// Current watermarks across every ready account, for a lag re-baseline.
-///
-/// Collected from all ready accounts because the bus — and therefore the
-/// `sync` frame — is process-wide, matching what the post-index baseline in
-/// `server::start_account` publishes.
-fn current_watermarks(state: &AppState) -> Vec<(String, crate::store::Watermark)> {
-    let handles: Vec<_> = {
-        let accounts = state.accounts.lock();
-        accounts
-            .values()
-            .filter(|h| h.status().is_ready())
-            .cloned()
-            .collect()
-    };
-    handles
-        .iter()
-        .flat_map(|h| {
-            let guard = h.store.read();
-            guard.watermarks.clone().into_iter().collect::<Vec<_>>()
-        })
-        .collect()
 }
 
 fn serialize_event(ev: crate::sync::Event) -> (&'static str, serde_json::Value) {

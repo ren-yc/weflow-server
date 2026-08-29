@@ -83,6 +83,7 @@ async fn start(dir: &std::path::Path) -> TestServer {
         db_storage: storage.clone(),
         session_db: Some(storage.join("session/session.db")),
     };
+    let stopped = sync.lock().stop_flag();
     let handle = Arc::new(AccountHandle {
         info,
         status: AtomicU8::new(2), // Ready
@@ -91,6 +92,7 @@ async fn start(dir: &std::path::Path) -> TestServer {
         sync,
         media_keys: None,
         watcher: Mutex::new(None),
+        stopped,
     });
     state
         .accounts
@@ -291,13 +293,13 @@ async fn subscriber_survives_account_registration() {
             db_storage: storage.clone(),
             session_db: Some(storage.join("session/session.db")),
         };
-        let (_h, is_new) = server::register_account(
-            &state,
-            info,
-            keystore::KeyMap::from(key),
-            None,
+        assert!(
+            matches!(
+                server::register_account(&state, info, keystore::KeyMap::from(key), None),
+                server::BindOutcome::Bound(_)
+            ),
+            "first registration for this wxid"
         );
-        assert!(is_new, "first registration for this wxid");
         tokio::time::sleep(Duration::from_millis(300)).await;
         // Published on the global bus — the pre-registration subscriber must see it.
         state.events.send(event).ok();

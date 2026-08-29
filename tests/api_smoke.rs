@@ -67,6 +67,7 @@ fn test_state_with(
     )));
     sync.lock().full_sync().unwrap();
 
+    let stopped = sync.lock().stop_flag();
     let handle = Arc::new(AccountHandle {
         info,
         status: AtomicU8::new(2), // Ready
@@ -75,6 +76,7 @@ fn test_state_with(
         sync,
         media_keys: None,
         watcher: Mutex::new(None),
+        stopped,
     });
     state
         .accounts
@@ -256,6 +258,16 @@ async fn sessions_contacts_group_members() {
         .find(|c| c["username"] == common::FAKE_FRIEND)
         .unwrap();
     assert_eq!(friend["displayName"], "客户张三"); // remark priority
+    // Absent source fields flatten to "" rather than null. The fixture's
+    // contact table has no avatar column at all, so `avatarUrl` is the
+    // None-valued case; `alias` is present and non-empty for this row.
+    assert_eq!(friend["avatarUrl"], "", "absent field is an empty string, not null");
+    assert_eq!(friend["alias"], "zhangsan001");
+    for c in body["contacts"].as_array().unwrap() {
+        for field in ["nickname", "remark", "alias", "avatarUrl"] {
+            assert!(c[field].is_string(), "{field} is a string, never null: {c}");
+        }
+    }
 
     let uri = format!(
         "/api/v1/group-members?chatroomId={}&includeMessageCounts=1&access_token={}",
@@ -535,10 +547,20 @@ async fn media_and_sync_endpoints() {
     let dir = common::tmp_dir("smoke-media");
     let state = test_state(&dir);
     let app = server::build_router(state);
-    // media: not exported -> 404 (and traversal attempts -> 400)
+    // media: not exported -> 404 in the standard envelope. The shape matters:
+    // this path (canonicalize failed) used to answer with a bare
+    // `{"error": ...}` while the open-failed path a few lines deeper in the
+    // handler used the envelope, so one endpoint had two 404 bodies.
     let uri = format!("/api/v1/media/{}/images/x.jpg?access_token={}", common::FAKE_GROUP, TOKEN);
-    let resp = app.clone().oneshot(request("GET", &uri, None)).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let (status, body) =
+        json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["success"], false);
+    assert_eq!(body["code"], 404);
+    assert!(body["message"].is_string(), "envelope carries a message: {body}");
+    assert!(body.get("error").is_none(), "no bare error key: {body}");
+
+    // traversal attempts -> 400
     let uri = format!("/api/v1/media/{}/images/..%2F..%2Fetc%2Fpasswd?access_token={}", common::FAKE_GROUP, TOKEN);
     let resp = app.clone().oneshot(request("GET", &uri, None)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -552,7 +574,7 @@ async fn media_and_sync_endpoints() {
 }
 
 #[tokio::test]
-async fn accounts_registration_is_idempotent_and_health_lists_state() {
+async fn accounts_registration_is_idempotent_and_health_reports_a_scalar_phase() {
     let dir = common::tmp_dir("smoke-acct");
     let state = test_state(&dir);
     let app = server::build_router(state);
@@ -578,10 +600,26 @@ async fn accounts_registration_is_idempotent_and_health_lists_state() {
     assert_eq!(body["state"], "already_ready");
     assert_eq!(body["status"], "ready");
 
-    // /health (unauthenticated) now carries the per-account state list.
-    let (status, body) = json_body(app.oneshot(request("GET", "/health", None)).await.unwrap()).await;
+    // /health is unauthenticated, so it carries a scalar phase and NOTHING
+    // that identifies the account or says how many exist on this machine.
+    let (status, body) =
+        json_body(app.clone().oneshot(request("GET", "/health", None)).await.unwrap()).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["status"], "ok", "all accounts ready");
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["account"], "ready");
+    assert!(body.get("accounts").is_none(), "/health must not enumerate accounts");
+    assert!(
+        !body.to_string().contains(common::FAKE_WXID),
+        "/health must not leak an account identity"
+    );
+
+    // The detail lives behind the token instead.
+    let resp = app.clone().oneshot(request("GET", "/api/v1/accounts", None)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "detail requires the token");
+    let uri = format!("/api/v1/accounts?access_token={TOKEN}");
+    let (status, body) = json_body(app.oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["success"], true);
     let acc = body["accounts"]
         .as_array()
         .unwrap()
@@ -590,11 +628,97 @@ async fn accounts_registration_is_idempotent_and_health_lists_state() {
         .expect("fake account listed");
     assert_eq!(acc["state"], "ready");
     assert!(acc["message_count"].as_i64().unwrap() >= 1);
+    assert!(!acc["db_storage"].as_str().unwrap().is_empty());
+}
+
+/// Registering a SECOND wxid is rejected with `account_conflict` at HTTP 200,
+/// and the incumbent keeps serving. Deregistering it frees the binding.
+#[tokio::test]
+async fn a_second_account_is_rejected_until_the_first_is_deregistered() {
+    let dir = common::tmp_dir("smoke-conflict");
+    let state = test_state(&dir);
+    let app = server::build_router(state.clone());
+
+    let post_account = |wxid: &str| {
+        let body = serde_json::json!({ "wxid": wxid, "access_token": TOKEN });
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/accounts")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+
+    // The conflict is reported BEFORE the key/path are validated, so a bogus
+    // db_path and no key at all still answer `account_conflict` rather than
+    // telling the caller anything about key validity.
+    let (status, body) =
+        json_body(app.clone().oneshot(post_account("wxid_other")).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "business rejection, not a 4xx");
+    assert_eq!(body["state"], "account_conflict");
+    assert_eq!(body["occupied_by"], common::FAKE_WXID);
+    assert_eq!(body["occupied_status"], "ready");
+    assert_eq!(state.accounts.lock().len(), 1, "the incumbent is untouched");
+
+    // Wrong wxid on the DELETE trips the interlock instead of unbinding.
+    let uri = format!("/api/v1/accounts/wxid_other?access_token={TOKEN}");
+    let (status, body) =
+        json_body(app.clone().oneshot(request("DELETE", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["state"], "wxid_mismatch");
+    assert_eq!(body["occupied_by"], common::FAKE_WXID);
+    assert_eq!(state.accounts.lock().len(), 1);
+
+    // Deregister for real, then the other account can bind.
+    let uri = format!("/api/v1/accounts/{}?access_token={TOKEN}", common::FAKE_WXID);
+    let (status, body) =
+        json_body(app.clone().oneshot(request("DELETE", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["state"], "deregistered");
+    assert_eq!(body["previous_status"], "ready");
+    assert_eq!(body["index_cleared"], true);
+    assert_eq!(body["purged_media"], false, "purge_media defaults to false");
+    assert_eq!(body["purged_dirs"], 0);
+
+    // Unregistered again: scalar health flips back and business endpoints 503.
+    let (_, body) =
+        json_body(app.clone().oneshot(request("GET", "/health", None)).await.unwrap()).await;
+    assert_eq!(body["status"], "starting");
+    assert_eq!(body["account"], "unregistered");
+    let uri = format!("/api/v1/sessions?access_token={TOKEN}");
+    let resp = app.clone().oneshot(request("GET", &uri, None)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    // Idempotent: retrying the deregistration is not an error.
+    let uri = format!("/api/v1/accounts/{}?access_token={TOKEN}", common::FAKE_WXID);
+    let (status, body) =
+        json_body(app.oneshot(request("DELETE", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["state"], "not_registered");
+}
+
+/// Deregistration requires the token, and the POST alias behaves like DELETE.
+#[tokio::test]
+async fn deregistration_is_authenticated_and_has_a_post_alias() {
+    let dir = common::tmp_dir("smoke-dereg-auth");
+    let state = test_state(&dir);
+    let app = server::build_router(state.clone());
+
+    let uri = format!("/api/v1/accounts/{}", common::FAKE_WXID);
+    let resp = app.clone().oneshot(request("DELETE", &uri, None)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(state.accounts.lock().len(), 1, "an unauthenticated call changes nothing");
+
+    let uri = format!("/api/v1/accounts/{}/deregister?access_token={TOKEN}", common::FAKE_WXID);
+    let (status, body) = json_body(app.oneshot(request("POST", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["state"], "deregistered");
+    assert!(state.accounts.lock().is_empty());
 }
 
 /// Direct `register_account` idempotency (the lock-level guard that also
 /// covers the concurrent re-registration window): the second call returns
-/// the same handle with `is_new == false`, and no watcher/rebuild happens.
+/// the live handle as `Existing`, and no watcher/rebuild happens.
 #[test]
 fn register_account_is_idempotent_at_registry_level() {
     let dir = std::env::temp_dir().join(format!("regacct-{}", std::process::id()));
@@ -625,20 +749,25 @@ fn register_account_is_idempotent_at_registry_level() {
     ));
 
     let keymap = weflow_server::keystore::KeyMap::from(key);
-    let (h1, is_new1) =
-        server::register_account(&state, info.clone(), keymap.clone(), None);
-    assert!(is_new1, "first registration creates the handle");
+    let h1 = match server::register_account(&state, info.clone(), keymap.clone(), None) {
+        server::BindOutcome::Bound(h) => h,
+        _ => panic!("first registration must claim the binding"),
+    };
     assert_eq!(h1.status(), weflow_server::server::AccountStatus::Indexing);
 
     // second registration (still indexing) -> same handle, no replacement
-    let (h2, is_new2) = server::register_account(&state, info.clone(), keymap.clone(), None);
-    assert!(!is_new2, "re-registration reuses the live handle");
-    assert!(Arc::ptr_eq(&h1, &h2), "same handle object, never rebuilt");
+    match server::register_account(&state, info.clone(), keymap.clone(), None) {
+        server::BindOutcome::Existing(h2) => {
+            assert!(Arc::ptr_eq(&h1, &h2), "same handle object, never rebuilt")
+        }
+        _ => panic!("re-registration must reuse the live handle"),
+    }
 
     // once ready, re-registration still reuses (no downgrade to indexing)
     h1.set_status(weflow_server::server::AccountStatus::Ready);
-    let (h3, is_new3) = server::register_account(&state, info.clone(), keymap, None);
-    assert!(!is_new3, "ready account stays ready on re-registration");
-    assert!(Arc::ptr_eq(&h1, &h3));
+    match server::register_account(&state, info.clone(), keymap, None) {
+        server::BindOutcome::Existing(h3) => assert!(Arc::ptr_eq(&h1, &h3)),
+        _ => panic!("ready account must stay ready on re-registration"),
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

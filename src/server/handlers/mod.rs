@@ -47,8 +47,13 @@ pub fn extract_params<T: serde::de::DeserializeOwned + serde::Serialize>(
 // from `super::` unchanged.
 pub use crate::server::auth::{authorized, require_auth};
 
-/// Require a registered, ready account; `wxid` from `wxid` param or the
-/// default (first ready) account.
+/// Require a registered, ready account; `wxid` from the `wxid` param, or else
+/// the bound account.
+///
+/// Only one account is ever bound (see `server::bound_account`), so the default
+/// is unambiguous. It deliberately does NOT filter on readiness: resolving the
+/// binding regardless lets the not-ready branch below answer "indexing or
+/// error" instead of the misleading "nothing registered".
 pub fn ready_account(
     state: &Arc<AppState>,
     params: &HashMap<String, String>,
@@ -56,10 +61,7 @@ pub fn ready_account(
     let accounts = state.accounts.lock();
     let handle = match params.get("wxid") {
         Some(w) => accounts.get(w).cloned(),
-        None => {
-            // default: first ready account
-            accounts.values().find(|a| a.status().is_ready()).cloned()
-        }
+        None => crate::server::bound_account(&accounts),
     };
     let Some(handle) = handle else {
         return Err(ApiError::service_unavailable(

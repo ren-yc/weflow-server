@@ -158,14 +158,18 @@ fn build_real_app(export_dir: &std::path::Path) -> Option<(axum::Router, Arc<App
     Some((app, state, inputs))
 }
 
-/// Poll /health until the account is ready; returns its indexed message count.
-/// Indexing a real account is minutes of work on a cold cache, hence the
-/// generous ceiling.
+/// Poll the account detail endpoint until the account is ready; returns its
+/// indexed message count. Indexing a real account is minutes of work on a cold
+/// cache, hence the generous ceiling.
+///
+/// `/health` only carries a scalar phase, so the per-account view (and the
+/// `message_count` this returns) comes from the token-protected endpoint.
 async fn wait_ready(app: &axum::Router, wxid: &str) -> usize {
     let deadline = std::time::Instant::now() + Duration::from_secs(600);
     let mut last = Value::Null;
+    let uri = format!("/api/v1/accounts?access_token={TEST_TOKEN}");
     while std::time::Instant::now() < deadline {
-        let (_, v) = client_get(app.clone(), "/health", &[]).await;
+        let (_, v) = client_get(app.clone(), &uri, &[]).await;
         let account = v["accounts"]
             .as_array()
             .and_then(|a| a.iter().find(|a| a["wxid"] == wxid))
@@ -220,6 +224,17 @@ async fn client_post(
     send(app, build_request("POST", uri, headers, Some(body))).await
 }
 
+/// Downstream-client DELETE (deregistration; token via the query string).
+async fn client_delete(app: axum::Router, uri: &str) -> (StatusCode, Value) {
+    send(app, build_request("DELETE", uri, &[], None)).await
+}
+
+/// DELETE returning the status alone, for the rejection paths whose body is an
+/// error envelope rather than a verdict.
+async fn client_delete_status(app: axum::Router, uri: &str) -> StatusCode {
+    app.oneshot(build_request("DELETE", uri, &[], None)).await.unwrap().status()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a real WeChat 4.x account (./weflow-server.json or WEFLOW_TEST_*)"]
 async fn downstream_client_real_db() {
@@ -239,10 +254,18 @@ async fn downstream_client_real_db() {
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["status"], "starting");
     assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
-    // Zero REGISTERED accounts. The list may still be non-empty: a startup
-    // scan would add `awaiting_key` entries — but this fixture never scans,
-    // so the list is empty here.
+    assert_eq!(v["account"], "unregistered");
+    assert!(v.get("accounts").is_none(), "/health must not enumerate accounts");
     assert!(state.accounts.lock().is_empty(), "no account registered at boot");
+    // The detail endpoint is empty too: a startup scan would add `awaiting_key`
+    // entries, but this fixture never scans.
+    let (s, v) = client_get(
+        app.clone(),
+        &format!("/api/v1/accounts?access_token={TEST_TOKEN}"),
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
     assert_eq!(v["accounts"].as_array().unwrap().len(), 0);
 
     // ---- 0.1 register the account (client-driven startup) ---------------
@@ -272,6 +295,28 @@ async fn downstream_client_real_db() {
         "re-registering must not restart the build: {v}"
     );
 
+    // ---- 0.3 a SECOND wxid is rejected, the incumbent keeps serving ------
+    // Deliberately no key and a nonexistent path: the conflict is decided
+    // before any validation, so this must answer `account_conflict` rather
+    // than a 400 about the key — an occupied server must not double as a key
+    // oracle. The real account must be completely unaffected.
+    let (s, v) = client_post(
+        app.clone(),
+        "/api/v1/accounts",
+        &[],
+        serde_json::json!({
+            "wxid": "wxid_downstream_intruder",
+            "db_path": "Z:/nonexistent",
+            "access_token": token,
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "business rejection, not a 4xx");
+    assert_eq!(v["state"], "account_conflict", "single-account binding enforced: {v}");
+    assert_eq!(v["occupied_by"], wxid);
+    assert!(v.get("status").is_none(), "no state machine value for a rejected wxid");
+    assert_eq!(state.accounts.lock().len(), 1, "the incumbent is untouched");
+
     // ---- 1. health: ready after the background index build --------------
     let indexed = wait_ready(&app, &wxid).await;
     assert!(indexed > 0, "real db must have messages");
@@ -279,6 +324,14 @@ async fn downstream_client_real_db() {
     let (s, v) = client_get(app.clone(), "/health", &[]).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["status"], "ok");
+    assert_eq!(v["account"], "ready");
+    let (s, v) = client_get(
+        app.clone(),
+        &format!("/api/v1/accounts?access_token={TEST_TOKEN}"),
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
     let accounts = v["accounts"].as_array().unwrap();
     assert_eq!(accounts.len(), 1);
     assert_eq!(accounts[0]["wxid"], wxid);
@@ -717,16 +770,14 @@ async fn downstream_client_real_db() {
         .collect();
     for c in v["contacts"].as_array().unwrap() {
         assert!(c["username"].is_string());
-        // displayName always resolves (remark > nickname > username), but the
-        // raw source fields are Option<String> and serialize to null when the
-        // contact row has no value — a real shape difference from qqflow,
-        // where they are always strings.
+        // Every name field is a string. The store keeps them as
+        // `Option<String>` (display_name() needs to tell "no remark" from
+        // "empty remark"), but the JSON boundary flattens absent values to
+        // `""` — same as group-members and chatlab pull, and no longer a
+        // shape difference from qqflow.
         assert!(c["displayName"].is_string());
         for field in ["nickname", "remark", "alias", "avatarUrl"] {
-            assert!(
-                c[field].is_string() || c[field].is_null(),
-                "{field} is a string or null: {c}"
-            );
+            assert!(c[field].is_string(), "{field} is a string, never null: {c}");
         }
         assert!(c["type"].is_string());
     }
@@ -891,7 +942,86 @@ async fn downstream_client_real_db() {
     );
     println!("[CLIENT] SSE connect: 200 text/event-stream");
 
-    // ---- 13. graceful shutdown ends live SSE streams ---------------------
+    // ---- 13. deregistration: interlock, teardown, rebind -----------------
+    // Runs last: it drops the index every check above depends on.
+    // 13a. the wxid in the path is an interlock, not a selector.
+    let (s, v) = client_delete(
+        app.clone(),
+        &format!("/api/v1/accounts/wxid_downstream_intruder?access_token={token}"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["state"], "wxid_mismatch", "a wrong wxid must not unbind: {v}");
+    assert_eq!(v["occupied_by"], wxid);
+    assert_eq!(v["occupied_status"], "ready");
+    assert_eq!(state.accounts.lock().len(), 1, "still bound");
+
+    // 13b. unauthenticated calls change nothing.
+    let s = client_delete_status(app.clone(), &format!("/api/v1/accounts/{wxid}")).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert_eq!(state.accounts.lock().len(), 1);
+
+    // 13c. the real thing. `purge_media` is left at its default (false): the
+    // export dir is this test's temp dir and gets removed wholesale below, and
+    // asserting the default is more valuable than exercising the purge.
+    let (s, v) =
+        client_delete(app.clone(), &format!("/api/v1/accounts/{wxid}?access_token={token}")).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["state"], "deregistered", "{v}");
+    assert_eq!(v["previous_status"], "ready");
+    assert_eq!(v["index_cleared"], true, "a real index was dropped");
+    assert_eq!(v["purged_media"], false);
+    assert_eq!(v["purged_dirs"], 0);
+    assert!(state.accounts.lock().is_empty(), "binding released");
+    println!("[CLIENT] deregistered: index cleared, binding released");
+
+    // 13d. back to the boot shape: scalar health, empty detail, business 503.
+    let (_, v) = client_get(app.clone(), "/health", &[]).await;
+    assert_eq!(v["status"], "starting");
+    assert_eq!(v["account"], "unregistered");
+    let (s, v) = client_get(
+        app.clone(),
+        &format!("/api/v1/accounts?access_token={token}"),
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        v["accounts"].as_array().unwrap().len(),
+        0,
+        "client-registered accounts vanish (this fixture never scans)"
+    );
+    // Authenticated, so this is the readiness gate answering and not auth.
+    let (s, _) =
+        client_get(app.clone(), &format!("/api/v1/sessions?access_token={token}"), &[]).await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "business endpoints gate again");
+
+    // 13e. idempotent, and the binding is genuinely free again.
+    let (s, v) =
+        client_delete(app.clone(), &format!("/api/v1/accounts/{wxid}?access_token={token}")).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["state"], "not_registered");
+    // Replay the intruder registration from 0.3 verbatim. It answered
+    // `account_conflict` while the binding was held; now it gets as far as path
+    // validation and fails there, which is exactly the proof that the gate is
+    // open. Deliberately NOT a re-registration of the real account: that would
+    // spawn a second full index and the runtime blocks on it at teardown.
+    let (s, v) = client_post(
+        app.clone(),
+        "/api/v1/accounts",
+        &[],
+        serde_json::json!({
+            "wxid": "wxid_downstream_intruder",
+            "db_path": "Z:/nonexistent",
+            "access_token": token,
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "past the conflict gate, into validation: {v}");
+    assert!(state.accounts.lock().is_empty(), "a failed registration binds nothing");
+    println!("[CLIENT] binding released: registration reaches validation again");
+
+    // ---- 14. graceful shutdown ends live SSE streams ---------------------
     // The watch flag is what `serve()` flips on Ctrl+C: watcher tasks stop and
     // every subscribed stream closes. Asserting it here keeps the shutdown
     // path covered without a real signal.
