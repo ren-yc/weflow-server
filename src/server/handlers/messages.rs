@@ -145,7 +145,10 @@ pub async fn handler(
                         "content": m.parsed.display,
                         "platformMessageId": m.server_id.to_string(),
                         "replyToMessageId": m.parsed.reply_to,
-                        "mediaPath": "",
+                        // `mediaPath` 有意不输出：安装版契约里有这个键，但本项目
+                        // 无法给出有意义的值（媒体导出由 `media=1` 开关控制，且
+                        // 只在原生形状回填），恒空的键比没有键更容易误导。
+                        // 媒体字节走本接口的 `media` 对象 + /api/v1/media/{id}。
                     })
                 })
                 .collect();

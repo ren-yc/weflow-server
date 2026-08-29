@@ -251,7 +251,11 @@ DELETE 的客户端用。
 `format=chatlab` / `chatlab=1` 时改为输出 ChatLab 信封（消息按时间**正序**）：
 `chatlab` / `meta`（含 `ownerId`）/ `members` / `messages`，外层保留
 `success` / `talker` / `count` / `hasMore`。字段语义同 ChatLab Pull（见下节），并按
-WeFlow（安装版）契约额外带 `messages[].replyToMessageId` 与 `messages[].mediaPath`。
+WeFlow（安装版）契约额外带 `messages[].replyToMessageId`。
+
+安装版契约里的 `messages[].mediaPath` **本项目不输出**（两个 ChatLab 面都不输出）：
+媒体导出由 `media=1` 开关控制且只在原生形状回填，这里给不出有意义的值，恒空的键比
+没有键更容易误导。媒体字节走本接口的 `media` 对象 + `/api/v1/media/{id}`。
 
 两处差异要注意：`accountName`（联系人自己的显示名）与 `groupNickname`（本群群昵称）是
 **两个不同字段**，与原生形状的 `senderName` 语义不同；`messages[].type` 是 ChatLab
@@ -299,9 +303,15 @@ qqflow-server 的 `type` 取值为 `1` 私聊 / `2` 群聊，数值含义与本�
 `since` / `end` 接受秒级时间戳或 `YYYYMMDD`。`end=YYYYMMDD` 是**包含**上界，解析为
 当天 23:59:59（否则传一个日期会得到空结果）；`since=YYYYMMDD` 取当天 0 点。
 
-`members` 仅含**本页**出现过的发送者，已去重。本接口按 WeFlow（安装版）契约**不含**
-`replyToMessageId`；需要引用关系请用 `/api/v1/messages`（原生形状有 `replyToMessageId`
-+ `quote`，`format=chatlab` 形状有 `replyToMessageId`）。
+`members` 仅含**本页**出现过的发送者，已去重。
+
+本接口**不含** `replyToMessageId`。理由是对齐 WeFlow（安装版）Pull 面的实际行为：该字段
+不在 ChatLab 0.0.2 标准里（标准的 `messages[]` 无此项），属于 WeFlow 的私有扩展，安装版
+只在 `format=chatlab` 面给出、Pull 面不给。需要引用关系请用 `/api/v1/messages`（原生形状
+有 `replyToMessageId` + `quote`，`format=chatlab` 形状也有 `replyToMessageId`）。
+
+对照之下 `messages[].groupNickname` **是**标准字段（语义为"发送时的群昵称"），所以两个面
+都输出 —— 尽管安装版文档的 Pull 示例里没有列出它。判据是标准，不是示例的字段清单。
 
 **`accountName` 与 `groupNickname` 是两个不同的名字**：`accountName` 是联系人自己的
 显示名（`remark > nickname > username`），`groupNickname` 是该成员在**本群**的群昵称
@@ -354,6 +364,23 @@ qqflow-server 的 `type` 取值为 `1` 私聊 / `2` 群聊，数值含义与本�
 
 按上述规则循环直到 `hasMore=false`，可完整取回会话全部消息且不重复
 （真库验证：3960 条 / 80 页，无丢无重）。
+
+#### 与标准 / 安装版的已知差异
+
+以下是有意不实现或受数据限制的部分，下游不要依赖这些字段存在：
+
+| 字段 | 标准 | 安装版 | 本项目 | 原因 |
+| ---- | ---- | ------ | ------ | ---- |
+| `meta.groupAvatar` | 可选，要求 Data URL | 字段清单里有 | **不输出** | 库里只有 HTTP 头像 URL，转 Data URL 需要额外下载与转码；给 HTTP URL 会违反标准的 Data URL 约定 |
+| `members[].aliases` | 可选，`string[]` | 未列出 | **不输出** | 原生形状已有 `alias` 单值，需要时从 `/api/v1/contacts` 取 |
+| `members[].avatar` | 可选，要求 Data URL | 真实 URL | HTTP URL 或 `""` | 直接透传联系人行的 `avatar_url`，**不是** Data URL；缺值为空串 |
+| `messages[].mediaPath` | 不在标准 | 字段清单里有 | **两个面都不输出** | 给不出有意义的值（导出受 `media=1` 控制且只回填原生形状）；媒体字节请走 `/api/v1/messages` 的 `media` 对象（`exported: true` 才是可取判据） |
+
+**类型覆盖面与 qqflow-server 不对等。** 本项目能输出
+`0/1/2/3/4/5/7/8/24/25/27/80/81/99`；qqflow-server 只能输出 `0/1/2/3/80/81/99`
+（QQ 侧没有引用关系抽取，也没有名片/位置/链接的细分解析）。同一个逻辑消息在两个平台上
+可能一边是 `25` REPLY、另一边落到 `99` OTHER。下游做类型分支时应把未覆盖码按 `99` 兜底，
+不要假设两个上游的枚举分布一致。
 
 ### GET/POST `/api/v1/contacts` — 联系人
 

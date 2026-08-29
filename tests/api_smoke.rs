@@ -702,6 +702,37 @@ async fn pull_omits_reply_to_message_id_but_messages_keeps_it() {
     }
 }
 
+/// `mediaPath` is in WeFlow's field list but we cannot fill it with anything
+/// meaningful, so neither ChatLab face emits it. A key that is always `""`
+/// advertises support that does not exist; media bytes go through the native
+/// shape's `media` object instead. Pinned so it is not reintroduced by accident.
+#[tokio::test]
+async fn neither_chatlab_face_emits_media_path() {
+    let dir = common::tmp_dir("smoke-mediapath");
+    let state = test_state(&dir);
+    let app = server::build_router(state);
+
+    for uri in [
+        format!(
+            "/api/v1/sessions/{}/messages?limit=5000&access_token={}",
+            common::FAKE_GROUP, TOKEN
+        ),
+        format!(
+            "/api/v1/messages?talker={}&chatlab=1&access_token={}",
+            common::FAKE_GROUP, TOKEN
+        ),
+    ] {
+        let (status, body) =
+            json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        let msgs = body["messages"].as_array().unwrap();
+        assert!(!msgs.is_empty(), "fixture must produce messages: {uri}");
+        for m in msgs {
+            assert!(m.get("mediaPath").is_none(), "{uri}: {m:?}");
+        }
+    }
+}
+
 /// `end=YYYYMMDD` is an INCLUSIVE upper bound, so it must cover the whole day
 /// rather than stopping at midnight. The lower bound keeps start-of-day.
 #[tokio::test]
