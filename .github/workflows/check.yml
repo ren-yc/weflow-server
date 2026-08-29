@@ -15,6 +15,14 @@
 # `-D warnings` safe to gate on: a floating toolchain would let a new stable
 # release introduce a lint and turn every PR red without a code change.
 #
+# The matrix `os:` values are not free-form — they are GitHub's hosted-runner
+# labels, and only labels GitHub publishes will schedule (a typo queues forever
+# rather than failing fast). `-latest` is a moving alias GitHub repoints on its
+# own schedule, so unlike the toolchain the runner image is deliberately NOT
+# pinned here. If an image bump ever breaks the Windows job (MSVC / Strawberry
+# Perl / nasm all come from the image, not from us), pin to a dated label such
+# as `windows-2025` to decouple the fix from the image rollout.
+#
 # Note there is deliberately no `cargo fmt --check` step. This repository has
 # never been rustfmt-clean; adding the check would require a repo-wide reformat
 # first, which is a separate decision (and a separate commit) from this gate.
@@ -28,7 +36,7 @@
 # turns that into a hard error and the Windows test step can never pass.
 # The double build is the cheaper problem, and rust-cache absorbs it after the
 # first successful run caches both fingerprints.
-name: ci
+name: check
 
 on:
   push:
@@ -39,7 +47,7 @@ on:
 # A new push to the same branch makes the in-flight run obsolete. Cancelling it
 # matters more than usual here because the vendored OpenSSL build is expensive.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: check-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
