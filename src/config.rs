@@ -38,13 +38,13 @@ pub fn data_dir() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
         dirs::data_dir()
-            .unwrap_or_else(|| std::env::temp_dir())
+            .unwrap_or_else(std::env::temp_dir)
             .join("weflow-server")
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         dirs::data_dir()
-            .unwrap_or_else(|| std::env::temp_dir())
+            .unwrap_or_else(std::env::temp_dir)
             .join("weflow-server")
     }
 }
