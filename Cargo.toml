@@ -1,6 +1,6 @@
 [package]
 name = "weflow-server"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 description = "Headless HTTP API + SSE service for reading local WeChat 4.x chat records (WCDB/SQLCipher-4 decryption, real-time monitoring)"
 license = "MIT"
