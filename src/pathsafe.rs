@@ -188,10 +188,27 @@ mod tests {
         let inside = root.join("exports").join("sns-all-20260829.json");
         assert!(is_contained(&root.join("exports"), &inside));
 
-        // the traversal the SNS export used to allow
+        // the traversal the SNS export used to allow. Windows-shaped: on Unix
+        // a backslash is an ordinary filename byte, so the same string is one
+        // contained component rather than an escape — the real-escape case
+        // below covers that platform.
+        #[cfg(windows)]
+        {
+            let poc = root
+                .join("exports")
+                .join(r"sns-..\..\..\outside\pwned-20260829.json");
+            assert!(!is_contained(&root.join("exports"), &poc));
+        }
+
+        // a real escape on every platform: the parent resolves (exists) to a
+        // directory outside root, so this exercises canonicalize's actual
+        // resolution instead of the ENOENT fail-closed branch.
+        std::fs::create_dir_all(root.join("outside")).unwrap();
         let escaped = root
             .join("exports")
-            .join(r"sns-..\..\..\outside\pwned-20260829.json");
+            .join("..")
+            .join("outside")
+            .join("pwned-20260829.json");
         assert!(!is_contained(&root.join("exports"), &escaped));
 
         // unresolvable parent -> false, never a lexical fallback
