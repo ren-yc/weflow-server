@@ -45,10 +45,25 @@ fn tmp_dir(tag: &str) -> std::path::PathBuf {
     dir
 }
 
+/// Both tests below boot a server, and every server shares ONE OS
+/// credential-store entry (`TOKEN_SERVICE`/`TOKEN_USER`) for the API token.
+/// `cargo test` runs them in parallel, and on a fresh CI runner the entry does
+/// not exist yet — so each server's `load_token` can hit the NoEntry branch
+/// and mint its own token before the other has stored theirs, leaving
+/// `show_token` to hand this test the OTHER server's token (401 on the SSE
+/// handshake). It passes locally only because a real stored token makes both
+/// servers reuse the same value. Serializing the whole test bodies makes each
+/// server load a settled entry, so reuse keeps read and expectation in sync.
+fn credential_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// The signal must actually stop the server, and it must do so well inside the
 /// grace period when nothing is holding a connection open.
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_signal_stops_the_server() {
+    let _credential = credential_lock().lock().await;
     let dir = tmp_dir("basic");
     let port = free_port();
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -99,6 +114,7 @@ async fn shutdown_signal_stops_the_server() {
 /// long as a client stayed subscribed.
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_ends_a_live_sse_stream_within_the_grace_period() {
+    let _credential = credential_lock().lock().await;
     let dir = tmp_dir("sse");
     let port = free_port();
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -117,7 +133,12 @@ async fn shutdown_ends_a_live_sse_stream_within_the_grace_period() {
     for _ in 0..100 {
         if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
             token = weflow_server::config::show_token().ok().flatten();
-            break;
+            // `load_token` runs before the listener binds, so a successful
+            // connect implies the token is already stored — but keep the
+            // retry loop honest instead of breaking with None.
+            if token.is_some() {
+                break;
+            }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
