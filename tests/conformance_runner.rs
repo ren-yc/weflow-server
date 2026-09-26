@@ -57,12 +57,15 @@ fn harness_router(
                     "harness.append_message" => {
                         let key = keystore::parse_db_key(&key_hex).unwrap();
                         common::append_group_message(&storage, &key.0);
-                        // 追加后立刻同步一次：Watcher 也会发现，但等它会让用例变成
-                        // 计时敏感的。主动同步让「追加 → 可见」成为确定的事。
+                        // 追加后立刻同步一次：Watcher 也会发现，但等它会让用例变成计时敏感的。
+                        //
+                        // **必须是 `poll_once` 而不是 `full_sync`**：广播事件的是前者；用后者
+                        // 索引会更新、库里也有新行，但 SSE 上永远等不到 `message.new` ——
+                        // 表现为「在 N 秒内没有收到事件」（我第一版就是这么写的）。
                         let acct = state.accounts.lock().values().next().cloned();
                         if let Some(a) = acct {
                             let sync = a.sync.clone();
-                            let _ = tokio::task::spawn_blocking(move || sync.lock().full_sync()).await;
+                            let _ = tokio::task::spawn_blocking(move || sync.lock().poll_once()).await;
                         }
                     }
                     "harness.deregister" => {
@@ -149,7 +152,10 @@ async fn conformance_suite_passes() {
     let key = keystore::parse_db_key(common::FAKE_KEY_HEX).unwrap();
     let storage = common::build_wechat_account(&dir, &key.0);
     // 同秒多条：Pull 面按**整秒组**分页，没有这样的行，相关用例就没有可验证的对象。
-    common::append_same_second_burst(&storage, &key.0, 4, 1_700_000_300);
+    // 时间戳要**落在**夹具已有的消息（…100–103）与 harness 追加之用（…200）**之间**：
+    // 用更晚的会让水位线越过 200，于是 harness 追加的那条被判成「旧的」，
+    // `poll_once` 返回 0、SSE 上永远等不到 `message.new`（我第一版就是这么写的）。
+    common::append_same_second_burst(&storage, &key.0, 4, 1_700_000_150);
 
     // 零账号启动，随后走真实注册路径。
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
