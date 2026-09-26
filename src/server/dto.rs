@@ -215,6 +215,49 @@ pub struct Quote {
     pub sender: String,
     pub r#type: i64,
 }
+// ── Pull 面（/api/v1/sessions/{id}/messages）─────────────
+
+/// ChatLab Pull 信封：**顶层就是那五块**，没有 `success` / `count`。
+#[derive(Debug, Serialize)]
+pub struct PullEnvelope {
+    pub chatlab: ChatlabHeader,
+    pub members: Vec<ChatlabMember>,
+    pub messages: Vec<PullMessage>,
+    pub meta: ChatlabMeta,
+    pub sync: PullSync,
+}
+
+/// Pull 面的消息项。
+///
+/// **与混合面（`ChatlabMessage`）不是同一个 struct**：本面的 `replyToMessageId` 在无引用时
+/// **省略该键**，而混合面输出 `null`。这个差异是有意的（混合面的形状已被下游依赖），
+/// 所以两处必须各建 struct —— 复用会把它们的契约绑在一起。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullMessage {
+    pub account_name: String,
+    pub content: String,
+    pub group_nickname: String,
+    pub platform_message_id: String,
+    /// **省略**（不是 `null`）：规范把它列为可选 *string*，`null` 会让信任类型的读者
+    /// 拿到解析不了的值。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<String>,
+    pub sender: String,
+    pub timestamp: i64,
+    pub r#type: i64,
+}
+
+/// 翻页与水位。**两个游标都要原样回传**：`nextSince` 是排他下界、`nextOffset` 只用于
+/// 时间戳没能前进的退化情形，客户端自行推导会跳行。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullSync {
+    pub has_more: bool,
+    pub next_offset: usize,
+    pub next_since: i64,
+    pub watermark: i64,
+}
 // ── 联系人 ────────────────────────────────────────────────
 
 /// `GET|POST /api/v1/contacts`。

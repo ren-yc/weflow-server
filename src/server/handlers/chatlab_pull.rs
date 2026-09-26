@@ -6,8 +6,8 @@ use std::sync::Arc;
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
-use serde_json::json;
 
+use crate::server::dto::{ChatlabHeader, ChatlabMember, ChatlabMeta, PullEnvelope, PullMessage, PullSync};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::handlers::{require_auth, ready_account};
 use crate::server::AppState;
@@ -17,7 +17,7 @@ pub async fn handler(
     Path(id): Path<String>,
     Query(query): Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<PullEnvelope>> {
     require_auth(&state, &query, &headers)?;
     let account = ready_account(&state, &query)?;
     // WeFlow (安装版) documents both as unix seconds; accepting "YYYYMMDD" too
@@ -80,69 +80,69 @@ pub async fn handler(
 
     // members = senders in this page (dedup)
     let mut seen = std::collections::HashSet::new();
-    let members: Vec<serde_json::Value> = page
+    let members: Vec<ChatlabMember> = page
         .iter()
         .filter(|m| !m.sender_username.is_empty() && seen.insert(m.sender_username.as_str()))
         .map(|m| {
             let c = store.contacts.get(&m.sender_username);
-            json!({
-                "platformId": m.sender_username,
-                "accountName": m.sender_name,
-                "groupNickname": store.group_card(chatroom, &m.sender_username),
-                "avatar": c.and_then(|c| c.avatar_url.clone()).unwrap_or_default(),
-            })
-        })
-        .collect();
-
-    let messages: Vec<serde_json::Value> = page
-        .iter()
-        .map(|m| {
-            let mut out = json!({
-                "sender": m.sender_username,
-                "accountName": m.sender_name,
-                "groupNickname": store.group_card(chatroom, &m.sender_username),
-                "timestamp": m.create_time,
-                "type": crate::server::handlers::chatlab_type(m.local_type, &m.parsed),
-                "content": m.parsed.display,
-                "platformMessageId": m.server_id.to_string(),
-            });
-            // 有引用才输出这个键：规范把它列为**可选 string**，给 `null` 会让
-            // 「可选字符串」的读者拿到一个类型不符的值，而省略键正是可选的表达方式。
-            // 混合面按既有契约仍输出 `null`（下游已依赖），不在本次改动范围内。
-            if let Some(reply) = m.parsed.reply_to.as_deref() {
-                out["replyToMessageId"] = serde_json::Value::String(reply.to_string());
+            ChatlabMember {
+                account_name: m.sender_name.clone(),
+                avatar: c.and_then(|c| c.avatar_url.clone()).unwrap_or_default(),
+                group_nickname: store.group_card(chatroom, &m.sender_username),
+                platform_id: m.sender_username.clone(),
             }
-            out
         })
         .collect();
 
-    Ok(Json(json!({
-        "chatlab": { "version": "0.0.2", "exportedAt": chrono::Utc::now().timestamp(), "generator": "weflow-server" },
-        "meta": {
-            "name": store.session_display(&id),
-            "platform": "wechat",
-            "type": if id.ends_with("@chatroom") { "group" } else { "private" },
-            "groupId": id,
-            "ownerId": store.my_wxid,
+    let messages: Vec<PullMessage> = page
+        .iter()
+        .map(|m| PullMessage {
+            account_name: m.sender_name.clone(),
+            content: m.parsed.display.clone(),
+            group_nickname: store.group_card(chatroom, &m.sender_username),
+            platform_message_id: m.server_id.to_string(),
+            // 有引用才输出这个键（`skip_serializing_if`）：规范把它列为**可选 string**，
+            // 给 `null` 会让「可选字符串」的读者拿到一个类型不符的值。
+            // 混合面按既有契约仍输出 `null`（下游已依赖），两处由此各建 struct。
+            reply_to_message_id: m.parsed.reply_to.clone(),
+            sender: m.sender_username.clone(),
+            timestamp: m.create_time,
+            r#type: crate::server::handlers::chatlab_type(m.local_type, &m.parsed),
+        })
+        .collect();
+
+    let body = PullEnvelope {
+        chatlab: ChatlabHeader {
+            exported_at: chrono::Utc::now().timestamp(),
+            generator: "weflow-server".to_string(),
+            version: "0.0.2".to_string(),
         },
-        "members": members,
-        "messages": messages,
-        "sync": {
-            "hasMore": has_more,
-            "nextSince": if has_more { next_since } else { watermark },
+        members,
+        messages,
+        meta: ChatlabMeta {
+            group_id: id.clone(),
+            name: store.session_display(&id),
+            owner_id: store.my_wxid.clone(),
+            platform: "wechat".to_string(),
+            r#type: if id.ends_with("@chatroom") { "group" } else { "private" }.to_string(),
+        },
+        sync: PullSync {
+            has_more,
+            next_since: if has_more { next_since } else { watermark },
             // Both cursors are meant to be echoed back verbatim, so they must
             // not skip the same rows twice. `nextSince` is exclusive and the
             // page ends on a complete ts group, so re-filtering with it drops
             // exactly the rows already served — leaving the next unseen row at
             // offset 0. `nextOffset` therefore only carries weight in the
             // degenerate case where the timestamp could not advance at all.
-            "nextOffset": if has_more && next_since <= since.unwrap_or(i64::MIN) {
+            next_offset: if has_more && next_since <= since.unwrap_or(i64::MIN) {
                 start.saturating_add(page.len())
             } else {
                 0
             },
-            "watermark": watermark,
+            watermark,
         },
-    })))
+    };
+    Ok(Json(body))
 }
 
