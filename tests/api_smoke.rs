@@ -1390,25 +1390,60 @@ mod golden {
         }
     }
 
-    /// 端点清单：名字 → (方法, URI)。名字同时是快照文件名。
-    fn endpoints() -> Vec<(&'static str, &'static str, String)> {
+    /// 端点清单：名字 → (方法, URI, **可选 JSON body**)。名字同时是快照文件名。
+    ///
+    /// **顺序是有意的**：会改状态的那几个（注销）排在最后，否则它们会让后面端点的
+    /// 快照取决于前面跑过什么。
+    fn endpoints() -> Vec<(&'static str, &'static str, String, Option<serde_json::Value>)> {
         let g = common::FAKE_GROUP;
+        let wxid = common::FAKE_WXID;
         vec![
-            ("health", "GET", "/health".to_string()),
-            ("accounts", "GET", format!("/api/v1/accounts?access_token={TOKEN}")),
-            ("sessions-native", "GET", format!("/api/v1/sessions?access_token={TOKEN}")),
-            ("sessions-chatlab", "GET", format!("/api/v1/sessions?chatlab=1&access_token={TOKEN}")),
-            ("messages-native", "GET", format!("/api/v1/messages?talker={g}&limit=50&access_token={TOKEN}")),
-            ("messages-chatlab", "GET", format!("/api/v1/messages?talker={g}&limit=50&chatlab=1&access_token={TOKEN}")),
-            ("messages-media", "GET", format!("/api/v1/messages?talker={g}&limit=50&media=1&access_token={TOKEN}")),
-            ("pull", "GET", format!("/api/v1/sessions/{g}/messages?limit=50&access_token={TOKEN}")),
-            ("contacts", "GET", format!("/api/v1/contacts?access_token={TOKEN}")),
+            ("health", "GET", "/health".to_string(), None),
+            ("accounts", "GET", format!("/api/v1/accounts?access_token={TOKEN}"), None),
+            ("sessions-native", "GET", format!("/api/v1/sessions?access_token={TOKEN}"), None),
+            ("sessions-chatlab", "GET", format!("/api/v1/sessions?chatlab=1&access_token={TOKEN}"), None),
+            ("messages-native", "GET", format!("/api/v1/messages?talker={g}&limit=50&access_token={TOKEN}"), None),
+            ("messages-chatlab", "GET", format!("/api/v1/messages?talker={g}&limit=50&chatlab=1&access_token={TOKEN}"), None),
+            ("messages-media", "GET", format!("/api/v1/messages?talker={g}&limit=50&media=1&access_token={TOKEN}"), None),
+            ("pull", "GET", format!("/api/v1/sessions/{g}/messages?limit=50&access_token={TOKEN}"), None),
+            ("contacts", "GET", format!("/api/v1/contacts?access_token={TOKEN}"), None),
             (
                 "group-members",
                 "GET",
                 format!("/api/v1/group-members?chatroomId={g}&includeMessageCounts=1&access_token={TOKEN}"),
+                None,
             ),
-            ("sync", "POST", format!("/api/v1/sync?access_token={TOKEN}")),
+            ("sync", "POST", format!("/api/v1/sync?access_token={TOKEN}"), None),
+            // ---- 别名路由与错误信封 ----
+            // 错误信封是刚建立的契约，DTO 化最容易在「构造响应的那条路径之外」把它碰坏。
+            ("health-alias", "GET", "/api/v1/health".to_string(), None),
+            ("error-unauthorized", "GET", "/api/v1/sessions".to_string(), None),
+            ("error-unknown-path", "GET", "/api/v1/nope".to_string(), None),
+            ("error-method-not-allowed", "DELETE", "/api/v1/health".to_string(), None),
+            // ---- 账号面的多形状返回（注册/注销各 3 种 state 的键集不同）----
+            (
+                "accounts-detail",
+                "GET",
+                format!("/api/v1/accounts/{wxid}?access_token={TOKEN}"),
+                None,
+            ),
+            (
+                "accounts-conflict",
+                "POST",
+                format!("/api/v1/accounts?access_token={TOKEN}"),
+                Some(serde_json::json!({ "wxid": wxid, "key": common::FAKE_KEY_HEX })),
+            ),
+            // ---- SNS（DTO 豁免，但快照很便宜）----
+            ("sns-timeline", "GET", format!("/api/v1/sns/timeline?access_token={TOKEN}"), None),
+            ("sns-usernames", "GET", format!("/api/v1/sns/usernames?access_token={TOKEN}"), None),
+            ("sns-stats", "GET", format!("/api/v1/sns/stats?access_token={TOKEN}"), None),
+            // ---- 会改状态的排最后 ----
+            (
+                "accounts-deregister",
+                "POST",
+                format!("/api/v1/accounts/{wxid}/deregister?access_token={TOKEN}"),
+                None,
+            ),
         ]
     }
 
@@ -1422,12 +1457,16 @@ mod golden {
         std::fs::create_dir_all(golden_dir()).unwrap();
 
         let mut drifted: Vec<String> = Vec::new();
-        for (name, method, uri) in endpoints() {
-            let resp = app
-                .clone()
-                .oneshot(Request::builder().method(method).uri(&uri).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
+        for (name, method, uri, payload) in endpoints() {
+            let mut req = Request::builder().method(method).uri(&uri);
+            let body = match payload {
+                Some(v) => {
+                    req = req.header("content-type", "application/json");
+                    Body::from(v.to_string())
+                }
+                None => Body::empty(),
+            };
+            let resp = app.clone().oneshot(req.body(body).unwrap()).await.unwrap();
             let status = resp.status();
             let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024).await.unwrap();
             let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_else(|e| {

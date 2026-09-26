@@ -1,0 +1,14 @@
+{
+  "body": {
+    "stats": {
+      "byKind": {},
+      "comments": 0,
+      "feeds": 0,
+      "mediaItems": 0,
+      "posters": 0,
+      "timeRange": null
+    },
+    "success": true
+  },
+  "status": 200
+}

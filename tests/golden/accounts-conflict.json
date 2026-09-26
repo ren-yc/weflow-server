@@ -1,0 +1,10 @@
+{
+  "body": {
+    "db_storage": "<volatile>",
+    "state": "already_ready",
+    "status": "ready",
+    "success": true,
+    "wxid": "wxid_fake000000000000001"
+  },
+  "status": 200
+}

@@ -1,0 +1,8 @@
+{
+  "body": {
+    "code": 405,
+    "message": "方法不允许",
+    "success": false
+  },
+  "status": 405
+}
