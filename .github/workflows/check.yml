@@ -124,6 +124,28 @@ jobs:
           git clone --depth 1 --branch "$pin" https://github.com/ren-yc/flow-contract.git conformance
           python3 scripts/check_common_section.py --conformance conformance
 
+      # ── 四条数据不变量（契约用例里最硬的那几条）──────────────────────────────
+      #
+      # 这一条**是开着的**，因为它现在就是绿的，而且它守的是四条已定的数据不变量：
+      #
+      #   `platformMessageId` 必为 string ／ `timestamp` 必为秒级 number ／
+      #   `type` 永不为 6 ／ `content` 键必须存在（值可为 null）
+      #
+      # 它们此前**只在一整套一致性套件里跑**，而那一步因为下面那条待裁决的断言一直是关着的
+      # —— 于是这四条钉子实际上没在 CI 里拦过任何东西。用 `--case` 只挑 nails 跑，就能让
+      # 「现在就能绿的」先变成门禁，「还没裁决的」继续等。
+      #
+      # 与下面那一步共用同一个 pin：升 pin 时两处一起生效。
+      - name: conformance nails (contract data invariants)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          pin="$(tr -d '[:space:]' < conformance.pin)"
+          git clone --depth 1 --branch "$pin" https://github.com/ren-yc/flow-contract.git conformance-nails
+          FLOW_CONTRACT_DIR="$PWD/conformance-nails" FLOW_CONTRACT_CASE="nails" \
+            bash scripts/build.sh test --locked --test conformance_runner -- --ignored
+
       # ── 一致性套件（契约用例，两个仓库共用一份）────────────────────────────
       #
       # **当前关闭**（见下面的 `if: false`）。原因：套件里有一条断言 404 响应体带 `error` 键，
