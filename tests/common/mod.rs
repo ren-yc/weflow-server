@@ -274,6 +274,36 @@ pub fn append_group_reply(storage: &Path, key: &Key, quoted_server_id: i64) {
     drop(conn);
 }
 
+/// Add `count` messages to the group conversation that share **one**
+/// `create_time` but differ in `sort_seq`.
+///
+/// Why the fixture needs this: the Pull face pages on whole timestamp groups,
+/// so a same-second burst is the case where a naive cursor either splits a group
+/// (skipping or repeating rows) or loops forever. Without such rows in the fake
+/// DB the conformance cases that pin that behaviour have nothing to exercise —
+/// they would pass against an implementation that gets it wrong.
+pub fn append_same_second_burst(storage: &Path, key: &Key, count: i64, create_time: i64) {
+    let path = storage.join("message/message_0.db");
+    let conn = wx_conn(&path, key, false);
+    let group_md5 = md5_hex(FAKE_GROUP);
+    for i in 0..count {
+        conn.execute(
+            &format!(
+                "INSERT INTO \"Msg_{md5}\" (server_id, local_type, create_time, sort_seq, real_sender_id, message_content) \
+                 VALUES (?1, 1, ?2, ?3, 2, ?4)",
+                md5 = group_md5
+            ),
+            rusqlite::params![
+                8_300_000_000_000_000_000i64 + i,
+                create_time,
+                i,
+                format!("同秒消息{i}")
+            ],
+        )
+        .unwrap();
+    }
+    drop(conn);
+}
 pub fn md5_hex(s: &str) -> String {
     use md5::Digest;
     let mut h = md5::Md5::new();
