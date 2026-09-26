@@ -5,8 +5,8 @@ use std::sync::Arc;
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
-use serde_json::json;
 
+use crate::server::dto::{Page, SessionChatlab, SessionNative, SessionsChatlab, SessionsNative};
 use crate::server::error::ApiResult;
 use crate::server::handlers::{extract_params, ready_account, require_auth};
 use crate::server::AppState;
@@ -16,7 +16,7 @@ pub async fn handler(
     Query(query): Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
     body: Option<axum::extract::Json<serde_json::Value>>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<axum::response::Response> {
     let params = extract_params(&query, body);
     require_auth(&state, &params, &headers)?;
     let account = ready_account(&state, &params)?;
@@ -55,45 +55,47 @@ pub async fn handler(
     let has_more = next_offset < total;
 
     if chatlab {
-        let items: Vec<serde_json::Value> = sessions
+        let items: Vec<SessionChatlab> = sessions
             .iter()
-            .map(|s| {
-                json!({
-                    "id": s.username,
-                    "name": store.session_display(&s.username),
-                    "platform": "wechat",
-                    "type": if s.kind == crate::store::SessionKind::Group { "group" } else { "private" },
-                    "messageCount": store.conv_count(&s.username),
-                    "lastMessageAt": s.last_timestamp,
-                })
+            .map(|s| SessionChatlab {
+                id: s.username.clone(),
+                last_message_at: s.last_timestamp,
+                message_count: store.conv_count(&s.username),
+                name: store.session_display(&s.username),
+                platform: "wechat".to_string(),
+                r#type: if s.kind == crate::store::SessionKind::Group {
+                    "group".to_string()
+                } else {
+                    "private".to_string()
+                },
             })
             .collect();
         // `count` 是**本页条数**（与原生面同义）；「还有没有更多」由 page 表达。
         // 排空时 nextCursor 为 null，调用方据此停止翻页。
-        return Ok(Json(json!({
-            "sessions": items,
-            "count": sessions.len(),
-            "page": {
-                "hasMore": has_more,
-                "nextCursor": if has_more { Some(next_offset.to_string()) } else { None },
+        let body = SessionsChatlab {
+            count: sessions.len(),
+            page: Page {
+                has_more,
+                next_cursor: has_more.then(|| next_offset.to_string()),
             },
-        })));
+            sessions: items,
+        };
+        return Ok(axum::response::IntoResponse::into_response(Json(body)));
     }
 
-    let items: Vec<serde_json::Value> = sessions
+    let items: Vec<SessionNative> = sessions
         .iter()
-        .map(|s| {
-            json!({
-                "username": s.username,
-                "displayName": store.session_display(&s.username),
-                "type": s.kind as i64,
-                "sessionType": s.kind.as_str(),
-                "lastTimestamp": s.last_timestamp,
-                "unreadCount": s.unread_count,
-                "messageCount": store.conv_count(&s.username),
-                "summary": s.summary,
-            })
+        .map(|s| SessionNative {
+            display_name: store.session_display(&s.username),
+            last_timestamp: s.last_timestamp,
+            message_count: store.conv_count(&s.username),
+            session_type: s.kind.as_str().to_string(),
+            summary: s.summary.clone(),
+            r#type: s.kind as i64,
+            unread_count: s.unread_count,
+            username: s.username.clone(),
         })
         .collect();
-    Ok(Json(json!({ "success": true, "count": items.len(), "sessions": items })))
+    let body = SessionsNative { count: items.len(), sessions: items, success: true };
+    Ok(axum::response::IntoResponse::into_response(Json(body)))
 }

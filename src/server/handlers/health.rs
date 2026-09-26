@@ -12,15 +12,15 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::Json;
-use serde_json::json;
 
+use crate::server::dto::Health;
 use crate::server::AppState;
 
-pub async fn handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+pub async fn handler(State(state): State<Arc<AppState>>) -> Json<Health> {
     let (account, ready) = state.account_phase();
-    Json(json!({
-        "status": if ready { "ok" } else { "starting" },
-        "version": env!("CARGO_PKG_VERSION"),
-        "account": account,
-    }))
+    Json(Health {
+        account,
+        status: if ready { "ok" } else { "starting" }.to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    })
 }

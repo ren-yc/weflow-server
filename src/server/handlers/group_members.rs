@@ -6,8 +6,8 @@ use std::sync::Arc;
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
-use serde_json::json;
 
+use crate::server::dto::{GroupMember, GroupMembers};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::handlers::{extract_params, ready_account, require_auth};
 use crate::server::AppState;
@@ -17,7 +17,7 @@ pub async fn handler(
     Query(query): Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
     body: Option<axum::extract::Json<serde_json::Value>>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<GroupMembers>> {
     let params = extract_params(&query, body);
     require_auth(&state, &params, &headers)?;
     let account = ready_account(&state, &params)?;
@@ -57,7 +57,7 @@ pub async fn handler(
         }
     }
 
-    let mut members: Vec<serde_json::Value> = member_map
+    let mut members: Vec<GroupMember> = member_map
         .iter()
         .map(|(wxid, count)| {
             let c = store.contacts.get(wxid);
@@ -67,31 +67,28 @@ pub async fn handler(
                 .and_then(|cards| cards.get(wxid))
                 .cloned()
                 .unwrap_or_default();
-            json!({
-                "wxid": wxid,
-                "displayName": store.sender_display(Some(&chatroom), wxid, wxid),
-                "nickname": c.and_then(|c| c.nickname.clone()).unwrap_or_default(),
-                "remark": c.and_then(|c| c.remark.clone()).unwrap_or_default(),
-                "alias": c.and_then(|c| c.alias.clone()).unwrap_or_default(),
-                "groupNickname": card,
-                "avatarUrl": c.and_then(|c| c.avatar_url.clone()).unwrap_or_default(),
-                "isOwner": false,
-                "isFriend": c.map(|c| c.kind == crate::store::SessionKind::Private).unwrap_or(false),
-                "messageCount": if with_counts { *count } else { 0 },
-            })
+            GroupMember {
+                alias: c.and_then(|c| c.alias.clone()).unwrap_or_default(),
+                avatar_url: c.and_then(|c| c.avatar_url.clone()).unwrap_or_default(),
+                display_name: store.sender_display(Some(&chatroom), wxid, wxid),
+                group_nickname: card,
+                is_friend: c.map(|c| c.kind == crate::store::SessionKind::Private).unwrap_or(false),
+                is_owner: false,
+                message_count: if with_counts { *count } else { 0 },
+                nickname: c.and_then(|c| c.nickname.clone()).unwrap_or_default(),
+                remark: c.and_then(|c| c.remark.clone()).unwrap_or_default(),
+                wxid: wxid.clone(),
+            }
         })
         .collect();
-    members.sort_by(|a, b| {
-        let (_, av) = (a["messageCount"].as_i64().unwrap_or(0), a["wxid"].as_str().unwrap_or(""));
-        let (_, bv) = (b["messageCount"].as_i64().unwrap_or(0), b["wxid"].as_str().unwrap_or(""));
-        bv.cmp(av)
-    });
+    // 直接在 struct 上排，不再读 `Value` 的字符串键：键名写错不会报错，只会静默排错。
+    members.sort_by_key(|m| std::cmp::Reverse(m.message_count));
 
-    Ok(Json(json!({
-        "success": true,
-        "chatroomId": chatroom,
-        "count": members.len(),
-        "refreshed": refreshed,
-        "members": members,
-    })))
+    Ok(Json(GroupMembers {
+        chatroom_id: chatroom,
+        count: members.len(),
+        members,
+        refreshed,
+        success: true,
+    }))
 }

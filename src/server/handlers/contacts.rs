@@ -5,8 +5,8 @@ use std::sync::Arc;
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
-use serde_json::json;
 
+use crate::server::dto::{Contact, Contacts};
 use crate::server::error::ApiResult;
 use crate::server::handlers::{extract_params, ready_account, require_auth};
 use crate::server::AppState;
@@ -16,7 +16,7 @@ pub async fn handler(
     Query(query): Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
     body: Option<axum::extract::Json<serde_json::Value>>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<Contacts>> {
     let params = extract_params(&query, body);
     require_auth(&state, &params, &headers)?;
     let account = ready_account(&state, &params)?;
@@ -43,7 +43,7 @@ pub async fn handler(
     });
     let total = contacts.len();
 
-    let items: Vec<serde_json::Value> = contacts
+    let items: Vec<Contact> = contacts
         .iter()
         .skip(offset)
         .take(limit)
@@ -53,26 +53,27 @@ pub async fn handler(
             // `Option<String>` because `display_name()` needs to tell "no
             // remark" apart from "empty remark" for its remark > nickname >
             // username fallback — only the JSON boundary flattens them.
-            json!({
-                "username": c.username,
-                "displayName": c.display_name(),
-                "remark": c.remark.clone().unwrap_or_default(),
-                "nickname": c.nickname.clone().unwrap_or_default(),
-                "alias": c.alias.clone().unwrap_or_default(),
-                "avatarUrl": c.avatar_url.clone().unwrap_or_default(),
-                "type": c.kind.as_str(),
-            })
+            Contact {
+                alias: c.alias.clone().unwrap_or_default(),
+                avatar_url: c.avatar_url.clone().unwrap_or_default(),
+                display_name: c.display_name(),
+                nickname: c.nickname.clone().unwrap_or_default(),
+                remark: c.remark.clone().unwrap_or_default(),
+                r#type: c.kind.as_str().to_string(),
+                username: c.username.clone(),
+            }
         })
         .collect();
     // `total` / `hasMore` let clients page deterministically instead of
     // inferring the end from "page shorter than limit" — which breaks silently
     // if the server-side default limit ever changes.
     let has_more = offset.saturating_add(items.len()) < total;
-    Ok(Json(json!({
-        "success": true,
-        "count": items.len(),
-        "total": total,
-        "hasMore": has_more,
-        "contacts": items,
-    })))
+    let count = items.len();
+    Ok(Json(Contacts {
+        contacts: items,
+        count,
+        has_more,
+        success: true,
+        total,
+    }))
 }
