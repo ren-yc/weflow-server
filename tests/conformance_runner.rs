@@ -30,6 +30,9 @@ use weflow_server::server;
 
 const TOKEN: &str = "conformance-runner-token-0123456789";
 
+/// harness 每次追加消息用一个递增序号，保证 `server_id` 唯一（见 `append_message` 的注释）。
+static SEQ: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
 fn contract_dir() -> Option<std::path::PathBuf> {
     let d = std::env::var("FLOW_CONTRACT_DIR").ok()?;
     let p = std::path::PathBuf::from(d);
@@ -42,6 +45,7 @@ fn contract_dir() -> Option<std::path::PathBuf> {
 /// 不是请求，只能由 harness 提供。放在测试里而不是产品里：产品多一个能改状态的未鉴权端点，
 /// 是给所有人开的门；而这里只有本测试能碰到它（它 merge 在测试自己构造的 Router 上）。
 fn harness_router(
+    account_root: std::path::PathBuf,
     storage: std::path::PathBuf,
     key_hex: String,
     state: Arc<server::AppState>,
@@ -49,14 +53,51 @@ fn harness_router(
     axum::Router::new().route(
         "/__harness",
         axum::routing::post(move |body: String| {
+            let account_root = account_root.clone();
             let storage = storage.clone();
             let state = state.clone();
             async move {
                 let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
                 match v["action"].as_str().unwrap_or("") {
                     "harness.append_message" => {
+                        // **前提恢复**：用例之间必须互相独立，而 `sse-deregister-replay` 会
+                        // 注销账号 —— 它字母序在前，于是本条用例在「没有账号」的环境里跑，
+                        // 追加的消息没人索引，SSE 上永远等不到。这里按需重新注册。
+                        //
+                        // （契约层面「用例必须独立」是一条性质；在 harness 里恢复前提是最小
+                        // 的修法 —— 产品行为没有被绕过，本用例要验的东西照旧。）
+                        let needs_register = state.accounts.lock().is_empty();
+                        if needs_register {
+                            let body = weflow_server::server::handlers::accounts::AccountBody {
+                                wxid: Some(common::FAKE_WXID.to_string()),
+                                key: Some(key_hex.clone()),
+                                db_path: Some(account_root.to_string_lossy().into_owned()),
+                                ..Default::default()
+                            };
+                            let _ = server::start_account(state.clone(), body).await;
+                            for _ in 0..120 {
+                                let ready = state
+                                    .accounts
+                                    .lock()
+                                    .values()
+                                    .next()
+                                    .map(|a| a.status().is_ready())
+                                    .unwrap_or(false);
+                                if ready {
+                                    break;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                            }
+                            println!("[harness] 账号不在（前面的用例注销了它），已重新注册");
+                        }
+                        // **不能用 `common::append_group_message`**：它的 `server_id` 是硬编码的，
+                        // 而本 harness 会被多条用例调用（`cursor-incremental-only-new` 与
+                        // `sse-notification-shape`）—— 两次调用就会产生两条同一个
+                        // `platformMessageId` 的消息，`nails-platform-message-id-string`
+                        // 如实报「页内重复」。判据是对的，错在夹具。
                         let key = keystore::parse_db_key(&key_hex).unwrap();
-                        common::append_group_message(&storage, &key.0);
+                        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        common::append_group_message_unique(&storage, &key.0, seq);
                         // 追加后立刻同步一次：Watcher 也会发现，但等它会让用例变成计时敏感的。
                         //
                         // **必须是 `poll_once` 而不是 `full_sync`**：广播事件的是前者；用后者
@@ -166,6 +207,7 @@ async fn conformance_suite_passes() {
     ));
     // 产品路由 + 测试专用 harness（后者只在这次测试的进程里存在）。
     let app = server::build_router(state.clone()).merge(harness_router(
+        dir.clone(),
         storage.clone(),
         common::FAKE_KEY_HEX.to_string(),
         state.clone(),
@@ -266,9 +308,13 @@ async fn conformance_suite_passes() {
             // 「ChatLab 适配」那一步的内容。置 false 让相关用例**跳过而不是失败**：契约的
             // 能力机制就是为这种「存在性差异」准备的。实现后翻成 true 即启用。
             "pullDiscovery": false,
-            // 同上：Pull 形状的通知面（`GET {baseUrl}/push/messages`，规范要求只带元信息，
-            // 不带消息体）也属那一步。
-            "pullNotification": false,
+            // SSE 通知面**是存在的**且符合契约：`GET {baseUrl}/push/messages` ＋
+            // `message.new`/`message.revoke`/`sync` 三种事件都通过套件断言。
+            //
+            // （先前这里写的是 false，理由是「规范要求通知帧只带元信息、不带消息体，而本仓库
+            // 推完整消息」—— 那是我**读规范读出来的推断**，套件实测推翻：`event_notification_shape`
+            // 对现行载荷是通过的。推断不该当作结论。）
+            "pullNotification": true,
             "roles": false,
             "sse": true,
             "authProbe": true,
@@ -277,6 +323,17 @@ async fn conformance_suite_passes() {
     let fx_path = dir.join("fixture.json");
     std::fs::write(&fx_path, serde_json::to_string_pretty(&fx).unwrap()).unwrap();
 
+    // `FLOW_CONTRACT_CASE` 透传给 runner 的 `--case`：把一条用例单独拉出来查。
+    // 一整套跑下来时，报错本身往往不足以定位问题出在哪条路径上。
+    let case_filter: Vec<String> = std::env::var("FLOW_CONTRACT_CASE")
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
     let out = std::process::Command::new("python")
         .arg(contract.join("runner/run.py"))
         .arg("--base-url")
@@ -287,6 +344,7 @@ async fn conformance_suite_passes() {
         .arg(&fx_path)
         .arg("--token")
         .arg(TOKEN)
+        .args(case_filter.iter().flat_map(|c| ["--case", c.as_str()]))
         .current_dir(&contract)
         .output()
         .expect("python 必须可用（提交路径本来就依赖它）");

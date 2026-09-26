@@ -253,6 +253,33 @@ pub fn append_group_message(storage: &Path, key: &Key) {
 /// WeChat renders a quote as an appmsg whose `<refermsg>` carries the parent's
 /// `<svrid>` — the very value the API exposes as `platformMessageId`, which is
 /// what makes the reference resolvable by a client instead of being a dead id.
+/// `append_group_message`, but with a caller-supplied suffix so repeated calls
+/// produce **distinct** `server_id`s.
+///
+/// The plain helper hardcodes one id, which is fine for a test that appends once.
+/// Anything that appends more than once (a harness several cases share) needs
+/// distinct ids: two rows carrying the same `platformMessageId` are a real
+/// contract violation, and a conformance case is right to flag them.
+pub fn append_group_message_unique(storage: &Path, key: &Key, seq: i64) {
+    let path = storage.join("message/message_0.db");
+    let conn = wx_conn(&path, key, false);
+    let group_md5 = md5_hex(FAKE_GROUP);
+    conn.execute(
+        &format!(
+            "INSERT INTO \"Msg_{md5}\" (server_id, local_type, create_time, sort_seq, real_sender_id, message_content) \
+             VALUES (?1, 1, ?2, 0, 2, ?3)",
+            md5 = group_md5
+        ),
+        rusqlite::params![
+            8_400_000_000_000_000_000i64 + seq,
+            1_700_000_200i64,
+            format!("一致性套件新增-{seq}")
+        ],
+    )
+    .unwrap();
+    drop(conn);
+}
+
 pub fn append_group_reply(storage: &Path, key: &Key, quoted_server_id: i64) {
     let path = storage.join("message/message_0.db");
     let conn = wx_conn(&path, key, false);
