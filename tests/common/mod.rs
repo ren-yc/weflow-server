@@ -248,6 +248,32 @@ pub fn append_group_message(storage: &Path, key: &Key) {
     drop(conn);
 }
 
+/// Add one reply row to the group conversation, quoting `quoted_server_id`.
+///
+/// WeChat renders a quote as an appmsg whose `<refermsg>` carries the parent's
+/// `<svrid>` — the very value the API exposes as `platformMessageId`, which is
+/// what makes the reference resolvable by a client instead of being a dead id.
+pub fn append_group_reply(storage: &Path, key: &Key, quoted_server_id: i64) {
+    let path = storage.join("message/message_0.db");
+    let conn = wx_conn(&path, key, false);
+    let group_md5 = md5_hex(FAKE_GROUP);
+    let content = format!(
+        "<msg><appmsg><type>57</type><title>回复</title>\
+         <refermsg><type>1</type><svrid>{quoted_server_id}</svrid><content>大家好</content></refermsg>\
+         </appmsg></msg>"
+    );
+    conn.execute(
+        &format!(
+            "INSERT INTO \"Msg_{md5}\" (server_id, local_type, create_time, sort_seq, real_sender_id, message_content)
+             VALUES (?1, 49, ?2, 0, 2, ?3)",
+            md5 = group_md5
+        ),
+        rusqlite::params![8_200_000_000_000_000_099i64, 1_700_000_109i64, content],
+    )
+    .unwrap();
+    drop(conn);
+}
+
 pub fn md5_hex(s: &str) -> String {
     use md5::Digest;
     let mut h = md5::Md5::new();

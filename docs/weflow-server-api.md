@@ -37,7 +37,8 @@
 |---|---|
 | `limit` | 条数上限（默认 100，上限 10000） |
 | `offset` | 偏移量（默认 0） |
-| `start` / `end` | 时间边界：Unix 秒，或 `YYYYMMDD`（见 `parse_time_bound`）。无法解析时该条件被忽略，不报 400 |
+| `cursor` | 翻页游标：把上一次响应的 `page.nextCursor` 原样传回。解析不了就退回 `offset`。两者做的是同一件事（本面按偏移翻页），`cursor` 只是免去调用方自己算下一个偏移 |
+| `start` / `end` | 时间边界：Unix 秒，或 `YYYYMMDD`。**`start` 取当天 0 点，`end` 取当天 23:59:59**（上界是包含的，日期形态必须覆盖当天）。无法解析时该条件被忽略，不报 400 |
 | `keyword` | 关键词过滤（小写匹配；sessions/contacts/messages 通用） |
 | `format=chatlab` / `chatlab=1` | 输出 ChatLab 风格形状 |
 | 导出开关 | `media=1`（或 `meiti=1`）开启媒体导出；再按类型 `image=1`/`voice=1`/`video=1`/`emoji=1`（兼容拼音别名 `tupian=1`、`vioce=1`） |
@@ -299,7 +300,7 @@ WeFlow（安装版）契约额外带 `messages[].replyToMessageId`。
 
 ### GET/POST `/api/v1/sessions` — 会话列表
 
-参数：`limit`、`offset`、`keyword`、`format/chatlab`。
+参数：`limit`、`offset`、`cursor`、`keyword`、`format/chatlab`。
 
 ```json
 { "success": true, "count": 315, "sessions": [
@@ -315,8 +316,19 @@ qqflow-server 的 `type` 取值为 `1` 私聊 / `2` 群聊，数值含义与本�
 
 按 `lastTimestamp` 降序、`username` 次键（全序稳定，便于 offset 翻页）。
 `format=chatlab` / `chatlab=1` 时改为输出
-`{ "sessions": [ { "id", "name", "platform", "type", "messageCount", "lastMessageAt" } ] }`，
-其中 `type` 为 `group` / `private` 字符串。
+
+```json
+{ "sessions": [ { "id", "name", "platform", "type", "messageCount", "lastMessageAt" } ],
+  "count": 1,
+  "page": { "hasMore": true, "nextCursor": "1" } }
+```
+
+其中 `type` 为 `group` / `private` 字符串，`count` 是**本页条数**（与原生面同义）。
+
+**`page` 块是必需的。** ChatLab 把「没有 `page` 块」的响应读作「这就是完整一页」，
+所以不带 `page` 的截断会被下游当成全量——默认 `limit` 是 100，普通账号就能撞上，
+表现是「第 101 个会话凭空消失」且不报错。`hasMore` 为假时 `nextCursor` 为 `null`；
+把 `nextCursor` 原样回传即可继续翻页。
 
 ### GET `/api/v1/sessions/{id}/messages` — ChatLab 拉取（消息游标）
 
@@ -341,10 +353,17 @@ qqflow-server 的 `type` 取值为 `1` 私聊 / `2` 群聊，数值含义与本�
 
 `members` 仅含**本页**出现过的发送者，已去重。
 
-本接口**不含** `replyToMessageId`。理由是对齐 WeFlow（安装版）Pull 面的实际行为：该字段
-不在 ChatLab 0.0.2 标准里（标准的 `messages[]` 无此项），属于 WeFlow 的私有扩展，安装版
-只在 `format=chatlab` 面给出、Pull 面不给。需要引用关系请用 `/api/v1/messages`（原生形状
-有 `replyToMessageId` + `quote`，`format=chatlab` 形状也有 `replyToMessageId`）。
+本接口**含** `messages[].replyToMessageId`。该字段在规范的**中文**字段表里，英文表漏了它，
+而两种语言的版本历史都写它属于 0.0.2 新增——判据是版本历史，因此按中文表实现。
+（此前这里写的是「不含」，理由是它不在英文表里；那是**共同误读同一处文档**，不是两处独立证据。）
+
+**有引用才输出；无引用时省略该键**，而不是给 `null`：规范把它列为可选 *string*，
+`null` 会让信任类型的读者拿到一个解析不了的值。引用目标的值等于**同一会话内**某条的
+`platformMessageId`（跨页匹配不作保证）。
+
+`/api/v1/messages` 的既有形状**不受本次改动影响**：它的原生形状与 `format=chatlab` 形状
+仍按原样输出 `null`（下游已依赖该形状，改动属破坏性）。因此同一个字段在两个面上
+「无引用」的表达方式不同——这是**有意的**，不要顺手「统一」，那会破坏 `/api/v1/messages` 的调用方。
 
 对照之下 `messages[].groupNickname` **是**标准字段（语义为"发送时的群昵称"），所以两个面
 都输出 —— 尽管安装版文档的 Pull 示例里没有列出它。判据是标准，不是示例的字段清单。
@@ -460,6 +479,20 @@ qqflow-server 的 `type` 取值为 `1` 私聊 / `2` 群聊，数值含义与本�
 
 成员标识键为 `wxid`（非 `username`）。`messageCount` 仅在 `includeMessageCounts=1`
 时为真实值，否则恒为 `0`；`isOwner` 当前始终 `false`（群主信息不在已解析的表中）。
+
+### GET/POST `/api/v1/media/{id}` — 按文件名直服
+
+`{id}` 是**导出文件名**（形如 `<md5>.<ext>`），也就是消息 `media.fileName` 的值。
+三段式路由要求调用方重复会话与媒体类型；这条只需要一个名字。
+
+- 解析范围仅限导出目录下的 `<会话>/<类型>/` 四类子目录，**不接受任何路径**；
+- 防穿越与三段式共用同一条规则（`pathsafe`），并在 `canonicalize` 后校验仍落在导出目录内；
+- 找不到文件 → 404 统一信封；内容按扩展名推断 MIME；
+- 与三段式一样**无就绪门控**。
+
+> 按文件名解析、而不是维护一张「id → 路径」的登记表：登记表会与磁盘漂移——
+> 导出被清理后登记仍在，于是「出现即保证可取」就变成谎话。文件名由内容摘要派生、
+> 全局唯一，**磁盘本身就是唯一事实源**。
 
 ### GET/POST `/api/v1/media/{talker}/{media_type}/{file}` — 导出媒体直服
 

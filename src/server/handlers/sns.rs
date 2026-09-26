@@ -119,7 +119,8 @@ pub async fn timeline(
     let limit = crate::server::parse_limit(&params, "limit", 50, 500);
     let offset = crate::server::parse_offset(&params, "offset");
     let start = params.get("start").and_then(|s| crate::server::parse_time_bound(s));
-    let end = params.get("end").and_then(|s| crate::server::parse_time_bound(s));
+    // 与混合面同规：上界是**包含**的，日期形态必须覆盖当天末刻。
+    let end = params.get("end").and_then(|s| crate::server::parse_time_bound_end(s));
 
     let store = account.store.read();
     // newest-first already; apply filters then window

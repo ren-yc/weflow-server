@@ -406,6 +406,46 @@ async fn sessions_paginate_by_offset() {
     assert_eq!(body["sessions"][0]["username"], common::FAKE_FRIEND, "POST body offset honoured");
 }
 
+/// The ChatLab session face must say when it truncated.
+///
+/// Regression: it returned `{sessions:[...]}` with no `count` and no `page`.
+/// A reader that treats a missing `page` block as "this is the complete set"
+/// (which is what the pull specification says it means) silently lost every
+/// session past `limit` — and the default limit is small enough to hit in a
+/// normal account.
+#[tokio::test]
+async fn chatlab_sessions_page_reports_more() {
+    let dir = common::tmp_dir("smoke-sessmore");
+    let state = test_state(&dir);
+    let app = server::build_router(state);
+
+    // Two sessions in the fixture; take them one at a time.
+    let uri = format!("/api/v1/sessions?chatlab=1&limit=1&access_token={TOKEN}");
+    let (status, body) = json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"].as_i64().unwrap(), 1, "count is the page size");
+    assert_eq!(body["page"]["hasMore"], true, "a truncated page must say so");
+    let cursor = body["page"]["nextCursor"]
+        .as_str()
+        .expect("truncation must hand back a cursor")
+        .to_string();
+
+    // Following the cursor serves the remainder and then reports completion.
+    let uri = format!("/api/v1/sessions?chatlab=1&limit=1&cursor={cursor}&access_token={TOKEN}");
+    let (status, body) = json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"].as_i64().unwrap(), 1);
+    assert_eq!(body["sessions"][0]["id"], common::FAKE_FRIEND, "cursor resumes after the page");
+    assert_eq!(body["page"]["hasMore"], false);
+    assert!(body["page"]["nextCursor"].is_null(), "no cursor once drained");
+
+    // A page that already covers everything reports completion immediately.
+    let uri = format!("/api/v1/sessions?chatlab=1&limit=50&access_token={TOKEN}");
+    let (_, body) = json_body(app.oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(body["count"].as_i64().unwrap(), 2);
+    assert_eq!(body["page"]["hasMore"], false);
+}
+
 /// Real WeChat 4.x `SessionTable` has no session-name column (probed against
 /// a live account: 315 rows, zero matches for every name alias the index
 /// looks for). The session list must still emit human names by falling back
@@ -674,28 +714,18 @@ fn chatlab_type_table_matches_the_published_enum() {
     assert_eq!(chatlab_type(10000, &notice), 80);
 }
 
-/// WeFlow (安装版) documents `messages[].replyToMessageId` on
-/// `/api/v1/messages?format=chatlab` but NOT in the Pull payload — the Pull
-/// face must not invent it.
+/// The mixed face always carries `messages[].replyToMessageId`, `null` when the
+/// message quotes nothing, and that shape is frozen: downstream already reads
+/// it, so dropping the key would be a breaking change.
+///
+/// The pull face deliberately differs — it **omits** the key when there is no
+/// quote (covered by `pull_carries_reply_to_message_id_only_when_a_quote_exists`).
+/// The two faces disagree on purpose; do not "unify" them.
 #[tokio::test]
-async fn pull_omits_reply_to_message_id_but_messages_keeps_it() {
-    let dir = common::tmp_dir("smoke-pullreply");
+async fn mixed_face_always_carries_reply_to_message_id() {
+    let dir = common::tmp_dir("smoke-mixedreply");
     let state = test_state(&dir);
     let app = server::build_router(state);
-
-    let uri = format!(
-        "/api/v1/sessions/{}/messages?limit=5000&access_token={}",
-        common::FAKE_GROUP, TOKEN
-    );
-    let (status, body) =
-        json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await;
-    assert_eq!(status, StatusCode::OK);
-    for m in body["messages"].as_array().unwrap() {
-        assert!(
-            m.get("replyToMessageId").is_none(),
-            "not in WeFlow's Pull field list: {m:?}"
-        );
-    }
 
     let uri = format!(
         "/api/v1/messages?talker={}&chatlab=1&access_token={}",
@@ -770,6 +800,72 @@ async fn pull_end_date_covers_the_whole_day() {
     );
     let (_, body) = json_body(app.oneshot(request("GET", &uri, None)).await.unwrap()).await;
     assert!(body["messages"].as_array().unwrap().is_empty());
+}
+
+/// The mixed face resolves `end=YYYYMMDD` the same way the pull face does:
+/// through the END of that day.
+///
+/// Regression: this endpoint used to resolve a bare date to the START of the
+/// day, so `end=20231114` silently dropped everything sent on the 14th — while
+/// the pull face of the same service kept it. One parameter, two meanings,
+/// depending on which endpoint you happened to call.
+#[tokio::test]
+async fn messages_end_date_covers_the_whole_day() {
+    let dir = common::tmp_dir("smoke-msgend");
+    let state = test_state(&dir);
+    let app = server::build_router(state);
+
+    // The group fixture sits at 1700000100..1700000103 = 2023-11-14 UTC.
+    let uri = format!(
+        "/api/v1/messages?talker={}&end=20231114&limit=5000&access_token={}",
+        common::FAKE_GROUP, TOKEN
+    );
+    let (status, body) =
+        json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["count"].as_i64().unwrap(),
+        4,
+        "end-of-day bound keeps that day's messages"
+    );
+
+    // The day before still excludes them all, so the bound remains a real filter.
+    let uri = format!(
+        "/api/v1/messages?talker={}&end=20231113&limit=5000&access_token={}",
+        common::FAKE_GROUP, TOKEN
+    );
+    let (_, body) = json_body(app.oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(body["count"].as_i64().unwrap(), 0);
+}
+
+/// `start=YYYYMMDD` keeps start-of-day: it is an inclusive LOWER bound, so
+/// midnight is the correct edge. Only the upper bound needed changing.
+#[tokio::test]
+async fn messages_start_date_starts_at_midnight() {
+    let dir = common::tmp_dir("smoke-msgstart");
+    let state = test_state(&dir);
+    let app = server::build_router(state);
+
+    let uri = format!(
+        "/api/v1/messages?talker={}&start=20231114&end=20231114&limit=5000&access_token={}",
+        common::FAKE_GROUP, TOKEN
+    );
+    let (status, body) =
+        json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["count"].as_i64().unwrap(),
+        4,
+        "a single-day window must contain that day's messages"
+    );
+
+    // Starting the day after drops them all: the lower bound is real too.
+    let uri = format!(
+        "/api/v1/messages?talker={}&start=20231115&limit=5000&access_token={}",
+        common::FAKE_GROUP, TOKEN
+    );
+    let (_, body) = json_body(app.oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(body["count"].as_i64().unwrap(), 0);
 }
 
 /// Paginating with the cursors the server hands back must serve every message
@@ -863,6 +959,105 @@ async fn media_and_sync_endpoints() {
     assert_eq!(status, StatusCode::OK);
     assert!(body["success"] == true);
     assert_eq!(body["newMessages"], 0, "nothing changed -> zero new");
+}
+
+/// `GET /api/v1/media/{id}` serves an exported file by name alone.
+///
+/// The three-segment route makes the caller repeat the conversation and the
+/// media type, which it already got from the message; this one takes only the
+/// file name. Resolution happens under the export root, so a caller can never
+/// name a path outside it.
+/// The pull face carries `replyToMessageId` when — and only when — the message
+/// quotes another one.
+///
+/// It is **omitted** rather than sent as `null`: the standard lists it as an
+/// optional *string*, so a `null` hands a reader that trusts the type a value
+/// it cannot parse. The same endpoint used to carry no such key at all, which
+/// left ChatLab unable to draw a quote even though the parser had the id.
+#[tokio::test]
+async fn pull_carries_reply_to_message_id_only_when_a_quote_exists() {
+    let dir = common::tmp_dir("smoke-quotereply");
+    let quoted = 8_200_000_000_000_000_000i64;
+    let state = test_state_with(&dir, |storage, key| {
+        common::append_group_reply(storage, key, quoted);
+    });
+    let app = server::build_router(state);
+
+    let uri = format!(
+        "/api/v1/sessions/{}/messages?limit=5000&access_token={}",
+        common::FAKE_GROUP, TOKEN
+    );
+    let (status, body) = json_body(app.oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    let msgs = body["messages"].as_array().unwrap();
+    let quoted_id = quoted.to_string();
+
+    // The reference resolves inside the same conversation — a dead id would be
+    // worse than no id, because a client cannot tell the difference.
+    assert!(
+        msgs.iter().any(|m| m["platformMessageId"] == quoted_id.as_str()),
+        "the quoted message is on the page: {msgs:?}"
+    );
+
+    let reply = msgs
+        .iter()
+        .find(|m| m["platformMessageId"] == "8200000000000000099")
+        .expect("the reply row is served");
+    assert_eq!(reply["replyToMessageId"], quoted_id, "the quote points at the parent");
+
+    // A message that quotes nothing omits the key entirely.
+    let plain = msgs
+        .iter()
+        .find(|m| m["platformMessageId"] == "8200000000000000000")
+        .expect("a plain message is served");
+    assert!(
+        plain.get("replyToMessageId").is_none(),
+        "no quote -> key omitted, never null: {plain:?}"
+    );
+}
+
+#[tokio::test]
+async fn media_by_id_serves_an_exported_file() {
+    let dir = common::tmp_dir("smoke-mediaid");
+    let state = test_state(&dir);
+    let app = server::build_router(state);
+
+    // Lay out an exported image exactly the way the exporter writes it.
+    let talker_dir = dir.join("api-media").join(common::FAKE_GROUP).join("images");
+    std::fs::create_dir_all(&talker_dir).unwrap();
+    let name = "aabbccddeeff00112233445566778899.jpg";
+    let bytes: &[u8] = b"\xFF\xD8 fake jpeg \xFF\xD9";
+    std::fs::write(talker_dir.join(name), bytes).unwrap();
+
+    let uri = format!("/api/v1/media/{name}?access_token={TOKEN}");
+    let resp = app.clone().oneshot(request("GET", &uri, None)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get(header::CONTENT_TYPE).unwrap(),
+        "image/jpeg",
+        "content type comes from the file extension"
+    );
+    let served = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    assert_eq!(&served[..], bytes, "the bytes are served verbatim");
+
+    // The three-segment route is untouched by the new one: they differ only in
+    // segment count, and both must keep resolving.
+    let uri = format!("/api/v1/media/{}/images/{name}?access_token={TOKEN}", common::FAKE_GROUP);
+    let resp = app.clone().oneshot(request("GET", &uri, None)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "three-segment route still works");
+
+    // An unknown name is a 404 in the standard envelope, not a bare error key.
+    let uri = format!("/api/v1/media/nosuchfile.jpg?access_token={TOKEN}");
+    let (status, body) = json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["success"], false);
+    assert_eq!(body["code"], 404);
+    assert!(body.get("error").is_none(), "no bare error key: {body}");
+
+    // Traversal is rejected by the same shared rule the other media routes use.
+    let uri = format!("/api/v1/media/..%2F..%2Fetc%2Fpasswd?access_token={TOKEN}");
+    let resp = app.oneshot(request("GET", &uri, None)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

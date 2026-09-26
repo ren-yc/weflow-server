@@ -1,5 +1,6 @@
 //! GET/POST /api/v1/media/{talker}/{media_type}/{file} — serve exported media
 //! from the export directory with traversal protection (WeFlow contract).
+//! GET/POST /api/v1/media/{id} — the same files, addressed by name alone.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -64,6 +65,71 @@ pub async fn handler(
     }
 
     serve_file(&canonical).await
+}
+
+/// 单段路由：`GET|POST /api/v1/media/{id}`。
+///
+/// `{id}` 是**导出文件名**（形如 `<md5>.<ext>`），不是文件系统路径。它由内容摘要
+/// 派生、全局唯一，因此可以在导出根下按名解析——不必维护一张「id → 路径」的登记表，
+/// 而登记表必然会与磁盘漂移：导出被清理之后登记仍在，于是「出现即保证可取」变成谎话。
+///
+/// 三段式路由要求调用方知道会话与媒体类型；这条只需要一个名字。
+pub async fn handler_by_id(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::extract::Json<serde_json::Value>>,
+) -> ApiResult<Response> {
+    let params = extract_params(&query, body);
+    require_auth(&state, &params, &headers)?;
+    // 与三段式共用同一条边界规则（`pathsafe`）：单段路由同样要挡住尾点、尾空格
+    // （Win32 会剥掉）与 `:`（NTFS 数据流）——它们都不带路径分隔符，只滤分隔符会漏。
+    if !crate::pathsafe::safe_segment(&id) {
+        return Err(ApiError::bad_request("path traversal attempt"));
+    }
+
+    let root_dir = state.cfg.media_export_dir.clone();
+    let found = tokio::task::spawn_blocking(move || find_exported(&root_dir, &id))
+        .await
+        .map_err(|e| ApiError::internal(format!("media path resolution task failed: {e}")))?;
+    let found = found.ok_or_else(|| ApiError::not_found("media not found"))?;
+
+    // 与三段式同一套包含性检查。符号链接可以让「文件存在」为真而真实目标在根外，
+    // 所以必须规范化后再比前缀；**取不到根就失败**——拿未规范化的根去比永远不相等，
+    // 那会把检查变成永假。
+    let root_dir = state.cfg.media_export_dir.clone();
+    let (canonical, canonical_root) = tokio::task::spawn_blocking(move || {
+        (found.canonicalize(), root_dir.canonicalize())
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("media path resolution task failed: {e}")))?;
+    let canonical = canonical.map_err(|_| ApiError::not_found("media not found"))?;
+    let canonical_root = canonical_root.map_err(|_| ApiError::not_found("media not found"))?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(ApiError::bad_request("path traversal attempt"));
+    }
+
+    serve_file(&canonical).await
+}
+
+/// 在导出根下按文件名查找。布局是 `<root>/<会话>/<类型>/<文件>`，而 `{id}` 不带会话，
+/// 所以把已知的四个类型目录逐一代入。只做 `is_file` 判断、不递归：
+/// 一次请求最多 (会话数 × 4) 次 stat。
+fn find_exported(root: &Path, name: &str) -> Option<std::path::PathBuf> {
+    for talker in std::fs::read_dir(root).ok()?.flatten() {
+        let dir = talker.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        for media_type in ALLOWED_TYPES {
+            let candidate = dir.join(media_type).join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 async fn serve_file(path: &Path) -> ApiResult<Response> {

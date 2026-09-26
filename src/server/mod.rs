@@ -390,6 +390,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             axum::routing::get(group_members::handler).post(group_members::handler),
         )
         .route(
+            "/api/v1/media/{id}",
+            axum::routing::get(media::handler_by_id).post(media::handler_by_id),
+        )
+        .route(
             "/api/v1/media/{talker}/{media_type}/{file}",
             axum::routing::get(media::handler).post(media::handler),
         )
@@ -473,8 +477,15 @@ pub fn parse_time_bound(s: &str) -> Option<i64> {
 ///
 /// Only for inclusive upper bounds: `end=20250101` reads as "through Jan 1",
 /// and start-of-day would silently return an empty range for that whole day.
-/// Kept separate from `parse_time_bound` so the lower-bound callers — and the
-/// endpoints downstream already consumes — keep their exact current behavior.
+///
+/// **Every inclusive upper bound should use this.** It used to be applied only
+/// to the pull face, which left `end=YYYYMMDD` meaning two different things on
+/// two endpoints of the same service.
+///
+/// This is the one deliberate semantic change in the current release: a bare
+/// date passed as `end` now covers its whole day rather than stopping at
+/// midnight. Callers that relied on the old cut-off should pass an explicit
+/// unix-seconds bound instead.
 pub fn parse_time_bound_end(s: &str) -> Option<i64> {
     parse_time_bound_inner(s, true)
 }

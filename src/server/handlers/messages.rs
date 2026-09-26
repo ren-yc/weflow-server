@@ -86,7 +86,10 @@ pub async fn handler(
         || chatlab;
 
     let start = params.get("start").and_then(|s| crate::server::parse_time_bound(s));
-    let end = params.get("end").and_then(|s| crate::server::parse_time_bound(s));
+    // 上界取**当天末刻**：`end=20250101` 读作「到 1 月 1 日为止」，
+    // 取当天 0 点会让那一整天被静默排除在外（回归见 tests/api_smoke.rs 的
+    // messages_end_date_covers_the_whole_day）。
+    let end = params.get("end").and_then(|s| crate::server::parse_time_bound_end(s));
 
     // Everything that touches the store happens inside this scoped block so
     // the (non-Send) read guard can never be held across the await below.

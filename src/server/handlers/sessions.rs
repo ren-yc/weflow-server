@@ -22,7 +22,12 @@ pub async fn handler(
     let account = ready_account(&state, &params)?;
     let keyword = params.get("keyword").filter(|s| !s.is_empty()).map(|s| s.to_lowercase());
     let limit = crate::server::parse_limit(&params, "limit", 100, 10000);
-    let offset = crate::server::parse_offset(&params, "offset");
+    // `cursor` 是 `page.nextCursor` 的回传入参；解析不了就退回 `offset`，
+    // 与其它参数一样「坏值退化为默认而不是报错」。
+    let offset = params
+        .get("cursor")
+        .and_then(|c| c.parse::<usize>().ok())
+        .unwrap_or_else(|| crate::server::parse_offset(&params, "offset"));
     let chatlab = crate::server::flex_bool(&params, "chatlab")
         || params.get("format").map(|f| f.eq_ignore_ascii_case("chatlab")).unwrap_or(false);
 
@@ -39,8 +44,15 @@ pub async fn handler(
     // BEFORE the page slice, so `offset` walks the filtered, sorted set. An
     // `offset` past the end yields an empty page (count=0, success=true); both
     // the native and chatlab shapes below page from the same slice.
+    //
+    // `total` 是切片前的长度，也就是「匹配到的总数」：ChatLab 把**没有 page 块**
+    // 的响应读作「这就是完整一页」，所以截断必须显式告知，否则第 limit 条之后的
+    // 会话会被静默丢掉。
+    let total = sessions.len();
     let sessions: Vec<&crate::store::Session> =
         sessions.into_iter().skip(offset).take(limit).collect();
+    let next_offset = offset + sessions.len();
+    let has_more = next_offset < total;
 
     if chatlab {
         let items: Vec<serde_json::Value> = sessions
@@ -56,7 +68,16 @@ pub async fn handler(
                 })
             })
             .collect();
-        return Ok(Json(json!({ "sessions": items })));
+        // `count` 是**本页条数**（与原生面同义）；「还有没有更多」由 page 表达。
+        // 排空时 nextCursor 为 null，调用方据此停止翻页。
+        return Ok(Json(json!({
+            "sessions": items,
+            "count": sessions.len(),
+            "page": {
+                "hasMore": has_more,
+                "nextCursor": if has_more { Some(next_offset.to_string()) } else { None },
+            },
+        })));
     }
 
     let items: Vec<serde_json::Value> = sessions

@@ -97,7 +97,7 @@ pub async fn handler(
     let messages: Vec<serde_json::Value> = page
         .iter()
         .map(|m| {
-            json!({
+            let mut out = json!({
                 "sender": m.sender_username,
                 "accountName": m.sender_name,
                 "groupNickname": store.group_card(chatroom, &m.sender_username),
@@ -105,7 +105,14 @@ pub async fn handler(
                 "type": crate::server::handlers::chatlab_type(m.local_type, &m.parsed),
                 "content": m.parsed.display,
                 "platformMessageId": m.server_id.to_string(),
-            })
+            });
+            // 有引用才输出这个键：规范把它列为**可选 string**，给 `null` 会让
+            // 「可选字符串」的读者拿到一个类型不符的值，而省略键正是可选的表达方式。
+            // 混合面按既有契约仍输出 `null`（下游已依赖），不在本次改动范围内。
+            if let Some(reply) = m.parsed.reply_to.as_deref() {
+                out["replyToMessageId"] = serde_json::Value::String(reply.to_string());
+            }
+            out
         })
         .collect();
 
