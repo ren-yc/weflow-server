@@ -1,0 +1,94 @@
+{
+  "body": {
+    "count": 4,
+    "hasMore": false,
+    "media": {
+      "count": 0,
+      "enabled": false,
+      "exportPath": "<volatile>"
+    },
+    "messages": [
+      {
+        "appmsgSubtype": null,
+        "baseType": 1,
+        "content": "群消息",
+        "createTime": 1700000103,
+        "isSend": 0,
+        "localId": 4,
+        "localType": 1,
+        "media": null,
+        "parsedContent": "群消息",
+        "quote": null,
+        "rawContent": "<msg>群消息</msg>",
+        "replyToMessageId": null,
+        "senderName": "李四",
+        "senderUsername": "wxid_member_b",
+        "serverId": "8200000000000000003",
+        "sortSeq": 0
+      },
+      {
+        "appmsgSubtype": null,
+        "baseType": 3,
+        "content": "[图片]",
+        "createTime": 1700000102,
+        "isSend": 0,
+        "localId": 3,
+        "localType": 3,
+        "media": {
+          "fileName": "00112233445566778899aabbccddeeff.jpg",
+          "localPath": "<volatile>",
+          "md5": "00112233445566778899aabbccddeeff",
+          "type": "image",
+          "url": ""
+        },
+        "parsedContent": "",
+        "quote": null,
+        "rawContent": "<msg><img hdLength=\"2\" md5=\"00112233445566778899aabbccddeeff\"/></msg>",
+        "replyToMessageId": null,
+        "senderName": "李四",
+        "senderUsername": "wxid_member_b",
+        "serverId": "8200000000000000002",
+        "sortSeq": 0
+      },
+      {
+        "appmsgSubtype": null,
+        "baseType": 1,
+        "content": "我发的",
+        "createTime": 1700000101,
+        "isSend": 1,
+        "localId": 2,
+        "localType": 1,
+        "media": null,
+        "parsedContent": "我发的",
+        "quote": null,
+        "rawContent": "我发的",
+        "replyToMessageId": null,
+        "senderName": "wxid_fake000000000000001",
+        "senderUsername": "wxid_fake000000000000001",
+        "serverId": "8200000000000000001",
+        "sortSeq": 0
+      },
+      {
+        "appmsgSubtype": null,
+        "baseType": 1,
+        "content": "大家好",
+        "createTime": 1700000100,
+        "isSend": 0,
+        "localId": 1,
+        "localType": 1,
+        "media": null,
+        "parsedContent": "大家好",
+        "quote": null,
+        "rawContent": "大家好",
+        "replyToMessageId": null,
+        "senderName": "李四",
+        "senderUsername": "wxid_member_b",
+        "serverId": "8200000000000000000",
+        "sortSeq": 0
+      }
+    ],
+    "success": true,
+    "talker": "wxid_fake_group@chatroom"
+  },
+  "status": 200
+}

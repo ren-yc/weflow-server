@@ -1,0 +1,35 @@
+{
+  "body": {
+    "chatroomId": "wxid_fake_group@chatroom",
+    "count": 2,
+    "members": [
+      {
+        "alias": "",
+        "avatarUrl": "",
+        "displayName": "李四",
+        "groupNickname": "",
+        "isFriend": true,
+        "isOwner": false,
+        "messageCount": 3,
+        "nickname": "李四",
+        "remark": "",
+        "wxid": "wxid_member_b"
+      },
+      {
+        "alias": "",
+        "avatarUrl": "",
+        "displayName": "wxid_fake000000000000001",
+        "groupNickname": "",
+        "isFriend": false,
+        "isOwner": false,
+        "messageCount": 1,
+        "nickname": "",
+        "remark": "",
+        "wxid": "wxid_fake000000000000001"
+      }
+    ],
+    "refreshed": false,
+    "success": true
+  },
+  "status": 200
+}

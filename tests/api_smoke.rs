@@ -1287,3 +1287,174 @@ fn register_account_is_idempotent_at_registry_level() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+/// Golden 快照：每个 JSON 响应的**逐字节**护栏。
+///
+/// 为什么必须在 DTO 化**之前**有它：DTO 是重写每一个响应构造，而「断言几个字段」的测试
+/// 看不出「某个键消失了」「某个键从 `null` 变成被省略」「某个值的类型变了」——这三类恰恰
+/// 是契约明令禁止的改动。快照把整个响应（**含状态码**）固定下来，差异只能靠**改快照**通过，
+/// 而改快照会在 review 里显形。
+///
+/// 易变值（时间戳、夹具临时路径）**掩盖值而不是删键**：删键会把「形状」一起丢掉，
+/// 而这个测试存在的意义正是守住形状。
+///
+/// 更新方式：设 `UPDATE_GOLDEN=1` 后跑本测试，然后**人工读一遍 diff**——
+/// 自动生成的快照等于没有快照。
+mod golden {
+    use super::*;
+
+    /// 值易变、但键必须留下的字段。按**键名**匹配：同一个字段换个端点仍叫这个名字，
+    /// 所以清单不随端点增长。
+    const VOLATILE_KEYS: &[&str] = &[
+        // 每次请求都不同
+        "exportedAt",
+        // 夹具的临时目录：每次运行都不同
+        "db_storage",
+        "dbPath",
+        "dir",
+        "dataDir",
+        "sessionDb",
+        "exportPath",
+        "localPath",
+        // 由 `chrono::Utc::now()` 派生：每次运行都不同
+        "watermark",
+        "nextSince",
+    ];
+
+    fn golden_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("golden")
+    }
+
+    /// 把易变值换成占位符，并断言夹具路径**没有从别处漏出去**。
+    ///
+    /// 那条断言是这套快照的关键：漏掩盖一个易变字段时，测试会**响亮地失败**，
+    /// 而不是每次运行都产生一份新快照——后者会让人习惯性地点「更新快照」，
+    /// 护栏于是名存实亡。
+    fn mask(value: &mut serde_json::Value, tmp: &str) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, val) in map.iter_mut() {
+                    if VOLATILE_KEYS.contains(&key.as_str()) {
+                        *val = serde_json::Value::String("<volatile>".into());
+                    } else {
+                        mask(val, tmp);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for it in items.iter_mut() {
+                    mask(it, tmp);
+                }
+            }
+            serde_json::Value::String(s) => {
+                assert!(!s.contains(tmp), "夹具路径从掩码外漏出：{s}");
+            }
+            _ => {}
+        }
+    }
+
+    /// **时钟哨兵**：快照里不得出现接近「现在」的时间戳。
+    ///
+    /// 这一条决定这套护栏能不能活下去。夹具的数据停在固定的历史时刻，所以任何接近
+    /// 现在的时间戳都必然来自 `Utc::now()`——它每次运行都会变，于是快照要么天天漂移，
+    /// 要么被人习惯性地点「更新快照」，两种结局都是护栏失效。
+    ///
+    /// 第一版只断言「夹具路径没漏出去」，因此**漏掉了 `sync.watermark`**：路径是对的，
+    /// 时间是变的。按名字枚举易变字段终究会漏，把「时间」这一整类圈出来才兜得住。
+    fn assert_no_wall_clock(value: &serde_json::Value, name: &str) {
+        const ONE_YEAR: i64 = 365 * 86_400;
+        let now = chrono::Utc::now().timestamp();
+        match value {
+            serde_json::Value::Number(n) => {
+                if let Some(v) = n.as_i64()
+                    // **不假设单位**：秒与毫秒各比一次。第一版只写了秒，于是
+                    // `updatedAt: 1790426034799`（毫秒）从哨兵底下漏了过去——
+                    // 一个用来防「时间类字段漏掩码」的哨兵，自己带着单位假设。
+                    && ((v - now).abs() < ONE_YEAR || (v - now * 1000).abs() < ONE_YEAR * 1000)
+                {
+                    panic!(
+                        "{name}：快照里出现接近「现在」的时间戳 {v}（now={now}）——它每次运行都会变，必须加进 VOLATILE_KEYS"
+                    );
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for v in map.values() {
+                    assert_no_wall_clock(v, name);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for v in items {
+                    assert_no_wall_clock(v, name);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 端点清单：名字 → (方法, URI)。名字同时是快照文件名。
+    fn endpoints() -> Vec<(&'static str, &'static str, String)> {
+        let g = common::FAKE_GROUP;
+        vec![
+            ("health", "GET", "/health".to_string()),
+            ("accounts", "GET", format!("/api/v1/accounts?access_token={TOKEN}")),
+            ("sessions-native", "GET", format!("/api/v1/sessions?access_token={TOKEN}")),
+            ("sessions-chatlab", "GET", format!("/api/v1/sessions?chatlab=1&access_token={TOKEN}")),
+            ("messages-native", "GET", format!("/api/v1/messages?talker={g}&limit=50&access_token={TOKEN}")),
+            ("messages-chatlab", "GET", format!("/api/v1/messages?talker={g}&limit=50&chatlab=1&access_token={TOKEN}")),
+            ("messages-media", "GET", format!("/api/v1/messages?talker={g}&limit=50&media=1&access_token={TOKEN}")),
+            ("pull", "GET", format!("/api/v1/sessions/{g}/messages?limit=50&access_token={TOKEN}")),
+            ("contacts", "GET", format!("/api/v1/contacts?access_token={TOKEN}")),
+            (
+                "group-members",
+                "GET",
+                format!("/api/v1/group-members?chatroomId={g}&includeMessageCounts=1&access_token={TOKEN}"),
+            ),
+            ("sync", "POST", format!("/api/v1/sync?access_token={TOKEN}")),
+        ]
+    }
+
+    #[tokio::test]
+    async fn responses_match_their_golden_snapshots() {
+        let dir = common::tmp_dir("golden");
+        let tmp = dir.to_string_lossy().to_string();
+        let state = test_state(&dir);
+        let app = server::build_router(state);
+        let update = std::env::var("UPDATE_GOLDEN").is_ok();
+        std::fs::create_dir_all(golden_dir()).unwrap();
+
+        let mut drifted: Vec<String> = Vec::new();
+        for (name, method, uri) in endpoints() {
+            let resp = app
+                .clone()
+                .oneshot(Request::builder().method(method).uri(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                panic!("{name} 的响应不是 JSON（HTTP {status}）：{e}")
+            });
+            // 状态码也进快照：只钉住 body 会漏掉「同一个 body 换了状态码」。
+            let mut snapshot = serde_json::json!({
+                "status": status.as_u16(),
+                "body": body,
+            });
+            mask(&mut snapshot, &tmp);
+            assert_no_wall_clock(&snapshot, name);
+            let actual = serde_json::to_string_pretty(&snapshot).unwrap() + "\n";
+
+            let path = golden_dir().join(format!("{name}.json"));
+            if update || !path.exists() {
+                std::fs::write(&path, &actual).unwrap();
+                println!("[GOLDEN] 写入 {}", path.display());
+                continue;
+            }
+            if std::fs::read_to_string(&path).unwrap() != actual {
+                drifted.push(name.to_string());
+            }
+        }
+        assert!(
+            drifted.is_empty(),
+            "这些端点的响应与快照不一致：{drifted:?}\n\n若改动是有意的，设 UPDATE_GOLDEN=1 重跑后**人工读一遍 diff**。"
+        );
+    }
+}

@@ -1,0 +1,28 @@
+{
+  "body": {
+    "count": 2,
+    "page": {
+      "hasMore": false,
+      "nextCursor": null
+    },
+    "sessions": [
+      {
+        "id": "wxid_fake_group@chatroom",
+        "lastMessageAt": 1700000015,
+        "messageCount": 4,
+        "name": "项目群",
+        "platform": "wechat",
+        "type": "group"
+      },
+      {
+        "id": "wxid_friend_a",
+        "lastMessageAt": 1700000010,
+        "messageCount": 4,
+        "name": "张三",
+        "platform": "wechat",
+        "type": "private"
+      }
+    ]
+  },
+  "status": 200
+}

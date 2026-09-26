@@ -1,0 +1,14 @@
+{
+  "body": {
+    "accounts": [
+      {
+        "db_storage": "<volatile>",
+        "message_count": 8,
+        "state": "ready",
+        "wxid": "wxid_fake000000000000001"
+      }
+    ],
+    "success": true
+  },
+  "status": 200
+}

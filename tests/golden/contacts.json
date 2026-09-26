@@ -1,0 +1,38 @@
+{
+  "body": {
+    "contacts": [
+      {
+        "alias": "zhangsan001",
+        "avatarUrl": "",
+        "displayName": "客户张三",
+        "nickname": "张三",
+        "remark": "客户张三",
+        "type": "private",
+        "username": "wxid_friend_a"
+      },
+      {
+        "alias": "",
+        "avatarUrl": "",
+        "displayName": "李四",
+        "nickname": "李四",
+        "remark": "",
+        "type": "private",
+        "username": "wxid_member_b"
+      },
+      {
+        "alias": "",
+        "avatarUrl": "",
+        "displayName": "项目群",
+        "nickname": "项目群",
+        "remark": "",
+        "type": "group",
+        "username": "wxid_fake_group@chatroom"
+      }
+    ],
+    "count": 3,
+    "hasMore": false,
+    "success": true,
+    "total": 3
+  },
+  "status": 200
+}

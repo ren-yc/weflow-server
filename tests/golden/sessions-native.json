@@ -1,0 +1,29 @@
+{
+  "body": {
+    "count": 2,
+    "sessions": [
+      {
+        "displayName": "项目群",
+        "lastTimestamp": 1700000015,
+        "messageCount": 4,
+        "sessionType": "group",
+        "summary": "[图片]",
+        "type": 1,
+        "unreadCount": 2,
+        "username": "wxid_fake_group@chatroom"
+      },
+      {
+        "displayName": "张三",
+        "lastTimestamp": 1700000010,
+        "messageCount": 4,
+        "sessionType": "private",
+        "summary": "你好",
+        "type": 0,
+        "unreadCount": 0,
+        "username": "wxid_friend_a"
+      }
+    ],
+    "success": true
+  },
+  "status": 200
+}
