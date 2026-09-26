@@ -12,9 +12,9 @@ use axum::http::{HeaderMap, HeaderName};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
-use serde_json::json;
 use tokio_stream::wrappers::BroadcastStream;
 
+use crate::server::dto::{EventMedia, EventNew, EventRevoke, EventSync, WatermarkEntry, WatermarkValue};
 use crate::server::error::ApiResult;
 use crate::server::handlers::require_auth;
 use crate::server::AppState;
@@ -104,50 +104,63 @@ pub async fn handler(
         .into_response())
 }
 
+/// 把内部事件映射成线上载荷。
+///
+/// 构造 DTO 后 `to_value`：`json!` 走 BTreeMap 会把键排序，`to_value` 同样如此，
+/// 因此**输出逐字节不变**；而类型化构造让「键名写错」变成编译错误 —— SSE 是流式接口，
+/// 没有快照护栏，这一层就是它的护栏。
 fn serialize_event(ev: crate::sync::Event) -> (&'static str, serde_json::Value) {
     match ev {
         crate::sync::Event::New(m) => (
             "message.new",
-            json!({
-                "event": "message.new",
-                "sessionId": m.session_id,
-                "sessionType": m.session_type,
-                "rawid": m.rawid,
-                "sourceName": m.source_name,
-                "groupName": m.group_name,
-                "content": m.content,
-                "timestamp": m.timestamp,
-                // Same shape as the REST `media` object minus `url`/`localPath`:
-                // bytes are fetched via /api/v1/messages?media=1, so this is
-                // metadata only (and never the aes key).
-                "media": m.media.as_ref().map(|md| json!({
-                    "type": md.kind,
-                    "fileName": md.file_name,
-                    "md5": md.md5,
-                })),
-            }),
+            serde_json::to_value(EventNew {
+                content: m.content,
+                event: "message.new".to_string(),
+                group_name: m.group_name,
+                media: m.media.as_ref().map(|md| EventMedia {
+                    file_name: md.file_name.clone(),
+                    md5: md.md5.clone(),
+                    r#type: md.kind.to_string(),
+                }),
+                rawid: m.rawid,
+                session_id: m.session_id,
+                session_type: m.session_type.to_string(),
+                source_name: m.source_name,
+                timestamp: m.timestamp,
+            })
+            .expect("事件载荷必须可序列化"),
         ),
         crate::sync::Event::Revoke(r) => (
             "message.revoke",
-            json!({
-                "event": "message.revoke",
-                "sessionId": r.session_id,
-                "sessionType": r.session_type,
-                "rawid": r.rawid,
-                "sourceName": r.source_name,
-                "groupName": r.group_name,
-                "content": r.content,
-                "timestamp": r.timestamp,
-            }),
+            serde_json::to_value(EventRevoke {
+                content: r.content,
+                event: "message.revoke".to_string(),
+                group_name: r.group_name,
+                rawid: r.rawid,
+                session_id: r.session_id,
+                session_type: r.session_type.to_string(),
+                source_name: r.source_name,
+                timestamp: r.timestamp,
+            })
+            .expect("事件载荷必须可序列化"),
         ),
         crate::sync::Event::Sync(wms) => (
             "sync",
-            json!({
-                "event": "sync",
-                "watermarks": wms.iter().map(|(k, w)| json!({"table": k, "watermark": {
-                    "create_time": w.create_time, "sort_seq": w.sort_seq, "local_id": w.local_id
-                }})).collect::<Vec<_>>(),
-            }),
+            serde_json::to_value(EventSync {
+                event: "sync".to_string(),
+                watermarks: wms
+                    .iter()
+                    .map(|(k, w)| WatermarkEntry {
+                        table: k.to_string(),
+                        watermark: WatermarkValue {
+                            create_time: w.create_time,
+                            local_id: w.local_id,
+                            sort_seq: w.sort_seq,
+                        },
+                    })
+                    .collect(),
+            })
+            .expect("事件载荷必须可序列化"),
         ),
     }
 }

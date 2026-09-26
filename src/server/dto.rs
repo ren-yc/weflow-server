@@ -198,6 +198,75 @@ pub struct ChatlabMessage {
     pub timestamp: i64,
     pub r#type: i64,
 }
+// ── SSE 事件 ──────────────────────────────────────────────
+
+/// `message.new` 事件载荷。
+///
+/// **`media` 是第三种媒体形状**：只有 `type` / `fileName` / `md5` —— 推送里不含任何路径
+/// 与取字节用的键（字节走 REST 的 `media=1` 导出），也**永远不含**解密密钥。推一个取不到
+/// 的地址只会让客户端误以为有东西可拿。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventNew {
+    pub content: String,
+    /// 事件名。帧头（`event:` 行）与载荷里各有一份，**不是**重复：客户端只解析
+    /// `data:` 行时也要能分辨类型。
+    pub event: String,
+    pub group_name: Option<String>,
+    /// 无媒体时为 `null`（键保留）。
+    pub media: Option<EventMedia>,
+    pub rawid: String,
+    pub session_id: String,
+    pub session_type: String,
+    pub source_name: String,
+    pub timestamp: i64,
+}
+
+/// 撤销事件。形状与 `message.new` 相同但**没有 `media`** —— 撤销的是消息，不是媒体。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventRevoke {
+    pub content: String,
+    pub event: String,
+    pub group_name: Option<String>,
+    pub rawid: String,
+    pub session_id: String,
+    pub session_type: String,
+    pub source_name: String,
+    pub timestamp: i64,
+}
+
+/// 推送里的媒体元数据（**第三种形状**：无 `url` / `localPath` / `exported`）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventMedia {
+    pub file_name: String,
+    pub md5: Option<String>,
+    pub r#type: String,
+}
+
+/// 水位基线/重基事件。客户端据此得知「从哪里继续拉」，因此**每次注册与注销都会发**。
+#[derive(Debug, Serialize)]
+pub struct EventSync {
+    pub event: String,
+    pub watermarks: Vec<WatermarkEntry>,
+}
+
+/// 一张表的水位。
+#[derive(Debug, Serialize)]
+pub struct WatermarkEntry {
+    pub table: String,
+    pub watermark: WatermarkValue,
+}
+
+/// 水位三元组。三个都要：`local_id` 单独不够（同一秒可能有多条），`create_time` 单独
+/// 也不够（同秒内要靠 `sort_seq` 与 `local_id` 定序）。
+#[derive(Debug, Serialize)]
+pub struct WatermarkValue {
+    pub create_time: i64,
+    pub local_id: i64,
+    pub sort_seq: i64,
+}
 // ── 消息（原生面）─────────────────────────────────────────
 
 /// `GET|POST /api/v1/messages`（原生面）。
