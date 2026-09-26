@@ -68,6 +68,153 @@ pub struct Page {
     pub next_cursor: Option<String>,
 }
 
+// ── 消息（ChatLab 混合面）─────────────────────────────────
+
+/// `GET|POST /api/v1/messages?chatlab=1`（或 `format=chatlab`）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagesChatlab {
+    pub chatlab: ChatlabHeader,
+    pub count: usize,
+    pub has_more: bool,
+    pub members: Vec<ChatlabMember>,
+    pub messages: Vec<ChatlabMessage>,
+    pub meta: ChatlabMeta,
+    pub success: bool,
+    pub talker: String,
+}
+
+/// ChatLab 信封头。`exportedAt` 是**墙钟**（每次请求都不同）——快照里靠时钟哨兵掩码。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatlabHeader {
+    pub exported_at: i64,
+    pub generator: String,
+    pub version: String,
+}
+
+/// 会话元信息。`type` 是字符串；`ownerId` 未绑定时是空串（现状如此）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatlabMeta {
+    pub group_id: String,
+    pub name: String,
+    pub owner_id: String,
+    pub platform: String,
+    pub r#type: String,
+}
+
+/// 本页出现过的发送者（去重）。`avatar` 无来源时是**空串**。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatlabMember {
+    pub account_name: String,
+    pub avatar: String,
+    pub group_nickname: String,
+    pub platform_id: String,
+}
+
+/// ChatLab 面的消息项。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatlabMessage {
+    pub account_name: String,
+    pub content: String,
+    pub group_nickname: String,
+    pub platform_message_id: String,
+    /// **本面是 `null`**（键始终出现）；**Pull 面是省略该键**。两个面的差异是
+    /// 有意的：本面的形状已被下游依赖，改它会破坏调用方。
+    pub reply_to_message_id: Option<String>,
+    pub sender: String,
+    pub timestamp: i64,
+    pub r#type: i64,
+}
+// ── 消息（原生面）─────────────────────────────────────────
+
+/// `GET|POST /api/v1/messages`（原生面）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagesNative {
+    pub count: usize,
+    pub has_more: bool,
+    pub media: MediaEnvelope,
+    pub messages: Vec<MessageNative>,
+    pub success: bool,
+    pub talker: String,
+}
+
+/// 本页的导出状态。`exportPath` 是绝对路径（客户端用它找导出的文件），
+/// `count` 是**成功导出**的条数 —— 不是本页消息数。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaEnvelope {
+    pub count: usize,
+    pub enabled: bool,
+    pub export_path: String,
+}
+
+/// 原生面的消息项。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageNative {
+    /// `localType` 的高 32 位（appmsg 子类型）；无子类型时为 `null`。
+    pub appmsg_subtype: Option<i64>,
+    /// `localType` 的低位（基础类型）。两个半边分开给，免得每个消费方自己去拆
+    /// `(子类型 << 32) | 基础类型` 这种打包常量。
+    pub base_type: i64,
+    pub content: String,
+    pub create_time: i64,
+    pub is_send: i64,
+    pub local_id: i64,
+    /// 平台原始打包值 —— 下游已依赖它，保留。
+    pub local_type: i64,
+    /// **始终出现**（无媒体时为 `null`），不要加 `skip_serializing_if`。
+    pub media: Option<MediaObject>,
+    pub parsed_content: String,
+    /// **始终出现**（无引用时为 `null`）。
+    pub quote: Option<Quote>,
+    pub raw_content: String,
+    /// **注意与 Pull 面的差异**：这里无引用时是 `null`，Pull 面是**省略该键**。
+    /// 这是有意保留的既有契约（下游已依赖本面的形状），不要「统一」。
+    pub reply_to_message_id: Option<String>,
+    pub sender_name: String,
+    pub sender_username: String,
+    pub server_id: String,
+    pub sort_seq: i64,
+}
+
+/// 消息的媒体元数据 —— **三种形状共用这一个 struct**。
+///
+/// - 未导出：`url` / `localPath` 是**空串**（不是省略），`exported` **不出现**；
+/// - 导出成功：`url` 是相对路径、`localPath` 是绝对路径，且**多出** `exported: true`；
+/// - SSE 版只有 `type` / `fileName` / `md5`（那两个空串字段在那边不序列化）。
+///
+/// `exported` 是**条件键**：不导出时它**不出现**而不是 `false`。客户端靠「键在不在」
+/// 判断字节可不可取 —— 改成恒出现会让这个判据失效。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaObject {
+    /// 字母序使然：`exported` 排在 `fileName` 之前，这样输出与 `json!` 的现状一致。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exported: Option<bool>,
+    /// 文件名**始终是字符串**；`md5` 解析不出时是 **`null`**（现状如此，勿统一成空串）。
+    pub file_name: String,
+    pub local_path: String,
+    pub md5: Option<String>,
+    pub r#type: String,
+    pub url: String,
+}
+
+/// 引用（回复）的渲染信息。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Quote {
+    pub account_name: String,
+    pub content: String,
+    pub platform_message_id: String,
+    pub sender: String,
+    pub r#type: i64,
+}
 // ── 联系人 ────────────────────────────────────────────────
 
 /// `GET|POST /api/v1/contacts`。

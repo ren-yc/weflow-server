@@ -6,8 +6,11 @@ use std::sync::Arc;
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
-use serde_json::json;
 
+use crate::server::dto::{
+    ChatlabHeader, ChatlabMember, ChatlabMessage, ChatlabMeta, MediaEnvelope, MediaObject,
+    MessageNative, MessagesChatlab, MessagesNative, Quote,
+};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::handlers::{extract_params, ready_account, require_auth};
 use crate::server::AppState;
@@ -17,47 +20,47 @@ fn sort_key(m: &crate::store::MessageRecord) -> (i64, i64, i64) {
     (m.create_time, m.sort_seq, m.local_id)
 }
 
-fn message_json(store: &Store, _conv: &str, m: &crate::store::MessageRecord, _include_media: bool) -> serde_json::Value {
-    // media metadata is always present when parseable (WeFlow shape); export
-    // urls/paths are filled in by the export pipeline when media=1
-    let media = m.parsed.media.as_ref().map(|media| {
-        json!({
-            "type": media.kind.as_str(),
-            "fileName": media.file_name,
-            "md5": media.md5,
-            "url": "",
-            "localPath": "",
-        })
+fn message_dto(store: &Store, m: &crate::store::MessageRecord) -> MessageNative {
+    // 媒体元数据只要解析得出就带上（WeFlow 形状）；导出的 url / localPath 由导出
+    // 管线在 `media=1` 时**填进 struct 字段**（类型化赋值 —— 键名写错就编译不过，
+    // 而早先按字符串键 `Value::insert` 时写错只会静默多/少一个键）。
+    let media = m.parsed.media.as_ref().map(|media| MediaObject {
+        exported: None,
+        file_name: media.file_name.clone(),
+        local_path: String::new(),
+        md5: media.md5.clone(),
+        r#type: media.kind.as_str().to_string(),
+        url: String::new(),
     });
     // `localType` stays the raw packed value downstream already pins. WeChat 4.x
     // packs `(appmsgSubtype << 32) | baseType` into it, so the two halves are
     // published as separate read-only fields rather than making every consumer
     // hardcode packed constants like 21474836529 to recognise a link card.
     let (base_type, appmsg_subtype) = crate::parser::split_local_type(m.local_type);
-    json!({
-        "localId": m.local_id,
-        "serverId": m.server_id.to_string(),
-        "localType": m.local_type,
-        "baseType": base_type,
-        "appmsgSubtype": appmsg_subtype,
-        "createTime": m.create_time,
-        "sortSeq": m.sort_seq,
-        "isSend": if m.is_send { 1 } else { 0 },
-        "senderUsername": m.sender_username,
-        "senderName": m.sender_name,
-        "content": m.parsed.display,
-        "rawContent": m.parsed.raw_content,
-        "parsedContent": m.parsed.parsed_text,
-        "replyToMessageId": m.parsed.reply_to,
-        "quote": m.parsed.quote.as_ref().map(|q| json!({
-            "platformMessageId": q.platform_message_id,
-            "sender": q.sender,
-            "accountName": store.session_display(&q.sender),
-            "content": q.content,
-            "type": q.msg_type,
-        })),
-        "media": media,
-    })
+    MessageNative {
+        appmsg_subtype,
+        base_type,
+        content: m.parsed.display.clone(),
+        create_time: m.create_time,
+        is_send: if m.is_send { 1 } else { 0 },
+        local_id: m.local_id,
+        local_type: m.local_type,
+        media,
+        parsed_content: m.parsed.parsed_text.clone(),
+        quote: m.parsed.quote.as_ref().map(|q| Quote {
+            account_name: store.session_display(&q.sender),
+            content: q.content.clone(),
+            platform_message_id: q.platform_message_id.clone(),
+            sender: q.sender.clone(),
+            r#type: q.msg_type,
+        }),
+        raw_content: m.parsed.raw_content.clone(),
+        reply_to_message_id: m.parsed.reply_to.clone(),
+        sender_name: m.sender_name.clone(),
+        sender_username: m.sender_username.clone(),
+        server_id: m.server_id.to_string(),
+        sort_seq: m.sort_seq,
+    }
 }
 
 #[axum::debug_handler]
@@ -66,7 +69,7 @@ pub async fn handler(
     Query(query): Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
     body: Option<axum::extract::Json<serde_json::Value>>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<axum::response::Response> {
     let params = extract_params(&query, body);
     require_auth(&state, &params, &headers)?;
     let account = ready_account(&state, &params)?;
@@ -126,7 +129,7 @@ pub async fn handler(
             // `groupNickname` is the per-chatroom card from `group_cards`, not
             // the contact's 备注 — see the same note in `chatlab_pull`.
             let chatroom = talker.ends_with("@chatroom").then_some(talker.as_str());
-            let members: Vec<serde_json::Value> = {
+            let members: Vec<ChatlabMember> = {
                 let sender_ids: Vec<&str> = asc.iter().map(|m| m.sender_username.as_str()).collect();
                 let mut seen = std::collections::HashSet::new();
                 sender_ids
@@ -134,54 +137,58 @@ pub async fn handler(
                     .filter(|s| !s.is_empty() && seen.insert(*s))
                     .map(|s| {
                         let c = store.contacts.get(s);
-                        json!({
-                            "platformId": s,
-                            "accountName": c.map(|c| c.display_name()).unwrap_or_else(|| s.to_string()),
-                            "groupNickname": store.group_card(chatroom, s),
-                            "avatar": c.and_then(|c| c.avatar_url.clone()).unwrap_or_default(),
-                        })
+                        ChatlabMember {
+                            account_name: c
+                                .map(|c| c.display_name())
+                                .unwrap_or_else(|| s.to_string()),
+                            avatar: c.and_then(|c| c.avatar_url.clone()).unwrap_or_default(),
+                            group_nickname: store.group_card(chatroom, s),
+                            platform_id: s.to_string(),
+                        }
                     })
                     .collect()
             };
-            let msgs: Vec<serde_json::Value> = asc
+            let msgs: Vec<ChatlabMessage> = asc
                 .iter()
                 .map(|m| {
-                    json!({
-                        "sender": m.sender_username,
-                        "accountName": m.sender_name,
-                        "groupNickname": store.group_card(chatroom, &m.sender_username),
-                        "timestamp": m.create_time,
-                        "type": crate::server::handlers::chatlab_type(m.local_type, &m.parsed),
-                        "content": m.parsed.display,
-                        "platformMessageId": m.server_id.to_string(),
-                        "replyToMessageId": m.parsed.reply_to,
+                    ChatlabMessage {
+                        account_name: m.sender_name.clone(),
+                        content: m.parsed.display.clone(),
+                        group_nickname: store.group_card(chatroom, &m.sender_username),
+                        platform_message_id: m.server_id.to_string(),
+                        reply_to_message_id: m.parsed.reply_to.clone(),
+                        sender: m.sender_username.clone(),
+                        timestamp: m.create_time,
+                        r#type: crate::server::handlers::chatlab_type(m.local_type, &m.parsed),
                         // `mediaPath` 有意不输出：安装版契约里有这个键，但本项目
                         // 无法给出有意义的值（媒体导出由 `media=1` 开关控制，且
                         // 只在原生形状回填），恒空的键比没有键更容易误导。
                         // 媒体字节走本接口的 `media` 对象 + /api/v1/media/{id}。
-                    })
+                    }
                 })
                 .collect();
-            return Ok(Json(json!({
-                "success": true,
-                "talker": talker,
-                "count": slice.len(),
-                "hasMore": has_more,
-                "chatlab": {
-                    "version": "0.0.2",
-                    "exportedAt": chrono::Utc::now().timestamp(),
-                    "generator": "weflow-server",
+            let body = MessagesChatlab {
+                chatlab: ChatlabHeader {
+                    exported_at: chrono::Utc::now().timestamp(),
+                    generator: "weflow-server".to_string(),
+                    version: "0.0.2".to_string(),
                 },
-                "meta": {
-                    "name": store.session_display(&talker),
-                    "platform": "wechat",
-                    "type": if talker.ends_with("@chatroom") { "group" } else { "private" },
-                    "groupId": group_id,
-                    "ownerId": owner_id,
+                count: slice.len(),
+                has_more,
+                members,
+                messages: msgs,
+                meta: ChatlabMeta {
+                    group_id,
+                    name: store.session_display(&talker),
+                    owner_id,
+                    platform: "wechat".to_string(),
+                    r#type: if talker.ends_with("@chatroom") { "group" } else { "private" }
+                        .to_string(),
                 },
-                "members": members,
-                "messages": msgs,
-            })));
+                success: true,
+                talker: talker.clone(),
+            };
+            return Ok(axum::response::IntoResponse::into_response(Json(body)));
         }
 
         // ---- media export job collection ----
@@ -236,10 +243,8 @@ pub async fn handler(
             export_jobs.truncate(200); // bound latency per request
         }
 
-        let messages: Vec<serde_json::Value> = slice
-            .iter()
-            .map(|m| message_json(&store, &talker, m, include_media))
-            .collect();
+        let messages: Vec<MessageNative> =
+            slice.iter().map(|m| message_dto(&store, m)).collect();
         (count, has_more, export_jobs, messages)
     };
 
@@ -264,14 +269,13 @@ pub async fn handler(
             .unwrap_or_default()
         };
     let mut exported_count = 0usize;
-    for mv in &mut messages {
-        let Some(local_id) = mv.get("localId").and_then(|v| v.as_i64()) else {
+    for msg in &mut messages {
+        let Some(res) = exported.get(&msg.local_id) else {
             continue;
         };
-        let Some(res) = exported.get(&local_id) else {
-            continue;
-        };
-        if let Some(media) = mv.get_mut("media").and_then(|m| m.as_object_mut()) {
+        // **类型化赋值**：字段名写错编译不过。此前是往 `Value` 里按字符串键 insert，
+        // 键名写错不会报错，只会静默改变响应。
+        if let Some(media) = msg.media.as_mut() {
             // **相对路径，且不带 token**：token 一旦进了响应体，就会出现在客户端日志、
             // 中间缓存与任何转发里，而它本来是只走请求头的凭据。相对路径还有一个好处——
             // 调用方按自己的基址拼接，反代或换端口都不会下发一个失效的绝对地址。
@@ -279,23 +283,24 @@ pub async fn handler(
                 Some(u) => u.clone(),
                 None => crate::media::export::exported_media_url(&talker, res.kind_dir, &res.file_name),
             };
-            media.insert("url".into(), json!(url));
-            media.insert(
-                "localPath".into(),
-                json!(res.local_path.to_string_lossy().to_string()),
-            );
-            media.insert("exported".into(), json!(true));
+            media.url = url;
+            media.local_path = res.local_path.to_string_lossy().to_string();
+            media.exported = Some(true);
             exported_count += 1;
         }
     }
 
-    Ok(Json(json!({
-        "success": true,
-        "talker": talker,
-        "count": count,
-        "hasMore": has_more,
-        "media": { "enabled": include_media, "exportPath": state.cfg.media_export_dir.display().to_string(), "count": exported_count },
-        "messages": messages,
+    Ok(axum::response::IntoResponse::into_response(Json(MessagesNative {
+        count,
+        has_more,
+        media: MediaEnvelope {
+            count: exported_count,
+            enabled: include_media,
+            export_path: state.cfg.media_export_dir.display().to_string(),
+        },
+        messages,
+        success: true,
+        talker,
     })))
 }
 
