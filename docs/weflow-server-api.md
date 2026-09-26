@@ -269,14 +269,18 @@ localType = (appmsgSubtype << 32) | baseType
 
 ```json
 "media": { "type": "image", "fileName": "...", "md5": "...",
-           "url": "http://127.0.0.1:5033/api/v1/media/<talker>/images/<file>?access_token=...",
+           "url": "/api/v1/media/<talker>/images/<file>",
            "localPath": "C:\\...\\api-media\\...", "exported": true }
 ```
 
 - **`exported: true` 是导出成功的唯一判据**；仅有 `media` 对象不代表字节可取（缺 md5 的
   非语音消息会被跳过），顶层 `media.count` 等于本页 `exported` 为真的条数。
 - 单次请求最多导出 200 项以限制延迟，超出部分保持未导出，可缩小 `limit` 分批取。
-- `url` 由 `--base-url`（未指定时按 `host:port` 推导）拼出；表情可能返回 CDN 绝对地址。
+- `url` 是**根相对路径**（形如 `/api/v1/media/<talker>/images/<file>`），且**不含 token**：
+  token 是只走请求头的凭据，拼进响应体会被复制到客户端日志与任何中间缓存；相对路径也
+  免掉了把服务基址烤进响应——反代或换端口之后下发的地址仍然有效。调用方按自己的基址
+  拼接，取字节时带上鉴权头。
+- 例外：表情（`emoji`）可能返回 CDN 绝对地址，那是第三方地址，不是本服务的路径。
 - `type`→目录映射：`images / voices / videos / emojis`。
 
 > 文件附件（`file`）暂不参与导出：与 WeFlow 官方契约一致，媒体导出仅覆盖图片/语音/视频/表情四类。

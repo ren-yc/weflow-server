@@ -601,7 +601,10 @@ async fn downstream_client_real_db() {
     for m in &exported {
         let media = &m["media"];
         let url = media["url"].as_str().unwrap();
-        assert!(url.starts_with("http"), "url is absolute: {url}");
+        // 根相对路径，且**不含凭据**：token 一旦进了响应体就会出现在客户端日志、
+        // 中间缓存与任何转发里；把服务基址烤进 URL 则会让反代/换端口后的地址失效。
+        assert!(url.starts_with("/api/v1/media/"), "url is a root-relative path: {url}");
+        assert!(!url.contains("access_token"), "no credential in a response body: {url}");
         let local_path = media["localPath"].as_str().unwrap();
         assert!(local_path.starts_with(export_path), "localPath under exportPath");
         assert!(
@@ -635,19 +638,17 @@ async fn downstream_client_real_db() {
     // ---- 4c. the exported URL is actually fetchable ---------------------
     if let Some(m) = exported.first() {
         let url = m["media"]["url"].as_str().unwrap();
-        // The handler mints an absolute URL; oneshot needs the path+query.
-        if let Some(path) = url.split_once("://").and_then(|(_, rest)| rest.split_once('/')) {
-            let uri = format!("/{}", path.1);
-            let resp = app
-                .clone()
-                .oneshot(Request::builder().method("GET").uri(&uri).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), StatusCode::OK, "exported media URL is fetchable");
-            let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024 * 1024).await.unwrap();
-            assert!(!bytes.is_empty(), "media response has a body");
-            println!("[CLIENT] media fetch: {} bytes", bytes.len());
-        }
+        // 返回值本身就是 oneshot 需要的路径（根相对、无查询串）。
+        let uri = url.to_string();
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().method("GET").uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "exported media URL is fetchable");
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024 * 1024).await.unwrap();
+        assert!(!bytes.is_empty(), "media response has a body");
+        println!("[CLIENT] media fetch: {} bytes", bytes.len());
     }
 
     // ---- 5. messages: POST body transport + YYYYMMDD bounds -------------

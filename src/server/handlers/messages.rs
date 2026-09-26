@@ -263,7 +263,6 @@ pub async fn handler(
             .await
             .unwrap_or_default()
         };
-    let base_url = &state.base_url;
     let mut exported_count = 0usize;
     for mv in &mut messages {
         let Some(local_id) = mv.get("localId").and_then(|v| v.as_i64()) else {
@@ -273,12 +272,12 @@ pub async fn handler(
             continue;
         };
         if let Some(media) = mv.get_mut("media").and_then(|m| m.as_object_mut()) {
+            // **相对路径，且不带 token**：token 一旦进了响应体，就会出现在客户端日志、
+            // 中间缓存与任何转发里，而它本来是只走请求头的凭据。相对路径还有一个好处——
+            // 调用方按自己的基址拼接，反代或换端口都不会下发一个失效的绝对地址。
             let url = match &res.external_url {
                 Some(u) => u.clone(),
-                None => format!(
-                    "{base_url}/api/v1/media/{}/{}/{}?access_token={}",
-                    talker, res.kind_dir, res.file_name, state.token
-                ),
+                None => crate::media::export::exported_media_url(&talker, res.kind_dir, &res.file_name),
             };
             media.insert("url".into(), json!(url));
             media.insert(

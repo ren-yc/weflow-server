@@ -20,6 +20,15 @@ use rusqlite::Connection;
 use crate::keystore::ImageKeys;
 use crate::media::{self, DatFormat};
 
+/// 导出媒体的对外地址：**根相对路径，且不含任何凭据**。
+///
+/// 两条都是刻意的：① token 是只走请求头的凭据，一旦拼进 URL 就会被复制到响应体、
+/// 客户端日志与任何中间缓存里；② 相对路径不把服务基址烤进响应，反代或换端口之后
+/// 下发的地址仍然有效。调用方按自己的基址拼接。
+pub fn exported_media_url(talker: &str, kind_dir: &str, file_name: &str) -> String {
+    format!("/api/v1/media/{talker}/{kind_dir}/{file_name}")
+}
+
 /// Filesystem-only context (no database handles).
 pub struct ExportCtx {
     /// The live account directory (`…/<wxid>`) that holds `msg/`.
@@ -485,4 +494,26 @@ pub fn export_batch_live(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 导出媒体的对外地址必须是**根相对路径、且不含任何凭据**。
+    ///
+    /// 回归点：它曾经是绝对 URL 且在末尾拼 `?access_token=`——于是 token 被复制进
+    /// 响应体、客户端日志与任何中间缓存；绝对形态还会把服务基址烤进响应，反代或换
+    /// 端口之后下发的是失效地址。
+    ///
+    /// 放在单元测试而不是 HTTP 测试里，是因为假夹具造不出可导出的媒体源文件，
+    /// 而真实账号的下游测试是 `#[ignore]` 的——两者都不会给这条回归兜底。
+    #[test]
+    fn exported_media_url_is_relative_and_carries_no_credential() {
+        let url = exported_media_url("talker", "images", "abc.jpg");
+        assert_eq!(url, "/api/v1/media/talker/images/abc.jpg");
+        assert!(url.starts_with('/'), "根相对路径以 / 开头");
+        assert!(!url.starts_with("http"), "不得把服务基址烤进响应");
+        assert!(!url.contains("access_token"), "响应体里不得出现凭据");
+    }
 }

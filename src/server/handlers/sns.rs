@@ -19,20 +19,13 @@ use crate::server::error::{ApiError, ApiResult};
 use crate::server::handlers::{extract_params, ready_account, require_auth};
 use crate::server::AppState;
 
-fn sns_feed_json(
-    store: &crate::store::Store,
-    f: &crate::store::SnsFeed,
-    base_url: &str,
-    token: &str,
-) -> serde_json::Value {
+fn sns_feed_json(store: &crate::store::Store, f: &crate::store::SnsFeed) -> serde_json::Value {
     let proxy = |raw: &str| {
         if raw.is_empty() {
             serde_json::Value::String(String::new())
         } else {
-            serde_json::Value::String(format!(
-                "{base_url}/api/v1/sns/media/proxy?url={}&access_token={token}",
-                urlencoding_encode(raw)
-            ))
+            // 与媒体导出同规：**相对路径、不带 token**（理由见 messages.rs 的同一处）。
+            serde_json::Value::String(format!("/api/v1/sns/media/proxy?url={}", urlencoding_encode(raw)))
         }
     };
     let media: Vec<serde_json::Value> = f
@@ -134,12 +127,11 @@ pub async fn timeline(
         })
         .collect();
     let total = matched.len();
-    let base_url = &state.base_url;
     let slice: Vec<serde_json::Value> = matched
         .iter()
         .skip(offset)
         .take(limit)
-        .map(|f| sns_feed_json(&store, f, base_url, &state.token))
+        .map(|f| sns_feed_json(&store, f))
         .collect();
     Ok(Json(json!({
         "success": true,
@@ -325,10 +317,9 @@ pub async fn export(
         .collect();
     let feed_owned: Vec<crate::store::SnsFeed> = feeds.iter().map(|f| (*f).clone()).collect();
     let stats = aggregate(&feed_owned);
-    let base_url = &state.base_url;
     let entries: Vec<serde_json::Value> = feeds
         .iter()
-        .map(|f| sns_feed_json(&store, f, base_url, &state.token))
+        .map(|f| sns_feed_json(&store, f))
         .collect();
     let display = store.session_display(username.as_deref().unwrap_or(""));
     drop(store);
