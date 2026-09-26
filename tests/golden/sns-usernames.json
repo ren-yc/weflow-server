@@ -4,5 +4,10 @@
     "success": true,
     "usernames": []
   },
+  "keys": [
+    "count",
+    "success",
+    "usernames"
+  ],
   "status": 200
 }

@@ -31,5 +31,32 @@
     "refreshed": false,
     "success": true
   },
+  "keys": [
+    "chatroomId",
+    "count",
+    "members",
+    "alias",
+    "avatarUrl",
+    "displayName",
+    "groupNickname",
+    "isFriend",
+    "isOwner",
+    "messageCount",
+    "nickname",
+    "remark",
+    "wxid",
+    "alias",
+    "avatarUrl",
+    "displayName",
+    "groupNickname",
+    "isFriend",
+    "isOwner",
+    "messageCount",
+    "nickname",
+    "remark",
+    "wxid",
+    "refreshed",
+    "success"
+  ],
   "status": 200
 }

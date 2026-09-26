@@ -4,5 +4,10 @@
     "message": "方法不允许",
     "success": false
   },
+  "keys": [
+    "success",
+    "code",
+    "message"
+  ],
   "status": 405
 }

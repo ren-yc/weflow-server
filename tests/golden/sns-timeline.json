@@ -6,5 +6,12 @@
     "timeline": [],
     "total": 0
   },
+  "keys": [
+    "count",
+    "hasMore",
+    "success",
+    "timeline",
+    "total"
+  ],
   "status": 200
 }

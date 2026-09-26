@@ -4,5 +4,10 @@
     "message": "invalid or missing access token",
     "success": false
   },
+  "keys": [
+    "success",
+    "code",
+    "message"
+  ],
   "status": 401
 }

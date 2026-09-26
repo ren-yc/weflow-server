@@ -8,5 +8,14 @@
     "success": true,
     "wxid": "wxid_fake000000000000001"
   },
+  "keys": [
+    "index_cleared",
+    "previous_status",
+    "purged_dirs",
+    "purged_media",
+    "state",
+    "success",
+    "wxid"
+  ],
   "status": 200
 }

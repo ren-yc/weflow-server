@@ -10,5 +10,13 @@
     ],
     "success": true
   },
+  "keys": [
+    "accounts",
+    "db_storage",
+    "message_count",
+    "state",
+    "wxid",
+    "success"
+  ],
   "status": 200
 }

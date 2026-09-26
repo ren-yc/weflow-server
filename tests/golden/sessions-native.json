@@ -25,5 +25,26 @@
     ],
     "success": true
   },
+  "keys": [
+    "count",
+    "sessions",
+    "displayName",
+    "lastTimestamp",
+    "messageCount",
+    "sessionType",
+    "summary",
+    "type",
+    "unreadCount",
+    "username",
+    "displayName",
+    "lastTimestamp",
+    "messageCount",
+    "sessionType",
+    "summary",
+    "type",
+    "unreadCount",
+    "username",
+    "success"
+  ],
   "status": 200
 }

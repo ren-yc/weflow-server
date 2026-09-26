@@ -4,5 +4,10 @@
     "revokeMessages": 0,
     "success": true
   },
+  "keys": [
+    "newMessages",
+    "revokeMessages",
+    "success"
+  ],
   "status": 200
 }

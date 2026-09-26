@@ -10,5 +10,15 @@
     },
     "success": true
   },
+  "keys": [
+    "stats",
+    "byKind",
+    "comments",
+    "feeds",
+    "mediaItems",
+    "posters",
+    "timeRange",
+    "success"
+  ],
   "status": 200
 }

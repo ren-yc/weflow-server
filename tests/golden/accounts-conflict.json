@@ -6,5 +6,12 @@
     "success": true,
     "wxid": "wxid_fake000000000000001"
   },
+  "keys": [
+    "db_storage",
+    "state",
+    "status",
+    "success",
+    "wxid"
+  ],
   "status": 200
 }

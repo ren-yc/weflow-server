@@ -4,5 +4,10 @@
     "status": "ok",
     "version": "0.5.1"
   },
+  "keys": [
+    "account",
+    "status",
+    "version"
+  ],
   "status": 200
 }
