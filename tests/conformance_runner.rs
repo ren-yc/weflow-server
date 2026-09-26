@@ -256,6 +256,13 @@ async fn conformance_suite_passes() {
             "mediaById": true,
             "sns": true,
             "memberCount": true,
+            // Pull 形状的发现面（规范里的 `GET {baseUrl}/sessions`）尚未实现 —— 它是计划里
+            // 「ChatLab 适配」那一步的内容。置 false 让相关用例**跳过而不是失败**：契约的
+            // 能力机制就是为这种「存在性差异」准备的。实现后翻成 true 即启用。
+            "pullDiscovery": false,
+            // 同上：Pull 形状的通知面（`GET {baseUrl}/push/messages`，规范要求只带元信息，
+            // 不带消息体）也属那一步。
+            "pullNotification": false,
             "roles": false,
             "sse": true,
             "authProbe": true,
