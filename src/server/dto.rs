@@ -22,6 +22,75 @@
 
 use serde::Serialize;
 
+// ── 账号面 ────────────────────────────────────────────────
+
+/// `GET /api/v1/accounts`。
+#[derive(Debug, Serialize)]
+pub struct AccountsList {
+    pub accounts: Vec<crate::server::AccountStateView>,
+    pub success: bool,
+}
+
+/// 注册**被别的账号占位**（互锁）。
+///
+/// `occupied_by` / `occupied_status` 让客户端能记下「实际在跟哪个账号说话」，
+/// 而不是无限重试。
+#[derive(Debug, Serialize)]
+pub struct AccountConflict {
+    pub occupied_by: String,
+    pub occupied_status: crate::server::AccountStatus,
+    pub state: String,
+    pub success: bool,
+    pub wxid: String,
+}
+
+/// 注册**受理**（或幂等命中：`already_ready` / `in_progress`）。
+#[derive(Debug, Serialize)]
+pub struct AccountRegistered {
+    pub db_storage: String,
+    pub state: String,
+    pub status: crate::server::AccountStatus,
+    pub success: bool,
+    pub wxid: String,
+}
+
+/// 注销：**已成功解绑**。
+#[derive(Debug, Serialize)]
+pub struct AccountDeregistered {
+    pub index_cleared: bool,
+    /// 请求落地时账号处于什么状态 —— 让客户端能区分「我取消了正在进行的构建」与
+    /// 「我解绑了一个就绪账号」。
+    pub previous_status: crate::server::AccountStatus,
+    pub purged_dirs: usize,
+    pub purged_media: bool,
+    pub state: String,
+    pub success: bool,
+    pub wxid: String,
+}
+
+/// 注销：**本来就没有绑定**。刻意幂等 —— 重试已完成的注销得到 200 而不是错误。
+#[derive(Debug, Serialize)]
+pub struct AccountNotRegistered {
+    pub index_cleared: bool,
+    pub purged_dirs: usize,
+    pub purged_media: bool,
+    pub state: String,
+    pub success: bool,
+    pub wxid: String,
+}
+
+/// 注销：**互锁触发**（另一个账号持有绑定，它被完全不动地留下）。
+#[derive(Debug, Serialize)]
+pub struct AccountWxidMismatch {
+    pub index_cleared: bool,
+    pub occupied_by: String,
+    pub occupied_status: crate::server::AccountStatus,
+    pub purged_dirs: usize,
+    pub purged_media: bool,
+    pub state: String,
+    pub success: bool,
+    pub wxid: String,
+}
 // ── 会话列表 ──────────────────────────────────────────────
 
 /// `GET /api/v1/sessions`（原生面）。

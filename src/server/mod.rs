@@ -351,14 +351,18 @@ impl AppState {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AccountStateView {
-    pub wxid: String,
-    pub state: AccountStatus,
-    pub message_count: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    /// 字段**按字母序声明**：此前它是经 `json!` 序列化的（走 BTreeMap，键被排序），
+    /// 而 struct 用声明序 —— 「换 DTO」时若不同步调整，响应里的键序会变。
+    /// 快照的 `keys` 字段就是为抓这个而加的。
+    ///
     /// Resolved live-database directory (`<account>/db_storage`). Same field
     /// name the registration endpoint echoes back.
     pub db_storage: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub message_count: usize,
+    pub state: AccountStatus,
+    pub wxid: String,
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {

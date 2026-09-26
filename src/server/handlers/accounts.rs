@@ -28,8 +28,11 @@ use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
 use serde::Deserialize;
-use serde_json::json;
 
+use crate::server::dto::{
+    AccountConflict, AccountDeregistered, AccountNotRegistered, AccountRegistered,
+    AccountWxidMismatch, AccountsList,
+};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::{bound_account, AccountStatus, AppState, BindOutcome, DeregisterOutcome};
 
@@ -111,13 +114,16 @@ pub async fn handler(
             // incumbent so the client can log which account it is actually
             // talking to instead of retrying forever.
             Some(b) if b.info.wxid != wxid_in => {
-                return Ok(Json(json!({
-                    "success": true,
-                    "wxid": wxid_in,
-                    "state": "account_conflict",
-                    "occupied_by": b.info.wxid,
-                    "occupied_status": b.status(),
-                })));
+                return Ok(Json(
+                    serde_json::to_value(AccountConflict {
+                        occupied_by: b.info.wxid.clone(),
+                        occupied_status: b.status(),
+                        state: "account_conflict".to_string(),
+                        success: true,
+                        wxid: wxid_in,
+                    })
+                    .map_err(|e| ApiError::internal(format!("序列化失败: {e}")))?,
+                ));
             }
             other => other,
         }
@@ -130,13 +136,16 @@ pub async fn handler(
             _ => None,
         };
         if let Some(state_name) = idempotent {
-            return Ok(Json(json!({
-                "success": true,
-                "wxid": h.info.wxid,
-                "state": state_name,
-                "status": h.status(),
-                "db_storage": h.info.db_storage.to_string_lossy(),
-            })));
+            return Ok(Json(
+                serde_json::to_value(AccountRegistered {
+                    db_storage: h.info.db_storage.to_string_lossy().into_owned(),
+                    state: state_name.to_string(),
+                    status: h.status(),
+                    success: true,
+                    wxid: h.info.wxid.clone(),
+                })
+                .map_err(|e| ApiError::internal(format!("序列化失败: {e}")))?,
+            ));
         }
     }
 
@@ -153,23 +162,29 @@ pub async fn handler(
         ),
         // Lost the race against a concurrent registration.
         BindOutcome::Occupied { wxid, status } => {
-            return Ok(Json(json!({
-                "success": true,
-                "wxid": wxid_in,
-                "state": "account_conflict",
-                "occupied_by": wxid,
-                "occupied_status": status,
-            })));
+            return Ok(Json(
+                serde_json::to_value(AccountConflict {
+                    occupied_by: wxid,
+                    occupied_status: status,
+                    state: "account_conflict".to_string(),
+                    success: true,
+                    wxid: wxid_in,
+                })
+                .map_err(|e| ApiError::internal(format!("序列化失败: {e}")))?,
+            ));
         }
     };
 
-    Ok(Json(json!({
-        "success": true,
-        "wxid": handle.info.wxid,
-        "state": state_name,
-        "status": handle.status(),
-        "db_storage": handle.info.db_storage.to_string_lossy(),
-    })))
+    Ok(Json(
+        serde_json::to_value(AccountRegistered {
+            db_storage: handle.info.db_storage.to_string_lossy().into_owned(),
+            state: state_name.to_string(),
+            status: handle.status(),
+            success: true,
+            wxid: handle.info.wxid.clone(),
+        })
+        .map_err(|e| ApiError::internal(format!("序列化失败: {e}")))?,
+    ))
 }
 
 /// `GET /api/v1/accounts` — the account detail `/health` no longer carries.
@@ -186,7 +201,11 @@ pub async fn list_handler(
 ) -> ApiResult<Json<serde_json::Value>> {
     // GET carries no body, so the token arrives via headers or query string.
     require_auth(&state, &query, &headers)?;
-    Ok(Json(json!({ "success": true, "accounts": state.account_views() })))
+    Ok(Json(serde_json::to_value(AccountsList {
+        accounts: state.account_views(),
+        success: true,
+    })
+    .map_err(|e| ApiError::internal(format!("序列化失败: {e}")))?))
 }
 
 /// `DELETE /api/v1/accounts/{wxid}` (and the `POST .../{wxid}/deregister`
@@ -232,40 +251,46 @@ pub async fn delete_handler(
     .map_err(|e| ApiError::internal(format!("注销任务失败: {e}")))?;
 
     let out = match outcome {
-        DeregisterOutcome::Deregistered { previous, index_cleared, purged_dirs } => json!({
-            "success": true,
-            "wxid": wxid,
-            "state": "deregistered",
-            // The state the account was in when the request landed — lets a
-            // client tell "I cancelled an in-flight build" from "I unbound a
-            // ready account".
-            "previous_status": previous,
-            "index_cleared": index_cleared,
-            "purged_media": purge_media,
-            "purged_dirs": purged_dirs,
-        }),
+        // 三个分支的**键集不同**，所以各建 struct、各自序列化 —— 而不是三份 `json!`
+        // 字面量（键名写错只有运行时才知道）。
+        DeregisterOutcome::Deregistered { previous, index_cleared, purged_dirs } => {
+            serde_json::to_value(AccountDeregistered {
+                index_cleared,
+                previous_status: previous,
+                purged_dirs,
+                purged_media: purge_media,
+                state: "deregistered".to_string(),
+                success: true,
+                wxid: wxid.clone(),
+            })
+            .map_err(|e| ApiError::internal(format!("序列化失败: {e}")))?
+        }
         // Nothing was bound. Idempotent by design: a client that retries a
         // deregistration it already completed gets a 200, not an error.
-        DeregisterOutcome::NotRegistered => json!({
-            "success": true,
-            "wxid": wxid,
-            "state": "not_registered",
-            "index_cleared": false,
-            "purged_media": false,
-            "purged_dirs": 0,
-        }),
+        DeregisterOutcome::NotRegistered => serde_json::to_value(AccountNotRegistered {
+            index_cleared: false,
+            purged_dirs: 0,
+            purged_media: false,
+            state: "not_registered".to_string(),
+            success: true,
+            wxid: wxid.clone(),
+        })
+        .map_err(|e| ApiError::internal(format!("序列化失败: {e}")))?,
         // The interlock tripped: a different account holds the binding and is
         // left completely untouched.
-        DeregisterOutcome::WxidMismatch { occupied_by, status } => json!({
-            "success": true,
-            "wxid": wxid,
-            "state": "wxid_mismatch",
-            "occupied_by": occupied_by,
-            "occupied_status": status,
-            "index_cleared": false,
-            "purged_media": false,
-            "purged_dirs": 0,
-        }),
+        DeregisterOutcome::WxidMismatch { occupied_by, status } => {
+            serde_json::to_value(AccountWxidMismatch {
+                index_cleared: false,
+                occupied_by,
+                occupied_status: status,
+                purged_dirs: 0,
+                purged_media: false,
+                state: "wxid_mismatch".to_string(),
+                success: true,
+                wxid,
+            })
+            .map_err(|e| ApiError::internal(format!("序列化失败: {e}")))?
+        }
     };
     Ok(Json(out))
 }

@@ -1464,7 +1464,9 @@ mod golden {
             ("error-method-not-allowed", "DELETE", "/api/v1/health".to_string(), None),
             // ---- 账号面的多形状返回（注册/注销各 3 种 state 的键集不同）----
             (
-                "accounts-detail",
+                // 这条路由**只接受 DELETE**，GET 会得到 405 —— 名字如实反映它记的是什么。
+                // （账号面的「详情」形状其实在列表里：`AccountStateView`。）
+                "error-accounts-wrong-method",
                 "GET",
                 format!("/api/v1/accounts/{wxid}?access_token={TOKEN}"),
                 None,
