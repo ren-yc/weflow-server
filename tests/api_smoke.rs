@@ -1060,6 +1060,35 @@ async fn media_by_id_serves_an_exported_file() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+/// Every error the client can provoke carries the same envelope — including the
+/// two axum answers by default with an empty body.
+///
+/// A client that always parses `{success,code,message}` would otherwise have to
+/// special-case exactly those two, and a missed exception surfaces as
+/// "the server returned something unparseable" rather than as the real cause.
+#[tokio::test]
+async fn boundary_errors_carry_the_envelope() {
+    let dir = common::tmp_dir("smoke-boundary");
+    let state = test_state(&dir);
+    let app = server::build_router(state);
+
+    // Unknown path: 404, not an empty body.
+    let (status, body) =
+        json_body(app.clone().oneshot(request("GET", "/api/v1/nope", None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["success"], false);
+    assert_eq!(body["code"], 404);
+    assert!(body["message"].is_string(), "envelope carries a message: {body}");
+
+    // Known path, wrong method: 405 — a different status, the same shape.
+    let (status, body) =
+        json_body(app.oneshot(request("DELETE", "/api/v1/health", None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(body["success"], false);
+    assert_eq!(body["code"], 405);
+    assert!(body["message"].is_string(), "envelope carries a message: {body}");
+}
+
 #[tokio::test]
 async fn accounts_registration_is_idempotent_and_health_reports_a_scalar_phase() {
     let dir = common::tmp_dir("smoke-acct");

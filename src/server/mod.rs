@@ -420,7 +420,29 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/v1/sns/media/proxy",
             axum::routing::get(sns::media_proxy).post(sns::media_proxy),
         )
+        .fallback(unknown_path)
+        .method_not_allowed_fallback(method_not_allowed)
         .with_state(state)
+}
+
+/// 未知路径：与其它错误走**同一个**信封。
+///
+/// axum 默认给的是**空响应体**的 404，于是「所有错误都带 `{success,code,message}`」这条
+/// 契约恰好留下一个例外——而例外正是客户端最容易漏掉的那一个：它只能靠状态码特判，
+/// 一旦漏了就会把「路径打错了」显示成「服务器返回了无法解析的东西」。
+async fn unknown_path() -> crate::server::error::ApiError {
+    crate::server::error::ApiError::not_found("未知路径")
+}
+
+/// 路径存在但方法不对：同样是客户端要解析的错误，同样走信封。
+///
+/// 状态码用 405 而不是 404——「这个方法不存在」与「这个路径不存在」是两回事，
+/// 合并会让调用方改不动自己的请求。
+async fn method_not_allowed() -> crate::server::error::ApiError {
+    crate::server::error::ApiError {
+        status: axum::http::StatusCode::METHOD_NOT_ALLOWED,
+        message: "方法不允许".into(),
+    }
 }
 
 /// Merge query params and JSON body into one param map (body wins).
