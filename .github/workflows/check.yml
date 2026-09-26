@@ -69,7 +69,60 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
+      # fetch-depth: 0 —— 提交信息扫描需要本次 push / PR 的提交范围，
+      # 默认的浅克隆（depth=1）里没有 `before` 也没有 `HEAD~1`，那一步会无从比较。
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # ── 文档门（廉价，放在最前：失败要在昂贵的 vendored OpenSSL 编译之前暴露）──
+      # 两项都只在 Linux 上跑：扫描器没有任何平台条件编译，Windows 开发机由本地
+      # pre-commit / commit-msg 钩子覆盖；而 Linux 上 python3 必定存在，不必做解释器探测。
+      - name: forbidden references (tracked files)
+        if: runner.os != 'Windows'
+        run: python3 scripts/forbidden_refs.py --tree
+
+      # 直推 master 的路径不经过本地钩子，所以提交信息必须在这里再扫一遍。
+      - name: forbidden references (commit messages)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch --no-tags --depth=200 origin "${{ github.base_ref }}"
+            range="FETCH_HEAD..HEAD"
+          else
+            before="${{ github.event.before }}"
+            range="HEAD~1..HEAD"
+            if [ -n "$before" ] && [ "$before" != "0000000000000000000000000000000000000000" ] \
+               && git cat-file -e "$before^{commit}" 2>/dev/null; then
+              range="$before..HEAD"
+            fi
+          fi
+          status=0
+          for sha in $(git log --format=%H "$range"); do
+            git log -1 --format=%B "$sha" > /tmp/commit-msg.txt
+            if ! python3 scripts/forbidden_refs.py --message-file /tmp/commit-msg.txt; then
+              echo "  ↑ 上面的命中来自提交 $sha" >&2
+              status=1
+            fi
+          done
+          exit $status
+
+      # 公共段不漂移：本仓 AGENTS.md 里公共段标记之间的内容，必须与契约仓库
+      # **所 pin tag**（conformance.pin）上的 AGENTS-common.md 逐字一致。
+      #
+      # 比对的是所 pin tag 的内容，**不是本仓工作副本**——否则改本地副本就能让比对
+      # 通过，守卫形同虚设；也因此「升 pin」是一个需要评审的动作，不是随手一行。
+      # clone 走 HTTPS：公开仓库无需凭据，也不必在 CI 里配 secret。
+      - name: common section matches the pinned contract tag
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          pin="$(tr -d '[:space:]' < conformance.pin)"
+          git clone --depth 1 --branch "$pin" https://github.com/ren-yc/flow-contract.git conformance
+          python3 scripts/check_common_section.py --conformance conformance
 
       - name: Install pinned toolchain (rust-toolchain.toml)
         run: rustup show
