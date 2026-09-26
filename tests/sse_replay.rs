@@ -310,3 +310,76 @@ async fn subscriber_survives_account_registration() {
         "pre-registration subscriber receives post-registration events: {frames:?}"
     );
 }
+
+/// SSE 载荷的**键集**与「媒体里没有什么」都是契约 —— 而 SSE 是流式接口，golden 快照
+/// 覆盖不到它（它是长连接，不是一次请求一次响应）。所以这条断言就是它的护栏。
+///
+/// 特别地：内部事件里的 `MediaHint` **带着 `aes_key`**，而推送载荷绝不能带上它 ——
+/// 那是解密用的密钥，进了 SSE 就等于进了每个订阅方的日志与浏览器内存。
+#[tokio::test]
+async fn sse_payload_keys_are_pinned() {
+    let dir = common::tmp_dir("sseshape");
+    let server = start(&dir).await;
+
+    let ev = weflow_server::sync::Event::New(weflow_server::sync::NewMessageEvent {
+        session_id: common::FAKE_GROUP.to_string(),
+        session_type: "group",
+        rawid: "shape-1".into(),
+        source_name: "src".into(),
+        group_name: Some("项目群".into()),
+        content: "hi".into(),
+        timestamp: 1_700_000_001,
+        // 从一个**带 `aes_key` 的内部提示**构造，用来验证那条 `From` 真的把密钥丢掉了。
+        // 类型 `PushMedia` 本身就没有这个字段 —— 也就是说这条保证由类型系统兜底，
+        // 下面的断言是第二道锁。
+        media: Some(weflow_server::sync::PushMedia::from(
+            &weflow_server::parser::MediaHint {
+                kind: weflow_server::parser::MediaKind::Image,
+                file_name: "a.jpg".into(),
+                md5: Some("deadbeef".into()),
+                aes_key: Some("SECRET-AES-KEY".into()),
+            },
+        )),
+    });
+    let reader = sse_frames(&server, None, Duration::from_secs(8), 1);
+    let sender = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        server.state.events.send(ev).ok();
+    };
+    let frames = tokio::join!(reader, sender).0;
+    let (_, _, data) = frames
+        .iter()
+        .find(|(_, e, _)| e == "message.new")
+        .expect("a message.new frame");
+    let v: serde_json::Value = serde_json::from_str(data).expect("payload is JSON");
+
+    // 键集：多一个少一个都是契约变更。
+    let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "content",
+            "event",
+            "groupName",
+            "media",
+            "rawid",
+            "sessionId",
+            "sessionType",
+            "sourceName",
+            "timestamp"
+        ],
+        "message.new 的键集是契约：{v}"
+    );
+
+    // media 是**第三种形状**：只有元数据，没有路径、没有取字节用的键。
+    let media = v["media"].as_object().expect("media object");
+    let mut mkeys: Vec<&str> = media.keys().map(String::as_str).collect();
+    mkeys.sort_unstable();
+    assert_eq!(mkeys, ["fileName", "md5", "type"], "SSE 的 media 只有元数据：{media:?}");
+
+    // 密钥绝不出现 —— 查**整帧原文**，而不是只看解析后的键：
+    // 藏在某个值里的密钥同样是泄露。
+    assert!(!data.contains("SECRET-AES-KEY"), "推送载荷里出现了 aes_key：{data}");
+    assert!(!data.contains("aes"), "推送载荷里出现了 aes 字样：{data}");
+}
