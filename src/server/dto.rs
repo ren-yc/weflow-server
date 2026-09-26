@@ -25,7 +25,7 @@ use serde::Serialize;
 // ── 账号面 ────────────────────────────────────────────────
 
 /// `GET /api/v1/accounts`。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct AccountsList {
     pub accounts: Vec<crate::server::AccountStateView>,
     pub success: bool,
@@ -35,7 +35,7 @@ pub struct AccountsList {
 ///
 /// `occupied_by` / `occupied_status` 让客户端能记下「实际在跟哪个账号说话」，
 /// 而不是无限重试。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct AccountConflict {
     pub occupied_by: String,
     pub occupied_status: crate::server::AccountStatus,
@@ -45,7 +45,7 @@ pub struct AccountConflict {
 }
 
 /// 注册**受理**（或幂等命中：`already_ready` / `in_progress`）。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct AccountRegistered {
     pub db_storage: String,
     pub state: String,
@@ -55,7 +55,7 @@ pub struct AccountRegistered {
 }
 
 /// 注销：**已成功解绑**。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct AccountDeregistered {
     pub index_cleared: bool,
     /// 请求落地时账号处于什么状态 —— 让客户端能区分「我取消了正在进行的构建」与
@@ -69,7 +69,7 @@ pub struct AccountDeregistered {
 }
 
 /// 注销：**本来就没有绑定**。刻意幂等 —— 重试已完成的注销得到 200 而不是错误。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct AccountNotRegistered {
     pub index_cleared: bool,
     pub purged_dirs: usize,
@@ -80,7 +80,7 @@ pub struct AccountNotRegistered {
 }
 
 /// 注销：**互锁触发**（另一个账号持有绑定，它被完全不动地留下）。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct AccountWxidMismatch {
     pub index_cleared: bool,
     pub occupied_by: String,
@@ -94,7 +94,7 @@ pub struct AccountWxidMismatch {
 // ── 会话列表 ──────────────────────────────────────────────
 
 /// `GET /api/v1/sessions`（原生面）。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct SessionsNative {
     pub count: usize,
     pub sessions: Vec<SessionNative>,
@@ -103,7 +103,7 @@ pub struct SessionsNative {
 
 /// 原生面的会话项。`type` 是**平台数值枚举**（weflow：0 私聊 / 1 群 / 2 公众号 / 3 其他；
 /// qqflow 的取值含义不同），`sessionType` 是同一枚举的字符串形式 —— 下游应当用后者。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionNative {
     pub display_name: String,
@@ -121,7 +121,7 @@ pub struct SessionNative {
 /// `GET /api/v1/sessions?chatlab=1`（或 `format=chatlab`）。
 ///
 /// **与原生面的键集不同**，且 `type` 在这里是字符串 —— 两个面不可能共用一个 struct。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct SessionsChatlab {
     pub count: usize,
     pub page: Page,
@@ -130,7 +130,7 @@ pub struct SessionsChatlab {
 
 /// 翻页信息。**`nextCursor` 始终出现**（排空时为 `null`），不要给它加
 /// `skip_serializing_if`：客户端按「键在不在」判断「还有没有下一页」会读错。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Page {
     pub has_more: bool,
@@ -140,7 +140,7 @@ pub struct Page {
 // ── 消息（ChatLab 混合面）─────────────────────────────────
 
 /// `GET|POST /api/v1/messages?chatlab=1`（或 `format=chatlab`）。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MessagesChatlab {
     pub chatlab: ChatlabHeader,
@@ -154,7 +154,7 @@ pub struct MessagesChatlab {
 }
 
 /// ChatLab 信封头。`exportedAt` 是**墙钟**（每次请求都不同）——快照里靠时钟哨兵掩码。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatlabHeader {
     pub exported_at: i64,
@@ -163,7 +163,7 @@ pub struct ChatlabHeader {
 }
 
 /// 会话元信息。`type` 是字符串；`ownerId` 未绑定时是空串（现状如此）。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatlabMeta {
     pub group_id: String,
@@ -174,7 +174,7 @@ pub struct ChatlabMeta {
 }
 
 /// 本页出现过的发送者（去重）。`avatar` 无来源时是**空串**。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatlabMember {
     pub account_name: String,
@@ -184,7 +184,7 @@ pub struct ChatlabMember {
 }
 
 /// ChatLab 面的消息项。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatlabMessage {
     pub account_name: String,
@@ -205,7 +205,7 @@ pub struct ChatlabMessage {
 /// **`media` 是第三种媒体形状**：只有 `type` / `fileName` / `md5` —— 推送里不含任何路径
 /// 与取字节用的键（字节走 REST 的 `media=1` 导出），也**永远不含**解密密钥。推一个取不到
 /// 的地址只会让客户端误以为有东西可拿。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EventNew {
     pub content: String,
@@ -223,7 +223,7 @@ pub struct EventNew {
 }
 
 /// 撤销事件。形状与 `message.new` 相同但**没有 `media`** —— 撤销的是消息，不是媒体。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EventRevoke {
     pub content: String,
@@ -237,7 +237,7 @@ pub struct EventRevoke {
 }
 
 /// 推送里的媒体元数据（**第三种形状**：无 `url` / `localPath` / `exported`）。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EventMedia {
     pub file_name: String,
@@ -246,14 +246,14 @@ pub struct EventMedia {
 }
 
 /// 水位基线/重基事件。客户端据此得知「从哪里继续拉」，因此**每次注册与注销都会发**。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct EventSync {
     pub event: String,
     pub watermarks: Vec<WatermarkEntry>,
 }
 
 /// 一张表的水位。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct WatermarkEntry {
     pub table: String,
     pub watermark: WatermarkValue,
@@ -261,7 +261,7 @@ pub struct WatermarkEntry {
 
 /// 水位三元组。三个都要：`local_id` 单独不够（同一秒可能有多条），`create_time` 单独
 /// 也不够（同秒内要靠 `sort_seq` 与 `local_id` 定序）。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct WatermarkValue {
     pub create_time: i64,
     pub local_id: i64,
@@ -270,7 +270,7 @@ pub struct WatermarkValue {
 // ── 消息（原生面）─────────────────────────────────────────
 
 /// `GET|POST /api/v1/messages`（原生面）。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MessagesNative {
     pub count: usize,
@@ -283,7 +283,7 @@ pub struct MessagesNative {
 
 /// 本页的导出状态。`exportPath` 是绝对路径（客户端用它找导出的文件），
 /// `count` 是**成功导出**的条数 —— 不是本页消息数。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaEnvelope {
     pub count: usize,
@@ -292,7 +292,7 @@ pub struct MediaEnvelope {
 }
 
 /// 原生面的消息项。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageNative {
     /// `localType` 的高 32 位（appmsg 子类型）；无子类型时为 `null`。
@@ -329,7 +329,7 @@ pub struct MessageNative {
 ///
 /// `exported` 是**条件键**：不导出时它**不出现**而不是 `false`。客户端靠「键在不在」
 /// 判断字节可不可取 —— 改成恒出现会让这个判据失效。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaObject {
     /// 字母序使然：`exported` 排在 `fileName` 之前，这样输出与 `json!` 的现状一致。
@@ -344,7 +344,7 @@ pub struct MediaObject {
 }
 
 /// 引用（回复）的渲染信息。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Quote {
     pub account_name: String,
@@ -356,7 +356,7 @@ pub struct Quote {
 // ── Pull 面（/api/v1/sessions/{id}/messages）─────────────
 
 /// ChatLab Pull 信封：**顶层就是那五块**，没有 `success` / `count`。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct PullEnvelope {
     pub chatlab: ChatlabHeader,
     pub members: Vec<ChatlabMember>,
@@ -370,7 +370,7 @@ pub struct PullEnvelope {
 /// **与混合面（`ChatlabMessage`）不是同一个 struct**：本面的 `replyToMessageId` 在无引用时
 /// **省略该键**，而混合面输出 `null`。这个差异是有意的（混合面的形状已被下游依赖），
 /// 所以两处必须各建 struct —— 复用会把它们的契约绑在一起。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PullMessage {
     pub account_name: String,
@@ -388,7 +388,7 @@ pub struct PullMessage {
 
 /// 翻页与水位。**两个游标都要原样回传**：`nextSince` 是排他下界、`nextOffset` 只用于
 /// 时间戳没能前进的退化情形，客户端自行推导会跳行。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PullSync {
     pub has_more: bool,
@@ -399,7 +399,7 @@ pub struct PullSync {
 // ── 联系人 ────────────────────────────────────────────────
 
 /// `GET|POST /api/v1/contacts`。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Contacts {
     pub contacts: Vec<Contact>,
@@ -414,7 +414,7 @@ pub struct Contacts {
 /// **缺字段一律是空串，绝不是 `null`**。`store::Contact` 内部用 `Option<String>`（因为
 /// `display_name()` 要区分「没有备注」与「备注是空串」），但**只有 JSON 边界**把它压平成
 /// 空串 —— 这个压平是契约的一部分，已在别处钉死。改回去会静默改变每个下游的判空逻辑。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Contact {
     pub alias: String,
@@ -429,7 +429,7 @@ pub struct Contact {
 // ── 群成员 ────────────────────────────────────────────────
 
 /// `GET|POST /api/v1/group-members`。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupMembers {
     pub chatroom_id: String,
@@ -444,7 +444,7 @@ pub struct GroupMembers {
 /// `isOwner` 目前恒为 `false`（群主信息不在已解析的表中）；`messageCount` 仅在
 /// `includeMessageCounts=1` 时为真实值。两个「暂时恒定的字段」都要留着键 —— 删掉它们
 /// 会让下游的字段存在性判断失效。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupMember {
     pub alias: String,
@@ -464,7 +464,7 @@ pub struct GroupMember {
 ///
 /// 刻意是标量：未鉴权方可访问，因此**不能**列出账号 —— 连数组长度都会泄露
 /// 「本机有几个账号、各自到哪一步」。账号身份与消息数走鉴权的 `/api/v1/accounts`。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct Health {
     /// 账号阶段枚举（**不是字符串**：它的取值集合是封闭的，用类型表达比用字符串稳）。
     /// 刻意**没有**「已配置但缺密钥」这一档 —— 否则未鉴权方就能数出本机配了几个账号。
@@ -476,7 +476,7 @@ pub struct Health {
 // ── 手工增量同步 ──────────────────────────────────────────
 
 /// `POST /api/v1/sync`。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncResult {
     pub new_messages: usize,
@@ -485,7 +485,7 @@ pub struct SyncResult {
 }
 
 /// ChatLab 面的会话项。`type` 是字符串（`group` / `private`）。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionChatlab {
     pub id: String,

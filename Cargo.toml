@@ -35,6 +35,8 @@ tokio-util = { version = "0.7", features = ["io"] }
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# OpenAPI 描述生成。**只加在服务层**：schema 是 HTTP 面的东西，解析/存储层不该依赖它。
+utoipa = { version = "6", features = ["axum_extras"] }
 zstd = "0.13"
 
 [dev-dependencies]

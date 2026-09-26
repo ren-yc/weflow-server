@@ -1459,6 +1459,9 @@ mod golden {
             // ---- 别名路由与错误信封 ----
             // 错误信封是刚建立的契约，DTO 化最容易在「构造响应的那条路径之外」把它碰坏。
             ("health-alias", "GET", "/api/v1/health".to_string(), None),
+            // 接口描述也是响应：DTO 一改它就变。快照 + `keys` 一起把它钉住，
+            // 于是「改了 DTO 却忘了看 schema」会在这里红。
+            ("openapi", "GET", "/openapi.json".to_string(), None),
             ("error-unauthorized", "GET", "/api/v1/sessions".to_string(), None),
             ("error-unknown-path", "GET", "/api/v1/nope".to_string(), None),
             ("error-method-not-allowed", "DELETE", "/api/v1/health".to_string(), None),

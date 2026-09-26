@@ -8,6 +8,7 @@
 pub mod auth;
 pub mod dto;
 pub mod error;
+pub mod openapi;
 pub mod handlers;
 
 use std::collections::HashMap;
@@ -30,7 +31,7 @@ use crate::sync::{watch::WatchConfig, AccountSync, Event};
 ///
 /// NOT what `/health` reports: that endpoint is unauthenticated and carries the
 /// coarser [`AccountPhase`] instead, which has no `AwaitingKey` variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountStatus {
     AwaitingKey,
@@ -54,7 +55,7 @@ impl AccountStatus {
 /// no `AwaitingKey` variant at all, so leaking discovery results through
 /// `/health` is a type error rather than a review item; the detail lives
 /// behind the token-protected `GET /api/v1/accounts`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountPhase {
     /// Nothing is bound (never registered, or deregistered since).
@@ -349,7 +350,7 @@ impl AppState {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct AccountStateView {
     /// 字段**按字母序声明**：此前它是经 `json!` 序列化的（走 BTreeMap，键被排序），
     /// 而 struct 用声明序 —— 「换 DTO」时若不同步调整，响应里的键序会变。
@@ -365,11 +366,28 @@ pub struct AccountStateView {
     pub wxid: String,
 }
 
+/// `GET /openapi.json` —— 由 DTO 的 `ToSchema` 生成的接口描述。
+///
+/// 每次请求重新生成：生成成本是一次内存遍历，而缓存会引入「改了 DTO 但描述是旧的」
+/// 这一类只在部署后才暴露的问题。
+async fn openapi_handler() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let doc = openapi::document();
+    match serde_json::to_value(&doc) {
+        Ok(v) => axum::Json(v).into_response(),
+        Err(_) => crate::server::error::ApiError::internal("OpenAPI 描述生成失败")
+            .into_response(),
+    }
+}
+
 pub fn build_router(state: Arc<AppState>) -> Router {
     use handlers::*;
     Router::new()
         .route("/health", axum::routing::get(health::handler).post(health::handler))
         .route("/api/v1/health", axum::routing::get(health::handler).post(health::handler))
+        // 接口描述**免鉴权**：它描述的是形状，不含任何本机信息（账号、路径、密钥都不在
+        // 里面），而且正是给尚未拿到 token 的接入方看的。
+        .route("/openapi.json", axum::routing::get(openapi_handler))
         .route(
             "/api/v1/accounts",
             axum::routing::get(accounts::list_handler).post(accounts::handler),
