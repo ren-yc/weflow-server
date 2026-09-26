@@ -536,6 +536,9 @@ qqflow-server 的 `type` 取值为 `1` 私聊 / `2` 群聊，数值含义与本�
 
 - 帧携带 `id:` 序号；`Last-Event-ID` 头（或查询参数）可回放最近 **1000 条 / 10 分钟**
   （序号为总线级单调值，跨账号注册保持连续）
+- **广播缓冲为 1024 条**：订阅端落后超过这个数就收不到逐条事件，改为收到一条 `sync` 对齐。
+  注意它与上面的重放缓冲（1000 条）**不是一回事**：前者防「慢订阅者悄悄丢消息」，
+  后者是断开重连时的补发窗口。两个数字都要知道，只知其一会在另一种场景下误判。
 - 每 25 秒发送 `ping` 注释帧保活
 - `message.new` 的 `media` 仅在消息含图片/语音/视频/表情/文件时出现，否则为 `null`。
   它是**元数据**：不含 `url` / `localPath`（字节走 REST `/api/v1/messages?media=1` 导出），
@@ -545,7 +548,7 @@ qqflow-server 的 `type` 取值为 `1` 私聊 / `2` 群聊，数值含义与本�
   `content` 与 `media.type`，或用 `sessionId` 回查 `/api/v1/messages`。
 - 订阅端滞后（broadcast 缓冲被覆盖）时补发一帧 `sync`，携带**当前真实水位**，客户端可据此
   重新增量拉取。该帧不占用总线序号（它只针对这一个滞后订阅者，占号会导致其他客户端跳号）。
-- 进程收到退出信号时，服务端主动结束所有 SSE 流（不等宽限期超时），客户端会看到连接正常关闭。
+- 进程收到退出信号时，服务端主动结束所有 SSE 流（**不等 3 秒宽限期超时**），客户端会看到连接正常关闭。
 
 ### GET/POST `/api/v1/sync` — 手动增量同步
 
@@ -566,7 +569,7 @@ Pull，避免同一批数据出现第二种形状。WeFlow（安装版）没有�
 
 | 端点 | 参数 | 响应键 |
 |---|---|---|
-| `/api/v1/sns/timeline` | `limit`、`offset`、`username`、`start`、`end` | `{count,total,feeds:[...]}` |
+| `/api/v1/sns/timeline` | `limit`（**默认 50、上限 500**）、`offset`、`username`、`start`、`end` | `{count,total,feeds:[...]}` |
 | `/api/v1/sns/usernames` | — | `{success,count,usernames:[...]}` |
 | `/api/v1/sns/stats` | — | `{feeds, ...}` |
 | `/api/v1/sns/export` | `format=json\|html`、`username` | `{count, entries/...}` |
