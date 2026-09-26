@@ -52,19 +52,29 @@ async fn file_event_triggers_sync_and_message_event() {
     let files_before = scan::enum_db_files(&storage);
     let _ = files_before;
 
-    // expect a message.new event within a few seconds
+    // Expect a message.new event within a few seconds.
+    //
+    // **超时必须套在 `recv()` 上，不能只做循环条件**：`recv().await` 会无限阻塞，
+    // 所以「到点了没事件」原本表现为**永远挂住**而不是失败 —— 挂住会一直占着测试
+    // 二进制（后续链接报 LNK1104）并让 CI 耗到 job 超时，比失败难查得多。
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let mut got: Option<Event> = None;
-    while tokio::time::Instant::now() < deadline {
-        match rx.recv().await {
-            Ok(ev) => {
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Ok(ev)) => {
                 if matches!(ev, Event::New(_)) {
                     got = Some(ev);
                     break;
                 }
             }
-            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(broadcast::error::RecvError::Closed) => break,
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(broadcast::error::RecvError::Closed)) => break,
+            // 到点：没有事件。留空让下面的 `expect` 报出「没收到」，而不是挂住。
+            Err(_elapsed) => break,
         }
     }
     // The loop above may have consumed non-New events (sync/ready) while the
