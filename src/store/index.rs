@@ -463,6 +463,14 @@ pub fn load_sns(conn: &Connection, store: &mut Store) -> Result<()> {
     Ok(())
 }
 
+/// `rowid -> username` 映射，**自动找本库自己的 `name2id` 表**。
+///
+/// 便捷入口存在的理由：两个库的 id 空间**互相独立**，调用方若拿错库的表名就会解析到**错误的
+/// 人**（而不是解析失败）—— 那是最难查的一类错。让调用方只传连接，就少一个拿错的机会。
+pub fn uid_map(conn: &Connection) -> std::collections::HashMap<i64, String> {
+    load_uid_map(conn, name2id_table(conn).as_deref())
+}
+
 /// Load the `Name2Id` uid map: rowid -> user_name.
 fn load_uid_map(conn: &Connection, name2id: Option<&str>) -> std::collections::HashMap<i64, String> {
     let mut map = std::collections::HashMap::new();
@@ -558,7 +566,7 @@ pub fn build_all_live(
         }
     }
 
-    // 2) contact.db
+    // 2) contact.db —— 联系人，以及**群主与名册**（后两者也住这个库）。
     if let Some(f) = db_files.iter().find(|f| f.kind == DbKind::Contact) {
         let Some(key) = keys.key_for(&f.rel) else {
             tracing::warn!("no key for contact.db");
@@ -569,8 +577,23 @@ pub fn build_all_live(
                 if let Err(e) = load_contacts(conn, &mut store) {
                     tracing::warn!("contact table unreadable: {e}");
                 }
+                crate::store::group_meta::load_chatroom_meta(conn, &mut store);
             }
             Err(e) => tracing::warn!("contact.db live open failed: {e}"),
+        }
+    }
+
+    // 2b) contact_fts.db —— 群名片。
+    //
+    // **缺失不是错误**：老版本可能没有这个库，密钥表里也可能没有它。少了它只是名片为空，
+    // 其余一切照常 —— 这正是「降级而非失败」该有的样子。
+    if let Some(f) = db_files.iter().find(|f| f.kind == DbKind::ContactFts) {
+        match keys.key_for(&f.rel) {
+            Some(key) => match pool.get_or_open(f, key) {
+                Ok(conn) => crate::store::group_meta::load_group_cards(conn, &mut store),
+                Err(e) => tracing::warn!("contact_fts.db live open failed: {e}"),
+            },
+            None => tracing::debug!("no key for contact_fts.db —— 群名片将为空"),
         }
     }
 

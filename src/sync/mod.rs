@@ -121,13 +121,20 @@ enum Work {
     Messages(DbFile),
     Sessions(DbFile),
     Sns(DbFile),
+    /// `contact.db` 变了：联系人**以及**群主/名册（后两者也住这个库）。
     Contacts(DbFile),
+    /// `contact_fts.db` 变了：群名片。
+    GroupMeta(DbFile),
 }
 
 impl Work {
     fn file(&self) -> &DbFile {
         match self {
-            Work::Messages(f) | Work::Sessions(f) | Work::Sns(f) | Work::Contacts(f) => f,
+            Work::Messages(f)
+            | Work::Sessions(f)
+            | Work::Sns(f)
+            | Work::Contacts(f)
+            | Work::GroupMeta(f) => f,
         }
     }
 }
@@ -267,6 +274,10 @@ impl AccountSync {
                 DbKind::Session => work.push(Work::Sessions(f.clone())),
                 DbKind::Sns => work.push(Work::Sns(f.clone())),
                 DbKind::Contact => work.push(Work::Contacts(f.clone())),
+                // 群元数据也要跟着变：名片住在 fts 库里，名册/群主住在 contact.db 里。
+                // 单独一类是必要的 —— 原来 fts 库被归为 `Contact`，于是「名片变了」会去
+                // **重载联系人**，而真正该重载的东西没人管。
+                DbKind::ContactFts => work.push(Work::GroupMeta(f.clone())),
                 _ => {}
             }
         }
@@ -292,7 +303,7 @@ impl AccountSync {
 
         for w in &work {
             match w {
-                Work::Sessions(_) | Work::Contacts(_) | Work::Sns(_) => {}
+                Work::Sessions(_) | Work::Contacts(_) | Work::GroupMeta(_) | Work::Sns(_) => {}
                 Work::Messages(f) => {
                     let Some(key) = self.keys.key_for(&f.rel) else {
                         continue;
@@ -497,6 +508,15 @@ impl AccountSync {
                         if let Err(e) = index::load_contacts(conn, &mut store) {
                             tracing::warn!("contacts reload failed: {e}");
                         }
+                        // 群主与名册也住 contact.db —— 顺带一起刷，免得它们只在启动时是对的。
+                        crate::store::group_meta::load_chatroom_meta(conn, &mut store);
+                    }
+                }
+                Work::GroupMeta(f) => {
+                        let Some(k) = keys.key_for(&f.rel) else { continue };
+                     if let Ok(conn) = self.pool.get_or_open(f, k) {
+                        let mut store = self.store.write();
+                        crate::store::group_meta::load_group_cards(conn, &mut store);
                     }
                 }
                 Work::Sns(f) => {

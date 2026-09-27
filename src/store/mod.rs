@@ -2,6 +2,7 @@
 //! skeleton, WeChat-ized). Everything the HTTP API and SSE push serve comes
 //! from this structure; queries never touch the encrypted databases.
 
+pub mod group_meta;
 pub mod index;
 
 use std::collections::HashMap;
@@ -177,8 +178,19 @@ pub struct Store {
     pub convs: HashMap<String, Vec<MessageRecord>>,
     /// username -> contact profile
     pub contacts: HashMap<String, Contact>,
-    /// chatroom username -> sender username -> display name (group cards)
+    /// chatroom username -> sender username -> 群名片。
+    ///
+    /// 来源是 `contact/contact_fts.db` 的 FTS **影子表**（见 [`crate::store::group_meta`]），
+    /// 不是联系人备注 —— 两者是不同字段，且实测有 335 个成员在不同群里名片不同。
     pub group_cards: GroupCards,
+    /// chatroom username -> 群主 username（`contact.db::chat_room.owner`）。
+    pub chatroom_owner: HashMap<String, String>,
+    /// chatroom username -> 名册（`contact.db::chatroom_member`）。
+    ///
+    /// **不用于 `group-members` 的成员集合** —— 那个端点的语义仍是「发言者全集」。改成真实
+    /// 名册会让 `count` 变大，并出现大量 `messageCount: 0` 的潜水成员（已评估、不采纳）。
+    /// 录名册只是为了让 ChatLab 面的 `memberCount` 有真值可依。
+    pub chatroom_roster: HashMap<String, Vec<String>>,
     /// `<rel>:<table>` -> watermark of the last indexed row
     pub watermarks: HashMap<String, Watermark>,
     /// Moments timeline, sorted newest-first

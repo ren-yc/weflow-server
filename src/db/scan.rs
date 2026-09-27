@@ -73,7 +73,15 @@ pub struct DbFile {
 pub enum DbKind {
     Session,
     Message,
+    /// `contact/contact.db` —— 联系人、会话表与**群元数据**（`chat_room` 的群主、
+    /// `chatroom_member` 的名册）。
     Contact,
+    /// `contact/contact_fts.db` —— 群名片的来源（FTS 影子表）。
+    ///
+    /// **必须与 [`DbKind::Contact`] 分开**：两者都在 `contact/` 下，而 `classify_rel` 原来
+    /// 用 `starts_with("contact")` 把两者归为一类 —— 调用方用 `find(kind == Contact)` 取**第一个**，
+    /// 于是「解析的是哪个库」取决于**文件顺序**（当前靠 `contact.db` 字母序在前侥幸成立）。
+    ContactFts,
     Media,
     Sns,
     Other,
@@ -203,6 +211,9 @@ pub fn classify_rel(rel: &str) -> DbKind {
         DbKind::Session
     } else if lower.starts_with("message") || lower.contains("msg") {
         DbKind::Message
+    } else if lower.contains("contact_fts") {
+        // 先判它 —— 两者都在 `contact/` 下，`starts_with("contact")` 会把两者混为一类。
+        DbKind::ContactFts
     } else if lower.starts_with("contact") {
         DbKind::Contact
     } else if lower.starts_with("media") {
