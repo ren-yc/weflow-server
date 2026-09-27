@@ -23,6 +23,7 @@ use parking_lot::RwLock;
 use crate::db::live::LivePool;
 use crate::store::Store;
 
+
 // 密钥：嵌入者**必须**能拿到它才能建索引 —— 没有密钥就没有读，所以它是承诺面的一部分。
 // 但「密钥从哪来」不在这里：本 crate 不做密钥提取，调用方自己负责（见 [`open`]）。
 pub use crate::keystore::{KeyMap, parse_db_key};
@@ -136,3 +137,82 @@ impl Index {
             .unwrap_or_default()
     }
 }
+
+/// 增量同步的嵌入者视图（需要 `sync` feature）。
+///
+/// ## 为什么不是直接给出 `sync::AccountSync`
+///
+/// 那个类型带 `pub` 的 `store` 字段（内部模块要写它）—— 放出去等于把索引的内部布局变成契约，
+/// 而这正是承诺面要避免的。它还有 `stop_flag` / `source_files` / `export_media_batch` 这些
+/// 服务层自己要用的东西。
+///
+/// 这里只留嵌入者**驱动更新**所需的那几样，而且事件走 [`Sync::drain_events`] 而不是 tokio 的
+/// `broadcast` —— 后者要求调用方处理 `RecvError::Lagged`，那是实现细节，不该是使用者的负担。
+///
+/// ## 典型用法
+///
+/// ```no_run
+/// use std::path::Path;
+/// use std::time::Duration;
+/// use weflow_server::api;
+///
+/// # fn main() -> anyhow::Result<()> {
+/// let storage = Path::new("/path/to/<账号>/db_storage");
+/// // 真实用法：密钥表由调用方提供（本 crate 不做密钥提取）。
+/// let keys = api::KeyMap::Empty;
+/// let mut sync = api::Sync::open(storage, &keys, "wxid_…")?;   // 首次全量
+/// loop {
+///     std::thread::sleep(Duration::from_secs(1));
+///     sync.poll_once()?;                    // 增量
+///     for ev in sync.drain_events() {       // 事件是**提示**，不是数据
+///         let _ = ev;
+///     }
+///     let _ = sync.index().sessions();      // 读
+/// }
+/// # }
+/// ```
+#[cfg(feature = "sync")]
+pub struct Sync {
+    inner: crate::sync::AccountSync,
+    store: Arc<RwLock<Store>>,
+}
+
+#[cfg(feature = "sync")]
+impl Sync {
+    /// 建索引并返回一个可继续增量的句柄。**同步**：真实账号是秒级到十几秒。
+    ///
+    /// 与 [`open`] 的区别是它**留着**同步引擎 —— 想要「一次读完就走」的用 [`open`]，想要
+    /// 持续跟进的用这个。
+    pub fn open(
+        storage: &std::path::Path,
+        keys: &KeyMap,
+        my_wxid: &str,
+    ) -> anyhow::Result<Self> {
+        let store = Arc::new(RwLock::new(Store::default()));
+        let mut inner = crate::sync::AccountSync::new(my_wxid, storage, keys.clone(), store.clone());
+        inner.full_sync()?;
+        Ok(Self { inner, store })
+    }
+
+    /// 读当前索引。与 [`Sync`] 共享同一份数据，`poll_once` 之后立刻可见。
+    pub fn index(&self) -> Index {
+        Index::new(self.store.clone())
+    }
+
+    /// 跑一轮增量：返回 `(新增消息数, 撤回数)`。
+    ///
+    /// 没有变化时是廉价的（只比对库文件的时间戳）。**由调用方决定节奏** —— 本 crate 不替你起
+    /// 后台线程，因为「多久轮一次」取决于你要多快看到新消息，而那只有你知道。
+    pub fn poll_once(&mut self) -> anyhow::Result<(usize, usize)> {
+        self.inner.poll_once()
+    }
+
+    /// 取走积压的事件，见 [`crate::sync::AccountSync::drain_events`]。
+    pub fn drain_events(&mut self) -> Vec<Event> {
+        self.inner.drain_events()
+    }
+}
+
+// 事件类型属于承诺面：嵌入者要能匹配 `Event::New(..)` 才用得上 `drain_events`。
+#[cfg(feature = "sync")]
+pub use crate::sync::{Event, NewMessageEvent, PushMedia, RevokeEvent};

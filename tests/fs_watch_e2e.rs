@@ -1,5 +1,5 @@
 //! Real end-to-end: file events (notify watcher) -> incremental sync ->
-//! broadcast events (the same path the SSE push serves).
+//! broadcast events (the same path the SSE push serves) —— 通过承诺面的 `drain_events()` 观察。
 
 mod common;
 
@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::{Mutex, RwLock};
-use tokio::sync::broadcast;
 
 use weflow_server::db::scan;
 use weflow_server::keystore;
@@ -31,14 +30,10 @@ async fn file_event_triggers_sync_and_message_event() {
     sync.full_sync().unwrap();
     assert_eq!(store.read().convs.len(), 2);
 
-    let (events, mut rx) = broadcast::channel(1024);
     let sync = Arc::new(Mutex::new(sync));
-    // swap the channel so the watcher broadcasts into our receiver
-    {
-        let mut guard = sync.lock();
-        let new_tx = events.clone();
-        guard.events = new_tx;
-    }
+    // **不换通道**：原来这里把 `AccountSync.events` 换成一个自建通道，好让自己的接收端收到
+    // 事件 —— 那既动了实现面，又要调用方自己处理 `Lagged` / `Closed`。现在用承诺面上的
+    // `drain_events()`：取走即消费，同步接口，需要的事件类型也从它自己带出来。
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let cfg = WatchConfig {
@@ -60,36 +55,19 @@ async fn file_event_triggers_sync_and_message_event() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let mut got: Option<Event> = None;
     loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
+        if tokio::time::Instant::now() >= deadline {
             break;
         }
-        match tokio::time::timeout(remaining, rx.recv()).await {
-            Ok(Ok(ev)) => {
-                if matches!(ev, Event::New(_)) {
-                    got = Some(ev);
-                    break;
-                }
-            }
-            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
-            Ok(Err(broadcast::error::RecvError::Closed)) => break,
-            // 到点：没有事件。留空让下面的 `expect` 报出「没收到」，而不是挂住。
-            Err(_elapsed) => break,
+        // **超时必须能到点**：`drain_events` 是同步的，这里用 `sleep` 定节奏 —— 不阻塞、也不会
+        // 像「无超时的 `recv().await`」那样永远挂住（挂住会占着测试二进制，后续链接报
+        // LNK1104，并让 CI 耗到 job 超时，比失败难查得多）。
+        let batch = sync.lock().drain_events();
+        if let Some(ev) = batch.into_iter().find(|e| matches!(e, Event::New(_))) {
+            got = Some(ev);
+            break;
         }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    // The loop above may have consumed non-New events (sync/ready) while the
-    // one we want was already queued behind them, so drain whatever is left.
-    // This must keep going past non-matching events: breaking on the first one
-    // would make a leading sync frame look like "no message arrived".
-    let got = got.or_else(|| {
-        loop {
-            match rx.try_recv() {
-                Ok(ev) if matches!(ev, Event::New(_)) => return Some(ev),
-                Ok(_) => continue, // not the event we want; keep draining
-                Err(_) => return None, // empty, lagged or closed
-            }
-        }
-    });
     let got = got.expect("must receive a message.new event after the file write");
 
     match got {

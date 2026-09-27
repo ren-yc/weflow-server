@@ -37,10 +37,17 @@ use crate::store::{MessageRecord, Store, Watermark};
 
 /// Events broadcast to SSE subscribers (and consumed by tests).
 #[derive(Debug, Clone)]
+/// 推送给订阅者的事件。
+///
+/// **事件是提示，不是数据。** 它不保证送达（队列有界、服务会重启），也不保证顺序完整 ——
+/// 收到 `New` 的正确反应是**去读那一页**，而不是把事件内容当权威。规范对事件通道也是这个
+/// 定位（「不假设可靠送达」）。
 pub enum Event {
-    /// Connection baseline (current watermarks).
+    /// 连接基线：当前的各表水位线。**连接建立时发一次**，用来让订阅者知道自己从哪开始。
     Sync(Vec<(String, Watermark)>),
+    /// 有新消息。
     New(NewMessageEvent),
+    /// 有消息被撤回。
     Revoke(RevokeEvent),
 }
 
@@ -53,8 +60,11 @@ pub enum Event {
 ///   only make clients think a fetchable link exists
 #[derive(Debug, Clone)]
 pub struct PushMedia {
+    /// 媒体大类（`image` / `video` / `voice` / `file` …）。
     pub kind: &'static str,
+    /// 建议的文件名，可直接用于导出路径的最后一段。
     pub file_name: String,
+    /// 原文件的 md5；取不到时为 `None`。
     pub md5: Option<String>,
 }
 
@@ -68,27 +78,45 @@ impl From<&crate::parser::MediaHint> for PushMedia {
     }
 }
 
+/// 一条新消息的通知。
 #[derive(Debug, Clone)]
 pub struct NewMessageEvent {
+    /// 所属会话（私聊是对方 wxid，群是 `…@chatroom`）。
     pub session_id: String,
+    /// 会话类型（`private` / `group` / …），与会话列表里的取值一致。
     pub session_type: &'static str,
+    /// 消息的平台 id，可用它回查这一条。
     pub rawid: String,
+    /// 发送者的展示名。
     pub source_name: String,
+    /// 群名；私聊时为 `None`。
     pub group_name: Option<String>,
+    /// 消息正文（或 `[图片]` 一类的占位）。
     pub content: String,
+    /// 发送时刻（秒）。
     pub timestamp: i64,
     /// Media metadata when the message carries any (image/voice/video/…).
     pub media: Option<PushMedia>,
 }
 
+/// 一次撤回的通知。
+///
+/// `rawid` 是**被撤回那条消息**的 id —— 用它去索引里找原文（撤回不会删库里的行）。
 #[derive(Debug, Clone)]
 pub struct RevokeEvent {
+    /// 所属会话。
     pub session_id: String,
+    /// 会话类型。
     pub session_type: &'static str,
+    /// 被撤回消息的平台 id。
     pub rawid: String,
+    /// 撤回者的展示名。
     pub source_name: String,
+    /// 群名；私聊时为 `None`。
     pub group_name: Option<String>,
+    /// 系统消息文本（「xxx 撤回了一条消息」）。
     pub content: String,
+    /// 撤回时刻（秒）。
     pub timestamp: i64,
 }
 
@@ -143,7 +171,11 @@ impl Work {
 pub struct AccountSync {
     pub wxid: String,
     pub store: Arc<RwLock<Store>>,
-    pub events: broadcast::Sender<Event>,
+    /// 内部事件总线。服务层的 SSE 直接订阅它 —— **这不是承诺面**：它要求调用方用 tokio 的
+    /// `broadcast` 并处理 `RecvError::Lagged`，而嵌入者不该被绑到这两件事上。
+    pub(crate) events: broadcast::Sender<Event>,
+    /// 给嵌入者的事件队列，见 [`AccountSync::drain_events`]。
+    events_rx: broadcast::Receiver<Event>,
     pool: LivePool,
     keys: KeyMap,
     /// Live source databases root (`<account>/db_storage`).
@@ -164,10 +196,12 @@ pub struct AccountSync {
 impl AccountSync {
     pub fn new(wxid: &str, storage: &Path, keys: KeyMap, store: Arc<RwLock<Store>>) -> Self {
         let (events, _) = broadcast::channel(1024);
+        let events_rx = events.subscribe();
         AccountSync {
             wxid: wxid.to_string(),
             store,
             events,
+            events_rx,
             pool: LivePool::new(),
             keys,
             storage: storage.to_path_buf(),
@@ -184,10 +218,12 @@ impl AccountSync {
         store: Arc<RwLock<Store>>,
         events: broadcast::Sender<Event>,
     ) -> Self {
+        let events_rx = events.subscribe();
         AccountSync {
             wxid: wxid.to_string(),
             store,
             events,
+            events_rx,
             pool: LivePool::new(),
             keys,
             storage: storage.to_path_buf(),
@@ -195,6 +231,30 @@ impl AccountSync {
             stamps: std::collections::HashMap::new(),
             stopped: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// 取走自上次调用以来积压的事件（按发生顺序）。
+    ///
+    /// 嵌入者用它消费增量，**不需要**接触 tokio 的 `broadcast`，也不需要处理 `Lagged`：
+    /// 队列满了就丢最旧的（与内部总线同样是有界队列），返回的就是还在的那些。
+    ///
+    /// 与「读游标」相比，这个接口不需要调用方维护任何状态 —— 取走即消费。代价是**事件不保证
+    /// 送达**（服务重启、队列溢出都会丢），所以调用方应当把它当**提示**：收到 `message.new`
+    /// 就去读那一页，而不是把事件本身当作数据。规范对事件通道也是这个定位（「不假设可靠
+    /// 送达」）。
+    ///
+    /// 为什么不是 `&self`：它要动接收端的游标。
+    pub fn drain_events(&mut self) -> Vec<Event> {
+        let mut out = Vec::new();
+        loop {
+            match self.events_rx.try_recv() {
+                Ok(ev) => out.push(ev),
+                // `Lagged` 说明调用方太慢，中间的事件已被丢弃 —— 剩下的仍然取走。
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+        out
     }
 
     /// Handle on the retirement flag, for the owning `AccountHandle`.
