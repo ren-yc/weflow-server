@@ -6,10 +6,10 @@
       {
         "alias": "",
         "avatarUrl": "",
-        "displayName": "李四",
-        "groupNickname": "",
+        "displayName": "四哥",
+        "groupNickname": "四哥",
         "isFriend": true,
-        "isOwner": false,
+        "isOwner": true,
         "messageCount": 3,
         "nickname": "李四",
         "remark": "",

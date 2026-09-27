@@ -73,7 +73,10 @@ pub async fn handler(
                 display_name: store.sender_display(Some(&chatroom), wxid, wxid),
                 group_nickname: card,
                 is_friend: c.map(|c| c.kind == crate::store::SessionKind::Private).unwrap_or(false),
-                is_owner: false,
+                // 群主来自 `contact.db::chat_room.owner`（真库实测 114/114 非空，且都能在已读的
+                // `contact` 表里解析出来）。取不到时是 `false` —— 与「不是群主」在响应上无法
+                // 区分，但另一种选择（整条不发）会让字段缺失，对下游更难处理。
+                is_owner: store.chatroom_owner.get(&chatroom).is_some_and(|o| o == wxid),
                 message_count: if with_counts { *count } else { 0 },
                 nickname: c.and_then(|c| c.nickname.clone()).unwrap_or_default(),
                 remark: c.and_then(|c| c.remark.clone()).unwrap_or_default(),

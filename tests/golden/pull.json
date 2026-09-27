@@ -9,7 +9,7 @@
       {
         "accountName": "李四",
         "avatar": "",
-        "groupNickname": "",
+        "groupNickname": "四哥",
         "platformId": "wxid_member_b"
       },
       {
@@ -23,7 +23,7 @@
       {
         "accountName": "李四",
         "content": "大家好",
-        "groupNickname": "",
+        "groupNickname": "四哥",
         "platformMessageId": "8200000000000000000",
         "sender": "wxid_member_b",
         "timestamp": 1700000100,
@@ -41,7 +41,7 @@
       {
         "accountName": "李四",
         "content": "[图片]",
-        "groupNickname": "",
+        "groupNickname": "四哥",
         "platformMessageId": "8200000000000000002",
         "sender": "wxid_member_b",
         "timestamp": 1700000102,
@@ -50,7 +50,7 @@
       {
         "accountName": "李四",
         "content": "群消息",
-        "groupNickname": "",
+        "groupNickname": "四哥",
         "platformMessageId": "8200000000000000003",
         "sender": "wxid_member_b",
         "timestamp": 1700000103,

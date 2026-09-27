@@ -93,6 +93,46 @@ pub fn build_wechat_account(dir: &Path, key: &Key) -> PathBuf {
             INSERT INTO contact VALUES ('wxid_fake_group@chatroom', '', '项目群', '', 2);",
         )
         .unwrap();
+        // 群元数据（群主与名册）住 contact.db。真库里它们是 `chat_room(room_id, owner)` 与
+        // `chatroom_member(room_id, member_id)`，两个 id 都要用**本库**的 `name2id` 解析。
+        conn.execute_batch(
+            r#"CREATE TABLE chat_room (room_id INTEGER, owner INTEGER);
+            CREATE TABLE chatroom_member (room_id INTEGER, member_id INTEGER);
+            -- 本库的 id 空间：群 = 3、member_b = 2。**故意与 fts 库不同**（见下一节），
+            -- 这样用错库的 name2id 会解析到错的人，而不是解析失败。
+            CREATE TABLE "Name2Id_contact" (user_name TEXT);
+            INSERT INTO "Name2Id_contact" (rowid, user_name) VALUES
+                (1, 'wxid_friend_a'), (2, 'wxid_member_b'),
+                (3, 'wxid_fake_group@chatroom'), (4, 'wxid_fake000000000000001');
+            -- 群主给 member_b —— 断言要看到每群恰一人为 true。
+            INSERT INTO chat_room VALUES (3, 2);
+            INSERT INTO chatroom_member VALUES (3, 1), (3, 2);"#,
+        )
+        .unwrap();
+    }
+
+    // ---- contact/contact_fts.db: 群名片的来源（FTS 影子表）----
+    //
+    // 真库里那张 `chatroom_member_fts_v3` 是**带 WeChat 自定义分词器**的 FTS5 虚拟表，普通
+    // SQLite 建不出来 —— 所以这里造它的**影子表**（普通表，形状与真库一致：`_content` 是
+    // (id, c0, c1, c2)、`_aux` 是 (room_id, member_id)，两者按 rowid 连接）。生产代码读的
+    // 也正是影子表，于是夹具路径与真库路径走的是同一条代码。
+    {
+        let path = storage.join("contact/contact_fts.db");
+        let conn = wx_conn(&path, key, false);
+        conn.execute_batch(
+            r#"CREATE TABLE "Name2Id_fts" (user_name TEXT);
+            -- **本库的 id 空间与 contact.db 不同**（11/12 vs 3/2）—— 这是真库的实测形态，
+            -- 也是这段代码最容易写错的地方：拿错库的表名不会报错，只会解析到错误的人。
+            INSERT INTO "Name2Id_fts" (rowid, user_name) VALUES
+                (11, 'wxid_fake_group@chatroom'), (12, 'wxid_member_b'), (13, 'wxid_friend_a');
+            CREATE TABLE chatroom_member_fts_v3_content (id INTEGER PRIMARY KEY, c0, c1, c2);
+            CREATE TABLE chatroom_member_fts_v3_aux (room_id INTEGER, member_id INTEGER);
+            -- c0 是 FTS 表的第一列 a_group_remark，即群名片。
+            INSERT INTO chatroom_member_fts_v3_content (rowid, c0, c1, c2) VALUES (1, '四哥', 11, 12);
+            INSERT INTO chatroom_member_fts_v3_aux (rowid, room_id, member_id) VALUES (1, 11, 12);"#,
+        )
+        .unwrap();
     }
 
     // ---- message/message_0.db: Name2Id + Msg_<md5> tables ----

@@ -527,20 +527,10 @@ async fn chatlab_pull_contract() {
 #[tokio::test]
 async fn chatlab_splits_account_name_from_group_nickname() {
     let dir = common::tmp_dir("smoke-pullnames");
+    // **没有任何手工注入**：卡片由夹具的库提供（`contact/contact_fts.db` 的影子表），
+    // 走的是与真库同一条加载路径。手工注入 store 字段会让断言在一个运行时并不存在的
+    // 状态上通过 —— 这条测试原来就是这么做的，而它「通过」恰恰是缺陷藏了这么久的原因。
     let state = test_state(&dir);
-    // The fixture has no chatroom card table; inject one for a real group
-    // sender (wxid_member_b, nickname 李四, no remark).
-    {
-        let accounts = state.accounts.lock();
-        let handle = accounts.get(common::FAKE_WXID).unwrap();
-        handle
-            .store
-            .write()
-            .group_cards
-            .entry(common::FAKE_GROUP.to_string())
-            .or_default()
-            .insert("wxid_member_b".to_string(), "四哥".to_string());
-    }
     let app = server::build_router(state);
 
     let uri = format!(
