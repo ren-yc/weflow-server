@@ -69,6 +69,10 @@ path = "src/main.rs"
 required-features = ["server"]
 
 [dev-dependencies]
+# 示例用它解析服务用的同一个配置文件（`anyhow` 与 `serde_json` 本就是运行时依赖，
+# 但 example 是独立 crate，得在 dev-dependencies 里也能看见）。
+anyhow = "1"
+serde_json = "1"
 tower = { version = "0.5", features = ["util"] }
 
 [profile.dev]

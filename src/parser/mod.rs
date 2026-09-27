@@ -33,9 +33,11 @@ impl MediaKind {
 /// Media hint extracted from a message (used by export/直服).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaHint {
+    /// 媒体大类（图片/视频/语音/文件/…）。
     pub kind: MediaKind,
     /// Suggested file name (e.g. `<md5>.jpg`, `voice_<svrid>.silk`).
     pub file_name: String,
+    /// 原文件的 md5；取不到时为 `None`（不是空串 —— 「没有」与「是空串」含义不同）。
     pub md5: Option<String>,
     /// CDN aes key when present (needed to reconstruct the cache path).
     pub aes_key: Option<String>,
@@ -44,9 +46,13 @@ pub struct MediaHint {
 /// Quote: the referenced message copy embedded in an appmsg.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuoteInfo {
+    /// 被引用那条消息的平台 id —— 与消息自己的 `platformMessageId` 同一套编号。
     pub platform_message_id: String,
+    /// 被引用消息的发送者展示名（快照，不是 wxid）。
     pub sender: String,
+    /// 被引用消息的正文。
     pub content: String,
+    /// 被引用消息的类型码（微信自己的编号）。
     pub msg_type: i64,
 }
 
@@ -54,7 +60,9 @@ pub struct QuoteInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevokeInfo {
     /// IDs usable to look up the withdrawn original message.
+    /// 原消息的 id（撤回后原记录仍在库里，可用它回查）。
     pub msg_id: Option<String>,
+    /// 撤回后系统消息自己的 id。
     pub new_msg_id: Option<String>,
     /// Human text from the system message (`replacemsg`).
     pub replace_msg: Option<String>,
@@ -69,10 +77,13 @@ pub struct ParsedMsg {
     pub raw_content: String,
     /// Strip to pure text when the raw content is XML (API `parsedContent`).
     pub parsed_text: String,
+    /// 这张消息带的媒体（图片/视频/文件）；纯文本时为 `None`。
     pub media: Option<MediaHint>,
     /// serverId of the quoted message (API `replyToMessageId`).
     pub reply_to: Option<String>,
+    /// 被引用的那条消息的内容快照；不是引用时为 `None`。
     pub quote: Option<QuoteInfo>,
+    /// 撤回信息；不是撤回事件时为 `None`。
     pub revoke: Option<RevokeInfo>,
 }
 

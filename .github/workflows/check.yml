@@ -146,6 +146,21 @@ jobs:
           FLOW_CONTRACT_DIR="$PWD/conformance-nails" FLOW_CONTRACT_CASE="nails" \
             bash scripts/build.sh test --locked --test conformance_runner -- --ignored
 
+      # ── 嵌入者示例（承诺面的第二道验收器）────────────────────────────────
+      #
+      # `examples/` 是**独立 crate**，只能看见 `pub`。所以在**不开 `testing`** 的前提下编译它，
+      # 同时证明三件事：
+      #
+      #   ① 承诺面**够用** —— 示例做的事，嵌入者照着做就行；
+      #   ② 示例**没有借用实现面** —— 一旦它用了 `pub(crate)` 的东西，这里就编译失败；
+      #   ③ 它**不拉 axum/tokio** —— `--no-default-features` 下能编译，说明「不起 HTTP 也能用」
+      #      不是一句口号。
+      #
+      # 只编译不运行：CI 里没有真实微信账号。**运行**由 `tests/embed_contract.rs` 在每次 CI 里
+      # 等价地证明（同一套 API，对着夹具造的库），真库那次由开发者在本地跑。
+      - name: embed example builds without default features
+        if: runner.os != 'Windows'
+        run: bash scripts/build.sh build --locked --example embed --no-default-features
       # ── 一致性套件（契约用例，两个仓库共用一份）────────────────────────────
       #
       # 此前关闭过一段时间：套件里有一条断言 404 响应体带 `error` 键，而本仓库统一成

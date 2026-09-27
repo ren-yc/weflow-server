@@ -12,15 +12,27 @@ use crate::parser::ParsedMsg;
 /// Session/contact kind classification by username conventions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[derive(Default)]
+/// 会话类型。
+///
+/// 由 `username` 的形状推出，**不需要额外数据**：`@chatroom` 结尾是群，`gh_` 开头是公众号。
+/// 因此它对任何 username 都有答案（推不出时是 [`SessionKind::Private`]），调用方不必处理
+/// 「未知类型」这一支。
 pub enum SessionKind {
+    /// 私聊（也是推不出其它类型时的默认值）。
     #[default]
     Private,
+    /// 群聊：`username` 以 `@chatroom` 结尾。
     Group,
+    /// 公众号：`username` 以 `gh_` 开头。
     Official,
+    /// 预留 —— 当前 [`SessionKind::classify`] 不会产生它。
     Other,
 }
 
 impl SessionKind {
+    /// 稳定的字符串形式（`private` / `group` / `official` / `other`），可直接进日志或 JSON。
+    ///
+    /// 这几个值是对外契约的一部分 —— 改动它们等同于破坏性变更。
     pub fn as_str(&self) -> &'static str {
         match self {
             SessionKind::Private => "private",
@@ -43,26 +55,45 @@ impl SessionKind {
 }
 
 
+/// 一个会话（聊天）的摘要。
 #[derive(Debug, Clone)]
 pub struct Session {
+    /// 会话的稳定 id（私聊是对方 wxid，群是 `…@chatroom`）。
     pub username: String,
+    /// 展示名（群名或联系人名）；取不到时为空串。
     pub display_name: String,
+    /// 会话类型。
     pub kind: SessionKind,
+    /// 最后一条消息的时刻（秒）。
     pub last_timestamp: i64,
+    /// 最后一条消息的类型码；没有消息时为 `None`（`0` 是合法类型码，不能当哨兵）。
     pub last_msg_type: Option<i64>,
+    /// 会话列表里显示的那行预览；没有时为 `None`。
     pub summary: Option<String>,
+    /// 未读数。
     pub unread_count: i64,
     /// Message count (filled from the conv index, may be an estimate).
     pub message_count: usize,
 }
 
+/// 一个联系人。
+///
+/// **`remark` 与群名片是两回事。** 前者是「你给他起的备注」，后者是「他在某个群里的名片」
+/// （见 [`crate::api::Index::group_card`]）。实测有成员在不同群里名片各不相同，把备注当名片
+/// 会显示错人。
 #[derive(Debug, Clone, Default)]
 pub struct Contact {
+    /// wxid。
     pub username: String,
+    /// 你给他起的备注；没设为 `None`。
     pub remark: Option<String>,
+    /// 他自己的昵称；没有为 `None`。
     pub nickname: Option<String>,
+    /// 微信号（alias）；没设为 `None`。
     pub alias: Option<String>,
+    /// 头像地址；没有为 `None`。
     pub avatar_url: Option<String>,
+    /// 这个联系人对应的会话类型。
     pub kind: SessionKind,
 }
 
@@ -78,17 +109,26 @@ impl Contact {
     }
 }
 
+/// 一条消息。
 #[derive(Debug, Clone)]
 pub struct MessageRecord {
+    /// 库内自增行号，同一 `(create_time, sort_seq)` 下的最终定序依据。
     pub local_id: i64,
+    /// 服务端 id（微信分配）。**不保证唯一**：不同会话里可能出现同一个值。
     pub server_id: i64,
+    /// 微信自己的类型码（与 ChatLab 的类型枚举是**两套**编号）。
     pub local_type: i64,
+    /// 发送时刻（秒）。
     pub create_time: i64,
+    /// 同一秒内的排序号 —— 只靠秒级时间戳无法定序。
     pub sort_seq: i64,
+    /// 是否由本账号发出。
     pub is_send: bool,
+    /// 发送者的 wxid。
     pub sender_username: String,
-    /// Display name resolved through contacts/Name2Id at index time.
+    /// 展示名：建索引时经 contacts/Name2Id 解析好的，调用方不必再查一次。
     pub sender_name: String,
+    /// 解析后的内容视图（正文、媒体、引用、撤回）。原始 XML 在 `parsed.raw_content` 里。
     pub parsed: ParsedMsg,
 }
 

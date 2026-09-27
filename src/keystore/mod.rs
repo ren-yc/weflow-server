@@ -53,6 +53,7 @@ impl KeyMap {
         }
     }
 
+    /// 一个密钥都没有（此时什么都解密不了，索引会是空的）。
     pub fn is_empty(&self) -> bool {
         matches!(self, KeyMap::Empty)
     }

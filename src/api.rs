@@ -34,6 +34,10 @@ pub use crate::store::{
     SnsPerson, Watermark,
 };
 
+// `MessageRecord::parsed` 是公开字段，它的类型因此也必须可达 —— 否则等于泄漏一个私有类型。
+// 同理还有 `ParsedMsg` 自己的几个字段类型。
+pub use crate::parser::{MediaHint, ParsedMsg, QuoteInfo, RevokeInfo};
+
 /// 从一份账号目录建立索引，**不起 HTTP**。
 ///
 /// 这是嵌入者通常的第一个调用：读 `db_storage` 下所有库、解密、建内存索引。**同步**（不返回
