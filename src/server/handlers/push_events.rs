@@ -40,9 +40,24 @@ pub async fn handler(
         .and_then(|s| s.parse::<u64>().ok())
         .or_else(|| query.get("lastEventId").and_then(|s| s.parse::<u64>().ok()))
         .unwrap_or(0);
-    let replay: Vec<(u64, &'static str, serde_json::Value)> =
-        state.history.lock().replay_since(last_id);
+    Ok(sse_from(state, last_id, serialize_event))
+}
 
+/// 事件的序列化器：把一个总线事件变成一个 SSE 帧（`(事件名, 载荷)`）。
+///
+/// 两个面对同一批事件有**不同的形状要求** —— WeFlow 兼容面发完整消息，ChatLab 面只发元信息
+/// （规范：「ChatLab 不假设事件可靠送达」，通知只负责告诉客户端去拉）。参数化这一处，
+/// 其余（鉴权、重放、保活、滞后重基线、关机）两面对**完全一致**。
+pub(crate) type Serializer =
+    fn(crate::sync::Event) -> (&'static str, serde_json::Value);
+
+/// 组装 SSE 响应。`serialize` 决定帧的形状，其余部分是两面的公共部分。
+pub(crate) fn sse_from(
+    state: Arc<AppState>,
+    last_id: u64,
+    serialize: Serializer,
+) -> Response {
+    let replay = state.history.lock().replay_since(last_id);
     let rx = state.events.subscribe();
     let history = state.history.clone();
     // An SSE stream never ends on its own, so it would hold graceful shutdown
@@ -54,7 +69,8 @@ pub async fn handler(
         yield Ok::<_, std::convert::Infallible>(
             Event::default().event("ready").data("{\"status\":\"ok\"}"),
         );
-        for (id, name, payload) in replay {
+        for (id, ev) in replay {
+            let (name, payload) = serialize(ev);
             yield Ok(Event::default()
                 .id(id.to_string())
                 .event(name)
@@ -78,7 +94,7 @@ pub async fn handler(
                     // watermarks: a bare `{"rebased":true}` tells the client
                     // it lost events but gives it nothing to resync from.
                     let wms = crate::server::current_watermarks(&lag_state);
-                    let (name, payload) = serialize_event(crate::sync::Event::Sync(wms));
+                    let (name, payload) = serialize(crate::sync::Event::Sync(wms));
                     // No history id: this frame is specific to this lagging
                     // subscriber, so it must not consume a bus-level
                     // sequence number that other clients would then skip.
@@ -89,8 +105,8 @@ pub async fn handler(
                     continue;
                 }
             };
-            let (name, payload) = serialize_event(ev);
-            let id = history.lock().append(name, payload.clone());
+            let id = history.lock().append(ev.clone());
+            let (name, payload) = serialize(ev);
             yield Ok(Event::default()
                 .id(id.to_string())
                 .event(name)
@@ -99,9 +115,9 @@ pub async fn handler(
         }
     });
 
-    Ok(Sse::new(stream)
+    Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(25)).text("ping"))
-        .into_response())
+        .into_response()
 }
 
 /// 把内部事件映射成线上载荷。

@@ -139,12 +139,35 @@ pub struct AccountHandle {
     pub stopped: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// **事件基线代号**：注销账号时递增。
+///
+/// 为什么需要它：注销会清掉重放缓冲里的条目，而**事件 id 计数器保留**（否则新账号的事件 id 会
+/// 从旧客户端已经见过的号段重新开始，它们会以为那些事件已经收过）。于是客户端带着旧的
+/// `Last-Event-ID` 重连时，看到的是一个**空的重放**加**跳号的 id** —— 它无法区分「注销后新账号
+/// 刚开始」与「自己漏收了」。基线里带上代号，客户端一比就知道该丢弃本地状态重新拉。
+///
+/// 进程级而不是每账号：事件总线与重放历史本来就是进程级的（见 `push_events` 的说明）。
+static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// 当前的基线代号，见 [`GENERATION`]。
+pub fn current_generation() -> u64 {
+    GENERATION.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// 推进基线代号（注销时调用）。
+pub fn bump_generation() -> u64 {
+    GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+}
+
 /// One buffered SSE event (WeFlow contract: replay cap 1000, TTL 10 min).
+///
+/// **存的是原始事件，不是序列化后的载荷。** 载荷形状是**视图**的事：两个面对同一个事件有不同的
+/// 形状要求（WeFlow 兼容面发完整消息，ChatLab 面只发元信息）。存序列化结果的话，后加的那个面
+/// 重放时会吐出**另一个面的形状** —— 而且这种错在只连新面时看不出来。
 pub struct HistoryItem {
     pub id: u64,
     pub at: std::time::Instant,
-    pub name: &'static str,
-    pub payload: serde_json::Value,
+    pub event: crate::sync::Event,
 }
 
 #[derive(Default)]
@@ -158,13 +181,12 @@ impl HistoryBuf {
     pub const TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
     /// Append an event and return its id (monotonic).
-    pub fn append(&mut self, name: &'static str, payload: serde_json::Value) -> u64 {
+    pub fn append(&mut self, event: crate::sync::Event) -> u64 {
         self.last_id += 1;
         self.items.push_back(HistoryItem {
             id: self.last_id,
             at: std::time::Instant::now(),
-            name,
-            payload,
+            event,
         });
         while self.items.len() > Self::MAX {
             self.items.pop_front();
@@ -172,13 +194,24 @@ impl HistoryBuf {
         self.last_id
     }
 
+    /// 清空缓冲，但**不动 id 计数器**。
+    ///
+    /// 注销时用它：旧账号的事件对下一个账号没有意义，而计数器若一起归零，带着旧
+    /// `Last-Event-ID` 重连的客户端会把新事件当成「已经收过」而丢掉 —— 那比跳号更难查。
+    /// 跳号是看得见的，丢事件是看不见的。
+    pub fn clear(&mut self) {
+        self.items.clear();
+    }
+
     /// Events with id > `since`, still within the TTL window.
-    pub fn replay_since(&self, since: u64) -> Vec<(u64, &'static str, serde_json::Value)> {
+    ///
+    /// 返回**事件本身** —— 由调用它的那个面决定怎么序列化（见 [`HistoryItem`] 的说明）。
+    pub fn replay_since(&self, since: u64) -> Vec<(u64, crate::sync::Event)> {
         let now = std::time::Instant::now();
         self.items
             .iter()
             .filter(|i| i.id > since && now.duration_since(i.at) < Self::TTL)
-            .map(|i| (i.id, i.name, i.payload.clone()))
+            .map(|i| (i.id, i.event.clone()))
             .collect()
     }
 }
@@ -423,6 +456,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/push/messages",
             axum::routing::get(push_events::handler).post(push_events::handler),
+        )
+        // ── ChatLab 适配面（新增，**不改老路由**）──────────────────────────
+        //
+        // 规范把 `baseUrl` 定义为 `/chatlab`，于是这三条是 Pull 形状的入口。它们与 `/api/v1/*`
+        // **共用同一份实现与同一条总线**，差别只在默认语义：老面靠 `format=chatlab` 参数切换，
+        // 新面**天生就是** ChatLab 形状（调用方不必知道还有另一种）。
+        .route(
+            "/chatlab/push/messages",
+            axum::routing::get(chatlab_push::handler),
         )
         .route("/api/v1/sync", axum::routing::get(sync::handler).post(sync::handler))
         .route(
@@ -949,6 +991,12 @@ fn purge_exported_media(root: &std::path::Path, talkers: &[String]) -> usize {
 /// account vanishes entirely (nothing here knows about it any more).
 pub fn deregister_account(state: &AppState, wxid: &str, purge_media: bool) -> DeregisterOutcome {
     // 1. Claim the removal under one lock.
+
+    // 注销时**清掉重放条目并推进基线代号**。条目留着对下一个账号没有意义；而事件 id
+    // 计数器**保留** —— 见 `HistoryBuf::clear` 与 `GENERATION` 的说明。基线代号让带着旧
+    // `Last-Event-ID` 重连的客户端能区分「注销后新账号刚开始」与「自己漏收了」。
+    state.history.lock().clear();
+    bump_generation();
     let handle = {
         let mut accounts = state.accounts.lock();
         match bound_account(&accounts) {

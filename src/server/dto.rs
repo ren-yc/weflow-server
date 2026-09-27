@@ -495,3 +495,44 @@ pub struct SessionChatlab {
     pub platform: String,
     pub r#type: String,
 }
+
+// ── ChatLab 通知帧 ────────────────────────────────────────
+
+/// `/chatlab/push/messages` 的通知帧：**只带元信息，不带正文**。
+///
+/// 规范对这条通道的定位是「仅通知：不假设事件可靠送达」—— 客户端收到后**去拉**那一页。
+/// 带正文会诱导调用方把它当数据源，而它并不保证送达；不带，语义就没有歧义。
+///
+/// `eventId` 与 `platformMessageId` 是**两个不同的号**：前者是事件通道自己的标识，后者是那条
+/// 消息在平台上的 id（拉取时用它定位）。撤回事件里 `platformMessageId` 是被撤回那条的 id。
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationFrame {
+    /// 事件名。帧头（`event:` 行）与载荷里各有一份，**不是**重复：只解析 `data:` 行的客户端
+    /// 也要能分辨类型。
+    pub event: String,
+    /// 事件通道自己的标识。
+    pub event_id: String,
+    /// 平台消息 id；取不到时为 `null`（键保留）。
+    pub platform_message_id: Option<String>,
+    /// 所属会话。
+    pub session_id: String,
+    /// 事件时刻（秒）。
+    pub timestamp: i64,
+}
+
+/// `/chatlab/push/messages` 的基线帧。
+///
+/// `generation` 在注销时递增（见 `server::GENERATION`）：带着旧 `Last-Event-ID` 重连的客户端
+/// 据此区分「注销后新账号刚开始」与「自己漏收了」—— 前者该丢弃本地状态重新拉，后者该补拉。
+/// 少了它，这两种情况在协议上是同一件事。
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncFrame {
+    /// 事件名（`sync`）。
+    pub event: String,
+    /// 基线代号。
+    pub generation: u64,
+    /// 各表的水位线 —— 客户端从这里开始增量拉。
+    pub watermarks: Vec<WatermarkEntry>,
+}

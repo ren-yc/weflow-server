@@ -290,7 +290,7 @@ async fn conformance_suite_passes() {
             "messages": "/api/v1/messages",
             "harness": "/__harness",
             "pull": "/api/v1/sessions/{id}/messages",
-            "push": "/api/v1/push/messages",
+            "push": "/chatlab/push/messages",
             "sessions": "/api/v1/sessions",
         },
         "authProbed": auth_probed,
