@@ -90,5 +90,18 @@ foreach ($line in $envBlock) {
 
 # --- 4. Passthrough ---
 Set-Location $PSScriptRoot\..
+
+# `testing` feature 只影响**可见性**：默认构建下实现面是 `pub(crate)`（边界由编译器强制），
+# 开了它才转成 `pub` —— 而集成测试在独立 crate 里，只能看见 `pub`。所以凡是编译测试的命令
+# 都要带上它，否则报的是「模块是私有的」，与真正的问题无关。
+#
+# 在这里补而不是写进文档：忘记它得到的是一堆看不懂的隐私错误，而不是一个明确的提示。
+# 已显式给过 feature 相关参数时不插手（尊重调用方的选择）。
+$needsTesting = $args.Count -gt 0 -and ($args[0] -eq 'test' -or ($args[0] -eq 'clippy' -and $args -contains '--all-targets'))
+$alreadyHas = $args -contains '--features' -or $args -contains '--all-features' -or $args -contains '--no-default-features'
+if ($needsTesting -and -not $alreadyHas) {
+    $args = @($args[0]) + @('--features', 'testing') + @($args[1..($args.Count - 1)])
+    Write-Host 'build.ps1: 已补 --features testing（集成测试需要它才看得见实现面）'
+}
 & cargo @args
 exit $LASTEXITCODE

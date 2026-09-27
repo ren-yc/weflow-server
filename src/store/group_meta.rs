@@ -56,9 +56,10 @@ pub fn load_chatroom_meta(conn: &Connection, store: &mut Store) {
     }
 
     // 名册：`chatroom_member(room_id, member_id)`，逐房间去重。
-    if let Ok(mut stmt) = conn.prepare("SELECT room_id, member_id FROM chatroom_member") {
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)));
-        if let Ok(rows) = rows {
+    if let Ok(mut stmt) = conn.prepare("SELECT room_id, member_id FROM chatroom_member")
+        && let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+    {
+        {
             for (room_id, member_id) in rows.filter_map(Result::ok) {
                 let (Some(room), Some(member)) = (name2id.get(&room_id), name2id.get(&member_id))
                 else {
@@ -95,14 +96,15 @@ pub fn load_group_cards(conn: &Connection, store: &mut Store) {
         // 影子表不在（老版本、或该库没有这张 FTS 表）不是错误。
         Err(_) => return,
     };
-    let rows = stmt.query_map([], |r| {
+    let Ok(rows) = stmt.query_map([], |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, i64>(1)?,
             r.get::<_, Option<String>>(2)?,
         ))
-    });
-    let Ok(rows) = rows else { return };
+    }) else {
+        return;
+    };
     let mut cards: GroupCards = HashMap::new();
     for (room_id, member_id, card) in rows.filter_map(Result::ok) {
         let Some(card) = card.filter(|c| !c.is_empty()) else {

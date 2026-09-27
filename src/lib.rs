@@ -4,24 +4,45 @@
 //! WeChat-specific pieces rewritten (WCDB/SQLCipher-4 page cipher, `db_storage`
 //! layout, `Msg_<md5>` message tables, XML/zstd content parsing).
 
-pub mod config;
-pub mod db;
-pub mod keystore;
-pub mod logging;
-pub mod media;
-pub mod parser;
-pub mod pathsafe;
-pub mod server;
-pub mod store;
-pub mod sync;
+// 实现面：默认 **`pub(crate)`**（边界由编译器强制，外部不可达）；
+// `--features testing` 下转 `pub` —— 集成测试在独立 crate 里，只能看见 `pub`。
+//
+// 承诺面是 [`api`]，见它的模块文档。
+macro_rules! internal {
+    ($($m:ident),* $(,)?) => {
+        $(
+            #[cfg(feature = "testing")]
+            pub mod $m;
+            #[cfg(not(feature = "testing"))]
+            pub(crate) mod $m;
+        )*
+    };
+}
 
+// 核心：只读数据访问与解析。不依赖 tokio，也不依赖 axum。
+internal!(config, db, keystore, logging, parser, pathsafe, store);
+
+// 可选面：关掉即从依赖树里消失。
+#[cfg(feature = "media")]
+internal!(media);
+#[cfg(feature = "sync")]
+internal!(sync);
+#[cfg(feature = "server")]
+internal!(server);
+
+#[cfg(feature = "server")]
 use std::sync::Arc;
 
+#[cfg(feature = "server")]
 use anyhow::{Context, Result};
 
+#[cfg(feature = "server")]
 use crate::config::Config;
 
 /// Parse CLI and run the service.
+///
+/// 需要 `server` feature —— 它建 tokio 运行时并起 HTTP 服务。
+#[cfg(feature = "server")]
 pub fn run(cfg: Config) -> Result<()> {
     if cfg.show_token {
         return match config::show_token()? {
@@ -47,8 +68,10 @@ pub fn run(cfg: Config) -> Result<()> {
 /// would hang for as long as a client stays subscribed. The SSE handler also
 /// watches the shutdown channel and closes its own stream, so this is the
 /// safety net rather than the normal path.
+#[cfg(feature = "server")]
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
+#[cfg(feature = "server")]
 async fn serve(cfg: Config) -> Result<()> {
     serve_with_shutdown(cfg, async {
         tokio::signal::ctrl_c().await.ok();
@@ -63,6 +86,7 @@ async fn serve(cfg: Config) -> Result<()> {
 /// here was precisely that no signal handler was installed at all — the
 /// process died before it could log or release the watcher handles. Tests
 /// drive this with a channel instead of a signal.
+#[cfg(feature = "server")]
 pub async fn serve_with_shutdown(
     cfg: Config,
     shutdown_signal: impl std::future::Future<Output = ()> + Send + 'static,

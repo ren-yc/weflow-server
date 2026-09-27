@@ -8,19 +8,19 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 aes = "0.8"
-async-stream = "0.3"
-axum = { version = "0.8", features = ["macros"] }
+async-stream = { version = "0.3", optional = true }
+axum = { optional = true, version = "0.8", features = ["macros"] }
 base64 = "0.22"
 cbc = { version = "0.1", features = ["alloc"] }
 chrono = "0.4"
 dirs = "6"
-futures-util = "0.3"
+futures-util = { version = "0.3", optional = true }
 hex = "0.4"
 keyring = { version = "3", default-features = false, features = ["windows-native", "apple-native", "linux-native"] }
 hmac = "0.12"
 md-5 = "0.10"
-notify = "8.2"
-notify-debouncer-mini = "0.7"
+notify = { version = "8.2", optional = true }
+notify-debouncer-mini = { version = "0.7", optional = true }
 parking_lot = "0.12"
 pbkdf2 = { version = "0.12", features = ["hmac"] }
 rand = "0.8"
@@ -29,15 +29,43 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.10"
 sha2 = "0.10"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "io-util", "fs"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
-tokio-util = { version = "0.7", features = ["io"] }
-tower-http = { version = "0.6", features = ["trace"] }
+tokio = { optional = true, version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "io-util", "fs"] }
+tokio-stream = { optional = true, version = "0.1", features = ["sync"] }
+tokio-util = { optional = true, version = "0.7", features = ["io"] }
+tower-http = { optional = true, version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # OpenAPI 描述生成。**只加在服务层**：schema 是 HTTP 面的东西，解析/存储层不该依赖它。
-utoipa = { version = "6", features = ["axum_extras"] }
+utoipa = { optional = true, version = "6", features = ["axum_extras"] }
 zstd = "0.13"
+
+[features]
+default = ["server"]
+
+# 服务层：HTTP/SSE。依赖 axum 与 tokio 运行时。
+server = ["dep:axum", "dep:utoipa", "dep:tower-http", "dep:tokio-stream", "dep:tokio-util", "dep:tokio", "sync", "media"]
+
+# 同步引擎：watcher 与水位线增量。
+sync = ["dep:tokio", "dep:notify", "dep:notify-debouncer-mini", "dep:async-stream", "dep:futures-util", "dep:tokio-stream"]
+
+# 媒体导出（调用外部 ffmpeg）。
+media = []
+
+# 造库/造密钥工具。
+#
+# 两个用途，缺一不可：
+#   ① **嵌入者写自己的测试**时需要造一份假库（和我们测试里做的是同一件事），这是有意设计的
+#      工具面，不是给测试开的后门；
+#   ② 本仓库的集成测试在**独立 crate** 里，只能看见 pub。默认构建下实现面是 pub(crate)
+#      （边界由编译器强制），开了这个 feature 才转成 pub。
+testing = []
+
+[[bin]]
+name = "weflow-server"
+path = "src/main.rs"
+# 二进制要建 tokio 运行时并起 HTTP 服务 —— 没有 `server` feature 时它没有意义，
+# 与其编译出一个起不来的 bin，不如让 cargo 直接不构建它。
+required-features = ["server"]
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
