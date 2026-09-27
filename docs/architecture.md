@@ -9,6 +9,7 @@
 - [定位与不变量](#定位与不变量)
 - [总览与数据流](#总览与数据流)
 - [核心模块](#核心模块)
+- [库面与 feature](#库面与-feature)
 - [服务层](#服务层)
 - [设计要点与陷阱](#设计要点与陷阱)
 
@@ -72,7 +73,7 @@
 | 模块 | 职责 | 对外接口 | 依赖方向 |
 |---|---|---|---|
 | `main.rs` | 进程入口：解析配置、装日志、起服务 | — | → `server` / `config` |
-| `lib.rs` | 库入口：模块声明与对外再导出 | 全部 `pub mod` | — |
+| `lib.rs` | 库入口：承诺面 `api` ＋ 实现面（默认 `pub(crate)`，见「库面与 feature」） | `api` | — |
 | `config.rs` | 命令行与数据目录解析、token 凭据库读写 | `Config` | ← 无 |
 | `logging.rs` | 日志初始化 | `init()` | ← 无 |
 | `pathsafe.rs` | **纯守卫**：路径分量与导出根目录的边界检查 | `slugify` / 校验函数 | ← 无（被 `media`、`server` 调用） |
@@ -92,6 +93,45 @@
 | `server/handlers/mod.rs` | **handler 之间的共享件**：类型码映射、参数解析、信封 | `chatlab_type` / `parse_limit` / `merge_body` | — |
 | `server/handlers/*` | 各端点的实现（account / session / message / contact / media / push / sns） | — | → `store` / `sync` |
 
+## 库面与 feature
+
+这个 crate **既是服务、也是库**，两条路径共用同一份实现。
+
+### 两条使用路径
+
+| 用途 | 怎么用 |
+|---|---|
+| 起服务 | `cargo run`（或 `cargo install <包名>`）—— 默认 feature 就是它 |
+| 当库用 | `default-features = false`，再按需开 feature。**必须显式关掉默认 feature**，否则会连带拉进 axum 与 tokio |
+
+嵌入者从 **`api`** 入手，它始终可用（不随任何 feature 开关）—— 「读自己的聊天记录」是最小可用面。
+`examples/embed.rs` 是它的活文档：**不起 HTTP**，直接把一个账号读出来。
+
+### 承诺面只有一处：`api`
+
+其余模块在默认构建下是 **`pub(crate)`** —— 外部不可达，**边界由编译器强制**。这样做的理由：
+`store::Store` 的字段是 `pub`（内部模块要写它），直接放出去等于把**每一个字段**都变成对外契约，
+而它们本来是内部布局。
+
+| 面 | 内容 | 稳定性 |
+|---|---|---|
+| `api` | 只读索引、同步句柄、事件类型、密钥类型、数据本身 | 有 semver 承诺；`#![deny(missing_docs)]` 只作用在这里 |
+| 其余模块 | 解析、存储、同步、服务层的实现 | 随时可变；仅 `--features testing` 下对集成测试可见 |
+
+`testing` 只改**可见性**，不改功能：开它则实现面转 `pub`（集成测试在独立 crate 里，只能看见
+`pub`）。它同时是**给嵌入者的造库工具**面 —— 写自己的测试时同样要造库、造密钥。
+
+### feature 矩阵
+
+| feature | 内容 | 关掉的影响 |
+|---|---|---|
+| `server`（默认）| HTTP/SSE：axum ＋ tokio 运行时 ＋ OpenAPI 描述 | 没有服务，只剩库 |
+| `sync` | watcher 与水位线增量：tokio ＋ notify | 没有增量同步；`api::Sync` 随之消失 |
+| `media` | 媒体导出（外部 ffmpeg 在**运行时**探测，缺失则降级） | 没有导出与媒体代理 |
+| `testing` | 把实现面转成 `pub`（见上） | 集成测试够不着实现面 |
+
+**依赖面的实际约束**（可测，不是口号）：`--no-default-features` 的依赖树里**不含 axum 与 tokio**。
+核心面（解析、存储）因此不得依赖可选面 —— 这条边界由 CI 上的一条检查守着。
 ## 服务层
 
 ### 响应形状只有一个事实源：`server/dto.rs`
