@@ -594,6 +594,46 @@ async fn chatlab_splits_account_name_from_group_nickname() {
     assert_eq!(msg["groupNickname"], "四哥");
 }
 
+/// `contact_fts.db` 缺失时**降级而不是失败**。
+///
+/// 群名片的来源是那个库，但它是**可选**的：老版本微信可能没有它，密钥表里也可能没有它的条目。
+/// 少了它只应该是名片为空 —— 服务照常启动、接口照常 200。把「缺一个可选数据源」做成启动失败
+/// 或 5xx，会让整台服务因为一个显示字段而不可用。
+#[tokio::test]
+async fn missing_contact_fts_db_degrades_to_empty_cards() {
+    let dir = common::tmp_dir("smoke-nofts");
+    // `test_state_with` 的钩子在**造库之后、首次同步之前**跑 —— 直接 `test_state` 会重建夹具，
+    // 把刚删掉的文件又造回来（我第一版就是这么写的，于是断言看到名片还在）。
+    let state = test_state_with(&dir, |storage, _key| {
+        // 删掉整个库（连同它的 WAL/SHM），模拟「这个账号没有它」。
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(storage.join(format!("contact/contact_fts.db{suffix}")));
+        }
+    });
+    let app = server::build_router(state);
+
+    // 服务照常起来，业务接口照常 200。
+    let (status, _) = json_body(
+        app.clone()
+            .oneshot(request("GET", "/health", None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "健康检查照常");
+
+    let uri = format!(
+        "/api/v1/group-members?chatroomId={}&access_token={}",
+        common::FAKE_GROUP, TOKEN
+    );
+    let (status, body) = json_body(app.oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "接口照常 200");
+    // 名片为空 —— 降级的可见后果仅此而已。
+    for m in body["members"].as_array().unwrap() {
+        assert_eq!(m["groupNickname"], "", "没有来源时名片为空，而不是报错");
+    }
+}
+
 /// `messages[].type` is the canonical ChatLab 0.0.2 code, a different space
 /// from the native `localType`: an image is 1 there and 3 natively, and the
 /// unassigned code 6 must never appear.
