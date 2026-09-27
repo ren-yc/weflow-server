@@ -37,3 +37,5 @@ Desktop.ini
 
 # 契约仓库的检出目标（内容由 conformance.pin 决定，不入库）
 conformance/
+conformance-suite/
+conformance-nails/

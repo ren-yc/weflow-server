@@ -199,6 +199,6 @@ jobs:
         run: |
           set -euo pipefail
           pin="$(tr -d '[:space:]' < conformance.pin)"
-          git clone --depth 1 --branch "$pin" https://github.com/ren-yc/flow-contract.git conformance
-          FLOW_CONTRACT_DIR="$PWD/conformance" \
+          git clone --depth 1 --branch "$pin" https://github.com/ren-yc/flow-contract.git conformance-suite
+          FLOW_CONTRACT_DIR="$PWD/conformance-suite" \
             bash scripts/build.sh test --locked --test conformance_runner -- --ignored
