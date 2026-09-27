@@ -95,8 +95,11 @@ pub struct MessageRecord {
 /// Incremental watermark per message table (`<rel>:<table>`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct Watermark {
+    /// 消息的 `create_time`（秒）。
     pub create_time: i64,
+    /// 同一秒内的排序号 —— 只靠秒级时间戳无法定序，微信同秒会发多条。
     pub sort_seq: i64,
+    /// 自增行号，同一 `(create_time, sort_seq)` 下的最终定序依据。
     pub local_id: i64,
 }
 
@@ -114,6 +117,7 @@ pub struct SnsFeed {
     pub object_id: String,
     /// Poster nickname from the payload (`LocalExtraInfo.nickname`)
     pub nickname: String,
+    /// 发布时刻（秒）。
     pub create_time: i64,
     /// Text content (`<contentDesc>`), empty for pure-media posts
     pub content_desc: String,
@@ -121,13 +125,18 @@ pub struct SnsFeed {
     pub kind: &'static str,
     /// Numeric `ContentObject.type` as string (WeFlow `type`)
     pub content_type: String,
+    /// 这条朋友圈里的图片/视频，顺序与 XML 里一致。
     pub media: Vec<SnsMedia>,
+    /// 评论条数（与 `comments` 的长度一致；单独给出是为了不让调用方为了计数而解析数组）。
     pub comment_count: usize,
     /// Likes (`like_user_list` blocks)
     pub likes: Vec<SnsPerson>,
     /// Comments (user_comment blocks carrying content)
     pub comments: Vec<SnsComment>,
+    /// 定位纬度；未携带定位时为 `0.0`（不是「赤道」——`0.0/0.0` 是不存在的几内亚湾坐标，
+    /// 用作哨兵）。
     pub latitude: f64,
+    /// 定位经度；语义同 `latitude`。
     pub longitude: f64,
     /// Full original XML (WeFlow returns `rawXml`)
     pub raw_xml: String,
@@ -136,17 +145,24 @@ pub struct SnsFeed {
 /// A liker on a moment.
 #[derive(Debug, Clone, Default)]
 pub struct SnsPerson {
+    /// 点赞者的 wxid。
     pub username: String,
+    /// 点赞时的昵称（历史快照 —— 对方改名后这里不会跟着变）。
     pub nickname: String,
+    /// 点赞时刻（秒）。
     pub create_time: i64,
 }
 
 /// A comment on a moment.
 #[derive(Debug, Clone, Default)]
 pub struct SnsComment {
+    /// 评论者的 wxid。
     pub username: String,
+    /// 评论时的昵称（历史快照）。
     pub nickname: String,
+    /// 评论时刻（秒）。
     pub create_time: i64,
+    /// 评论正文。
     pub content: String,
 }
 
@@ -155,16 +171,21 @@ pub struct SnsComment {
 pub struct SnsMedia {
     /// image | video
     pub kind: &'static str,
+    /// 原图/原视频的 md5；取不到时为 `None`（不是空串 —— 「没有」与「是空串」在这里含义不同）。
     pub md5: Option<String>,
     /// Full-size CDN url (`<url>` element text)
     pub url: String,
     /// Thumbnail CDN url (`<thumb>` element text)
     pub thumb: Option<String>,
+    /// 像素宽；未知时为 `0`。
     pub width: i64,
+    /// 像素高；未知时为 `0`。
     pub height: i64,
     /// CDN access material (passthrough for proxy clients)
     pub token: Option<String>,
+    /// 解码密钥材料（原样透传给代理客户端，本 crate 不解读它）。
     pub key: Option<String>,
+    /// 加密索引（同上，原样透传）。
     pub enc_idx: Option<String>,
 }
 

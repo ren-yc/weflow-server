@@ -1,5 +1,18 @@
 //! weflow-server: headless WeChat 4.x database monitor + decrypt/extract service.
 //!
+//! # 两条使用路径
+//!
+//! - **起服务**：`cargo run`（或 `cargo install weflow-server`）——默认 feature 就是它。
+//! - **当库用**：`default-features = false`，然后按需开 feature。**必须显式关掉默认 feature**，
+//!   否则会连带拉进 axum 与 tokio。嵌入者从 [`api`] 入手。
+//!
+//! # 文档门
+//!
+//! `#![deny(missing_docs)]` 开着。它**天然只作用在承诺面**：[`api`] —— 因为其余模块在默认构建下
+//! 是 `pub(crate)`，而 missing_docs 只看得到 `pub`。于是「补 rustdoc」从愿望变成了可验证的门。
+
+#![deny(missing_docs)]
+//!
 //! Module layout mirrors qqflow-server (reference architecture) with the
 //! WeChat-specific pieces rewritten (WCDB/SQLCipher-4 page cipher, `db_storage`
 //! layout, `Msg_<md5>` message tables, XML/zstd content parsing).
@@ -11,13 +24,22 @@
 macro_rules! internal {
     ($($m:ident),* $(,)?) => {
         $(
+            // `testing` 那一支**豁免文档门**：它把实现面转成 `pub` 只是为了让集成测试够得着，
+            // 不是对外承诺 —— 要求它逐项写 rustdoc 会把 370 处内部项变成文档债，而它们随时会变。
+            // 文档门（`#![deny(missing_docs)]`）因此**始终只作用在承诺面 [`api`] 上**。
             #[cfg(feature = "testing")]
+            #[allow(missing_docs)]
             pub mod $m;
             #[cfg(not(feature = "testing"))]
             pub(crate) mod $m;
         )*
     };
 }
+
+/// 嵌入者承诺面 —— 本 crate **唯一**的对外承诺。
+///
+/// 它始终可用（不随任何 feature 开关），因为「读自己的聊天记录」是最小可用面。
+pub mod api;
 
 // 核心：只读数据访问与解析。不依赖 tokio，也不依赖 axum。
 internal!(config, db, keystore, logging, parser, pathsafe, store);
