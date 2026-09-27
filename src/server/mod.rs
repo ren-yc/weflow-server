@@ -465,9 +465,16 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/chatlab/push/messages",
             axum::routing::get(chatlab_push::handler),
-        )        .route(
+        )
+        .route(
             "/chatlab/sessions",
             axum::routing::get(chatlab_sessions::handler),
+        )
+        // Pull 面**本身就是** ChatLab 形状（它没有 `format` 参数）。挂到规范约定的
+        // `{baseUrl}/sessions/{id}/messages` 上，于是 `baseUrl=/chatlab` 三条路由齐了。
+        .route(
+            "/chatlab/sessions/{id}/messages",
+            axum::routing::get(chatlab_pull::handler),
         )
         .route("/api/v1/sync", axum::routing::get(sync::handler).post(sync::handler))
         .route(
