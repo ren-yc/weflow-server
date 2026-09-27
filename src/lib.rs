@@ -39,6 +39,23 @@ use anyhow::{Context, Result};
 #[cfg(feature = "server")]
 use crate::config::Config;
 
+/// CLI 入口：读参数、初始化日志、起服务。
+///
+/// **二进制走这里，而不是直接用 `config`/`logging`。** 原因是一个容易被忽略的事实：
+/// `src/main.rs` 是**独立 crate**，只能看见 `pub` —— 而实现面默认是 `pub(crate)`（边界由编译器
+/// 强制）。所以「连自家二进制也得走承诺面」不是麻烦，正是这条边界在起作用：它证明承诺面**够用**，
+/// 嵌入者能做的事，二进制没有多一分。
+///
+/// 需要 `server` feature —— 它建 tokio 运行时并起 HTTP 服务。
+#[cfg(feature = "server")]
+pub fn run_cli() -> Result<()> {
+    let Some(cfg) = config::load()? else {
+        return Ok(()); // --help / --version 已经打印过了
+    };
+    logging::init(&cfg.log);
+    run(cfg)
+}
+
 /// Parse CLI and run the service.
 ///
 /// 需要 `server` feature —— 它建 tokio 运行时并起 HTTP 服务。

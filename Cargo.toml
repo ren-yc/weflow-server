@@ -45,8 +45,9 @@ default = ["server"]
 # 服务层：HTTP/SSE。依赖 axum 与 tokio 运行时。
 server = ["dep:axum", "dep:utoipa", "dep:tower-http", "dep:tokio-stream", "dep:tokio-util", "dep:tokio", "sync", "media"]
 
-# 同步引擎：watcher 与水位线增量。
-sync = ["dep:tokio", "dep:notify", "dep:notify-debouncer-mini", "dep:async-stream", "dep:futures-util", "dep:tokio-stream"]
+# 同步引擎：watcher 与水位线增量。**隐含 `media`** —— 增量同步顺带导出媒体（`sync/mod.rs` 调
+# `media::export`），拆开就编译不过。这也是为什么单独开 `sync` 时 `media` 会跟着来。
+sync = ["dep:tokio", "dep:notify", "dep:notify-debouncer-mini", "dep:async-stream", "dep:futures-util", "dep:tokio-stream", "media"]
 
 # 媒体导出（调用外部 ffmpeg）。
 media = []
