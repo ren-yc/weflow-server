@@ -35,16 +35,22 @@ pub fn load_chatroom_meta(conn: &Connection, store: &mut Store) {
         return;
     }
 
-    // 群主：`chat_room(room_id, owner)`。真库实测 114/114 非空、且都能在已读的 contact 表里找到。
-    if let Ok(mut stmt) = conn.prepare("SELECT room_id, owner FROM chat_room") {
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)));
+    // 群主：`chat_room`。**这一张表用的是用户名，不是 rowid** —— 真库实测它的列是
+    // (id, username, owner, ext_buffer)：`username` 是群、`owner` 是群主，两者都已经是
+    // 用户名；按 rowid 去 name2id 里查会**一个都查不到**（实测 0/114，而按用户名匹配 114/114）。
+    // 同一个库里 `chatroom_member` 用的却**是** rowid —— 两张表形态不同，不能一起假设。
+    if let Ok(mut stmt) = conn.prepare("SELECT username, owner FROM chat_room") {
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?))
+        });
         if let Ok(rows) = rows {
-            for (room_id, owner_id) in rows.filter_map(Result::ok) {
-                let (Some(room), Some(owner)) = (name2id.get(&room_id), name2id.get(&owner_id))
-                else {
+            for (room, owner) in rows.filter_map(Result::ok) {
+                let (Some(room), Some(owner)) = (room, owner) else {
                     continue;
                 };
-                store.chatroom_owner.insert(room.clone(), owner.clone());
+                if !room.is_empty() && !owner.is_empty() {
+                    store.chatroom_owner.insert(room, owner);
+                }
             }
         }
     }

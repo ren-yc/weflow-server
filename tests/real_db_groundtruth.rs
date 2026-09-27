@@ -224,6 +224,19 @@ async fn real_contact_fts_schema_probe() {
 
         // 5. **实现的关键坑**：`room_id`/`member_id` 不在 contact.db 的 id 空间里，
         //    必须用 contact_fts.db **自己**的 `name2id`。验证它在这里确实存在、且能解析。
+        // **列名必须查，不能假设**：本文件第 5 步用的是 `n.username`（没有下划线），而
+        // `store::index::load_uid_map` 硬编码了 `user_name` —— 两者只要不一致，那条 SELECT
+        // 就会失败、静默返回空表，于是「ID 一个都解析不出来」。夹具若恰好写成另一个拼法，
+        // 夹具就永远发现不了这个分歧。
+        let n2i_cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(name2id)")
+            .and_then(|mut s| {
+                Ok(s.query_map([], |r| r.get::<_, String>(1))?
+                    .filter_map(Result::ok)
+                    .collect::<Vec<_>>())
+            })
+            .unwrap_or_default();
+        println!("[probe] name2id 的列 = {n2i_cols:?}");
         let has_name2id = objs.iter().any(|(_, n)| n == "name2id");
         println!("[probe] contact_fts.db 里有 name2id: {has_name2id}");
         if has_name2id {
@@ -263,4 +276,118 @@ async fn real_contact_fts_schema_probe() {
             println!("[probe] name2id 有 {n} 行；room 解析 {room_hit}（其中 @chatroom 形态 {room_like}），member 解析 {member_hit}");
         }
     }
+}
+
+/// 真库路径下**群昵称与群主有真值**，且 id 确实是用**各自库**的 `name2id` 解析的。
+///
+/// 最后一条断言是这里最要紧的：两个库的 id 空间互相独立，拿错库的表名**不会报错**，只会解析
+/// 到错误的人。若解析错了库，房间键就不可能是 `@chatroom` 形态（会解析成某个联系人的 wxid），
+/// 所以「所有房间键都以 @chatroom 结尾」是一条能真正证伪的判据 —— 而不是「跑起来了就算过」。
+///
+/// 只输出计数与形态，不打印任何内容。
+#[test]
+#[ignore = "requires a real WeChat 4.0 account"]
+fn real_group_metadata_has_values() {
+    let Some((root, keys)) = real_env() else { return };
+    let storage = root.join("db_storage");
+    let files = scan::enum_db_files(&storage);
+    let mut pool = LivePool::new();
+    let store = index::build_all_live(&mut pool, &keys, "real", &files).unwrap();
+
+    // 群主为什么可能是 0：`chat_room.owner` 存的到底是 rowid（要用本库 name2id 解析）还是
+    // 用户名本身？两种形态的修法完全不同，不能猜 —— 探一次，只看形态与计数。
+    {
+        let cdb = root.join("db_storage/contact/contact.db");
+        if let Some(ck) = keys.key_for("contact/contact.db")
+            && let Ok(c) = rusqlite::Connection::open(&cdb)
+        {
+            {
+                let _ = c.execute_batch(&format!("PRAGMA key = \"x'{}'\";", hex::encode(ck.0)));
+                let cols: Vec<String> = c
+                    .prepare("PRAGMA table_info(chat_room)")
+                    .and_then(|mut s| {
+                        Ok(s.query_map([], |r| r.get::<_, String>(1))?
+                            .filter_map(Result::ok)
+                            .collect::<Vec<_>>())
+                    })
+                    .unwrap_or_default();
+                eprintln!("[real] chat_room 的列 = {cols:?}");
+                let n: i64 = c
+                    .query_row("SELECT COUNT(*) FROM chat_room", [], |r| r.get(0))
+                    .unwrap_or(-1);
+                let nonempty: i64 = c
+                    .query_row(
+                        "SELECT COUNT(*) FROM chat_room WHERE owner IS NOT NULL AND owner <> ''",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(-1);
+                // owner 若是 rowid，用本库 name2id 应当能全部解析。
+                let resolved: i64 = c
+                    .query_row(
+                        "SELECT COUNT(*) FROM chat_room r JOIN name2id n ON n.rowid = r.owner",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(-1);
+                // owner 若是用户名本身，应当能在 contact.userName 里找到。
+                let as_name: i64 = c
+                    .query_row(
+                        "SELECT COUNT(*) FROM chat_room r JOIN contact ct ON ct.userName = CAST(r.owner AS TEXT)",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(-1);
+                eprintln!(
+                    "[real] chat_room {n} 行、owner 非空 {nonempty}；按 rowid 解析 {resolved}；按用户名匹配 {as_name}"
+                );
+            }
+        }
+    }
+
+    let cards: usize = store.group_cards.values().map(|m| m.len()).sum();
+    let owners = store.chatroom_owner.len();
+    let roster_rooms = store.chatroom_roster.len();
+    let roster: usize = store.chatroom_roster.values().map(|v| v.len()).sum();
+    eprintln!(
+        "[real] 有卡片的群 {}、卡片 {cards}；群主 {owners}；名册 {roster_rooms} 群 / {roster} 人",
+        store.group_cards.len()
+    );
+
+    assert!(cards > 0, "真库里应有群名片 —— 否则加载路径没生效");
+    assert!(owners > 0, "真库里应有群主 —— 否则 chat_room 没读到");
+    assert!(roster > 0, "真库里应有名册 —— 否则 chatroom_member 没读到");
+
+    // 房间键必须是群。解析错了库就做不到这一点。
+    let wrong: Vec<&String> = store
+        .group_cards
+        .keys()
+        .filter(|room| !room.ends_with("@chatroom"))
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "有 {} 个房间键不是群形态 —— 说明 id 是用错库的 name2id 解析的（前几个：{:?}）",
+        wrong.len(),
+        wrong.iter().take(3).collect::<Vec<_>>()
+    );
+
+    // 群名片不该是联系人备注的副本：它们是两个不同的字段。真库实测「同名」是少数（90/2568）。
+    // 这条只报数、不设阈值 —— 真库会变，把某个具体比例钉成断言会让它变成一个脆弱的测试。
+    let same_as_remark: usize = store
+        .group_cards
+        .values()
+        .flat_map(|cards| cards.iter())
+        .filter(|(member, card)| {
+            store
+                .contacts
+                .get(*member)
+                .and_then(|c| c.remark.as_deref())
+                .is_some_and(|r| !r.is_empty() && r == card.as_str())
+        })
+        .count();
+    eprintln!("[real] 名片与联系人备注逐条相同的条数（应为少数）：{same_as_remark}");
+    assert!(
+        same_as_remark < cards,
+        "名片若与备注全都相同，说明读错了来源"
+    );
 }

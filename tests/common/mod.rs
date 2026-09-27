@@ -93,10 +93,11 @@ pub fn build_wechat_account(dir: &Path, key: &Key) -> PathBuf {
             INSERT INTO contact VALUES ('wxid_fake_group@chatroom', '', '项目群', '', 2);",
         )
         .unwrap();
-        // 群元数据（群主与名册）住 contact.db。真库里它们是 `chat_room(room_id, owner)` 与
-        // `chatroom_member(room_id, member_id)`，两个 id 都要用**本库**的 `name2id` 解析。
+        // 群元数据（群主与名册）住 contact.db。**两张表的形态不一样**：`chat_room` 的
+        // `username`/`owner` 是**用户名本身**（列是 id/username/owner/ext_buffer），而
+        // `chatroom_member` 的 `room_id`/`member_id` 是 **rowid**、要用本库的 `name2id` 解析。
         conn.execute_batch(
-            r#"CREATE TABLE chat_room (room_id INTEGER, owner INTEGER);
+            r#"CREATE TABLE chat_room (id INTEGER, username TEXT, owner TEXT, ext_buffer TEXT);
             CREATE TABLE chatroom_member (room_id INTEGER, member_id INTEGER);
             -- 本库的 id 空间：群 = 3、member_b = 2。**故意与 fts 库不同**（见下一节），
             -- 这样用错库的 name2id 会解析到错的人，而不是解析失败。
@@ -105,7 +106,8 @@ pub fn build_wechat_account(dir: &Path, key: &Key) -> PathBuf {
                 (1, 'wxid_friend_a'), (2, 'wxid_member_b'),
                 (3, 'wxid_fake_group@chatroom'), (4, 'wxid_fake000000000000001');
             -- 群主给 member_b —— 断言要看到每群恰一人为 true。
-            INSERT INTO chat_room VALUES (3, 2);
+            -- `chat_room` 用**用户名**（不是 rowid）—— 真库实测列为 (id, username, owner, ext_buffer)。
+            INSERT INTO chat_room (username, owner) VALUES ('wxid_fake_group@chatroom', 'wxid_member_b');
             INSERT INTO chatroom_member VALUES (3, 1), (3, 2);"#,
         )
         .unwrap();

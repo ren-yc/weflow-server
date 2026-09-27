@@ -475,7 +475,20 @@ pub fn uid_map(conn: &Connection) -> std::collections::HashMap<i64, String> {
 fn load_uid_map(conn: &Connection, name2id: Option<&str>) -> std::collections::HashMap<i64, String> {
     let mut map = std::collections::HashMap::new();
     let Some(t) = name2id else { return map };
-    let Ok(mut stmt) = conn.prepare(&format!("SELECT rowid, user_name FROM \"{t}\"")) else {
+    // **列名要探测，不能二选一硬编码。** 真库实测：`contact.db` 与 `contact_fts.db` 的
+    // `name2id` 列叫 `username`（没有下划线），而消息库的 `Name2Id` 叫 `user_name`。
+    // 硬编码其中一个，另一个库的 SELECT 就会失败 —— 而它是**静默**返回空表的，于是症状是
+    // 「发送者全是空串」或「群主/名册一个都解析不出来」，不是报错。夹具若恰好写成另一个拼法，
+    // 夹具路径永远发现不了这个分歧（实测就是这样：夹具写 `user_name` 一路绿灯，真库全 0）。
+    let cols = crate::db::open::table_columns(conn, t);
+    let Some(col) = ["user_name", "username"]
+        .into_iter()
+        .find(|c| cols.iter().any(|x| x == c))
+    else {
+        tracing::warn!("{t} 里没有 user_name/username 列，发送者名将为空");
+        return map;
+    };
+    let Ok(mut stmt) = conn.prepare(&format!("SELECT rowid, \"{col}\" FROM \"{t}\"")) else {
         return map;
     };
     let mut rows = match stmt.query([]) {
