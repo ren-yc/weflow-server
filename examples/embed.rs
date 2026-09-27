@@ -52,7 +52,7 @@ fn main() -> anyhow::Result<()> {
 
     // ② 读会话。顺序是稳定的（按 username 升序），调用方可以直接做 diff。
     for session in index.sessions().iter().take(5) {
-        let kind = match index.session_kind(&session.username) {
+        let kind = match api::SessionKind::classify(&session.username) {
             api::SessionKind::Group => "群",
             api::SessionKind::Private => "私聊",
             api::SessionKind::Official => "公众号",
@@ -69,7 +69,7 @@ fn main() -> anyhow::Result<()> {
     if let Some(group) = index
         .sessions()
         .into_iter()
-        .find(|s| index.session_kind(&s.username) == api::SessionKind::Group)
+        .find(|s| api::SessionKind::classify(&s.username) == api::SessionKind::Group)
     {
         let owner = index.chatroom_owner(&group.username);
         println!(

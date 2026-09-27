@@ -87,6 +87,8 @@ impl Index {
     }
 
     /// 全部会话，按 `username` 升序 —— 顺序稳定，便于调用方做 diff。
+    ///
+    /// 返回副本（会话是摘要级数据，几百到几千条，代价可接受）。
     pub fn sessions(&self) -> Vec<Session> {
         let store = self.store.read();
         let mut out: Vec<Session> = store.sessions.values().cloned().collect();
@@ -100,6 +102,10 @@ impl Index {
     }
 
     /// 一个会话的消息，按时间升序。未知会话返回空。
+    ///
+    /// **返回的是副本，且是整段会话** —— 大群可能是几千条。只要最近几条的调用方，自己 `take`
+    /// 即可，但代价已经付过了（这个面刻意不引入分页：分页状态该由调用方持有，而它想要的
+    /// 切片方式未必和我们猜的一样）。
     pub fn messages(&self, username: &str) -> Vec<MessageRecord> {
         let store = self.store.read();
         let mut out = store.convs.get(username).cloned().unwrap_or_default();
@@ -113,11 +119,6 @@ impl Index {
         let mut out: Vec<Contact> = store.contacts.values().cloned().collect();
         out.sort_by(|a, b| a.username.cmp(&b.username));
         out
-    }
-
-    /// 会话类型（私聊 / 群 / 公众号 / 其他）。
-    pub fn session_kind(&self, username: &str) -> SessionKind {
-        SessionKind::classify(username)
     }
 
     /// 一个发送者在某个群里的**群名片**（不是联系人备注 —— 两者是不同字段）。

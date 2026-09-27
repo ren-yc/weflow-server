@@ -57,7 +57,7 @@ fn an_embedder_can_read_an_account_without_http() {
 
     // ⑥ 会话类型判定不需要额外数据。
     assert_eq!(
-        index.session_kind(common::FAKE_GROUP),
+        api::SessionKind::classify(common::FAKE_GROUP),
         weflow_server::api::SessionKind::Group
     );
 }
