@@ -7,7 +7,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
 
-use crate::server::dto::{ChatlabHeader, ChatlabMember, ChatlabMeta, PullEnvelope, PullMessage, PullSync};
+use crate::server::dto::{ChatlabMember, PullEnvelope, PullMessage, PullSync};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::handlers::{require_auth, ready_account};
 use crate::server::AppState;
@@ -96,36 +96,30 @@ pub async fn handler(
 
     let messages: Vec<PullMessage> = page
         .iter()
-        .map(|m| PullMessage {
-            account_name: m.sender_name.clone(),
-            content: m.parsed.display.clone(),
-            group_nickname: store.group_card(chatroom, &m.sender_username),
-            platform_message_id: m.server_id.to_string(),
-            // 有引用才输出这个键（`skip_serializing_if`）：规范把它列为**可选 string**，
-            // 给 `null` 会让「可选字符串」的读者拿到一个类型不符的值。
-            // 混合面按既有契约仍输出 `null`（下游已依赖），两处由此各建 struct。
-            reply_to_message_id: m.parsed.reply_to.clone(),
-            sender: m.sender_username.clone(),
-            timestamp: m.create_time,
-            r#type: crate::server::handlers::chatlab_type(m.local_type, &m.parsed),
+        .map(|m| {
+            // 字段怎么填只有一处出处（`server::chatlab`）；这里只剩这个面**自己的契约差异**：
+            // 有引用才输出 `replyToMessageId`（`skip_serializing_if`）—— 规范把它列为可选 string，
+            // 给 `null` 会让「可选字符串」的读者拿到一个类型不符的值。混合面按既有契约仍输出
+            // `null`（下游已依赖），两处由此各建 struct。
+            let f = crate::server::chatlab::message_fields(&store, chatroom, m);
+            PullMessage {
+                account_name: f.account_name,
+                content: f.content,
+                group_nickname: f.group_nickname,
+                platform_message_id: f.platform_message_id,
+                reply_to_message_id: f.reply_to_message_id,
+                sender: f.sender,
+                timestamp: f.timestamp,
+                r#type: f.r#type,
+            }
         })
         .collect();
 
     let body = PullEnvelope {
-        chatlab: ChatlabHeader {
-            exported_at: chrono::Utc::now().timestamp(),
-            generator: "weflow-server".to_string(),
-            version: "0.0.2".to_string(),
-        },
+        chatlab: crate::server::chatlab::header(),
         members,
         messages,
-        meta: ChatlabMeta {
-            group_id: id.clone(),
-            name: store.session_display(&id),
-            owner_id: store.my_wxid.clone(),
-            platform: "wechat".to_string(),
-            r#type: if id.ends_with("@chatroom") { "group" } else { "private" }.to_string(),
-        },
+        meta: crate::server::chatlab::meta(&store, &id, id.clone(), store.my_wxid.clone()),
         sync: PullSync {
             has_more,
             next_since: if has_more { next_since } else { watermark },

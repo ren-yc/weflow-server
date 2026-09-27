@@ -9,6 +9,7 @@ pub mod auth;
 pub mod dto;
 pub mod error;
 pub mod openapi;
+pub(crate) mod chatlab;
 pub mod handlers;
 
 use std::collections::HashMap;

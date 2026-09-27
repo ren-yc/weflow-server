@@ -8,8 +8,8 @@ use axum::http::HeaderMap;
 use axum::Json;
 
 use crate::server::dto::{
-    ChatlabHeader, ChatlabMember, ChatlabMessage, ChatlabMeta, MediaEnvelope, MediaObject,
-    MessageNative, MessagesChatlab, MessagesNative, Quote,
+    ChatlabMember, ChatlabMessage, MediaEnvelope, MediaObject, MessageNative, MessagesChatlab,
+    MessagesNative, Quote,
 };
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::handlers::{extract_params, ready_account, require_auth};
@@ -151,40 +151,31 @@ pub async fn handler(
             let msgs: Vec<ChatlabMessage> = asc
                 .iter()
                 .map(|m| {
+                    // 字段怎么填只有一处出处（`server::chatlab`）；这里只剩这个面**自己的契约差异**：
+                    // 混合面按既有契约输出 `null`（下游已依赖），而 Pull 面在该键缺席时不输出它。
+                    let f = crate::server::chatlab::message_fields(&store, chatroom, m);
                     ChatlabMessage {
-                        account_name: m.sender_name.clone(),
-                        content: m.parsed.display.clone(),
-                        group_nickname: store.group_card(chatroom, &m.sender_username),
-                        platform_message_id: m.server_id.to_string(),
-                        reply_to_message_id: m.parsed.reply_to.clone(),
-                        sender: m.sender_username.clone(),
-                        timestamp: m.create_time,
-                        r#type: crate::server::handlers::chatlab_type(m.local_type, &m.parsed),
-                        // `mediaPath` 有意不输出：安装版契约里有这个键，但本项目
-                        // 无法给出有意义的值（媒体导出由 `media=1` 开关控制，且
-                        // 只在原生形状回填），恒空的键比没有键更容易误导。
-                        // 媒体字节走本接口的 `media` 对象 + /api/v1/media/{id}。
+                        account_name: f.account_name,
+                        content: f.content,
+                        group_nickname: f.group_nickname,
+                        platform_message_id: f.platform_message_id,
+                        reply_to_message_id: f.reply_to_message_id,
+                        sender: f.sender,
+                        timestamp: f.timestamp,
+                        r#type: f.r#type,
+                        // `mediaPath` 有意不输出：安装版契约里有这个键，但本项目无法给出有意义的值
+                        // （媒体导出由 `media=1` 开关控制，且只在原生形状回填），恒空的键比没有键更
+                        // 容易误导。媒体字节走本接口的 `media` 对象 + /api/v1/media/{id}。
                     }
                 })
                 .collect();
             let body = MessagesChatlab {
-                chatlab: ChatlabHeader {
-                    exported_at: chrono::Utc::now().timestamp(),
-                    generator: "weflow-server".to_string(),
-                    version: "0.0.2".to_string(),
-                },
+                chatlab: crate::server::chatlab::header(),
                 count: slice.len(),
                 has_more,
                 members,
                 messages: msgs,
-                meta: ChatlabMeta {
-                    group_id,
-                    name: store.session_display(&talker),
-                    owner_id,
-                    platform: "wechat".to_string(),
-                    r#type: if talker.ends_with("@chatroom") { "group" } else { "private" }
-                        .to_string(),
-                },
+                meta: crate::server::chatlab::meta(&store, &talker, group_id, owner_id),
                 success: true,
                 talker: talker.clone(),
             };
