@@ -1271,7 +1271,7 @@
     },
     "info": {
       "title": "weflow-server",
-      "version": "0.5.1"
+      "version": "0.6.0"
     },
     "openapi": "3.1.0",
     "paths": {
