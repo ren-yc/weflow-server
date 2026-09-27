@@ -47,8 +47,9 @@ pub use crate::parser::{MediaHint, ParsedMsg, QuoteInfo, RevokeInfo};
 /// `keys` 是各库的密钥表（`db_storage` 里的相对路径 -> 密钥）；密钥从哪来由调用方负责，
 /// 本 crate 不做密钥提取。
 ///
-/// 缺库、缺密钥、某个库读不动，都只是**少索引一部分**，不会让整个调用失败 —— 「能读到多少
-/// 算多少」比「一个库坏了就全不可用」更符合只读服务的使用场景。
+/// 缺库、缺密钥、某个库读不动，都只是**少索引一部分**：目前没有任何一条路径会让整个调用
+/// 失败（签名仍留着 `Result` 以防将来需要）。「能读到多少算多少」比「一个库坏了就全不可用」
+/// 更符合只读服务的使用场景。
 pub fn open(
     storage: &std::path::Path,
     keys: &KeyMap,
@@ -71,9 +72,10 @@ pub struct Index {
 impl Index {
     /// 包住一个索引。
     ///
-    /// 索引的**构建**不在这里：那是写路径，由 [`crate::sync`] 与 [`crate::store::index`] 驱动。
-    /// 嵌入者拿到的是已经建好的那一个。
-    pub fn new(store: Arc<RwLock<Store>>) -> Self {
+    /// **不是 `pub`**：它要一个 `Arc<RwLock<Store>>`，而 `Store` 不在承诺面上 —— 留成 `pub` 会逼
+    /// 嵌入者去命名一个我们没承诺的类型（等于把内部布局漏出去）。索引由 [`open`] 或
+    /// [`Sync::index`] 给出，那两个签名里没有 `Store`。
+    pub(crate) fn new(store: Arc<RwLock<Store>>) -> Self {
         Self { store }
     }
 
@@ -82,7 +84,7 @@ impl Index {
         self.store.read().my_wxid.clone()
     }
 
-    /// 索引是否还没建起来（零账号启动、或构建尚未完成时为真）。
+    /// 索引里既没有会话也没有消息。账号库是空的、或一个库都没读到时为真。
     pub fn is_empty(&self) -> bool {
         self.store.read().is_empty()
     }
