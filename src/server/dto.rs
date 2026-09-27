@@ -485,15 +485,29 @@ pub struct SyncResult {
 }
 
 /// ChatLab 面的会话项。`type` 是字符串（`group` / `private`）。
+///
+/// `type` 只有两个取值（规范的枚举就这么大）—— 公众号与「其它」都归到 `private`：它们都是**一对
+/// 一的对话**，而规范没有第三个格子可放。
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionChatlab {
+    /// 会话在数据源里的唯一标识，可直接用作拉取路径。
     pub id: String,
+    /// 最新消息时间戳（秒）。
     pub last_message_at: i64,
+    /// 消息总数（用于 ChatLab 展示预估量）。
     pub message_count: usize,
+    /// 会话名称（群名/联系人名）。
     pub name: String,
+    /// 平台标识。
     pub platform: String,
+    /// `group` / `private`。
     pub r#type: String,
+    /// 成员数 —— **可选**：群名册的加载器拿得到才给（私聊、或名册缺失时**不出现这个键**）。
+    ///
+    /// 规范把它列为可选，而「没有名册」与「名册是空的」在下游是两件事：前者不该被读成 0。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member_count: Option<usize>,
 }
 
 // ── ChatLab 通知帧 ────────────────────────────────────────

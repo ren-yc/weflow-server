@@ -591,6 +591,33 @@ qqflow-server 的 `type` 取值为 `1` 私聊 / `2` 群聊，数值含义与本�
 
 鉴权、错误信封、`Last-Event-ID` 重放与保活都与老面**完全一致**（同一条总线、同一套连接机制）。
 
+### `GET /chatlab/sessions` — Pull 形状的发现面
+
+响应（规范形状）：
+
+```json
+{
+  "sessions": [
+    { "id": "…", "name": "项目群", "platform": "wechat", "type": "group",
+      "messageCount": 58000, "memberCount": 86, "lastMessageAt": 1711468800 }
+  ],
+  "page": { "hasMore": true, "nextCursor": "2" }
+}
+```
+
+参数 `keyword`（按名称或 id 模糊匹配）、`limit`、`cursor`（原样回传上一页的 `nextCursor`）。
+
+- **不给 `offset`**：规范明确不建议在发现接口用它（列表变化时会出现重复或漏项）。
+- **`page` 总是给出**：规范说客户端在响应里**未发现** `page` 时按「单次全量结果」处理 —— 那比
+  「靠条数猜有没有截断」明确。契约套件里有一条断言正是查这个。
+- `cursor` 与查询条件绑定：`keyword` 变化后旧游标应视为失效（本实现里它退化为第一页）。
+- **`memberCount` 是可选键**：群名册加载得到才出现（私聊、或名册缺失时**不出现这个键**）。
+  「没有名册」与「名册是空的」在下游是两件事 —— 前者不该被读成 `0`。
+- `type` 只有 `group` / `private` 两个取值（规范的枚举就这么大）：公众号与「其它」都归到
+  `private`，它们都是**一对一的对话**，而规范没有第三个格子可放。
+
+排序为 `lastMessageAt` 降序、`id` 升序 —— 稳定，游标翻页因此不会跳项或重复。
+
 ### `GET /chatlab/push/messages` — 通知面
 
 与 `/api/v1/push/messages` 唯一的差别是**帧的形状**：

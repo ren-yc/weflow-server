@@ -17,9 +17,24 @@ pub async fn handler(
     headers: HeaderMap,
     body: Option<axum::extract::Json<serde_json::Value>>,
 ) -> ApiResult<axum::response::Response> {
-    let params = extract_params(&query, body);
-    require_auth(&state, &params, &headers)?;
-    let account = ready_account(&state, &params)?;
+    respond(&state, &query, &headers, body, false).await
+}
+
+/// `handler` 的本体，带一个「强制 ChatLab 形状」的开关。
+///
+/// `/chatlab/sessions` 用它并传 `true`：Pull 面**天生就是** ChatLab 形状，调用方不该再知道
+/// 有 `format` 这个参数。两条路的其余部分（鉴权、筛选、稳定排序、分页、信封）**逐字一致** ——
+/// 抄一份就会漂移，而漂移的后果是两个面在多账号/分页边界上表现不同。
+pub(crate) async fn respond(
+    state: &Arc<AppState>,
+    query: &std::collections::HashMap<String, String>,
+    headers: &HeaderMap,
+    body: Option<axum::extract::Json<serde_json::Value>>,
+    force_chatlab: bool,
+) -> ApiResult<axum::response::Response> {
+    let params = extract_params(query, body);
+    require_auth(state, &params, headers)?;
+    let account = ready_account(state, &params)?;
     let keyword = params.get("keyword").filter(|s| !s.is_empty()).map(|s| s.to_lowercase());
     let limit = crate::server::parse_limit(&params, "limit", 100, 10000);
     // `cursor` 是 `page.nextCursor` 的回传入参；解析不了就退回 `offset`，
@@ -28,7 +43,8 @@ pub async fn handler(
         .get("cursor")
         .and_then(|c| c.parse::<usize>().ok())
         .unwrap_or_else(|| crate::server::parse_offset(&params, "offset"));
-    let chatlab = crate::server::flex_bool(&params, "chatlab")
+    let chatlab = force_chatlab
+        || crate::server::flex_bool(&params, "chatlab")
         || params.get("format").map(|f| f.eq_ignore_ascii_case("chatlab")).unwrap_or(false);
 
     let store = account.store.read();
@@ -62,6 +78,10 @@ pub async fn handler(
                 last_message_at: s.last_timestamp,
                 message_count: store.conv_count(&s.username),
                 name: store.session_display(&s.username),
+                member_count: store
+                    .chatroom_roster
+                    .get(&s.username)
+                    .map(|r| r.len()),
                 platform: "wechat".to_string(),
                 r#type: if s.kind == crate::store::SessionKind::Group {
                     "group".to_string()

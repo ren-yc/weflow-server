@@ -9,6 +9,7 @@
       {
         "id": "wxid_fake_group@chatroom",
         "lastMessageAt": 1700000015,
+        "memberCount": 2,
         "messageCount": 4,
         "name": "项目群",
         "platform": "wechat",
@@ -36,6 +37,7 @@
     "name",
     "platform",
     "type",
+    "memberCount",
     "id",
     "lastMessageAt",
     "messageCount",

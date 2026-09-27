@@ -465,6 +465,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/chatlab/push/messages",
             axum::routing::get(chatlab_push::handler),
+        )        .route(
+            "/chatlab/sessions",
+            axum::routing::get(chatlab_sessions::handler),
         )
         .route("/api/v1/sync", axum::routing::get(sync::handler).post(sync::handler))
         .route(

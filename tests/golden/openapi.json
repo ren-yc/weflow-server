@@ -1047,26 +1047,40 @@
           "type": "object"
         },
         "SessionChatlab": {
-          "description": "ChatLab 面的会话项。`type` 是字符串（`group` / `private`）。",
+          "description": "ChatLab 面的会话项。`type` 是字符串（`group` / `private`）。\n\n`type` 只有两个取值（规范的枚举就这么大）—— 公众号与「其它」都归到 `private`：它们都是**一对\n一的对话**，而规范没有第三个格子可放。",
           "properties": {
             "id": {
+              "description": "会话在数据源里的唯一标识，可直接用作拉取路径。",
               "type": "string"
             },
             "lastMessageAt": {
+              "description": "最新消息时间戳（秒）。",
               "format": "int64",
               "type": "integer"
             },
+            "memberCount": {
+              "description": "成员数 —— **可选**：群名册的加载器拿得到才给（私聊、或名册缺失时**不出现这个键**）。\n\n规范把它列为可选，而「没有名册」与「名册是空的」在下游是两件事：前者不该被读成 0。",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "messageCount": {
+              "description": "消息总数（用于 ChatLab 展示预估量）。",
               "minimum": 0,
               "type": "integer"
             },
             "name": {
+              "description": "会话名称（群名/联系人名）。",
               "type": "string"
             },
             "platform": {
+              "description": "平台标识。",
               "type": "string"
             },
             "type": {
+              "description": "`group` / `private`。",
               "type": "string"
             }
           },
@@ -2120,18 +2134,28 @@
     "description",
     "properties",
     "id",
+    "description",
     "type",
     "lastMessageAt",
+    "description",
     "format",
     "type",
+    "memberCount",
+    "description",
+    "minimum",
+    "type",
     "messageCount",
+    "description",
     "minimum",
     "type",
     "name",
+    "description",
     "type",
     "platform",
+    "description",
     "type",
     "type",
+    "description",
     "type",
     "required",
     "type",

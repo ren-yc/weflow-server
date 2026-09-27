@@ -2,6 +2,7 @@
 
 pub mod accounts;
 pub mod chatlab_pull;
+pub mod chatlab_sessions;
 pub mod chatlab_push;
 pub mod contacts;
 pub mod group_members;

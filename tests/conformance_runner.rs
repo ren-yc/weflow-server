@@ -291,7 +291,7 @@ async fn conformance_suite_passes() {
             "harness": "/__harness",
             "pull": "/api/v1/sessions/{id}/messages",
             "push": "/chatlab/push/messages",
-            "sessions": "/api/v1/sessions",
+            "sessions": "/chatlab/sessions",
         },
         "authProbed": auth_probed,
         "slots": {
@@ -307,7 +307,7 @@ async fn conformance_suite_passes() {
             // Pull 形状的发现面（规范里的 `GET {baseUrl}/sessions`）尚未实现 —— 它是计划里
             // 「ChatLab 适配」那一步的内容。置 false 让相关用例**跳过而不是失败**：契约的
             // 能力机制就是为这种「存在性差异」准备的。实现后翻成 true 即启用。
-            "pullDiscovery": false,
+            "pullDiscovery": true,
             // SSE 通知面**是存在的**且符合契约：`GET {baseUrl}/push/messages` ＋
             // `message.new`/`message.revoke`/`sync` 三种事件都通过套件断言。
             //
