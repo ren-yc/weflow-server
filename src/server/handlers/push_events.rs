@@ -83,6 +83,20 @@ pub(crate) fn sse_from(
                 .json_data(payload)
                 .unwrap_or_else(|_| Event::default().event("message.new").data("{}")));
         }
+        // **连接基线**：把当前水位先给出去。
+        //
+        // 没有它，客户端在「连接建立」到「第一次水位变化」之间是**盲的** —— 而这中间可能很长
+        // （账号空闲、或还没注册账号）。它也让「重放里没有 sync」与「sync 就是空水位」不再混淆。
+        //
+        // 必须走 `serialize`，不能直接吐 DTO：通知面与老面的 `sync` 形状不同，直接吐会让新面
+        // 收到另一个面的形状（这个错在只连新面时看不出来）。
+        {
+            let (name, payload) = serialize(crate::sync::Event::Sync(crate::server::current_watermarks(&state)), &export_dir);
+            yield Ok(Event::default()
+                .event(name)
+                .json_data(payload)
+                .unwrap_or_else(|_| Event::default().event("sync").data("{}")));
+        }
         let mut bstream = BroadcastStream::new(rx);
         loop {
             let item = tokio::select! {
@@ -183,6 +197,7 @@ fn serialize_event(
             "sync",
             serde_json::to_value(EventSync {
                 event: "sync".to_string(),
+                generation: crate::server::current_generation(),
                 watermarks: wms
                     .iter()
                     .map(|(k, w)| WatermarkEntry {

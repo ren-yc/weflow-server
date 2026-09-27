@@ -559,7 +559,13 @@ qqflow-server 的 `type` 取值为 `1` 私聊 / `2` 群聊，数值含义与本�
 | `ready` | `{"status":"ok"}`（连接建立基线） |
 | `message.new` | `{"event":"message.new","sessionId":"...","sessionType":"group","rawid":"...","sourceName":"...","groupName":"...","content":"...","timestamp":1700000100,"media":{"type":"image","fileName":"...","md5":"..."}}` |
 | `message.revoke` | 同上（`event` 为 `message.revoke`） |
-| `sync` | `{"event":"sync","watermarks":[...]}`（水位基线/重基） |
+| `sync` | `{"event":"sync","generation":N,"watermarks":[…]}`（水位基线/重基）|
+
+- **连接建立就发一帧 `sync` 基线**：没有它，客户端在「连上」到「第一次水位变化」之间是**盲的**，
+  而这中间可能很长（账号空闲、或还没注册账号）。
+- **`generation` 在注销时递增**：带着旧 `Last-Event-ID` 重连的客户端据此区分「注销后新账号刚开始」
+  （该丢弃本地状态重新拉）与「自己漏收了」（该补拉）—— 少了它，这两种情况在协议上是同一件事。
+  它与新的通知面（`/chatlab/push/messages`）发的是**同一个**计数器。
 
 - 帧携带 `id:` 序号；`Last-Event-ID` 头（或查询参数）可回放最近 **1000 条 / 10 分钟**
   （序号为总线级单调值，跨账号注册保持连续）

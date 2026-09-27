@@ -550,12 +550,20 @@
           "type": "object"
         },
         "EventSync": {
-          "description": "水位基线/重基事件。客户端据此得知「从哪里继续拉」，因此**每次注册与注销都会发**。",
+          "description": "水位基线/重基事件。客户端据此得知「从哪里继续拉」。\n\n**什么时候发**：连接建立（基线）、订阅端落后（重基线）、索引重建、注销（水位归零）。\n\n`generation` 在**注销**时递增：带着旧 `Last-Event-ID` 重连的客户端据此区分「注销后新账号\n刚开始」（该丢弃本地状态重新拉）与「自己漏收了」（该补拉）。少了它这两种情况在协议上是同一\n件事。它与新的通知面发的是**同一个**计数器。",
           "properties": {
             "event": {
+              "description": "事件名（`sync`）。",
               "type": "string"
             },
+            "generation": {
+              "description": "事件基线代号，注销时递增。",
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            },
             "watermarks": {
+              "description": "各表的水位线 —— 客户端从这里开始增量拉。",
               "items": {
                 "$ref": "#/components/schemas/WatermarkEntry"
               },
@@ -564,6 +572,7 @@
           },
           "required": [
             "event",
+            "generation",
             "watermarks"
           ],
           "type": "object"
@@ -1868,8 +1877,15 @@
     "description",
     "properties",
     "event",
+    "description",
+    "type",
+    "generation",
+    "description",
+    "format",
+    "minimum",
     "type",
     "watermarks",
+    "description",
     "items",
     "$ref",
     "type",

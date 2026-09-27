@@ -255,10 +255,20 @@ pub struct EventMedia {
     pub media_id: Option<String>,
 }
 
-/// 水位基线/重基事件。客户端据此得知「从哪里继续拉」，因此**每次注册与注销都会发**。
+/// 水位基线/重基事件。客户端据此得知「从哪里继续拉」。
+///
+/// **什么时候发**：连接建立（基线）、订阅端落后（重基线）、索引重建、注销（水位归零）。
+///
+/// `generation` 在**注销**时递增：带着旧 `Last-Event-ID` 重连的客户端据此区分「注销后新账号
+/// 刚开始」（该丢弃本地状态重新拉）与「自己漏收了」（该补拉）。少了它这两种情况在协议上是同一
+/// 件事。它与新的通知面发的是**同一个**计数器。
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct EventSync {
+    /// 事件名（`sync`）。
     pub event: String,
+    /// 事件基线代号，注销时递增。
+    pub generation: u64,
+    /// 各表的水位线 —— 客户端从这里开始增量拉。
     pub watermarks: Vec<WatermarkEntry>,
 }
 

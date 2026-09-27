@@ -383,3 +383,32 @@ async fn sse_payload_keys_are_pinned() {
     assert!(!data.contains("SECRET-AES-KEY"), "推送载荷里出现了 aes_key：{data}");
     assert!(!data.contains("aes"), "推送载荷里出现了 aes 字样：{data}");
 }
+/// `sync` 基线帧的**键集**是契约。
+///
+/// 这条护栏此前不存在 —— `sync` 的载荷改动了在仓库里是静默的（上面那条只钉 `message.new`）。
+/// 它同时钉住「**连接建立就发一帧基线**」：没有那一帧，客户端在「连上」到「第一次水位变化」之间
+/// 是盲的，而这中间可能很长（账号空闲、或还没注册账号）。
+#[tokio::test]
+async fn sync_baseline_keys_are_pinned() {
+    let dir = common::tmp_dir("ssesync");
+    let server = start(&dir).await;
+
+    // 新连接：`ready` 之后应立刻收到一帧 `sync` 基线。
+    let frames = sse_frames(&server, None, Duration::from_secs(8), 1).await;
+    let (_, _, data) = frames
+        .iter()
+        .find(|(_, e, _)| e == "sync")
+        .unwrap_or_else(|| panic!("连接后应立刻有一帧 sync 基线，实际拿到：{frames:?}"));
+    let v: serde_json::Value = serde_json::from_str(data).expect("payload is JSON");
+
+    let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["event", "generation", "watermarks"], "sync 的键集是契约：{v}");
+    assert_eq!(v["event"], "sync");
+    assert!(v["generation"].as_u64().is_some(), "generation 是非负整数：{v}");
+    assert!(v["watermarks"].is_array(), "watermarks 是数组：{v}");
+    // 基线帧**只**说水位：它不该看起来像一条消息。
+    for leaked in ["content", "sessionId", "rawid", "media"] {
+        assert!(v.get(leaked).is_none(), "基线帧不该带 {leaked}：{v}");
+    }
+}
