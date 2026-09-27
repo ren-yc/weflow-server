@@ -423,15 +423,25 @@
           "description": "推送里的媒体元数据（**第三种形状**：无 `url` / `localPath` / `exported`）。",
           "properties": {
             "fileName": {
+              "description": "建议文件名（含扩展名）。",
               "type": "string"
             },
             "md5": {
+              "description": "原文件的 md5；取不到时为 `null`（键保留）。",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "mediaId": {
+              "description": "**可直接取字节的 id** —— 单段路由 `GET /api/v1/media/{id}`。\n\n**只在导出根下确有这个文件时才出现**（键随之消失，不是给 `null`）：承诺是「出现即可\n取」，不是尽力而为。通告一个取不到的 id，调用方会拿到 404 并以为是服务坏了；反过来\n（能取到却没通告）只是少一个便捷入口，仍可走三段式路径。",
               "type": [
                 "string",
                 "null"
               ]
             },
             "type": {
+              "description": "媒体大类。",
               "type": "string"
             }
           },
@@ -1791,10 +1801,16 @@
     "description",
     "properties",
     "fileName",
+    "description",
     "type",
     "md5",
+    "description",
+    "type",
+    "mediaId",
+    "description",
     "type",
     "type",
+    "description",
     "type",
     "required",
     "type",

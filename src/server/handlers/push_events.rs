@@ -40,7 +40,8 @@ pub async fn handler(
         .and_then(|s| s.parse::<u64>().ok())
         .or_else(|| query.get("lastEventId").and_then(|s| s.parse::<u64>().ok()))
         .unwrap_or(0);
-    Ok(sse_from(state, last_id, serialize_event))
+    let export_dir = state.cfg.media_export_dir.clone();
+    Ok(sse_from(state, last_id, &export_dir, serialize_event))
 }
 
 /// 事件的序列化器：把一个总线事件变成一个 SSE 帧（`(事件名, 载荷)`）。
@@ -48,15 +49,20 @@ pub async fn handler(
 /// 两个面对同一批事件有**不同的形状要求** —— WeFlow 兼容面发完整消息，ChatLab 面只发元信息
 /// （规范：「ChatLab 不假设事件可靠送达」，通知只负责告诉客户端去拉）。参数化这一处，
 /// 其余（鉴权、重放、保活、滞后重基线、关机）两面对**完全一致**。
+///
+/// `export_dir` 是**取字节能力的判据输入**：`mediaId` 只在导出根下确有文件时才通告
+/// （见 `media::export::fetchable_media_id`）。它随流一起传，而不是每次现查配置。
 pub(crate) type Serializer =
-    fn(crate::sync::Event) -> (&'static str, serde_json::Value);
+    fn(crate::sync::Event, &std::path::Path) -> (&'static str, serde_json::Value);
 
 /// 组装 SSE 响应。`serialize` 决定帧的形状，其余部分是两面的公共部分。
 pub(crate) fn sse_from(
     state: Arc<AppState>,
     last_id: u64,
+    export_dir: &std::path::Path,
     serialize: Serializer,
 ) -> Response {
+    let export_dir = export_dir.to_path_buf();
     let replay = state.history.lock().replay_since(last_id);
     let rx = state.events.subscribe();
     let history = state.history.clone();
@@ -70,7 +76,7 @@ pub(crate) fn sse_from(
             Event::default().event("ready").data("{\"status\":\"ok\"}"),
         );
         for (id, ev) in replay {
-            let (name, payload) = serialize(ev);
+            let (name, payload) = serialize(ev, &export_dir);
             yield Ok(Event::default()
                 .id(id.to_string())
                 .event(name)
@@ -94,7 +100,7 @@ pub(crate) fn sse_from(
                     // watermarks: a bare `{"rebased":true}` tells the client
                     // it lost events but gives it nothing to resync from.
                     let wms = crate::server::current_watermarks(&lag_state);
-                    let (name, payload) = serialize(crate::sync::Event::Sync(wms));
+                    let (name, payload) = serialize(crate::sync::Event::Sync(wms), &export_dir);
                     // No history id: this frame is specific to this lagging
                     // subscriber, so it must not consume a bus-level
                     // sequence number that other clients would then skip.
@@ -106,7 +112,7 @@ pub(crate) fn sse_from(
                 }
             };
             let id = history.lock().append(ev.clone());
-            let (name, payload) = serialize(ev);
+            let (name, payload) = serialize(ev, &export_dir);
             yield Ok(Event::default()
                 .id(id.to_string())
                 .event(name)
@@ -125,7 +131,10 @@ pub(crate) fn sse_from(
 /// 构造 DTO 后 `to_value`：`json!` 走 BTreeMap 会把键排序，`to_value` 同样如此，
 /// 因此**输出逐字节不变**；而类型化构造让「键名写错」变成编译错误 —— SSE 是流式接口，
 /// 没有快照护栏，这一层就是它的护栏。
-fn serialize_event(ev: crate::sync::Event) -> (&'static str, serde_json::Value) {
+fn serialize_event(
+    ev: crate::sync::Event,
+    export_dir: &std::path::Path,
+) -> (&'static str, serde_json::Value) {
     match ev {
         crate::sync::Event::New(m) => (
             "message.new",
@@ -134,6 +143,16 @@ fn serialize_event(ev: crate::sync::Event) -> (&'static str, serde_json::Value) 
                 event: "message.new".to_string(),
                 group_name: m.group_name,
                 media: m.media.as_ref().map(|md| EventMedia {
+                    // 「出现即可取」：只有导出根下确有这个文件才通告 id（见
+                    // `media::export::fetchable_media_id`）。
+                    media_id: md.kind_dir.and_then(|dir| {
+                        crate::media::export::fetchable_media_id(
+                            export_dir,
+                            &m.session_id,
+                            dir,
+                            &md.file_name,
+                        )
+                    }),
                     file_name: md.file_name.clone(),
                     md5: md.md5.clone(),
                     r#type: md.kind.to_string(),

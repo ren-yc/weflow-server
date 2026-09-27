@@ -62,6 +62,12 @@ pub enum Event {
 pub struct PushMedia {
     /// 媒体大类（`image` / `video` / `voice` / `file` …）。
     pub kind: &'static str,
+    /// **导出子目录**（`images` / `voices` / …）；`None` = 这个类型不参与导出。
+    ///
+    /// 它与 `kind` **不是同一个字符串**（`image` vs `images`），所以只能取自同一处映射
+    /// （`media::export::kind_dir_for`）——写两遍必然漂移，而漂移的表现是「导出到了
+    /// `images/`、查找却去 `image/`」，两边都静默。
+    pub kind_dir: Option<&'static str>,
     /// 建议的文件名，可直接用于导出路径的最后一段。
     pub file_name: String,
     /// 原文件的 md5；取不到时为 `None`。
@@ -72,6 +78,7 @@ impl From<&crate::parser::MediaHint> for PushMedia {
     fn from(m: &crate::parser::MediaHint) -> Self {
         Self {
             kind: m.kind.as_str(),
+            kind_dir: crate::media::export::kind_dir_for(m.kind),
             file_name: m.file_name.clone(),
             md5: m.md5.clone(),
         }

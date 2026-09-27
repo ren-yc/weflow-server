@@ -149,6 +149,42 @@ fn walk_find(root: &Path, pattern: &str, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// `MediaKind` → 导出子目录。与 `write_out` 的三处调用点用的是**同一套字符串** ——
+/// 写两遍必然漂移，而漂移的表现是「导出到了 `images/`、查找却去 `photos/`」，两边都静默。
+///
+/// 返回 `None` 表示这个类型**本就不参与导出**（文件附件就是）：没有目录可找，
+/// 因此永远不该通告它的 id。
+pub fn kind_dir_for(kind: crate::parser::MediaKind) -> Option<&'static str> {
+    use crate::parser::MediaKind;
+    match kind {
+        MediaKind::Image => Some("images"),
+        MediaKind::Voice => Some("voices"),
+        MediaKind::Video => Some("videos"),
+        MediaKind::Emoji => Some("emojis"),
+        _ => None,
+    }
+}
+
+/// 媒体 id 的「**出现即可取**」判据：导出根下确有这个文件才通告。
+///
+/// 承诺是**出现即可取**，不是尽力而为 —— 通告一个取不到的 id，只会让调用方拿到 404 并以为
+/// 是服务坏了。反过来（能取到却没通告）只是少一个便捷入口，调用方仍可走三段式路径。
+///
+/// 只做**一次直接 stat**：布局是 `<root>/<会话>/<类型>/<文件>`，三段都已知，不需要像
+/// `find_exported` 那样遍历所有会话（那是 (会话数 × 4) 次 stat，放在每个推送事件上不可接受）。
+pub fn fetchable_media_id(
+    export_dir: &Path,
+    talker: &str,
+    kind_dir: &str,
+    file_name: &str,
+) -> Option<String> {
+    // 两个分量都会进路径拼接，规则与导出侧一致（`write_out` 同样先过 `safe_segment`）。
+    if !crate::pathsafe::safe_segment(talker) || !crate::pathsafe::safe_segment(file_name) {
+        return None;
+    }
+    let path = export_dir.join(talker).join(kind_dir).join(file_name);
+    path.is_file().then(|| file_name.to_string())
+}
 fn write_out(
     export_dir: &Path,
     talker: &str,
@@ -515,5 +551,52 @@ mod tests {
         assert!(url.starts_with('/'), "根相对路径以 / 开头");
         assert!(!url.starts_with("http"), "不得把服务基址烤进响应");
         assert!(!url.contains("access_token"), "响应体里不得出现凭据");
+    }
+
+
+    /// 「**出现即可取**」是承诺：导出根下确有文件才通告 id。
+    ///
+    /// 反面同样重要：能取到却没通告只是少一个便捷入口（调用方仍可走三段式路径），而通告一个
+    /// 取不到的 id 会让调用方拿到 404 并以为是服务坏了 —— 两个方向的代价不对称。
+    #[test]
+    fn media_id_is_only_advertised_when_the_file_is_there() {
+        let root = std::env::temp_dir().join(format!("wfs_media_id_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("wxid_a@chatroom").join("images");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("abc123.jpg"), b"x").unwrap();
+
+        assert_eq!(
+            fetchable_media_id(&root, "wxid_a@chatroom", "images", "abc123.jpg").as_deref(),
+            Some("abc123.jpg"),
+            "文件在 ⇒ 通告"
+        );
+        assert_eq!(
+            fetchable_media_id(&root, "wxid_a@chatroom", "images", "nope.jpg"),
+            None,
+            "文件不在 ⇒ 不通告（这正是「出现即可取」）"
+        );
+        assert_eq!(
+            fetchable_media_id(&root, "wxid_a@chatroom", "voices", "abc123.jpg"),
+            None,
+            "类型目录也要对得上"
+        );
+        // 路径分量守卫：与导出侧同一套规则。
+        assert_eq!(fetchable_media_id(&root, "../..", "images", "abc123.jpg"), None);
+        assert_eq!(fetchable_media_id(&root, "wxid_a@chatroom", "images", "../x"), None);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 目录映射与「不参与导出的类型」的判据。
+    #[test]
+    fn kind_dir_matches_the_export_layout() {
+        use crate::parser::MediaKind;
+        assert_eq!(kind_dir_for(MediaKind::Image), Some("images"));
+        assert_eq!(kind_dir_for(MediaKind::Voice), Some("voices"));
+        assert_eq!(kind_dir_for(MediaKind::Video), Some("videos"));
+        assert_eq!(kind_dir_for(MediaKind::Emoji), Some("emojis"));
+        // 文件附件不参与导出 ⇒ 永远没有目录可找 ⇒ 永远不该通告它的 id。
+        assert_eq!(kind_dir_for(MediaKind::File), None);
     }
 }

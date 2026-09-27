@@ -240,9 +240,19 @@ pub struct EventRevoke {
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EventMedia {
+    /// 建议文件名（含扩展名）。
     pub file_name: String,
+    /// 原文件的 md5；取不到时为 `null`（键保留）。
     pub md5: Option<String>,
+    /// 媒体大类。
     pub r#type: String,
+    /// **可直接取字节的 id** —— 单段路由 `GET /api/v1/media/{id}`。
+    ///
+    /// **只在导出根下确有这个文件时才出现**（键随之消失，不是给 `null`）：承诺是「出现即可
+    /// 取」，不是尽力而为。通告一个取不到的 id，调用方会拿到 404 并以为是服务坏了；反过来
+    /// （能取到却没通告）只是少一个便捷入口，仍可走三段式路径。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_id: Option<String>,
 }
 
 /// 水位基线/重基事件。客户端据此得知「从哪里继续拉」，因此**每次注册与注销都会发**。

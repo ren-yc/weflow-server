@@ -36,8 +36,15 @@ pub async fn handler(
         .and_then(|s| s.parse::<u64>().ok())
         .or_else(|| query.get("lastEventId").and_then(|s| s.parse::<u64>().ok()))
         .unwrap_or(0);
-    // 与老面共用整套连接机制，只换序列化器。
-    Ok(super::push_events::sse_from(state, last_id, serialize_notification))
+    // 与老面共用整套连接机制，只换序列化器。导出根是**取字节能力的判据输入**（通知帧目前不用它，
+    // 但签名与老面一致 —— 两面走同一条流，参数不能各写一套）。
+    let export_dir = state.cfg.media_export_dir.clone();
+    Ok(super::push_events::sse_from(
+        state,
+        last_id,
+        &export_dir,
+        serialize_notification,
+    ))
 }
 
 /// 把一个总线事件映射成**通知帧**：只带标识与时间，不带正文。
@@ -47,6 +54,7 @@ pub async fn handler(
 /// - `sync` → `{generation, watermarks:[…]}`（基线；`generation` 的用途见 `server::GENERATION`）
 fn serialize_notification(
     ev: crate::sync::Event,
+    _export_dir: &std::path::Path,
 ) -> (&'static str, serde_json::Value) {
     use crate::server::dto::{NotificationFrame, SyncFrame};
     match ev {
