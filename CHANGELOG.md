@@ -6,6 +6,47 @@
 
 ChatLab 适配层上线，**并接受一次破坏性发布**（五项，见下）。下游需按迁移表逐项核对。
 
+> **版本归属**：安全修复与代理加固**实际随 0.5.1 发布**（2026-08-30，当时未单列条目）——
+> 明细已归档到下方 **[0.5.1]** 节。本节只记 0.5.1 之后发生的变化。
+
+### 修复
+
+- `mediaId` **只在取得到字节时才通告**（「出现即可取」是承诺，不是尽力而为）。
+
+### 破坏性变更
+
+| 变更 | 改了什么 | 怎么迁 | 过渡期 |
+|---|---|---|---|
+| **`end=YYYYMMDD`** | 由「当天 0 点」变「当天 **23:59:59**」 | 若依赖旧语义，改用显式时刻参数 | **不适用** —— 唯一已知下游零影响（实测：只用 `start`）|
+| **SSE `sync` 载荷** | weflow 统一为 `{event,generation,watermarks:[…]}`；qqflow 由平铺的 `lastRowidGroup`/`lastRowidC2c` 收敛为 `{event,watermarks:[{table,watermark}]}` | 订阅者若解析 `sync`，按新形状改 | **不适用** —— 唯一已知下游零影响（实测：显式忽略 `sync`）|
+| **注销后重放** | 清重放条目 ＋ **保留** id 计数器 ＋ 基线带 `generation` | 依赖 `Last-Event-ID` 的下游需处理 `generation`（它区分「换了个账号」与「自己漏收了」）| **不适用** —— 唯一已知下游零影响 |
+| **媒体 URL 去 token** | URL 不再内嵌 `?access_token=` | 旧的 `split("?",1)[0]` 写法**仍兼容**（不报错），可简化 | **不适用** —— 向后兼容 |
+| **`message.new` 媒体字段** | weflow 补一个**过滤后的** `mediaId`（只在导出根下确有文件时出现），`md5` **保留** | 无 —— 纯增量 | **不适用** |
+
+### 新增
+
+- **ChatLab 适配面 `/chatlab/*`**（`baseUrl` 指向 `http://127.0.0.1:PORT/chatlab` 即可）：
+  - `GET /chatlab/sessions` —— Pull 形状的发现面（`keyword` / `limit` / `cursor`）；
+  - `GET /chatlab/sessions/{id}/messages` —— Pull 面；
+  - `GET /chatlab/push/messages` —— **通知面**：只发元信息（`eventId` / `sessionId` / `timestamp` /
+    `platformMessageId?`），**不发消息体**。规范对这条通道的定位是「仅通知，不假设事件可靠送达」，
+    客户端收到后**去拉**那一页。
+  - **老面 `/api/v1/*` 的路由集合与默认语义不变** —— 不关心新能力可以不迁。
+- **SSE 连接建立就发一帧 `sync` 基线**：没有它，客户端在「连上」到「第一次水位变化」之间是盲的。
+- **`generation`**：注销时递增，两个 SSE 面发同一个计数器。
+- **`mediaId`**（SSE 的 `media` 里）：可直接走 `GET /api/v1/media/{id}` 取字节。
+- **接入配方写在 `docs/*-api.md` 里**（四阶段 ＋ 实测数字 ＋ 接入者会踩的坑）。
+- **群元数据接上真实数据源**（`/api/v1/group-members` 与 ChatLab 两面同步受益）：
+  `groupNickname` 由恒空串 → 真实群名片（源 `contact_fts.db::chatroom_member_fts_v3`；
+  缺该库时降级为空、服务照常启动）；`isOwner` 由恒 `false` → 每群恰一人 `true`
+  （源 `contact.db::chat_room.owner`）；名册入库供 `/chatlab/sessions` 的 `memberCount` 使用。
+  **此前 `group-members` 的群名片恒空曾让下游误判该端点冗余并退订——现在可以重新评估。**
+
+## [0.5.1] - 2026-08-30
+
+本版发布于 08-30，但当时没有单列变更条目（内容挂在「未发布」下、直到 0.6.0 才写入本文件）
+——现补记归档，**安全修复的归属以本节为准**。
+
 ### 安全
 
 - **修复 SNS 导出的路径遍历（任意文件写入）**。`GET|POST /api/v1/sns/export` 的产物名原为
@@ -34,6 +75,7 @@ ChatLab 适配层上线，**并接受一次破坏性发布**（五项，见下�
   压根不含分隔符）与控制字符。规则是**先派生名字，再对规范化根断言包含关系**——仅过滤输入
   正是 SNS 导出得以逃逸的原因。`is_contained` 失败时关闭，不退化为拿非规范化根做词法比较
   （verbatim 前缀与裸路径混比会静默永不匹配）。
+
 ### 修复
 
 - 媒体路由的 `canonicalize` 与代理的 curl 子进程原先在 tokio worker 上做阻塞 IO，并发媒体读取
@@ -41,7 +83,16 @@ ChatLab 适配层上线，**并接受一次破坏性发布**（五项，见下�
 - 媒体代理原先把响应体写到共享临时目录下一个以纳秒时间戳命名的可预测路径，改为经 stdout
   管道回传、元数据走 stderr 带标签行（二进制载荷不可能被误读为状态行）。
 - 媒体代理硬编码 `curl.exe`，与其"Windows/macOS/linux 都自带"的注释矛盾，改为按平台取二进制名。
-- `mediaId` **只在取得到字节时才通告**（「出现即可取」是承诺，不是尽力而为）。
+
+### 变更
+
+- **ChatLab 两个面对齐 0.0.2 标准枚举**，并把账号名与群名片拆成两个字段——依赖旧枚举取值、
+  或把群名片当账号名使用的下游需同步调整。
+- **`localType` 按打包字段掩码解析**：高 32 位（appmsg 子类型）此前不掩码即丢失，appmsg 一族
+  大量落 `99 OTHER`；掩码后类型覆盖面恢复。
+- Pull 面删除恒空的 `mediaPath`：该键从未有过值、规范列为可选——依赖它的下游改用 `media` 对象。
+- CI 加固：clippy `-D warnings` ＋ 全量测试的 PR 门禁上线；路径逃逸用例按平台拆分；
+  `graceful_shutdown` 用例串行化消除凭据库竞态。
 
 ### 说明
 
@@ -51,30 +102,6 @@ ChatLab 适配层上线，**并接受一次破坏性发布**（五项，见下�
   （如 `12345678@chatroom` → `sns-12345678_chatroom-<stamp>.json`）。响应内容与导出语义不变。
 - 遍历写入位于鉴权之后（`require_auth` 守着该端点）。若该 token 是共享的或强度不足，应按
   远程任意写入对待。
-
-### 破坏性变更
-
-| 变更 | 改了什么 | 怎么迁 | 过渡期 |
-|---|---|---|---|
-| **`end=YYYYMMDD`** | 由「当天 0 点」变「当天 **23:59:59**」 | 若依赖旧语义，改用显式时刻参数 | **不适用** —— 唯一已知下游零影响（实测：只用 `start`）|
-| **SSE `sync` 载荷** | weflow 统一为 `{event,generation,watermarks:[…]}`；qqflow 由平铺的 `lastRowidGroup`/`lastRowidC2c` 收敛为 `{event,watermarks:[{table,watermark}]}` | 订阅者若解析 `sync`，按新形状改 | **不适用** —— 唯一已知下游零影响（实测：显式忽略 `sync`）|
-| **注销后重放** | 清重放条目 ＋ **保留** id 计数器 ＋ 基线带 `generation` | 依赖 `Last-Event-ID` 的下游需处理 `generation`（它区分「换了个账号」与「自己漏收了」）| **不适用** —— 唯一已知下游零影响 |
-| **媒体 URL 去 token** | URL 不再内嵌 `?access_token=` | 旧的 `split("?",1)[0]` 写法**仍兼容**（不报错），可简化 | **不适用** —— 向后兼容 |
-| **`message.new` 媒体字段** | weflow 补一个**过滤后的** `mediaId`（只在导出根下确有文件时出现），`md5` **保留** | 无 —— 纯增量 | **不适用** |
-
-### 新增
-
-- **ChatLab 适配面 `/chatlab/*`**（`baseUrl` 指向 `http://127.0.0.1:PORT/chatlab` 即可）：
-  - `GET /chatlab/sessions` —— Pull 形状的发现面（`keyword` / `limit` / `cursor`）；
-  - `GET /chatlab/sessions/{id}/messages` —— Pull 面；
-  - `GET /chatlab/push/messages` —— **通知面**：只发元信息（`eventId` / `sessionId` / `timestamp` /
-    `platformMessageId?`），**不发消息体**。规范对这条通道的定位是「仅通知，不假设事件可靠送达」，
-    客户端收到后**去拉**那一页。
-  - **老面 `/api/v1/*` 的路由集合与默认语义不变** —— 不关心新能力可以不迁。
-- **SSE 连接建立就发一帧 `sync` 基线**：没有它，客户端在「连上」到「第一次水位变化」之间是盲的。
-- **`generation`**：注销时递增，两个 SSE 面发同一个计数器。
-- **`mediaId`**（SSE 的 `media` 里）：可直接走 `GET /api/v1/media/{id}` 取字节。
-- **接入配方写在 `docs/*-api.md` 里**（四阶段 ＋ 实测数字 ＋ 接入者会踩的坑）。
 
 ## [0.5.0] - 2026-08-28
 
