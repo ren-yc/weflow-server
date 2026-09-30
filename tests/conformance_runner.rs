@@ -279,7 +279,7 @@ async fn conformance_suite_passes() {
         auth_probed.insert(n, json!(s));
     }
     let fx = json!({
-        "contractVersion": "0.2.2",
+        "contractVersion": "0.3.0",
         "platform": "wechat",
         "generatedBy": "weflow-server tests/conformance_runner.rs",
         // schema 要求七项齐全（用例只用到其中两个，但夹具的完整性由 schema 校验）。
@@ -289,6 +289,7 @@ async fn conformance_suite_passes() {
             "health": "/health",
             "messages": "/api/v1/messages",
             "harness": "/__harness",
+            "group-members": "/api/v1/group-members",
             "pull": "/chatlab/sessions/{id}/messages",
             "push": "/chatlab/push/messages",
             "sessions": "/chatlab/sessions",
