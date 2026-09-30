@@ -588,6 +588,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// 越界分量在**写入点**被拒：`talker` 来自库（外部数据）、`file_name` 派生自
+    /// 消息自带的 md5 属性（**发送方可控**）——两者都过 `safe_segment` 才落盘，
+    /// 拒绝发生在 join 之前。这是四个 pathsafe 调用点里唯一「写」的一个：
+    /// 它被绕过的代价是任意位置落文件，所以断言既要「拒绝」也要「无残留」，
+    /// 还要有正向对照防「全都拒绝」的假绿。
+    #[test]
+    fn write_out_refuses_traversal_components() {
+        let root = std::env::temp_dir().join(format!("wfs_write_out_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(
+            write_out(&root, "wxid_a", "images", "../pwn.jpg", b"x").is_none(),
+            "越界 file_name 被拒"
+        );
+        assert!(
+            write_out(&root, "../evil", "images", "ok.jpg", b"x").is_none(),
+            "越界 talker 被拒（它来自库，不是请求——但正因为不可控才必须拒）"
+        );
+        assert!(
+            write_out(&root, "wxid_a", "images", "a:b.jpg", b"x").is_none(),
+            "Windows 备用数据流冒号也被拒"
+        );
+        assert!(
+            !root.parent().unwrap().join("pwn.jpg").exists(),
+            "root 之外没有任何残留"
+        );
+        assert!(!root.join("evil").exists(), "root 之内也没有越界产物");
+
+        // 正向对照：合法分量照常写入。
+        assert!(write_out(&root, "wxid_a", "images", "ok.jpg", b"x").is_some());
+        assert!(root.join("wxid_a/images/ok.jpg").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// 目录映射与「不参与导出的类型」的判据。
     #[test]
     fn kind_dir_matches_the_export_layout() {

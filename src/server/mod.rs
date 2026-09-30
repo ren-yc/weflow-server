@@ -1380,9 +1380,21 @@ mod tests {
         std::fs::write(root.join("keep-me.txt"), b"x").unwrap();
 
         // `../escape` is skipped by the containment check, not resolved.
+        // 让这条断言**有区分力**：先在「越界解析会打到的位置」放一个真实受害者。
+        // 没有 containment 检查时 `root/../escape/images` 会被 remove_dir_all 删掉，
+        // 而旧版只数 removed——受害者本就不存在时，守卫与否结果相同（假绿）。
+        let victim = root.parent().unwrap().join("escape");
+        let _ = std::fs::remove_dir_all(&victim);
+        std::fs::create_dir_all(victim.join("images")).unwrap();
+        std::fs::write(victim.join("images").join("v.jpg"), b"x").unwrap();
+
         let removed = purge_exported_media(&root, &["talker_a".into(), "../escape".into()]);
         assert_eq!(removed, 2, "images + voices");
         assert!(!root.join("talker_a/images").exists());
+        assert!(
+            victim.join("images").join("v.jpg").exists(),
+            "越界 talker 必须被跳过——root 之外的受害者必须原样在"
+        );
         assert!(!root.join("talker_a/voices").exists());
         assert!(
             root.join("talker_a/operator_notes").exists(),
@@ -1395,6 +1407,7 @@ mod tests {
         assert_eq!(purge_exported_media(&root, &["talker_b".into()]), 1);
         assert!(!root.join("talker_b").exists());
         let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&victim);
     }
 
     #[test]

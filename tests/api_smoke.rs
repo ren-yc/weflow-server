@@ -991,6 +991,40 @@ async fn media_and_sync_endpoints() {
     assert_eq!(body["newMessages"], 0, "nothing changed -> zero new");
 }
 
+/// SNS 导出的 `username` 是自由参数（只用于匹配 feed、从不与 store 校验），
+/// 因此必须整体 slugify ＋ 断言包含性。端到端钉住「越界分量折不进文件名、
+/// 也落不出导出根」—— 这是四个 pathsafe 调用点里唯一走 HTTP 的自由文本入口，
+/// `sns-` 前缀不构成防护（Win32 会剥尾点，`sns-..` 规范化后载荷继续上穿）。
+#[tokio::test]
+async fn sns_export_folds_traversal_usernames() {
+    let dir = common::tmp_dir("smoke-sns-export");
+    let app = server::build_router(test_state(&dir));
+    let exports_root = dir.join("data").join("exports");
+
+    for raw in ["../../etc/passwd", r"..\..\pwn"] {
+        let enc = raw.replace('/', "%2F").replace('\\', "%5C");
+        let uri = format!(
+            "/api/v1/sns/export?username={enc}&format=json&access_token={TOKEN}"
+        );
+        let (status, body) =
+            json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "导出本身照常成功：{body}");
+        assert_eq!(body["success"], true);
+        let file = body["file"].as_str().expect("file 字段");
+        assert!(file.starts_with("sns-"), "文件名形态：{file}");
+        assert!(
+            !file.contains('/') && !file.contains('\\') && !file.contains(".."),
+            "越界分量必须被折叠进文件名：{file}"
+        );
+        // 声称的 path 必须真实存在、且落在导出根内（canonical 后比较）。
+        let path = std::path::PathBuf::from(body["path"].as_str().expect("path 字段"));
+        assert!(path.is_file(), "文件写在声称的位置");
+        let parent = std::fs::canonicalize(path.parent().unwrap()).unwrap();
+        let root = std::fs::canonicalize(&exports_root).unwrap();
+        assert!(parent.starts_with(&root), "{parent:?} 应在 {root:?} 内");
+    }
+}
+
 /// `GET /api/v1/media/{id}` serves an exported file by name alone.
 ///
 /// The three-segment route makes the caller repeat the conversation and the
