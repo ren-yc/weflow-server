@@ -290,6 +290,9 @@ pub struct WatermarkValue {
 // ── 消息（原生面）─────────────────────────────────────────
 
 /// `GET|POST /api/v1/messages`（原生面）。
+///
+/// `media=1` 触发媒体导出，**单请求上限 200 项**——超出的部分保持未导出，再次请求续传。
+/// 这个闸门必须留在描述里：下游只能靠它规划分批策略，而它此前只存在于散文文档。
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MessagesNative {
@@ -461,9 +464,9 @@ pub struct GroupMembers {
 
 /// 群成员项。字段缺失同样压平成**空串**（与 `contacts` 同规）。
 ///
-/// `isOwner` 目前恒为 `false`（群主信息不在已解析的表中）；`messageCount` 仅在
-/// `includeMessageCounts=1` 时为真实值。两个「暂时恒定的字段」都要留着键 —— 删掉它们
-/// 会让下游的字段存在性判断失效。
+/// `isOwner` 由 `chat_room.owner` 解析得出：**本页成员中恰为群主者为 `true`**；群主不在
+/// 本页、或缺 `chat_room`/owner 时全为 `false`（键恒保留）。`messageCount` 仅在
+/// `includeMessageCounts=1` 时为真实值。删掉这些键会让下游的字段存在性判断失效。
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupMember {

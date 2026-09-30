@@ -52,6 +52,7 @@ use utoipa::openapi::{Components, OpenApi, OpenApiBuilder};
     crate::server::dto::MessageNative,
     crate::server::dto::MessagesChatlab,
     crate::server::dto::MessagesNative,
+    crate::server::dto::NotificationFrame,
     crate::server::dto::Page,
     crate::server::dto::PullEnvelope,
     crate::server::dto::PullMessage,
@@ -61,57 +62,150 @@ use utoipa::openapi::{Components, OpenApi, OpenApiBuilder};
     crate::server::dto::SessionNative,
     crate::server::dto::SessionsChatlab,
     crate::server::dto::SessionsNative,
+    crate::server::dto::SyncFrame,
     crate::server::dto::SyncResult,
     crate::server::dto::WatermarkEntry,
     crate::server::dto::WatermarkValue,
 )))]
 pub struct ApiDoc;
 
-/// 一个端点：路径、方法、成功响应的 schema 名列表（多于一个即 `oneOf`）。
-type Shaped = (&'static str, HttpMethod, &'static [&'static str]);
+/// 成功响应的形态 —— 不是所有端点都回 JSON。
+enum Media {
+    /// JSON：schema 名列表（多于一个即 `oneOf`）。
+    Json(&'static [&'static str]),
+    /// 二进制字节（媒体字节面）。
+    Bytes,
+    /// SSE 帧流（推送面）。
+    EventStream,
+    /// 描述文档自身（`/openapi.json`）。
+    SelfDoc,
+}
+
+/// 一个端点：路径、方法、成功响应的形态、端点级描述。
+///
+/// `desc` 承载**对外闸门**（导出上限、单页上限、缓冲尺寸）——这些数字只写在散文文档里
+/// 就没人查得到，进描述才会随 `/openapi.json` 一起被下游与生成工具消费。
+type Ep = (&'static str, HttpMethod, Media, &'static str);
 
 /// 端点表。**它是手写的**：`#[utoipa::path]` 要给每个 handler 加注解，而那些 handler 的
 /// 返回类型是 `Response` / `Value`（多形状所致），注解反而容易与真实形状脱节。
 ///
 /// 改路由时**必须**改这里 —— 与 `tests/api_smoke.rs` 的 golden 端点清单互为对照：
-/// 那边漏了是快照缺口，这边漏了是描述缺口。
-const ENDPOINTS: &[Shaped] = &[
-    ("/health", HttpMethod::Get, &["Health"]),
-    ("/health", HttpMethod::Post, &["Health"]),
-    ("/api/v1/health", HttpMethod::Get, &["Health"]),
-    ("/api/v1/health", HttpMethod::Post, &["Health"]),
-    ("/api/v1/accounts", HttpMethod::Get, &["AccountsList"]),
+/// 那边漏了是快照缺口，这边漏了是描述缺口（字节面与 SSE 面无法进 JSON 快照，由本表收录）。
+/// `sns/*` 按 DTO 豁免暂不列入（它排在 DTO 化的最后一批）。
+const ENDPOINTS: &[Ep] = &[
+    ("/health", HttpMethod::Get, Media::Json(&["Health"]), ""),
+    ("/health", HttpMethod::Post, Media::Json(&["Health"]), ""),
+    ("/api/v1/health", HttpMethod::Get, Media::Json(&["Health"]), ""),
+    ("/api/v1/health", HttpMethod::Post, Media::Json(&["Health"]), ""),
+    (
+        "/openapi.json",
+        HttpMethod::Get,
+        Media::SelfDoc,
+        "免鉴权：只描述形状，不含账号、路径与密钥。",
+    ),
+    ("/api/v1/accounts", HttpMethod::Get, Media::Json(&["AccountsList"]), ""),
     (
         "/api/v1/accounts",
         HttpMethod::Post,
-        &["AccountRegistered", "AccountConflict"],
+        Media::Json(&["AccountRegistered", "AccountConflict"]),
+        "",
+    ),
+    (
+        "/api/v1/accounts/{wxid}",
+        HttpMethod::Delete,
+        Media::Json(&["AccountDeregistered", "AccountNotRegistered", "AccountWxidMismatch"]),
+        "注销账号；`POST .../{wxid}/deregister` 是其别名（供无法发 DELETE 的客户端与代理）。",
     ),
     (
         "/api/v1/accounts/{wxid}/deregister",
         HttpMethod::Post,
-        &["AccountDeregistered", "AccountNotRegistered", "AccountWxidMismatch"],
+        Media::Json(&["AccountDeregistered", "AccountNotRegistered", "AccountWxidMismatch"]),
+        "",
     ),
     (
         "/api/v1/sessions",
         HttpMethod::Get,
-        &["SessionsNative", "SessionsChatlab"],
+        Media::Json(&["SessionsNative", "SessionsChatlab"]),
+        "会话列表：`limit` 默认 100。",
     ),
-    ("/api/v1/sessions/{id}/messages", HttpMethod::Get, &["PullEnvelope"]),
+    (
+        "/api/v1/sessions/{id}/messages",
+        HttpMethod::Get,
+        Media::Json(&["PullEnvelope"]),
+        "游标拉取：`limit` 单页上限 5000。",
+    ),
     (
         "/api/v1/messages",
         HttpMethod::Get,
-        &["MessagesNative", "MessagesChatlab"],
+        Media::Json(&["MessagesNative", "MessagesChatlab"]),
+        "`media=1` 触发导出，**每请求最多导出 200 项**（超出的保持未导出，再请求续传）。",
     ),
     (
         "/api/v1/messages",
         HttpMethod::Post,
-        &["MessagesNative", "MessagesChatlab"],
+        Media::Json(&["MessagesNative", "MessagesChatlab"]),
+        "`media=1` 触发导出，**每请求最多导出 200 项**（超出的保持未导出，再请求续传）。",
     ),
-    ("/api/v1/contacts", HttpMethod::Get, &["Contacts"]),
-    ("/api/v1/contacts", HttpMethod::Post, &["Contacts"]),
-    ("/api/v1/group-members", HttpMethod::Get, &["GroupMembers"]),
-    ("/api/v1/group-members", HttpMethod::Post, &["GroupMembers"]),
-    ("/api/v1/sync", HttpMethod::Post, &["SyncResult"]),
+    ("/api/v1/contacts", HttpMethod::Get, Media::Json(&["Contacts"]), ""),
+    ("/api/v1/contacts", HttpMethod::Post, Media::Json(&["Contacts"]), ""),
+    ("/api/v1/group-members", HttpMethod::Get, Media::Json(&["GroupMembers"]), ""),
+    ("/api/v1/group-members", HttpMethod::Post, Media::Json(&["GroupMembers"]), ""),
+    (
+        "/api/v1/media/{id}",
+        HttpMethod::Get,
+        Media::Bytes,
+        "字节面：只服务导出根下已导出的文件；未导出的先经 `messages?media=1`（每请求上限 200 项）导出。",
+    ),
+    (
+        "/api/v1/media/{id}",
+        HttpMethod::Post,
+        Media::Bytes,
+        "同 GET（兼容不能发 GET 的调用方）。",
+    ),
+    (
+        "/api/v1/media/{talker}/{media_type}/{file}",
+        HttpMethod::Get,
+        Media::Bytes,
+        "三段式字节面；语义同 `/api/v1/media/{id}`。",
+    ),
+    (
+        "/api/v1/media/{talker}/{media_type}/{file}",
+        HttpMethod::Post,
+        Media::Bytes,
+        "同 GET。",
+    ),
+    (
+        "/api/v1/push/messages",
+        HttpMethod::Get,
+        Media::EventStream,
+        "SSE：重放缓冲 1000 条 / 600 秒；广播缓冲 1024；保活 25 秒（注释帧）。载荷为完整事件（老面形状）。",
+    ),
+    (
+        "/api/v1/push/messages",
+        HttpMethod::Post,
+        Media::EventStream,
+        "同 GET。",
+    ),
+    (
+        "/chatlab/push/messages",
+        HttpMethod::Get,
+        Media::EventStream,
+        "SSE 通知面：只发元信息、不发正文；缓冲与保活同老面；基线帧带 `generation`。",
+    ),
+    (
+        "/chatlab/sessions",
+        HttpMethod::Get,
+        Media::Json(&["SessionsChatlab"]),
+        "Pull 形状的发现面：`keyword`/`limit`/`cursor` 分页；`count`/`page` 报告截断。",
+    ),
+    (
+        "/chatlab/sessions/{id}/messages",
+        HttpMethod::Get,
+        Media::Json(&["PullEnvelope"]),
+        "Pull 面（与 `/api/v1/sessions/{id}/messages` 同一实现）：`limit` 单页上限 5000。",
+    ),
+    ("/api/v1/sync", HttpMethod::Post, Media::Json(&["SyncResult"]), ""),
 ];
 
 /// 方法名 → OpenAPI 的键。
@@ -128,21 +222,42 @@ fn method_key(m: &HttpMethod) -> &'static str {
     }
 }
 
-/// 成功响应：一个 schema 直接用，多个包成 `oneOf`。
-fn success_response(names: &[&str]) -> serde_json::Value {
-    let schema = if names.len() == 1 {
-        serde_json::json!({ "$ref": format!("#/components/schemas/{}", names[0]) })
-    } else {
-        serde_json::json!({
-            "oneOf": names
-                .iter()
-                .map(|n| serde_json::json!({ "$ref": format!("#/components/schemas/{n}") }))
-                .collect::<Vec<_>>(),
-        })
+/// 成功响应：JSON 面按 schema 名出（一个直接引用、多个 `oneOf`）；字节面与 SSE 面按各自
+/// 的媒体类型出 —— 生成的客户端因此不会拿 JSON 解码器去解字节流或 SSE 帧。
+fn success_response(media: &Media) -> serde_json::Value {
+    let (content_type, schema) = match media {
+        Media::Json(names) => {
+            let schema = if names.len() == 1 {
+                serde_json::json!({ "$ref": format!("#/components/schemas/{}", names[0]) })
+            } else {
+                serde_json::json!({
+                    "oneOf": names
+                        .iter()
+                        .map(|n| serde_json::json!({ "$ref": format!("#/components/schemas/{n}") }))
+                        .collect::<Vec<_>>(),
+                })
+            };
+            ("application/json", schema)
+        }
+        Media::Bytes => (
+            "application/octet-stream",
+            serde_json::json!({ "type": "string", "format": "binary" }),
+        ),
+        Media::EventStream => (
+            "text/event-stream",
+            serde_json::json!({
+                "type": "string",
+                "description": "SSE 帧流（event: + data: 行）。帧结构：老面见 EventNew/EventRevoke/EventSync，通知面见 NotificationFrame/SyncFrame。"
+            }),
+        ),
+        Media::SelfDoc => (
+            "application/json",
+            serde_json::json!({ "type": "object", "description": "OpenAPI 描述文档自身" }),
+        ),
     };
     serde_json::json!({
         "description": "成功",
-        "content": { "application/json": { "schema": schema } },
+        "content": { content_type: { "schema": schema } },
     })
 }
 
@@ -150,7 +265,7 @@ fn success_response(names: &[&str]) -> serde_json::Value {
 pub fn document() -> OpenApi {
     let base = ApiDoc::openapi();
     let mut paths_json = serde_json::Map::new();
-    for (path, method, names) in ENDPOINTS {
+    for (path, method, media, desc) in ENDPOINTS {
         let entry = paths_json
             .entry((*path).to_string())
             .or_insert_with(|| serde_json::json!({}));
@@ -158,10 +273,14 @@ pub fn document() -> OpenApi {
             .replace(['/', '{', '}'], "_")
             .trim_matches('_')
             .to_string();
-        entry[method_key(method)] = serde_json::json!({
+        let mut op = serde_json::json!({
             "operationId": op_id,
-            "responses": { "200": success_response(names) },
+            "responses": { "200": success_response(media) },
         });
+        if !desc.is_empty() {
+            op["description"] = serde_json::Value::String((*desc).to_string());
+        }
+        entry[method_key(method)] = op;
     }
     let paths: Paths = serde_json::from_value(serde_json::Value::Object(paths_json))
         .expect("端点表必须能构成合法的 OpenAPI paths");

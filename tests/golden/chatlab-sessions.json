@@ -1,0 +1,49 @@
+{
+  "body": {
+    "count": 2,
+    "page": {
+      "hasMore": false,
+      "nextCursor": null
+    },
+    "sessions": [
+      {
+        "id": "wxid_fake_group@chatroom",
+        "lastMessageAt": 1700000015,
+        "memberCount": 2,
+        "messageCount": 4,
+        "name": "项目群",
+        "platform": "wechat",
+        "type": "group"
+      },
+      {
+        "id": "wxid_friend_a",
+        "lastMessageAt": 1700000010,
+        "messageCount": 4,
+        "name": "张三",
+        "platform": "wechat",
+        "type": "private"
+      }
+    ]
+  },
+  "keys": [
+    "count",
+    "page",
+    "hasMore",
+    "nextCursor",
+    "sessions",
+    "id",
+    "lastMessageAt",
+    "messageCount",
+    "name",
+    "platform",
+    "type",
+    "memberCount",
+    "id",
+    "lastMessageAt",
+    "messageCount",
+    "name",
+    "platform",
+    "type"
+  ],
+  "status": 200
+}

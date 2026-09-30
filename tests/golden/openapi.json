@@ -578,7 +578,7 @@
           "type": "object"
         },
         "GroupMember": {
-          "description": "群成员项。字段缺失同样压平成**空串**（与 `contacts` 同规）。\n\n`isOwner` 目前恒为 `false`（群主信息不在已解析的表中）；`messageCount` 仅在\n`includeMessageCounts=1` 时为真实值。两个「暂时恒定的字段」都要留着键 —— 删掉它们\n会让下游的字段存在性判断失效。",
+          "description": "群成员项。字段缺失同样压平成**空串**（与 `contacts` 同规）。\n\n`isOwner` 由 `chat_room.owner` 解析得出：**本页成员中恰为群主者为 `true`**；群主不在\n本页、或缺 `chat_room`/owner 时全为 `false`（键恒保留）。`messageCount` 仅在\n`includeMessageCounts=1` 时为真实值。删掉这些键会让下游的字段存在性判断失效。",
           "properties": {
             "alias": {
               "type": "string"
@@ -883,7 +883,7 @@
           "type": "object"
         },
         "MessagesNative": {
-          "description": "`GET|POST /api/v1/messages`（原生面）。",
+          "description": "`GET|POST /api/v1/messages`（原生面）。\n\n`media=1` 触发媒体导出，**单请求上限 200 项**——超出的部分保持未导出，再次请求续传。\n这个闸门必须留在描述里：下游只能靠它规划分批策略，而它此前只存在于散文文档。",
           "properties": {
             "count": {
               "minimum": 0,
@@ -915,6 +915,42 @@
             "messages",
             "success",
             "talker"
+          ],
+          "type": "object"
+        },
+        "NotificationFrame": {
+          "description": "`/chatlab/push/messages` 的通知帧：**只带元信息，不带正文**。\n\n规范对这条通道的定位是「仅通知：不假设事件可靠送达」—— 客户端收到后**去拉**那一页。\n带正文会诱导调用方把它当数据源，而它并不保证送达；不带，语义就没有歧义。\n\n`eventId` 与 `platformMessageId` 是**两个不同的号**：前者是事件通道自己的标识，后者是那条\n消息在平台上的 id（拉取时用它定位）。撤回事件里 `platformMessageId` 是被撤回那条的 id。",
+          "properties": {
+            "event": {
+              "description": "事件名。帧头（`event:` 行）与载荷里各有一份，**不是**重复：只解析 `data:` 行的客户端\n也要能分辨类型。",
+              "type": "string"
+            },
+            "eventId": {
+              "description": "事件通道自己的标识。",
+              "type": "string"
+            },
+            "platformMessageId": {
+              "description": "平台消息 id；取不到时为 `null`（键保留）。",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sessionId": {
+              "description": "所属会话。",
+              "type": "string"
+            },
+            "timestamp": {
+              "description": "事件时刻（秒）。",
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "event",
+            "eventId",
+            "sessionId",
+            "timestamp"
           ],
           "type": "object"
         },
@@ -1208,6 +1244,34 @@
           ],
           "type": "object"
         },
+        "SyncFrame": {
+          "description": "`/chatlab/push/messages` 的基线帧。\n\n`generation` 在注销时递增（见 `server::GENERATION`）：带着旧 `Last-Event-ID` 重连的客户端\n据此区分「注销后新账号刚开始」与「自己漏收了」—— 前者该丢弃本地状态重新拉，后者该补拉。\n少了它，这两种情况在协议上是同一件事。",
+          "properties": {
+            "event": {
+              "description": "事件名（`sync`）。",
+              "type": "string"
+            },
+            "generation": {
+              "description": "基线代号。",
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "watermarks": {
+              "description": "各表的水位线 —— 客户端从这里开始增量拉。",
+              "items": {
+                "$ref": "#/components/schemas/WatermarkEntry"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "event",
+            "generation",
+            "watermarks"
+          ],
+          "type": "object"
+        },
         "SyncResult": {
           "description": "`POST /api/v1/sync`。",
           "properties": {
@@ -1304,6 +1368,34 @@
                       },
                       {
                         "$ref": "#/components/schemas/AccountConflict"
+                      }
+                    ]
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
+        }
+      },
+      "/api/v1/accounts/{wxid}": {
+        "delete": {
+          "description": "注销账号；`POST .../{wxid}/deregister` 是其别名（供无法发 DELETE 的客户端与代理）。",
+          "operationId": "delete__api_v1_accounts__wxid",
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "oneOf": [
+                      {
+                        "$ref": "#/components/schemas/AccountDeregistered"
+                      },
+                      {
+                        "$ref": "#/components/schemas/AccountNotRegistered"
+                      },
+                      {
+                        "$ref": "#/components/schemas/AccountWxidMismatch"
                       }
                     ]
                   }
@@ -1437,8 +1529,81 @@
           }
         }
       },
+      "/api/v1/media/{id}": {
+        "get": {
+          "description": "字节面：只服务导出根下已导出的文件；未导出的先经 `messages?media=1`（每请求上限 200 项）导出。",
+          "operationId": "get__api_v1_media__id",
+          "responses": {
+            "200": {
+              "content": {
+                "application/octet-stream": {
+                  "schema": {
+                    "format": "binary",
+                    "type": "string"
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
+        },
+        "post": {
+          "description": "同 GET（兼容不能发 GET 的调用方）。",
+          "operationId": "post__api_v1_media__id",
+          "responses": {
+            "200": {
+              "content": {
+                "application/octet-stream": {
+                  "schema": {
+                    "format": "binary",
+                    "type": "string"
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
+        }
+      },
+      "/api/v1/media/{talker}/{media_type}/{file}": {
+        "get": {
+          "description": "三段式字节面；语义同 `/api/v1/media/{id}`。",
+          "operationId": "get__api_v1_media__talker___media_type___file",
+          "responses": {
+            "200": {
+              "content": {
+                "application/octet-stream": {
+                  "schema": {
+                    "format": "binary",
+                    "type": "string"
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
+        },
+        "post": {
+          "description": "同 GET。",
+          "operationId": "post__api_v1_media__talker___media_type___file",
+          "responses": {
+            "200": {
+              "content": {
+                "application/octet-stream": {
+                  "schema": {
+                    "format": "binary",
+                    "type": "string"
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
+        }
+      },
       "/api/v1/messages": {
         "get": {
+          "description": "`media=1` 触发导出，**每请求最多导出 200 项**（超出的保持未导出，再请求续传）。",
           "operationId": "get__api_v1_messages",
           "responses": {
             "200": {
@@ -1461,6 +1626,7 @@
           }
         },
         "post": {
+          "description": "`media=1` 触发导出，**每请求最多导出 200 项**（超出的保持未导出，再请求续传）。",
           "operationId": "post__api_v1_messages",
           "responses": {
             "200": {
@@ -1483,8 +1649,45 @@
           }
         }
       },
+      "/api/v1/push/messages": {
+        "get": {
+          "description": "SSE：重放缓冲 1000 条 / 600 秒；广播缓冲 1024；保活 25 秒（注释帧）。载荷为完整事件（老面形状）。",
+          "operationId": "get__api_v1_push_messages",
+          "responses": {
+            "200": {
+              "content": {
+                "text/event-stream": {
+                  "schema": {
+                    "description": "SSE 帧流（event: + data: 行）。帧结构：老面见 EventNew/EventRevoke/EventSync，通知面见 NotificationFrame/SyncFrame。",
+                    "type": "string"
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
+        },
+        "post": {
+          "description": "同 GET。",
+          "operationId": "post__api_v1_push_messages",
+          "responses": {
+            "200": {
+              "content": {
+                "text/event-stream": {
+                  "schema": {
+                    "description": "SSE 帧流（event: + data: 行）。帧结构：老面见 EventNew/EventRevoke/EventSync，通知面见 NotificationFrame/SyncFrame。",
+                    "type": "string"
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
+        }
+      },
       "/api/v1/sessions": {
         "get": {
+          "description": "会话列表：`limit` 默认 100。",
           "operationId": "get__api_v1_sessions",
           "responses": {
             "200": {
@@ -1509,6 +1712,7 @@
       },
       "/api/v1/sessions/{id}/messages": {
         "get": {
+          "description": "游标拉取：`limit` 单页上限 5000。",
           "operationId": "get__api_v1_sessions__id__messages",
           "responses": {
             "200": {
@@ -1541,6 +1745,61 @@
           }
         }
       },
+      "/chatlab/push/messages": {
+        "get": {
+          "description": "SSE 通知面：只发元信息、不发正文；缓冲与保活同老面；基线帧带 `generation`。",
+          "operationId": "get__chatlab_push_messages",
+          "responses": {
+            "200": {
+              "content": {
+                "text/event-stream": {
+                  "schema": {
+                    "description": "SSE 帧流（event: + data: 行）。帧结构：老面见 EventNew/EventRevoke/EventSync，通知面见 NotificationFrame/SyncFrame。",
+                    "type": "string"
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
+        }
+      },
+      "/chatlab/sessions": {
+        "get": {
+          "description": "Pull 形状的发现面：`keyword`/`limit`/`cursor` 分页；`count`/`page` 报告截断。",
+          "operationId": "get__chatlab_sessions",
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/SessionsChatlab"
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
+        }
+      },
+      "/chatlab/sessions/{id}/messages": {
+        "get": {
+          "description": "Pull 面（与 `/api/v1/sessions/{id}/messages` 同一实现）：`limit` 单页上限 5000。",
+          "operationId": "get__chatlab_sessions__id__messages",
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/PullEnvelope"
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
+        }
+      },
       "/health": {
         "get": {
           "operationId": "get__health",
@@ -1565,6 +1824,25 @@
                 "application/json": {
                   "schema": {
                     "$ref": "#/components/schemas/Health"
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
+        }
+      },
+      "/openapi.json": {
+        "get": {
+          "description": "免鉴权：只描述形状，不含账号、路径与密钥。",
+          "operationId": "get__openapi.json",
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "description": "OpenAPI 描述文档自身",
+                    "type": "object"
                   }
                 }
               },
@@ -2078,6 +2356,27 @@
     "type",
     "required",
     "type",
+    "NotificationFrame",
+    "description",
+    "properties",
+    "event",
+    "description",
+    "type",
+    "eventId",
+    "description",
+    "type",
+    "platformMessageId",
+    "description",
+    "type",
+    "sessionId",
+    "description",
+    "type",
+    "timestamp",
+    "description",
+    "format",
+    "type",
+    "required",
+    "type",
     "Page",
     "description",
     "properties",
@@ -2245,6 +2544,24 @@
     "type",
     "required",
     "type",
+    "SyncFrame",
+    "description",
+    "properties",
+    "event",
+    "description",
+    "type",
+    "generation",
+    "description",
+    "format",
+    "minimum",
+    "type",
+    "watermarks",
+    "description",
+    "items",
+    "$ref",
+    "type",
+    "required",
+    "type",
     "SyncResult",
     "description",
     "properties",
@@ -2304,6 +2621,20 @@
     "application/json",
     "schema",
     "oneOf",
+    "$ref",
+    "$ref",
+    "description",
+    "/api/v1/accounts/{wxid}",
+    "delete",
+    "description",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "application/json",
+    "schema",
+    "oneOf",
+    "$ref",
     "$ref",
     "$ref",
     "description",
@@ -2377,8 +2708,55 @@
     "schema",
     "$ref",
     "description",
+    "/api/v1/media/{id}",
+    "get",
+    "description",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "application/octet-stream",
+    "schema",
+    "format",
+    "type",
+    "description",
+    "post",
+    "description",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "application/octet-stream",
+    "schema",
+    "format",
+    "type",
+    "description",
+    "/api/v1/media/{talker}/{media_type}/{file}",
+    "get",
+    "description",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "application/octet-stream",
+    "schema",
+    "format",
+    "type",
+    "description",
+    "post",
+    "description",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "application/octet-stream",
+    "schema",
+    "format",
+    "type",
+    "description",
     "/api/v1/messages",
     "get",
+    "description",
     "operationId",
     "responses",
     "200",
@@ -2390,6 +2768,7 @@
     "$ref",
     "description",
     "post",
+    "description",
     "operationId",
     "responses",
     "200",
@@ -2400,8 +2779,32 @@
     "$ref",
     "$ref",
     "description",
+    "/api/v1/push/messages",
+    "get",
+    "description",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "text/event-stream",
+    "schema",
+    "description",
+    "type",
+    "description",
+    "post",
+    "description",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "text/event-stream",
+    "schema",
+    "description",
+    "type",
+    "description",
     "/api/v1/sessions",
     "get",
+    "description",
     "operationId",
     "responses",
     "200",
@@ -2414,6 +2817,7 @@
     "description",
     "/api/v1/sessions/{id}/messages",
     "get",
+    "description",
     "operationId",
     "responses",
     "200",
@@ -2424,6 +2828,40 @@
     "description",
     "/api/v1/sync",
     "post",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "application/json",
+    "schema",
+    "$ref",
+    "description",
+    "/chatlab/push/messages",
+    "get",
+    "description",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "text/event-stream",
+    "schema",
+    "description",
+    "type",
+    "description",
+    "/chatlab/sessions",
+    "get",
+    "description",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "application/json",
+    "schema",
+    "$ref",
+    "description",
+    "/chatlab/sessions/{id}/messages",
+    "get",
+    "description",
     "operationId",
     "responses",
     "200",
@@ -2450,6 +2888,18 @@
     "application/json",
     "schema",
     "$ref",
+    "description",
+    "/openapi.json",
+    "get",
+    "description",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "application/json",
+    "schema",
+    "description",
+    "type",
     "description"
   ],
   "status": 200

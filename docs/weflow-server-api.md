@@ -65,6 +65,9 @@
 - **描述随 DTO 变**。改 DTO 就会改它，不需要手工同步；`tests/openapi.rs` 保证描述自身自洽
   （每个 `$ref` 都能解析、operationId 唯一、多形状确实用 `oneOf`），golden 快照则保证它
   的变更有人看过。
+- **字节面与 SSE 面如实标注媒体类型**：媒体路由是 `application/octet-stream`（binary），
+  推送面是 `text/event-stream`；端点级 `description` 携带各面的对外闸门（导出每请求 200 项、
+  单页上限 5000、重放缓冲 1000 条/600 秒等）——生成的客户端不必再翻散文文档找这些数字。
 
 错误响应（401/404/405 等）**不在描述里**：它们是跨端点的统一信封，见上文「错误信封」。
 
@@ -505,7 +508,8 @@ qqflow-server 的 `type` 取值为 `1` 私聊 / `2` 群聊，数值含义与本�
 ```
 
 成员标识键为 `wxid`（非 `username`）。`messageCount` 仅在 `includeMessageCounts=1`
-时为真实值，否则恒为 `0`；`isOwner` 当前始终 `false`（群主信息不在已解析的表中）。
+时为真实值，否则恒为 `0`；`isOwner` 由 `chat_room.owner` 解析——本页成员中恰为群主者为
+`true`，群主不在本页（或缺 `chat_room`/owner 数据）时全为 `false`。
 
 ### GET/POST `/api/v1/media/{id}` — 按文件名直服
 

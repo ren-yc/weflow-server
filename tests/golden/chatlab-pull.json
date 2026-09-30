@@ -1,0 +1,130 @@
+{
+  "body": {
+    "chatlab": {
+      "exportedAt": "<volatile>",
+      "generator": "weflow-server",
+      "version": "0.0.2"
+    },
+    "members": [
+      {
+        "accountName": "李四",
+        "avatar": "",
+        "groupNickname": "四哥",
+        "platformId": "wxid_member_b"
+      },
+      {
+        "accountName": "wxid_fake000000000000001",
+        "avatar": "",
+        "groupNickname": "",
+        "platformId": "wxid_fake000000000000001"
+      }
+    ],
+    "messages": [
+      {
+        "accountName": "李四",
+        "content": "大家好",
+        "groupNickname": "四哥",
+        "platformMessageId": "8200000000000000000",
+        "sender": "wxid_member_b",
+        "timestamp": 1700000100,
+        "type": 0
+      },
+      {
+        "accountName": "wxid_fake000000000000001",
+        "content": "我发的",
+        "groupNickname": "",
+        "platformMessageId": "8200000000000000001",
+        "sender": "wxid_fake000000000000001",
+        "timestamp": 1700000101,
+        "type": 0
+      },
+      {
+        "accountName": "李四",
+        "content": "[图片]",
+        "groupNickname": "四哥",
+        "platformMessageId": "8200000000000000002",
+        "sender": "wxid_member_b",
+        "timestamp": 1700000102,
+        "type": 1
+      },
+      {
+        "accountName": "李四",
+        "content": "群消息",
+        "groupNickname": "四哥",
+        "platformMessageId": "8200000000000000003",
+        "sender": "wxid_member_b",
+        "timestamp": 1700000103,
+        "type": 0
+      }
+    ],
+    "meta": {
+      "groupId": "wxid_fake_group@chatroom",
+      "name": "项目群",
+      "ownerId": "wxid_fake000000000000001",
+      "platform": "wechat",
+      "type": "group"
+    },
+    "sync": {
+      "hasMore": false,
+      "nextOffset": 0,
+      "nextSince": "<volatile>",
+      "watermark": "<volatile>"
+    }
+  },
+  "keys": [
+    "chatlab",
+    "exportedAt",
+    "generator",
+    "version",
+    "members",
+    "accountName",
+    "avatar",
+    "groupNickname",
+    "platformId",
+    "accountName",
+    "avatar",
+    "groupNickname",
+    "platformId",
+    "messages",
+    "accountName",
+    "content",
+    "groupNickname",
+    "platformMessageId",
+    "sender",
+    "timestamp",
+    "type",
+    "accountName",
+    "content",
+    "groupNickname",
+    "platformMessageId",
+    "sender",
+    "timestamp",
+    "type",
+    "accountName",
+    "content",
+    "groupNickname",
+    "platformMessageId",
+    "sender",
+    "timestamp",
+    "type",
+    "accountName",
+    "content",
+    "groupNickname",
+    "platformMessageId",
+    "sender",
+    "timestamp",
+    "type",
+    "meta",
+    "groupId",
+    "name",
+    "ownerId",
+    "platform",
+    "type",
+    "sync",
+    "hasMore",
+    "nextOffset",
+    "nextSince",
+    "watermark"
+  ],
+  "status": 200
+}

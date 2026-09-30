@@ -1,0 +1,19 @@
+{
+  "body": {
+    "index_cleared": false,
+    "purged_dirs": 0,
+    "purged_media": false,
+    "state": "not_registered",
+    "success": true,
+    "wxid": "wxid_fake000000000000001"
+  },
+  "keys": [
+    "index_cleared",
+    "purged_dirs",
+    "purged_media",
+    "state",
+    "success",
+    "wxid"
+  ],
+  "status": 200
+}
