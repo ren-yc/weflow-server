@@ -2,6 +2,47 @@
 
 本文件从 0.5.0 起维护。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.6.1] - 2026-10-01
+
+门禁与文档收口。**响应形状未变** —— 新增的是接口描述里的两条操作与更严的门禁。
+
+### 新增
+
+- **`/openapi.json` 补上两条真实存在的操作**：`POST /api/v1/sessions`、`GET /api/v1/sync`。
+  它们一直能被调用却不在描述里，从描述生成客户端的人看不到它们。
+- 路由现在有**唯一事实源**（`src/server/routes.rs`）：`build_router` 由它构建，
+  与端点表的对等由 `documented_routes_match_the_openapi_table` 强制 —— 集合必须等于
+  「路由 − 豁免」（`sns` 六个操作尚未 DTO 化，豁免写成代码常量），未声明的方法必须 405。
+
+### 变更（对门禁，不对接口）
+
+- 一致性套件带上跳过即失败：有用例被跳过时整套失败（此前跳过不影响退出码，
+  「夹具少声明一个端点」会让用例静默变成不跑，而 CI 仍是绿的）。缺 `FLOW_CONTRACT_DIR`
+  同样由静默通过改为失败。
+- 契约 pin 升到 `v0.3.3`（`v0.3.1` 引入跳过即失败；`v0.3.2` 让 runner 校验 tag；
+  `v0.3.3` 修公共段措辞）。夹具的 `contractVersion` 与 `conformance.pin` 由
+  `pinned_contract_version_matches_the_fixture` 钉在一起，只改一处不再能溜过。
+- golden 快照**缺失即失败**（此前缺失会被静默重建，drift 检测随之失效）。
+
+### 修复
+
+- SSE 面补 `mediaId` 的正路径端到端断言：导出根下有文件 → 帧里带 `mediaId` → 用该 id
+  取回字节（此前只有单元测试证明「一次 stat 的判据对」）。
+- 导出写入单测里两条「无残留」断言此前查错了位置（按 join 链算，一个落在 root 内、
+  一个落在 root 的父目录），移除守卫时它们仍然是绿的。
+- SSE 的 content-type 断言此前只在 `#[ignore]` 的真库测试里，现进了门禁。
+- `CHANGELOG` 的 `[0.5.1]` 说明改为与史实一致：那段内容是**改名**归入 `0.6.0`，
+  不是那时才写入本文件。
+
+### 文档
+
+- `docs/architecture.md` 补「工程与工具链」「测试与夹具」两节。
+- `docs/weflow-server-api.md` 登记 `members[].roles` 为**有意不输出**（与 `isOwner` 同义，
+  且受同一个「群主可能不在本页」的限制）。
+
+### 迁移
+
+无。
 ## [0.6.0] - 2026-09-27
 
 ChatLab 适配层上线，**并接受一次破坏性发布**（五项，见下）。下游需按迁移表逐项核对。
