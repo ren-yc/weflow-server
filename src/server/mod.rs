@@ -919,13 +919,18 @@ fn purge_exported_media(root: &std::path::Path, talkers: &[String]) -> usize {
 /// 4. re-broadcast the watermark baseline for whatever remains ready, so a
 ///    client learns its watermarks are gone.
 ///
-/// Two things are deliberately NOT done. The SSE replay history is left alone:
-/// it is process-wide and its ids are a bus-level sequence, so clearing it
-/// would break Last-Event-ID replay for subscribers that have nothing to do
-/// with this account. And `discovered` is left alone, which is exactly the
-/// right behavior for free: an account the startup scan found reappears as
+/// One thing is deliberately NOT done: `discovered` is left alone, which is exactly
+/// the right behavior for free — an account the startup scan found reappears as
 /// `awaiting_key` (it really is still on this machine), while a client-only
 /// account vanishes entirely (nothing here knows about it any more).
+///
+/// The SSE replay history **is** cleared (see the call below), and the event-id
+/// counter is deliberately **kept**: dropping it too would let a client that
+/// reconnects with a stale `Last-Event-ID` match ids that were issued to the
+/// previous account. The generation counter carried by the baseline `sync` frame
+/// is what lets it tell "a new account just started" from "I missed events".
+/// (An earlier revision of this comment said the history was left alone — that was
+/// true before the deregister semantics were unified, and it has been wrong since.)
 pub fn deregister_account(state: &AppState, wxid: &str, purge_media: bool) -> DeregisterOutcome {
     // 1. Claim the removal under one lock.
 

@@ -541,7 +541,12 @@ pub struct SessionChatlab {
 /// 带正文会诱导调用方把它当数据源，而它并不保证送达；不带，语义就没有歧义。
 ///
 /// `eventId` 与 `platformMessageId` 是**两个不同的号**：前者是事件通道自己的标识，后者是那条
-/// 消息在平台上的 id（拉取时用它定位）。撤回事件里 `platformMessageId` 是被撤回那条的 id。
+/// 消息在平台上的 id（拉取时用它定位）。
+///
+/// **本面当前不下发 `platformMessageId`**（键保留、值恒为 `null`）：事件里带的是各平台自己的
+/// 那套编号，把它翻成平台消息号需要在**推送热路径**上逐事件查一次索引，而规范里这个字段是
+/// **可选**的。定位消息请用**拉取面**返回的 `platformMessageId` —— 「收到通知后去拉那一页」
+/// 本来就是这条通道的用法。
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct NotificationFrame {

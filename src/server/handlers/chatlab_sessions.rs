@@ -7,7 +7,8 @@
 //! 响应形状（规范）：
 //!
 //! ```json
-//! { "sessions": [ { "id", "name", "platform", "type", "messageCount", "memberCount?", "lastMessageAt" } ],
+//! { "count": 2,
+//!   "sessions": [ { "id", "name", "platform", "type", "messageCount", "memberCount?", "lastMessageAt" } ],
 //!   "page": { "hasMore": true, "nextCursor": "…" } }
 //! ```
 //!
