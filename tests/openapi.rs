@@ -86,16 +86,26 @@ fn openapi_document_is_self_consistent() {
 
     // 4. 多形状端点必须用 `oneOf` —— 用「所有字段都可选」的单个 schema 会让描述看起来
     //    合法，而实际没有任何取值组合是对的。
+    let accounts = &doc["paths"]["/api/v1/accounts"]["post"]["responses"]["200"]["content"]
+        ["application/json"]["schema"];
+    assert!(
+        accounts["oneOf"].is_array(),
+        "post /api/v1/accounts 是多形状端点（注册受理 / 占用冲突），应该用 oneOf，实际是 {accounts}"
+    );
+
+    // 5. 反过来：**单形状**端点不得用 `oneOf`。老面在 ChatLab 形状搬走之后只剩一种形状，
+    //    这条断言把「两个形状又被塞回老面」变成红的 —— 只钉「多形状要用 oneOf」的话，
+    //    形状变少是无声的。
     for (path, method) in [
         ("/api/v1/sessions", "get"),
         ("/api/v1/messages", "get"),
-        ("/api/v1/accounts", "post"),
+        ("/chatlab/messages", "get"),
     ] {
         let schema = &doc["paths"][path][method]["responses"]["200"]["content"]
             ["application/json"]["schema"];
         assert!(
-            schema["oneOf"].is_array(),
-            "{method} {path} 是多形状端点，应该用 oneOf，实际是 {schema}"
+            schema["$ref"].is_string() && schema["oneOf"].is_null(),
+            "{method} {path} 只有一种形状，应当直接引用单个 schema，实际是 {schema}"
         );
     }
 }

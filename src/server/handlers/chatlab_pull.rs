@@ -78,34 +78,26 @@ pub async fn handler(
     // member who had a remark but no card (and for every private chat).
     let chatroom = id.ends_with("@chatroom").then_some(id.as_str());
 
-    // members = senders in this page (dedup)
+    // members = senders in this page (dedup)。字段取法与消息面共用一处（server::chatlab）：
+    // 两处各写一遍时，「取联系人档案还是取消息里的昵称」这种分歧不会有任何东西变红。
     let mut seen = std::collections::HashSet::new();
     let members: Vec<ChatlabMember> = page
         .iter()
         .filter(|m| !m.sender_username.is_empty() && seen.insert(m.sender_username.as_str()))
-        .map(|m| {
-            let c = store.contacts.get(&m.sender_username);
-            ChatlabMember {
-                account_name: m.sender_name.clone(),
-                avatar: c.and_then(|c| c.avatar_url.clone()).unwrap_or_default(),
-                group_nickname: store.group_card(chatroom, &m.sender_username),
-                platform_id: m.sender_username.clone(),
-            }
-        })
+        .map(|m| crate::server::chatlab::member_fields(&store, chatroom, &m.sender_username))
         .collect();
 
     let messages: Vec<PullMessage> = page
         .iter()
         .map(|m| {
-            // 字段怎么填只有一处出处（`server::chatlab`）；这里只剩这个面**自己的契约差异**：
-            // 有引用才输出 `replyToMessageId`（`skip_serializing_if`）—— 规范把它列为可选 string，
-            // 给 `null` 会让「可选字符串」的读者拿到一个类型不符的值。混合面按既有契约仍输出
-            // `null`（下游已依赖），两处由此各建 struct。
+            // 字段怎么填只有一处出处（`server::chatlab`）：三个面（原生面、消息面、拉取面）在
+            // `replyToMessageId` 与 `media` 上同规 —— 无引用时省略该键，无媒体时省略整个 media。
             let f = crate::server::chatlab::message_fields(&store, chatroom, m);
             PullMessage {
                 account_name: f.account_name,
                 content: f.content,
                 group_nickname: f.group_nickname,
+                media: f.media,
                 platform_message_id: f.platform_message_id,
                 reply_to_message_id: f.reply_to_message_id,
                 sender: f.sender,

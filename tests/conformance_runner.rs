@@ -201,7 +201,7 @@ async fn wait_ready(app: &axum::Router) -> bool {
 
 /// 夹具声明的契约版本。**必须与 `conformance.pin` 同改** —— 见下面的
 /// `pinned_contract_version_matches_the_fixture`。
-const CONTRACT_VERSION: &str = "0.3.3";
+const CONTRACT_VERSION: &str = "0.4.0";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "由 CI 的一致性步骤显式运行：需要 FLOW_CONTRACT_DIR"]
@@ -261,12 +261,13 @@ async fn conformance_suite_passes() {
     assert!(wait_ready(&client).await, "索引没能在 30 秒内到 ready");
 
     // 写夹具文件并交给 runner。
-    // 五通道鉴权探测：契约的 `authProbed` 是「传输名 → 状态码」，由 harness 探测后填入。
+    // 鉴权探测：契约的 `authProbed` 是「传输名 → 状态码」，由 harness 探测后填入。
     // 这不是断言，是**告知** —— 用例据此判断哪些通道可用。
+    //
+    // **只探两条**：凭据写法不同（`authorization` 要 `Bearer ` 前缀，查询参数是裸 token），
+    // 而 `X-Api-Key`、`?token=` 与 POST body 已不是通道 —— 探它们只会得到 401，而 401 与
+    // 「通道还在但没带对凭据」在探测结果里无法区分。
     let mut auth_probed = serde_json::Map::new();
-    // 五种传输各自的**凭据写法不同**：`authorization` 要 `Bearer ` 前缀，`x-api-key` 要裸
-    // token，两个查询参数与 body 都是裸 token。第一版把两种 header 都写成 `Bearer `，
-    // 于是 `x-api-key` 探出 401、断言当场报「这些传输方式没有返回 200：[x-api-key]」。
     let plain_get = |q: &str| {
         Request::builder()
             .method("GET")
@@ -286,18 +287,7 @@ async fn conformance_suite_passes() {
     };
     let probes = [
         ("bearer", with_header("authorization", format!("Bearer {TOKEN}"))),
-        ("x-api-key", with_header("x-api-key", TOKEN.to_string())),
         ("access_token", plain_get("access_token")),
-        ("token", plain_get("token")),
-        (
-            "body",
-            Request::builder()
-                .method("POST")
-                .uri("/api/v1/sessions")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(json!({ "access_token": TOKEN }).to_string()))
-                .unwrap(),
-        ),
     ];
     for (name, r) in probes {
         let (n, s) = probe(client.clone(), name, r).await;
@@ -307,12 +297,13 @@ async fn conformance_suite_passes() {
         "contractVersion": CONTRACT_VERSION,
         "platform": "wechat",
         "generatedBy": "weflow-server tests/conformance_runner.rs",
-        // schema 要求七项齐全（用例只用到其中两个，但夹具的完整性由 schema 校验）。
+        // 夹具必须声明 schema 里要求的每个端点（缺一个即 setup 失败，而不是静默跳过）。
         "endpoints": {
             "accounts": "/api/v1/accounts",
             "contacts": "/api/v1/contacts",
             "health": "/health",
             "messages": "/api/v1/messages",
+            "messages_chatlab": "/chatlab/messages",
             "harness": "/__harness",
             "group-members": "/api/v1/group-members",
             "pull": "/chatlab/sessions/{id}/messages",

@@ -352,8 +352,9 @@ async fn downstream_client_real_db() {
     .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED, "a wrong token is not a missing token");
 
-    // ---- 2b. all FIVE auth transports reach the same endpoint -----------
-    // Bearer header / X-Api-Key header / ?access_token= / ?token= / POST body.
+    // ---- 2b. 两条鉴权通道到达同一个端点 --------------------------------
+    // Authorization: Bearer 与 ?access_token=。其余写法（X-Api-Key、?token=、POST body）
+    // 已删除 —— 下面同时钉住「它们不再被接受」：只删实现、留下断言时不会有任何东西红。
     let bearer = format!("Bearer {token}");
     let transports: Vec<(&str, Request<Body>)> = vec![
         (
@@ -361,12 +362,21 @@ async fn downstream_client_real_db() {
             build_request("GET", "/api/v1/sessions?limit=1", &[("authorization", &bearer)], None),
         ),
         (
-            "X-Api-Key",
-            build_request("GET", "/api/v1/sessions?limit=1", &[("x-api-key", token)], None),
-        ),
-        (
             "?access_token=",
             build_request("GET", &format!("/api/v1/sessions?limit=1&access_token={token}"), &[], None),
+        ),
+    ];
+    for (name, req) in transports {
+        let (s, v) = send(app.clone(), req).await;
+        assert_eq!(s, StatusCode::OK, "auth transport {name} accepted");
+        assert_eq!(v["success"], true, "auth transport {name} answered: {v}");
+    }
+    println!("[CLIENT] auth: 2 transports accepted");
+
+    let removed: Vec<(&str, Request<Body>)> = vec![
+        (
+            "X-Api-Key",
+            build_request("GET", "/api/v1/sessions?limit=1", &[("x-api-key", token)], None),
         ),
         (
             "?token=",
@@ -377,12 +387,11 @@ async fn downstream_client_real_db() {
             build_request("POST", "/api/v1/sessions", &[], Some(json!({"access_token": token, "limit": 1}))),
         ),
     ];
-    for (name, req) in transports {
-        let (s, v) = send(app.clone(), req).await;
-        assert_eq!(s, StatusCode::OK, "auth transport {name} accepted");
-        assert_eq!(v["success"], true, "auth transport {name} answered: {v}");
+    for (name, req) in removed {
+        let (s, _) = send(app.clone(), req).await;
+        assert_ne!(s, StatusCode::OK, "auth transport {name} 已删除，不该再被接受");
     }
-    println!("[CLIENT] auth: all 5 transports accepted");
+    println!("[CLIENT] auth: removed transports rejected");
 
     // ---- 3. sessions: Bearer header, WeFlow shape -----------------------
     let (s, v) = client_get(
@@ -482,10 +491,10 @@ async fn downstream_client_real_db() {
         println!("[CLIENT] empty session -> 404 envelope");
     }
 
-    // ---- 3b. sessions: chatlab projection ------------------------------
+    // ---- 3b. sessions: chatlab projection（新面）------------------------
     let (s, v) = client_get(
         app.clone(),
-        &format!("/api/v1/sessions?limit=5&chatlab=1&access_token={token}"),
+        &format!("/chatlab/sessions?limit=5&access_token={token}"),
         &[],
     )
     .await;
@@ -523,17 +532,17 @@ async fn downstream_client_real_db() {
         assert!(m["content"].is_string());
         assert!(m["rawContent"].is_string());
         assert!(m["parsedContent"].is_string());
-        // Structured media rides on image/voice/video/emoji messages. Without
-        // `media=1` the url/localPath stay empty strings rather than being
-        // absent, so a client can rely on the field existing.
+        // 有媒体就带 media 对象；**未导出时 url/localPath/mediaId 都不出现**（不是空串）——
+        // 「键不在」才是「取不到字节」的表达，空串会被读成「有地址、只是空的」。
         if let Some(media) = m["media"].as_object() {
             assert!(matches!(
                 media["type"].as_str(),
                 Some("image" | "voice" | "video" | "emoji" | "file")
             ));
             assert!(media["fileName"].is_string());
-            assert_eq!(media["url"], "", "no url until media=1 exports the bytes");
-            assert_eq!(media["localPath"], "", "no localPath until media=1");
+            assert!(media.get("url").is_none(), "no url until media=1 exports the bytes");
+            assert!(media.get("localPath").is_none(), "no localPath until media=1");
+            assert!(media.get("mediaId").is_none(), "no handle until media=1 exports the bytes");
         }
         // A quote carries the parent's id plus a rendered preview.
         if let Some(q) = m["quote"].as_object() {
@@ -651,26 +660,19 @@ async fn downstream_client_real_db() {
         println!("[CLIENT] media fetch: {} bytes", bytes.len());
     }
 
-    // ---- 5. messages: POST body transport + YYYYMMDD bounds -------------
-    let (s, v) = client_post(
-        app.clone(),
-        "/api/v1/messages",
-        &[],
-        json!({
-            "access_token": token,
-            "talker": first_talker,
-            "limit": 5,
-            "start": "20200101",
-            "end": "20301231",
-        }),
-    )
-    .await;
+    // ---- 5. messages: GET + YYYYMMDD bounds -----------------------------
+    // 读端点只有 GET（POST body 那条通道已删）。YYYYMMDD 上界读作**当天末刻** ——
+    // 取当天 0 点会把那一整天静默排除在外。
+    let uri = format!(
+        "/api/v1/messages?talker={first_talker}&limit=5&start=20200101&end=20301231&access_token={token}"
+    );
+    let (s, v) = client_get(app.clone(), &uri, &[]).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["success"], true);
     let posted = v["messages"].as_array().unwrap();
     assert_eq!(v["count"].as_u64().unwrap() as usize, posted.len());
     assert!(posted.len() <= 5, "limit honoured");
-    println!("[CLIENT] POST messages: {} rows (limit=5, YYYYMMDD bounds)", posted.len());
+    println!("[CLIENT] GET messages: {} rows (limit=5, YYYYMMDD bounds)", posted.len());
 
     // ---- 6. ChatLab Pull: drain the conversation with nextSince/nextOffset
     // The strong contract: feeding both cursors back verbatim must eventually
@@ -829,18 +831,31 @@ async fn downstream_client_real_db() {
                 assert!(m["groupNickname"].is_string());
                 assert!(m["avatarUrl"].is_string());
                 assert!(m["messageCount"].is_number(), "includeMessageCounts=1");
-                assert_eq!(m["isOwner"], false);
                 assert!(m["isFriend"].is_boolean());
             }
+            // 成员集合是**名册 ∪ 发言人**，所以群主通常就在里面 —— 断言「至多一个」，
+            // 「恰好一个」的严格判据留给契约套件的受控夹具（真账号的降级形态是合法的）。
+            let owners = members.iter().filter(|m| m["isOwner"] == json!(true)).count();
+            assert!(owners <= 1, "每群至多一个群主，实际 {owners}");
+            assert_eq!(v["fromCache"], false);
+            assert!(v["updatedAt"].as_i64().is_some_and(|t| t > 0), "索引构建时刻：{v}");
             println!("[CLIENT] group-members: {} rows", members.len());
 
-            // POST transport, `talker` alias for chatroomId. Counts default
-            // off, so messageCount must come back 0 rather than absent.
-            let (s, v) = client_post(
+            // 读端点只有 GET：POST 与 `talker` 别名都已删除，这里钉住它们不再被接受。
+            let (s, _) = client_post(
                 app.clone(),
                 "/api/v1/group-members",
                 &[],
                 json!({ "access_token": token, "talker": gid }),
+            )
+            .await;
+            assert_ne!(s, StatusCode::OK, "POST 与 talker 别名已删除");
+
+            // 不带 includeMessageCounts 时计数恒为 0（键仍在，不是缺键）。
+            let (s, v) = client_get(
+                app.clone(),
+                &format!("/api/v1/group-members?chatroomId={gid}&access_token={token}"),
+                &[],
             )
             .await;
             assert_eq!(s, StatusCode::OK);

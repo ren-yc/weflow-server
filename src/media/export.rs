@@ -25,8 +25,19 @@ use crate::media::{self, DatFormat};
 /// 两条都是刻意的：① token 是只走请求头的凭据，一旦拼进 URL 就会被复制到响应体、
 /// 客户端日志与任何中间缓存里；② 相对路径不把服务基址烤进响应，反代或换端口之后
 /// 下发的地址仍然有效。调用方按自己的基址拼接。
-pub fn exported_media_url(talker: &str, kind_dir: &str, file_name: &str) -> String {
-    format!("/api/v1/media/{talker}/{kind_dir}/{file_name}")
+pub fn exported_media_url(file_name: &str) -> String {
+    format!("/api/v1/media/{file_name}")
+}
+
+/// 文件名是否**由内容摘要派生**（形如 32 位十六进制 + 扩展名）。
+///
+/// 为什么按名取字节的路由只接受这种名字：它要遍历**所有**会话的导出目录，而「同名」在
+/// 别的会话里完全可能是另一个文件的内容。摘要派生的名字天然内容唯一 —— 同名即同内容，
+/// 遍历的结果因此是确定的。反过来，DB 名回落（视频的 `video_hardlink_info_v4.file_name`）
+/// 与原文件名回落都不具备这个性质：它们可以作**元数据**下发，但不能当**句柄**。
+pub fn name_is_content_digest(name: &str) -> bool {
+    let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+    stem.len() == 32 && stem.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Filesystem-only context (no database handles).
@@ -48,6 +59,12 @@ pub struct ExportedMedia {
     pub local_path: PathBuf,
     /// External URL (emoji cdn) — when set, no local file was written.
     pub external_url: Option<String>,
+    /// 文件名是否由内容摘要派生（见同名函数）。
+    ///
+    /// 只有它为真、且**确实写出了本地文件**时，这个名字才可以作为句柄下发（原生面的
+    /// `mediaId`、消息面 `media.fileName` 的可用形态）。非摘要派生的名字仍作为
+    /// 元数据照给 —— 「这条有媒体、叫什么」与「字节取得到」是两件事。
+    pub digest_named: bool,
 }
 
 fn sniff_image_ext(bytes: &[u8]) -> &'static str {
@@ -168,7 +185,7 @@ pub fn kind_dir_for(kind: crate::parser::MediaKind) -> Option<&'static str> {
 /// 媒体 id 的「**出现即可取**」判据：导出根下确有这个文件才通告。
 ///
 /// 承诺是**出现即可取**，不是尽力而为 —— 通告一个取不到的 id，只会让调用方拿到 404 并以为
-/// 是服务坏了。反过来（能取到却没通告）只是少一个便捷入口，调用方仍可走三段式路径。
+/// 是服务坏了。反过来（能取到却没通告）代价小得多：调用方仍可先 `media=1` 触发导出、再取。
 ///
 /// 只做**一次直接 stat**：布局是 `<root>/<会话>/<类型>/<文件>`，三段都已知，不需要像
 /// `find_exported` 那样遍历所有会话（那是 (会话数 × 4) 次 stat，放在每个推送事件上不可接受）。
@@ -182,6 +199,12 @@ pub fn fetchable_media_id(
     if !crate::pathsafe::safe_segment(talker) || !crate::pathsafe::safe_segment(file_name) {
         return None;
     }
+    // 名字必须**由内容摘要派生**：本函数只 stat 本会话的目录，看不到别处是否躺着同名异内容的
+    // 文件，而按名取字节是跨会话解析的。通告一个非摘要派生的名字，可能把别的会话的同名文件
+    // 当成它 —— 那正是「出现即可取」被破坏的形态。
+    if !name_is_content_digest(file_name) {
+        return None;
+    }
     let path = export_dir.join(talker).join(kind_dir).join(file_name);
     path.is_file().then(|| file_name.to_string())
 }
@@ -191,6 +214,7 @@ fn write_out(
     kind_dir: &'static str,
     file_name: &str,
     bytes: &[u8],
+    digest_named: bool,
 ) -> Option<ExportedMedia> {
     // Both of these become path components. `talker` reaches here from the
     // store (external data — the WeChat database), and `file_name` is derived
@@ -218,6 +242,7 @@ fn write_out(
             kind_dir,
             local_path: path,
             external_url: None,
+            digest_named,
         });
     }
     let tmp = dir.join(format!(".{file_name}.tmp"));
@@ -228,6 +253,7 @@ fn write_out(
         kind_dir,
         local_path: path,
         external_url: None,
+        digest_named,
     })
 }
 
@@ -355,7 +381,8 @@ pub fn export_one(
                 let e = sniff_image_ext(&decoded);
                 (decoded, e)
             };
-            write_out(&ctx.export_dir, talker, "images", &format!("{img_md5}.{ext}"), &bytes)
+            // 图片的落盘名是 32 位摘要 + 嗅探出的扩展名 ⇒ 摘要派生。
+            write_out(&ctx.export_dir, talker, "images", &format!("{img_md5}.{ext}"), &bytes, true)
         }
         K::Voice => {
             let svr_id = server_id;
@@ -382,19 +409,25 @@ pub fn export_one(
                 if data.is_empty() {
                     continue;
                 }
+                // 语音的落盘名来自服务端序号（voice_<svr_id>.silk），**不是**内容摘要派生：
+                // 别的会话可以有同一个 svr_id 的另一个文件。它照常作为元数据下发，但不作句柄。
                 return write_out(
                     &ctx.export_dir,
                     talker,
                     "voices",
                     &format!("voice_{svr_id}.silk"),
                     &data,
+                    false,
                 );
             }
             None
         }
         K::Video => {
             let video_md5 = md5?;
-            let fname = aux
+            // 两个来源的性质不同，必须分开：库里查到的文件名是**平台给的名字**，别的会话
+            // 可能有同名但内容不同的文件 ⇒ 只作元数据；回落出来的 "<md5>.mp4" 是摘要派生的
+            // ⇒ 可以作句柄。把两者混成一个名字，等于让「出现即可取」在最需要它的那一端失效。
+            let from_db = aux
                 .get("hardlink/hardlink.db")
                 .and_then(|conn| {
                     let mut stmt = conn
@@ -403,8 +436,11 @@ pub fn export_one(
                         )
                         .ok()?;
                     stmt.query_row([video_md5], |r| r.get::<_, String>(0)).ok()
-                })
-                .unwrap_or_else(|| format!("{video_md5}.mp4"));
+                });
+            let (fname, digest_named) = match from_db {
+                Some(name) => (name, false),
+                None => (format!("{video_md5}.mp4"), true),
+            };
             let video_root = ctx.account_dir.join("msg").join("video");
             let mut hits = Vec::new();
             walk_find(&video_root, &fname, 3, &mut hits);
@@ -414,7 +450,7 @@ pub fn export_one(
                 // encrypted video stream (ISAAC-64) — not yet supported
                 return None;
             }
-            write_out(&ctx.export_dir, talker, "videos", &fname, &bytes)
+            write_out(&ctx.export_dir, talker, "videos", &fname, &bytes, digest_named)
         }
         K::Emoji => {
             let emoji_md5 = md5?;
@@ -433,6 +469,9 @@ pub fn export_one(
                         kind_dir: "emojis",
                         local_path: PathBuf::new(),
                         external_url: Some(url),
+                        // 名字确实是摘要派生的，但它只有外链、没有本地文件 ⇒
+                        // 句柄判据里的「文件存在」那一半会挡住它。
+                        digest_named: true,
                     });
                 }
             }
@@ -546,8 +585,8 @@ mod tests {
     /// 而真实账号的下游测试是 `#[ignore]` 的——两者都不会给这条回归兜底。
     #[test]
     fn exported_media_url_is_relative_and_carries_no_credential() {
-        let url = exported_media_url("talker", "images", "abc.jpg");
-        assert_eq!(url, "/api/v1/media/talker/images/abc.jpg");
+        let url = exported_media_url("aabbccddeeff00112233445566778899.jpg");
+        assert_eq!(url, "/api/v1/media/aabbccddeeff00112233445566778899.jpg");
         assert!(url.starts_with('/'), "根相对路径以 / 开头");
         assert!(!url.starts_with("http"), "不得把服务基址烤进响应");
         assert!(!url.contains("access_token"), "响应体里不得出现凭据");
@@ -556,34 +595,49 @@ mod tests {
 
     /// 「**出现即可取**」是承诺：导出根下确有文件才通告 id。
     ///
-    /// 反面同样重要：能取到却没通告只是少一个便捷入口（调用方仍可走三段式路径），而通告一个
-    /// 取不到的 id 会让调用方拿到 404 并以为是服务坏了 —— 两个方向的代价不对称。
+    /// 反面同样重要：能取到却没通告的代价小得多（调用方仍可先 `media=1` 触发导出再取），
+    /// 而通告一个取不到的 id 会让调用方拿到 404 并以为是服务坏了 —— 两个方向的代价不对称。
     #[test]
     fn media_id_is_only_advertised_when_the_file_is_there() {
         let root = std::env::temp_dir().join(format!("wfs_media_id_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let dir = root.join("wxid_a@chatroom").join("images");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("abc123.jpg"), b"x").unwrap();
+        let name = "aabbccddeeff00112233445566778899.jpg";
+        std::fs::write(dir.join(name), b"x").unwrap();
+        // 非摘要派生的名字（语音的 voice_<svr_id>.silk 就是这一形态）：文件在也不通告。
+        std::fs::write(dir.join("voice_123.silk"), b"x").unwrap();
 
         assert_eq!(
-            fetchable_media_id(&root, "wxid_a@chatroom", "images", "abc123.jpg").as_deref(),
-            Some("abc123.jpg"),
-            "文件在 ⇒ 通告"
+            fetchable_media_id(&root, "wxid_a@chatroom", "images", name).as_deref(),
+            Some(name),
+            "文件在且名字是摘要派生 ⇒ 通告"
         );
         assert_eq!(
-            fetchable_media_id(&root, "wxid_a@chatroom", "images", "nope.jpg"),
+            fetchable_media_id(&root, "wxid_a@chatroom", "images", "00112233445566778899aabbccddeeff.jpg"),
             None,
             "文件不在 ⇒ 不通告（这正是「出现即可取」）"
         );
         assert_eq!(
-            fetchable_media_id(&root, "wxid_a@chatroom", "voices", "abc123.jpg"),
+            fetchable_media_id(&root, "wxid_a@chatroom", "voices", name),
             None,
             "类型目录也要对得上"
         );
+        assert_eq!(
+            fetchable_media_id(&root, "wxid_a@chatroom", "images", "voice_123.silk"),
+            None,
+            "名字不是摘要派生 ⇒ 不通告：按名取字节是跨会话解析的，同名可能是别的文件"
+        );
         // 路径分量守卫：与导出侧同一套规则。
-        assert_eq!(fetchable_media_id(&root, "../..", "images", "abc123.jpg"), None);
+        assert_eq!(fetchable_media_id(&root, "../..", "images", name), None);
         assert_eq!(fetchable_media_id(&root, "wxid_a@chatroom", "images", "../x"), None);
+        // 判据本身：32 位十六进制（大小写都算）+ 扩展名。
+        assert!(name_is_content_digest(name));
+        assert!(name_is_content_digest("AABBCCDDEEFF00112233445566778899.mp4"));
+        assert!(name_is_content_digest("aabbccddeeff00112233445566778899"));
+        assert!(!name_is_content_digest("voice_123.silk"));
+        assert!(!name_is_content_digest("aabbccddeeff0011223344556677889.jpg"));
+        assert!(!name_is_content_digest("1.mp4"));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -599,15 +653,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
 
         assert!(
-            write_out(&root, "wxid_a", "images", "../pwn.jpg", b"x").is_none(),
+            write_out(&root, "wxid_a", "images", "../pwn.jpg", b"x", true).is_none(),
             "越界 file_name 被拒"
         );
         assert!(
-            write_out(&root, "../evil", "images", "ok.jpg", b"x").is_none(),
+            write_out(&root, "../evil", "images", "ok.jpg", b"x", true).is_none(),
             "越界 talker 被拒（它来自库，不是请求——但正因为不可控才必须拒）"
         );
         assert!(
-            write_out(&root, "wxid_a", "images", "a:b.jpg", b"x").is_none(),
+            write_out(&root, "wxid_a", "images", "a:b.jpg", b"x", true).is_none(),
             "Windows 备用数据流冒号也被拒"
         );
         // 落点必须按 **join 链**算，不能凭直觉：`dir = root/wxid_a/images`，
@@ -625,7 +679,7 @@ mod tests {
         );
 
         // 正向对照：合法分量照常写入。
-        assert!(write_out(&root, "wxid_a", "images", "ok.jpg", b"x").is_some());
+        assert!(write_out(&root, "wxid_a", "images", "ok.jpg", b"x", false).is_some());
         assert!(root.join("wxid_a/images/ok.jpg").exists());
 
         let _ = std::fs::remove_dir_all(&root);

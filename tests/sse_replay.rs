@@ -493,3 +493,84 @@ async fn sync_baseline_keys_are_pinned() {
         assert!(v.get(leaked).is_none(), "基线帧不该带 {leaked}：{v}");
     }
 }
+
+/// 通知面的**撤回帧**带上平台消息号。
+///
+/// 规范里 `platformMessageId` 是可选的，而这条通道的用法是「收到通知后去拉那一页」——
+/// 撤回帧不给它，客户端就只剩时间戳可猜。新消息帧仍不给：那要在推送热路径上逐事件查一次
+/// 索引。两种帧的差别只在一个值上，所以必须分别钉住（键集断言看不出这个差别）。
+#[tokio::test]
+async fn chatlab_revoke_frame_carries_platform_message_id() {
+    let dir = common::tmp_dir("sserevoke");
+    let server = start(&dir).await;
+
+    // 打开的是**通知面**（不是老面 /api/v1/push/messages）。
+    let req = format!(
+        "GET /chatlab/push/messages?access_token={TOKEN} HTTP/1.1\r\nHost: {}\r\nAccept: text/event-stream\r\n\r\n",
+        server.addr
+    );
+    let mut stream = TcpStream::connect(&server.addr).await.unwrap();
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut reader = BufReader::new(stream);
+    // 消费 HTTP 头
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).await.unwrap() == 0 || line == "\r\n" {
+            break;
+        }
+    }
+
+    // 订阅建立之后再发事件：连接建立前发出的事件不会进这条流的重放缓冲。
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    server
+        .state
+        .events
+        .send(weflow_server::sync::Event::Revoke(weflow_server::sync::RevokeEvent {
+            session_id: common::FAKE_GROUP.to_string(),
+            session_type: "group",
+            rawid: "9001".into(),
+            source_name: "src".into(),
+            group_name: Some("项目群".into()),
+            content: "对方撤回了一条消息".into(),
+            timestamp: 1_700_000_005,
+        }))
+        .ok();
+
+    // 第一帧是基线 `sync`，所以一直读到 `message.revoke` 为止。
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut event = String::new();
+    let mut data = String::new();
+    let mut saw_revoke = false;
+    while !saw_revoke {
+        let mut line = String::new();
+        let read = tokio::time::timeout(
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            reader.read_line(&mut line),
+        )
+        .await;
+        match read {
+            Ok(Ok(0)) | Err(_) | Ok(Err(_)) => panic!("在 8 秒内没有收到 message.revoke 帧"),
+            Ok(Ok(_)) => {
+                let l = line.trim_end();
+                if let Some(v) = l.strip_prefix("event:") {
+                    event = v.trim().to_string();
+                } else if let Some(v) = l.strip_prefix("data:") {
+                    data.push_str(v.trim());
+                } else if l.is_empty() {
+                    if event == "message.revoke" {
+                        saw_revoke = true;
+                    } else {
+                        event.clear();
+                        data.clear();
+                    }
+                }
+            }
+        }
+    }
+
+    let v: serde_json::Value = serde_json::from_str(&data).expect("payload is JSON");
+    assert_eq!(v["platformMessageId"], "9001", "撤回帧必须带平台消息号：{v}");
+    assert_eq!(v["eventId"], "9001", "事件 id 与平台号同值但不同义：{v}");
+    assert_eq!(v["event"], "message.revoke");
+    assert!(v.get("content").is_none(), "通知帧不带正文：{v}");
+}

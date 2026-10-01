@@ -248,10 +248,15 @@ pub struct Store {
     pub chatroom_owner: HashMap<String, String>,
     /// chatroom username -> 名册（`contact.db::chatroom_member`）。
     ///
-    /// **不用于 `group-members` 的成员集合** —— 那个端点的语义仍是「发言者全集」。改成真实
-    /// 名册会让 `count` 变大，并出现大量 `messageCount: 0` 的潜水成员（已评估、不采纳）。
-    /// 录名册只是为了让 ChatLab 面的 `memberCount` 有真值可依。
+    /// 它有两个用处：ChatLab 面的 `memberCount`（真值），以及 `group-members` 的成员集合
+    /// —— 后者是**名册 ∪ 发言人**：只列发言人会让潜水成员永远不出现，而「群里有谁」的答案
+    /// 不该取决于谁最近说过话。
     pub chatroom_roster: HashMap<String, Vec<String>>,
+    /// 索引**最近一次构建或增量更新完成**的时刻（毫秒，墙钟）。
+    ///
+    /// 它与成员表一起下发（`updatedAt`），让客户端判断这份数据有多旧。用墙钟而不是单调
+    /// 时钟，是因为它要跨进程重启保持可比；用毫秒是因为同一秒内可能发生两次更新。
+    pub index_built_at_ms: i64,
     /// `<rel>:<table>` -> watermark of the last indexed row
     pub watermarks: HashMap<String, Watermark>,
     /// Moments timeline, sorted newest-first
@@ -261,6 +266,14 @@ pub struct Store {
 impl Store {
     pub fn is_empty(&self) -> bool {
         self.convs.is_empty() && self.sessions.is_empty()
+    }
+
+    /// 记下索引刚刚构建/更新完成（见 `index_built_at_ms`）。
+    pub fn mark_index_built(&mut self) {
+        self.index_built_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
     }
 
     /// Best display name for a session: session display name, else the

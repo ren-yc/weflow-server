@@ -1,14 +1,13 @@
 //! Access-token authentication for the HTTP API.
 //!
-//! Five accepted transports, checked in this order (qqflow-server parity):
-//!   1. `Authorization: Bearer <token>`
-//!   2. `X-Api-Key: <token>`
-//!   3. `?access_token=<token>` (query)
-//!   4. `?token=<token>` (query)
-//!   5. the same two keys inside a POST JSON body
+//! **Two** accepted transports, checked in this order:
+//!   1. `Authorization: Bearer <token>` (header)
+//!   2. `?access_token=<token>` (query)
 //!
-//! Query and body share one map: handlers merge them via
-//! `handlers::extract_params` before calling in here, so 3-5 are one check.
+//! 为什么砍到两条：每多一条通道就多一处凭据会被复制到的地方（URL 之外还有请求体、代理日志、
+//! 客户端抓包），而它们鉴权的是同一个东西。`X-Api-Key` 与本服务的命名无关；`?token=` 是同一
+//! 通道的第二种拼写 —— 两种拼写意味着下游有一半会写错而另一半不会；body 更糟：它连「这是谁的
+//! 凭据」都区分不出来（见 `handlers::extract_params`，它从不把凭据键从 body 带进来）。
 
 use std::collections::HashMap;
 
@@ -30,15 +29,8 @@ pub fn authorized(
     {
         return true;
     }
-    // Header: X-Api-Key: <token>
-    if let Some(h) = headers.get(axum::http::HeaderName::from_static("x-api-key"))
-        && let Ok(token) = h.to_str()
-        && constant_time_eq(token.as_bytes(), expected)
-    {
-        return true;
-    }
-    // Query / body: access_token | token
-    if let Some(t) = params.get("access_token").or_else(|| params.get("token"))
+    // Query: ?access_token=<token>
+    if let Some(t) = params.get("access_token")
         && constant_time_eq(t.as_bytes(), expected)
     {
         return true;
@@ -110,7 +102,7 @@ mod tests {
     }
 
     #[test]
-    fn authorized_all_channels_constant_time() {
+    fn authorized_two_transports_constant_time() {
         let state = test_state();
         // empty params/headers → false
         assert!(!authorized(&state, &HashMap::new(), &axum::http::HeaderMap::new()));
@@ -130,31 +122,23 @@ mod tests {
         );
         assert!(!authorized(&state, &HashMap::new(), &h));
 
-        // X-Api-Key header
+        // 被砍掉的通道**不再被接受**：`X-Api-Key` 与 `?token=` 都得是 401 的那一支。
+        // 它们此前各有一条正向断言 —— 删通道时如果只删实现、留下断言，测试会红；
+        // 反过来（只删断言、留下实现）则不会有任何东西红，所以这两条负向断言必须留下。
         let mut h = axum::http::HeaderMap::new();
         h.insert(
             axum::http::HeaderName::from_static("x-api-key"),
             axum::http::HeaderValue::from_static("0123456789abcdef"),
         );
-        assert!(authorized(&state, &HashMap::new(), &h));
-        // wrong X-Api-Key → false
-        let mut h = axum::http::HeaderMap::new();
-        h.insert(
-            axum::http::HeaderName::from_static("x-api-key"),
-            axum::http::HeaderValue::from_static("0123456789abcde0"),
-        );
-        assert!(!authorized(&state, &HashMap::new(), &h));
+        assert!(!authorized(&state, &HashMap::new(), &h), "X-Api-Key 通道已删除");
 
-        // query params
+        // query param
         let mut p = HashMap::new();
         p.insert("access_token".into(), "0123456789abcdef".into());
         assert!(authorized(&state, &p, &axum::http::HeaderMap::new()));
         let mut p = HashMap::new();
         p.insert("token".into(), "0123456789abcdef".into());
-        assert!(authorized(&state, &p, &axum::http::HeaderMap::new()));
-        let mut p = HashMap::new();
-        p.insert("token".into(), "wrong".into());
-        assert!(!authorized(&state, &p, &axum::http::HeaderMap::new()));
+        assert!(!authorized(&state, &p, &axum::http::HeaderMap::new()), "?token= 拼写已删除");
     }
 
     #[test]

@@ -7,8 +7,9 @@
 //!   HMAC); on success the live-acquisition index build and a watcher task are
 //!   spawned.
 //! - `GET /api/v1/accounts` — the account detail `/health` no longer carries.
-//! - `DELETE /api/v1/accounts/{wxid}` (alias `POST .../{wxid}/deregister`) —
-//!   undo a registration.
+//! - `DELETE /api/v1/accounts/{wxid}` — undo a registration. The `deregister`
+//!   POST alias was removed: two routes doing one thing meant two places to
+//!   keep authenticated and documented, and one of them lagged behind.
 //!
 //! At most ONE account may be bound at a time (see `server::bound_account`).
 //! Registering a second wxid is **rejected** with `account_conflict` and leaves
@@ -66,6 +67,11 @@ pub async fn handler(
         && let Some(map) = v.as_object()
     {
         for (k, val) in map {
+            // 凭据键不从 body 进参数表（判据只有一处：server::is_credential_key）。
+            // 这条路径此前漏了它，于是「把 token 放进 JSON body」在本端点仍然可用。
+            if crate::server::is_credential_key(k) {
+                continue;
+            }
             params.insert(
                 k.clone(),
                 match val {
@@ -208,9 +214,8 @@ pub async fn list_handler(
     .map_err(|e| ApiError::internal(format!("序列化失败: {e}")))?))
 }
 
-/// `DELETE /api/v1/accounts/{wxid}` (and the `POST .../{wxid}/deregister`
-/// alias) — undo a registration and return the server to its unregistered
-/// state.
+/// `DELETE /api/v1/accounts/{wxid}` — undo a registration and return the
+/// server to its unregistered state.
 ///
 /// The `wxid` in the path is a safety interlock, not a selector: there is only
 /// ever one binding, so naming the wrong account is a client bug worth

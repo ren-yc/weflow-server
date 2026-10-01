@@ -6,7 +6,6 @@
       "version": "0.0.2"
     },
     "count": 4,
-    "hasMore": false,
     "members": [
       {
         "accountName": "李四",
@@ -27,7 +26,6 @@
         "content": "大家好",
         "groupNickname": "四哥",
         "platformMessageId": "8200000000000000000",
-        "replyToMessageId": null,
         "sender": "wxid_member_b",
         "timestamp": 1700000100,
         "type": 0
@@ -37,7 +35,6 @@
         "content": "我发的",
         "groupNickname": "",
         "platformMessageId": "8200000000000000001",
-        "replyToMessageId": null,
         "sender": "wxid_fake000000000000001",
         "timestamp": 1700000101,
         "type": 0
@@ -46,8 +43,12 @@
         "accountName": "李四",
         "content": "[图片]",
         "groupNickname": "四哥",
+        "media": {
+          "fileName": "00112233445566778899aabbccddeeff.jpg",
+          "md5": "00112233445566778899aabbccddeeff",
+          "type": "image"
+        },
         "platformMessageId": "8200000000000000002",
-        "replyToMessageId": null,
         "sender": "wxid_member_b",
         "timestamp": 1700000102,
         "type": 1
@@ -57,7 +58,6 @@
         "content": "群消息",
         "groupNickname": "四哥",
         "platformMessageId": "8200000000000000003",
-        "replyToMessageId": null,
         "sender": "wxid_member_b",
         "timestamp": 1700000103,
         "type": 0
@@ -70,7 +70,10 @@
       "platform": "wechat",
       "type": "group"
     },
-    "success": true,
+    "page": {
+      "hasMore": false,
+      "nextCursor": null
+    },
     "talker": "wxid_fake_group@chatroom"
   },
   "keys": [
@@ -79,7 +82,6 @@
     "generator",
     "version",
     "count",
-    "hasMore",
     "members",
     "accountName",
     "avatar",
@@ -94,7 +96,6 @@
     "content",
     "groupNickname",
     "platformMessageId",
-    "replyToMessageId",
     "sender",
     "timestamp",
     "type",
@@ -102,7 +103,17 @@
     "content",
     "groupNickname",
     "platformMessageId",
-    "replyToMessageId",
+    "sender",
+    "timestamp",
+    "type",
+    "accountName",
+    "content",
+    "groupNickname",
+    "media",
+    "fileName",
+    "md5",
+    "type",
+    "platformMessageId",
     "sender",
     "timestamp",
     "type",
@@ -110,15 +121,6 @@
     "content",
     "groupNickname",
     "platformMessageId",
-    "replyToMessageId",
-    "sender",
-    "timestamp",
-    "type",
-    "accountName",
-    "content",
-    "groupNickname",
-    "platformMessageId",
-    "replyToMessageId",
     "sender",
     "timestamp",
     "type",
@@ -128,7 +130,9 @@
     "ownerId",
     "platform",
     "type",
-    "success",
+    "page",
+    "hasMore",
+    "nextCursor",
     "talker"
   ],
   "status": 200

@@ -92,8 +92,11 @@ fn serialize_notification(
             "message.revoke",
             serde_json::to_value(NotificationFrame {
                 event: "message.revoke".to_string(),
-                event_id: r.rawid,
-                platform_message_id: None,
+                event_id: r.rawid.clone(),
+                // 撤回帧**带上平台消息号**：本仓事件里的 rawid 就是平台号（与 eventId 同值，
+                // 但不是同一件事 —— 前者是那条消息的身份，后者是事件通道的身份）。拉取面用它
+                // 定位被撤回的那条；不给的话客户端只能靠时间戳去猜。
+                platform_message_id: Some(r.rawid),
                 session_id: r.session_id,
                 timestamp: r.timestamp,
             })

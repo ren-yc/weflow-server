@@ -447,7 +447,19 @@ async fn method_not_allowed() -> crate::server::error::ApiError {
     }
 }
 
+/// 这个参数名是不是**鉴权凭据**。
+///
+/// 凭据只走请求头与查询串。**每一处**把 JSON body 并入参数表的地方都必须跳过它们 ——
+/// 只在一处过滤时，另一处就是一条仍然可用的通道，而绕过它只需要把 token 挪进 JSON：
+/// 表现是「通道已删除」的声称与实现不符，且不会有任何东西变红。
+pub fn is_credential_key(k: &str) -> bool {
+    k == "access_token" || k == "token"
+}
+
 /// Merge query params and JSON body into one param map (body wins).
+///
+/// 凭据键**不从 body 进表**（见 `is_credential_key`）：query 里的同名键照旧生效，
+/// body 里的不生效 —— 两条通道里 body 那条已经删了。
 pub fn merge_params(
     query: &axum::extract::Query<HashMap<String, String>>,
     body: Option<serde_json::Value>,
@@ -456,6 +468,9 @@ pub fn merge_params(
     if let Some(body) = body
         && let Some(map) = body.as_object() {
             for (k, v) in map {
+                if is_credential_key(k) {
+                    continue;
+                }
                 out.insert(
                     k.clone(),
                     match v {

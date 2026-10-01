@@ -37,6 +37,7 @@ use utoipa::openapi::{Components, OpenApi, OpenApiBuilder};
     crate::server::dto::ChatlabHeader,
     crate::server::dto::ChatlabMember,
     crate::server::dto::ChatlabMessage,
+    crate::server::dto::ChatlabMessages,
     crate::server::dto::ChatlabMeta,
     crate::server::dto::Contact,
     crate::server::dto::Contacts,
@@ -47,10 +48,10 @@ use utoipa::openapi::{Components, OpenApi, OpenApiBuilder};
     crate::server::dto::GroupMember,
     crate::server::dto::GroupMembers,
     crate::server::dto::Health,
+    crate::server::dto::MediaBrief,
     crate::server::dto::MediaEnvelope,
     crate::server::dto::MediaObject,
     crate::server::dto::MessageNative,
-    crate::server::dto::MessagesChatlab,
     crate::server::dto::MessagesNative,
     crate::server::dto::NotificationFrame,
     crate::server::dto::Page,
@@ -96,6 +97,11 @@ type Ep = (&'static str, HttpMethod, Media, &'static str);
 /// 且这里声明的每个方法都要被真实路由接受。豁免写在代码里，不写在注释里。
 ///
 /// 字节面与 SSE 面进不了 golden 端点清单，由本表收录。
+///
+/// **`sns/*` 六条不在本表里**：它们是强绑定 XML 形状的朋友圈面，本轮明确标为「暂不 DTO 化」——
+/// 没有 schema 可引用，因此不进描述。豁免由 `routes.rs` 的 `NOT_DOCUMENTED` 表达，那是一份
+/// **可断言的代码表**而不是注释：漏写一条、或豁免了一条其实有描述的路径，对等测试都会红。
+/// 它们的 POST 也照旧保留 —— 「读端点收敛为 GET」不适用于这六条。
 const ENDPOINTS: &[Ep] = &[
     ("/health", HttpMethod::Get, Media::Json(&["Health"]), ""),
     ("/health", HttpMethod::Post, Media::Json(&["Health"]), ""),
@@ -118,25 +124,13 @@ const ENDPOINTS: &[Ep] = &[
         "/api/v1/accounts/{wxid}",
         HttpMethod::Delete,
         Media::Json(&["AccountDeregistered", "AccountNotRegistered", "AccountWxidMismatch"]),
-        "注销账号；`POST .../{wxid}/deregister` 是其别名（供无法发 DELETE 的客户端与代理）。",
-    ),
-    (
-        "/api/v1/accounts/{wxid}/deregister",
-        HttpMethod::Post,
-        Media::Json(&["AccountDeregistered", "AccountNotRegistered", "AccountWxidMismatch"]),
-        "",
+        "注销账号。",
     ),
     (
         "/api/v1/sessions",
         HttpMethod::Get,
-        Media::Json(&["SessionsNative", "SessionsChatlab"]),
-        "会话列表：`limit` 默认 100。",
-    ),
-    (
-        "/api/v1/sessions",
-        HttpMethod::Post,
-        Media::Json(&["SessionsNative", "SessionsChatlab"]),
-        "同 GET（兼容不能发 GET 的调用方）。",
+        Media::Json(&["SessionsNative"]),
+        "会话列表（原生形状）：`limit` 默认 100、上限 10000；`offset` 翻页。ChatLab 形状走 `/chatlab/sessions`。",
     ),
     (
         "/api/v1/sessions/{id}/messages",
@@ -147,54 +141,27 @@ const ENDPOINTS: &[Ep] = &[
     (
         "/api/v1/messages",
         HttpMethod::Get,
-        Media::Json(&["MessagesNative", "MessagesChatlab"]),
-        "`media=1` 触发导出，**每请求最多导出 200 项**（超出的保持未导出，再请求续传）。",
-    ),
-    (
-        "/api/v1/messages",
-        HttpMethod::Post,
-        Media::Json(&["MessagesNative", "MessagesChatlab"]),
-        "`media=1` 触发导出，**每请求最多导出 200 项**（超出的保持未导出，再请求续传）。",
+        Media::Json(&["MessagesNative"]),
+        "原生/富数据形状：`limit` 默认 100、上限 10000；`media=1` 触发导出，**每请求最多导出 200 项**（超出的保持未导出，再请求续传）。ChatLab 形状走 `/chatlab/messages`。",
     ),
     ("/api/v1/contacts", HttpMethod::Get, Media::Json(&["Contacts"]), ""),
-    ("/api/v1/contacts", HttpMethod::Post, Media::Json(&["Contacts"]), ""),
-    ("/api/v1/group-members", HttpMethod::Get, Media::Json(&["GroupMembers"]), ""),
-    ("/api/v1/group-members", HttpMethod::Post, Media::Json(&["GroupMembers"]), ""),
+    (
+        "/api/v1/group-members",
+        HttpMethod::Get,
+        Media::Json(&["GroupMembers"]),
+        "成员集合是**名册 ∪ 发言人**：从未发过言的成员也会出现（`messageCount` 为 0）。",
+    ),
     (
         "/api/v1/media/{id}",
         HttpMethod::Get,
         Media::Bytes,
-        "字节面：只服务导出根下已导出的文件；未导出的先经 `messages?media=1`（每请求上限 200 项）导出。",
-    ),
-    (
-        "/api/v1/media/{id}",
-        HttpMethod::Post,
-        Media::Bytes,
-        "同 GET（兼容不能发 GET 的调用方）。",
-    ),
-    (
-        "/api/v1/media/{talker}/{media_type}/{file}",
-        HttpMethod::Get,
-        Media::Bytes,
-        "三段式字节面；语义同 `/api/v1/media/{id}`。",
-    ),
-    (
-        "/api/v1/media/{talker}/{media_type}/{file}",
-        HttpMethod::Post,
-        Media::Bytes,
-        "同 GET。",
+        "字节面（唯一入口）：只服务导出根下**摘要派生**的文件名；未导出的先经 `media=1`（每请求上限 200 项）导出。同名多命中时内容一致才服务、不一致给 404。",
     ),
     (
         "/api/v1/push/messages",
         HttpMethod::Get,
         Media::EventStream,
         "SSE：重放缓冲 1000 条 / 600 秒；广播缓冲 1024；保活 25 秒（注释帧）。载荷为完整事件（老面形状）。",
-    ),
-    (
-        "/api/v1/push/messages",
-        HttpMethod::Post,
-        Media::EventStream,
-        "同 GET。",
     ),
     (
         "/chatlab/push/messages",
@@ -207,6 +174,12 @@ const ENDPOINTS: &[Ep] = &[
         HttpMethod::Get,
         Media::Json(&["SessionsChatlab"]),
         "Pull 形状的发现面：`keyword`/`limit`/`cursor` 分页；`count`/`page` 报告截断。",
+    ),
+    (
+        "/chatlab/messages",
+        HttpMethod::Get,
+        Media::Json(&["ChatlabMessages"]),
+        "ChatLab 形状的消息面：`talker` 必填，`limit`/`offset`/`cursor`/`start`/`end`/`media`/`keyword`；`count` 是**本页条数**、消息**升序**、`page` 报告截断；`media=1` 真正执行导出（每请求上限 200 项）。",
     ),
     (
         "/chatlab/sessions/{id}/messages",

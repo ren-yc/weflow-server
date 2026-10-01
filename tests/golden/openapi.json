@@ -289,11 +289,22 @@
             "groupNickname": {
               "type": "string"
             },
+            "media": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/MediaBrief",
+                  "description": "媒体元数据；无媒体时**整个键省略**（见 `MediaBrief`）。"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "platformMessageId": {
               "type": "string"
             },
             "replyToMessageId": {
-              "description": "**本面是 `null`**（键始终出现）；**Pull 面是省略该键**。两个面的差异是\n有意的：本面的形状已被下游依赖，改它会破坏调用方。",
+              "description": "**无引用时省略该键**（不是给 `null`）：规范把它列为可选 *string*，`null` 会让信任\n类型的读者拿到解析不了的值。三个面（原生面、消息面、拉取面）在这一键上同规。",
               "type": [
                 "string",
                 "null"
@@ -319,6 +330,50 @@
             "sender",
             "timestamp",
             "type"
+          ],
+          "type": "object"
+        },
+        "ChatlabMessages": {
+          "description": "`GET /chatlab/messages`（消息面）。\n\n**不带 `success`**：它输出的是数据信封，而 `success` 是「操作结果」的语言 —— 两者同时\n出现时，读者无法判断 `count`/`page` 是否可信。翻页信息一律走 `page`，与发现面同规。",
+          "properties": {
+            "chatlab": {
+              "$ref": "#/components/schemas/ChatlabHeader"
+            },
+            "count": {
+              "description": "**本页条数**（不是总数）—— 总数不在这个面上表达，分页语义由 `page` 承担。",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "members": {
+              "items": {
+                "$ref": "#/components/schemas/ChatlabMember"
+              },
+              "type": "array"
+            },
+            "messages": {
+              "items": {
+                "$ref": "#/components/schemas/ChatlabMessage"
+              },
+              "type": "array"
+            },
+            "meta": {
+              "$ref": "#/components/schemas/ChatlabMeta"
+            },
+            "page": {
+              "$ref": "#/components/schemas/Page"
+            },
+            "talker": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "chatlab",
+            "count",
+            "members",
+            "messages",
+            "meta",
+            "page",
+            "talker"
           ],
           "type": "object"
         },
@@ -434,7 +489,7 @@
               ]
             },
             "mediaId": {
-              "description": "**可直接取字节的 id** —— 单段路由 `GET /api/v1/media/{id}`。\n\n**只在导出根下确有这个文件时才出现**（键随之消失，不是给 `null`）：承诺是「出现即可\n取」，不是尽力而为。通告一个取不到的 id，调用方会拿到 404 并以为是服务坏了；反过来\n（能取到却没通告）只是少一个便捷入口，仍可走三段式路径。",
+              "description": "**可直接取字节的 id** —— 单段路由 `GET /api/v1/media/{id}`。\n\n**只在导出根下确有这个文件、且名字由内容摘要派生时才出现**（键随之消失，不是给\n`null`）：承诺是「出现即可取」，不是尽力而为 —— 按名取字节是跨会话解析的，平台给的\n名字（语音的 svr_id、视频的 DB 名）在别的会话里可能有同名异内容的文件。通告一个取不到\n的 id，调用方会拿到 404 并以为是服务坏了。",
               "type": [
                 "string",
                 "null"
@@ -627,7 +682,7 @@
           "type": "object"
         },
         "GroupMembers": {
-          "description": "`GET|POST /api/v1/group-members`。",
+          "description": "`GET /api/v1/group-members`。\n\n成员集合是**名册 ∪ 发言人**：从未发过言的名册成员（潜水成员）也会出现，其 `messageCount`\n为 0。这是有意的 —— 只列发言人会让「群里有谁」这个问题的答案取决于谁最近说过话。",
           "properties": {
             "chatroomId": {
               "type": "string"
@@ -636,25 +691,28 @@
               "minimum": 0,
               "type": "integer"
             },
+            "fromCache": {
+              "description": "名册与消息都在内存索引里，本请求不读盘、也不触发同步 ⇒ 恒为 `false`。",
+              "type": "boolean"
+            },
             "members": {
               "items": {
                 "$ref": "#/components/schemas/GroupMember"
               },
               "type": "array"
             },
-            "refreshed": {
-              "type": "boolean"
-            },
             "success": {
               "type": "boolean"
-            }
+            },
+            "updatedAt": "<volatile>"
           },
           "required": [
             "chatroomId",
             "count",
+            "fromCache",
             "members",
-            "refreshed",
-            "success"
+            "success",
+            "updatedAt"
           ],
           "type": "object"
         },
@@ -679,6 +737,28 @@
           ],
           "type": "object"
         },
+        "MediaBrief": {
+          "description": "一条消息的媒体**元数据**（拉取面与消息面同形）。\n\n它**不是**「字节可取」的承诺：无媒体时整个键省略；`fileName` 只有在导出确实写出了本地\n副本之后才是可取句柄（那时它是**实际导出文件名**），否则它只是这条消息自带的文件名。\n`md5` 取不到时省略该键 —— 未导出不等于没有摘要。",
+          "properties": {
+            "fileName": {
+              "type": "string"
+            },
+            "md5": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "fileName",
+            "type"
+          ],
+          "type": "object"
+        },
         "MediaEnvelope": {
           "description": "本页的导出状态。`exportPath` 是绝对路径（客户端用它找导出的文件），\n`count` 是**成功导出**的条数 —— 不是本页消息数。",
           "properties": {
@@ -699,7 +779,7 @@
           "type": "object"
         },
         "MediaObject": {
-          "description": "消息的媒体元数据 —— **三种形状共用这一个 struct**。\n\n- 未导出：`url` / `localPath` 是**空串**（不是省略），`exported` **不出现**；\n- 导出成功：`url` 是相对路径、`localPath` 是绝对路径，且**多出** `exported: true`；\n- SSE 版只有 `type` / `fileName` / `md5`（那两个空串字段在那边不序列化）。\n\n`exported` 是**条件键**：不导出时它**不出现**而不是 `false`。客户端靠「键在不在」\n判断字节可不可取 —— 改成恒出现会让这个判据失效。",
+          "description": "消息的媒体元数据 —— **原生面专用**（拉取面与消息面用 `MediaBrief`，SSE 用 `EventMedia`）。\n\n- 未导出：`url` / `localPath` / `mediaId` **都不出现**，`exported` 也不出现；\n- 导出成功：`url` 是根相对路径、`localPath` 是绝对路径，且多出 `exported: true`；\n  其中**名字由内容摘要派生**的那些再多一个 `mediaId`（可直接喂给按名取字节的路由）；\n  名字来自平台（视频的 DB 名回落）的那些**不给** `mediaId` —— 按名取字节是跨会话解析的，\n  同名可能是别的会话的另一个文件。\n\n`exported` 是**条件键**：不导出时它**不出现**而不是 `false`。客户端靠「键在不在」\n判断字节可不可取 —— 改成恒出现会让这个判据失效。",
           "properties": {
             "exported": {
               "description": "字母序使然：`exported` 排在 `fileName` 之前，这样输出与 `json!` 的现状一致。",
@@ -709,11 +789,19 @@
               ]
             },
             "fileName": {
-              "description": "文件名**始终是字符串**；`md5` 解析不出时是 **`null`**（现状如此，勿统一成空串）。",
+              "description": "文件名**始终是字符串**；没有名字时是空串（不是 `null`）。",
               "type": "string"
             },
             "localPath": "<volatile>",
             "md5": {
+              "description": "**取不到摘要时才省略**（不是给 `null`）：未导出不等于没有摘要。",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "mediaId": {
+              "description": "可直接取字节的 id；只在**本次请求的导出批次**确实写出了摘要派生的本地文件时出现。",
               "type": [
                 "string",
                 "null"
@@ -723,14 +811,16 @@
               "type": "string"
             },
             "url": {
-              "type": "string"
+              "description": "根相对路径；未导出时**省略**。",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
             "fileName",
-            "localPath",
-            "type",
-            "url"
+            "type"
           ],
           "type": "object"
         },
@@ -799,7 +889,7 @@
               "type": "string"
             },
             "replyToMessageId": {
-              "description": "**注意与 Pull 面的差异**：这里无引用时是 `null`，Pull 面是**省略该键**。\n这是有意保留的既有契约（下游已依赖本面的形状），不要「统一」。",
+              "description": "**无引用时省略该键**（不是给 `null`）：下游若按「键在不在」判断引用关系，\n应改为「键在且非空」—— 这条与拉取面、消息面同规，三个面不再有形状差异。",
               "type": [
                 "string",
                 "null"
@@ -832,53 +922,6 @@
             "senderUsername",
             "serverId",
             "sortSeq"
-          ],
-          "type": "object"
-        },
-        "MessagesChatlab": {
-          "description": "`GET|POST /api/v1/messages?chatlab=1`（或 `format=chatlab`）。",
-          "properties": {
-            "chatlab": {
-              "$ref": "#/components/schemas/ChatlabHeader"
-            },
-            "count": {
-              "minimum": 0,
-              "type": "integer"
-            },
-            "hasMore": {
-              "type": "boolean"
-            },
-            "members": {
-              "items": {
-                "$ref": "#/components/schemas/ChatlabMember"
-              },
-              "type": "array"
-            },
-            "messages": {
-              "items": {
-                "$ref": "#/components/schemas/ChatlabMessage"
-              },
-              "type": "array"
-            },
-            "meta": {
-              "$ref": "#/components/schemas/ChatlabMeta"
-            },
-            "success": {
-              "type": "boolean"
-            },
-            "talker": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "chatlab",
-            "count",
-            "hasMore",
-            "members",
-            "messages",
-            "meta",
-            "success",
-            "talker"
           ],
           "type": "object"
         },
@@ -919,7 +962,7 @@
           "type": "object"
         },
         "NotificationFrame": {
-          "description": "`/chatlab/push/messages` 的通知帧：**只带元信息，不带正文**。\n\n规范对这条通道的定位是「仅通知：不假设事件可靠送达」—— 客户端收到后**去拉**那一页。\n带正文会诱导调用方把它当数据源，而它并不保证送达；不带，语义就没有歧义。\n\n`eventId` 与 `platformMessageId` 是**两个不同的号**：前者是事件通道自己的标识，后者是那条\n消息在平台上的 id（拉取时用它定位）。\n\n**本面当前不下发 `platformMessageId`**（键保留、值恒为 `null`）：事件里带的是各平台自己的\n那套编号，把它翻成平台消息号需要在**推送热路径**上逐事件查一次索引，而规范里这个字段是\n**可选**的。定位消息请用**拉取面**返回的 `platformMessageId` —— 「收到通知后去拉那一页」\n本来就是这条通道的用法。",
+          "description": "`/chatlab/push/messages` 的通知帧：**只带元信息，不带正文**。\n\n规范对这条通道的定位是「仅通知：不假设事件可靠送达」—— 客户端收到后**去拉**那一页。\n带正文会诱导调用方把它当数据源，而它并不保证送达；不带，语义就没有歧义。\n\n`eventId` 与 `platformMessageId` 是**两个不同的号**：前者是事件通道自己的标识，后者是那条\n消息在平台上的 id（拉取时用它定位）。\n\n**`platformMessageId` 按事件类型给**：撤回帧带上（本仓事件里的 rawid 就是平台消息号），\n`message.new` 仍为 `null` —— 新消息要把事件里的编号翻成平台消息号，得在**推送热路径**上\n逐事件查一次索引，而规范里这个字段是**可选**的；定位它请用**拉取面**返回的同名字段，\n「收到通知后去拉那一页」本来就是这条通道的用法。",
           "properties": {
             "event": {
               "description": "事件名。帧头（`event:` 行）与载荷里各有一份，**不是**重复：只解析 `data:` 行的客户端\n也要能分辨类型。",
@@ -1007,7 +1050,7 @@
           "type": "object"
         },
         "PullMessage": {
-          "description": "Pull 面的消息项。\n\n**与混合面（`ChatlabMessage`）不是同一个 struct**：本面的 `replyToMessageId` 在无引用时\n**省略该键**，而混合面输出 `null`。这个差异是有意的（混合面的形状已被下游依赖），\n所以两处必须各建 struct —— 复用会把它们的契约绑在一起。",
+          "description": "Pull 面的消息项。\n\n**与消息面（`ChatlabMessage`）是两个 struct**，尽管字段目前一致：它们属于两个面 —— 一个\n由 Pull 协议定义、一个由本服务的消息面定义，规范面加字段时不该顺带改到另一个面。\n复用同一个 struct 会把两份契约绑在一起（这一批之前它们正是靠两个 struct 承载\n`replyToMessageId` 的形状差异，现在差异消失了，分建的理由仍在）。",
           "properties": {
             "accountName": {
               "type": "string"
@@ -1017,6 +1060,17 @@
             },
             "groupNickname": {
               "type": "string"
+            },
+            "media": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/MediaBrief",
+                  "description": "媒体元数据；无媒体时**整个键省略**（见 `MediaBrief`）。"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "platformMessageId": {
               "type": "string"
@@ -1197,7 +1251,7 @@
           "type": "object"
         },
         "SessionsChatlab": {
-          "description": "`GET /api/v1/sessions?chatlab=1`（或 `format=chatlab`）。\n\n**与原生面的键集不同**，且 `type` 在这里是字符串 —— 两个面不可能共用一个 struct。",
+          "description": "`GET /chatlab/sessions`（Pull 形状的发现面）。\n\n**与原生面的键集不同**，且 `type` 在这里是字符串 —— 两个面不可能共用一个 struct。",
           "properties": {
             "count": {
               "minimum": 0,
@@ -1380,35 +1434,8 @@
       },
       "/api/v1/accounts/{wxid}": {
         "delete": {
-          "description": "注销账号；`POST .../{wxid}/deregister` 是其别名（供无法发 DELETE 的客户端与代理）。",
+          "description": "注销账号。",
           "operationId": "delete__api_v1_accounts__wxid",
-          "responses": {
-            "200": {
-              "content": {
-                "application/json": {
-                  "schema": {
-                    "oneOf": [
-                      {
-                        "$ref": "#/components/schemas/AccountDeregistered"
-                      },
-                      {
-                        "$ref": "#/components/schemas/AccountNotRegistered"
-                      },
-                      {
-                        "$ref": "#/components/schemas/AccountWxidMismatch"
-                      }
-                    ]
-                  }
-                }
-              },
-              "description": "成功"
-            }
-          }
-        }
-      },
-      "/api/v1/accounts/{wxid}/deregister": {
-        "post": {
-          "operationId": "post__api_v1_accounts__wxid__deregister",
           "responses": {
             "200": {
               "content": {
@@ -1448,41 +1475,12 @@
               "description": "成功"
             }
           }
-        },
-        "post": {
-          "operationId": "post__api_v1_contacts",
-          "responses": {
-            "200": {
-              "content": {
-                "application/json": {
-                  "schema": {
-                    "$ref": "#/components/schemas/Contacts"
-                  }
-                }
-              },
-              "description": "成功"
-            }
-          }
         }
       },
       "/api/v1/group-members": {
         "get": {
+          "description": "成员集合是**名册 ∪ 发言人**：从未发过言的成员也会出现（`messageCount` 为 0）。",
           "operationId": "get__api_v1_group-members",
-          "responses": {
-            "200": {
-              "content": {
-                "application/json": {
-                  "schema": {
-                    "$ref": "#/components/schemas/GroupMembers"
-                  }
-                }
-              },
-              "description": "成功"
-            }
-          }
-        },
-        "post": {
-          "operationId": "post__api_v1_group-members",
           "responses": {
             "200": {
               "content": {
@@ -1531,61 +1529,8 @@
       },
       "/api/v1/media/{id}": {
         "get": {
-          "description": "字节面：只服务导出根下已导出的文件；未导出的先经 `messages?media=1`（每请求上限 200 项）导出。",
+          "description": "字节面（唯一入口）：只服务导出根下**摘要派生**的文件名；未导出的先经 `media=1`（每请求上限 200 项）导出。同名多命中时内容一致才服务、不一致给 404。",
           "operationId": "get__api_v1_media__id",
-          "responses": {
-            "200": {
-              "content": {
-                "application/octet-stream": {
-                  "schema": {
-                    "format": "binary",
-                    "type": "string"
-                  }
-                }
-              },
-              "description": "成功"
-            }
-          }
-        },
-        "post": {
-          "description": "同 GET（兼容不能发 GET 的调用方）。",
-          "operationId": "post__api_v1_media__id",
-          "responses": {
-            "200": {
-              "content": {
-                "application/octet-stream": {
-                  "schema": {
-                    "format": "binary",
-                    "type": "string"
-                  }
-                }
-              },
-              "description": "成功"
-            }
-          }
-        }
-      },
-      "/api/v1/media/{talker}/{media_type}/{file}": {
-        "get": {
-          "description": "三段式字节面；语义同 `/api/v1/media/{id}`。",
-          "operationId": "get__api_v1_media__talker___media_type___file",
-          "responses": {
-            "200": {
-              "content": {
-                "application/octet-stream": {
-                  "schema": {
-                    "format": "binary",
-                    "type": "string"
-                  }
-                }
-              },
-              "description": "成功"
-            }
-          }
-        },
-        "post": {
-          "description": "同 GET。",
-          "operationId": "post__api_v1_media__talker___media_type___file",
           "responses": {
             "200": {
               "content": {
@@ -1603,44 +1548,14 @@
       },
       "/api/v1/messages": {
         "get": {
-          "description": "`media=1` 触发导出，**每请求最多导出 200 项**（超出的保持未导出，再请求续传）。",
+          "description": "原生/富数据形状：`limit` 默认 100、上限 10000；`media=1` 触发导出，**每请求最多导出 200 项**（超出的保持未导出，再请求续传）。ChatLab 形状走 `/chatlab/messages`。",
           "operationId": "get__api_v1_messages",
           "responses": {
             "200": {
               "content": {
                 "application/json": {
                   "schema": {
-                    "oneOf": [
-                      {
-                        "$ref": "#/components/schemas/MessagesNative"
-                      },
-                      {
-                        "$ref": "#/components/schemas/MessagesChatlab"
-                      }
-                    ]
-                  }
-                }
-              },
-              "description": "成功"
-            }
-          }
-        },
-        "post": {
-          "description": "`media=1` 触发导出，**每请求最多导出 200 项**（超出的保持未导出，再请求续传）。",
-          "operationId": "post__api_v1_messages",
-          "responses": {
-            "200": {
-              "content": {
-                "application/json": {
-                  "schema": {
-                    "oneOf": [
-                      {
-                        "$ref": "#/components/schemas/MessagesNative"
-                      },
-                      {
-                        "$ref": "#/components/schemas/MessagesChatlab"
-                      }
-                    ]
+                    "$ref": "#/components/schemas/MessagesNative"
                   }
                 }
               },
@@ -1666,65 +1581,18 @@
               "description": "成功"
             }
           }
-        },
-        "post": {
-          "description": "同 GET。",
-          "operationId": "post__api_v1_push_messages",
-          "responses": {
-            "200": {
-              "content": {
-                "text/event-stream": {
-                  "schema": {
-                    "description": "SSE 帧流（event: + data: 行）。帧结构：老面见 EventNew/EventRevoke/EventSync，通知面见 NotificationFrame/SyncFrame。",
-                    "type": "string"
-                  }
-                }
-              },
-              "description": "成功"
-            }
-          }
         }
       },
       "/api/v1/sessions": {
         "get": {
-          "description": "会话列表：`limit` 默认 100。",
+          "description": "会话列表（原生形状）：`limit` 默认 100、上限 10000；`offset` 翻页。ChatLab 形状走 `/chatlab/sessions`。",
           "operationId": "get__api_v1_sessions",
           "responses": {
             "200": {
               "content": {
                 "application/json": {
                   "schema": {
-                    "oneOf": [
-                      {
-                        "$ref": "#/components/schemas/SessionsNative"
-                      },
-                      {
-                        "$ref": "#/components/schemas/SessionsChatlab"
-                      }
-                    ]
-                  }
-                }
-              },
-              "description": "成功"
-            }
-          }
-        },
-        "post": {
-          "description": "同 GET（兼容不能发 GET 的调用方）。",
-          "operationId": "post__api_v1_sessions",
-          "responses": {
-            "200": {
-              "content": {
-                "application/json": {
-                  "schema": {
-                    "oneOf": [
-                      {
-                        "$ref": "#/components/schemas/SessionsNative"
-                      },
-                      {
-                        "$ref": "#/components/schemas/SessionsChatlab"
-                      }
-                    ]
+                    "$ref": "#/components/schemas/SessionsNative"
                   }
                 }
               },
@@ -1775,6 +1643,24 @@
                 "application/json": {
                   "schema": {
                     "$ref": "#/components/schemas/SyncResult"
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
+        }
+      },
+      "/chatlab/messages": {
+        "get": {
+          "description": "ChatLab 形状的消息面：`talker` 必填，`limit`/`offset`/`cursor`/`start`/`end`/`media`/`keyword`；`count` 是**本页条数**、消息**升序**、`page` 报告截断；`media=1` 真正执行导出（每请求上限 200 项）。",
+          "operationId": "get__chatlab_messages",
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ChatlabMessages"
                   }
                 }
               },
@@ -2054,6 +1940,11 @@
     "type",
     "groupNickname",
     "type",
+    "media",
+    "oneOf",
+    "$ref",
+    "description",
+    "type",
     "platformMessageId",
     "type",
     "replyToMessageId",
@@ -2066,6 +1957,31 @@
     "type",
     "type",
     "format",
+    "type",
+    "required",
+    "type",
+    "ChatlabMessages",
+    "description",
+    "properties",
+    "chatlab",
+    "$ref",
+    "count",
+    "description",
+    "minimum",
+    "type",
+    "members",
+    "items",
+    "$ref",
+    "type",
+    "messages",
+    "items",
+    "$ref",
+    "type",
+    "meta",
+    "$ref",
+    "page",
+    "$ref",
+    "talker",
     "type",
     "required",
     "type",
@@ -2241,13 +2157,18 @@
     "count",
     "minimum",
     "type",
+    "fromCache",
+    "description",
+    "type",
     "members",
     "items",
     "$ref",
     "type",
-    "refreshed",
-    "type",
     "success",
+    "type",
+    "updatedAt",
+    "description",
+    "format",
     "type",
     "required",
     "type",
@@ -2260,6 +2181,17 @@
     "status",
     "type",
     "version",
+    "type",
+    "required",
+    "type",
+    "MediaBrief",
+    "description",
+    "properties",
+    "fileName",
+    "type",
+    "md5",
+    "type",
+    "type",
     "type",
     "required",
     "type",
@@ -2285,12 +2217,18 @@
     "description",
     "type",
     "localPath",
+    "description",
     "type",
     "md5",
+    "description",
+    "type",
+    "mediaId",
+    "description",
     "type",
     "type",
     "type",
     "url",
+    "description",
     "type",
     "required",
     "type",
@@ -2345,32 +2283,6 @@
     "type",
     "sortSeq",
     "format",
-    "type",
-    "required",
-    "type",
-    "MessagesChatlab",
-    "description",
-    "properties",
-    "chatlab",
-    "$ref",
-    "count",
-    "minimum",
-    "type",
-    "hasMore",
-    "type",
-    "members",
-    "items",
-    "$ref",
-    "type",
-    "messages",
-    "items",
-    "$ref",
-    "type",
-    "meta",
-    "$ref",
-    "success",
-    "type",
-    "talker",
     "type",
     "required",
     "type",
@@ -2451,6 +2363,11 @@
     "content",
     "type",
     "groupNickname",
+    "type",
+    "media",
+    "oneOf",
+    "$ref",
+    "description",
     "type",
     "platformMessageId",
     "type",
@@ -2676,19 +2593,6 @@
     "$ref",
     "$ref",
     "description",
-    "/api/v1/accounts/{wxid}/deregister",
-    "post",
-    "operationId",
-    "responses",
-    "200",
-    "content",
-    "application/json",
-    "schema",
-    "oneOf",
-    "$ref",
-    "$ref",
-    "$ref",
-    "description",
     "/api/v1/contacts",
     "get",
     "operationId",
@@ -2699,26 +2603,9 @@
     "schema",
     "$ref",
     "description",
-    "post",
-    "operationId",
-    "responses",
-    "200",
-    "content",
-    "application/json",
-    "schema",
-    "$ref",
-    "description",
     "/api/v1/group-members",
     "get",
-    "operationId",
-    "responses",
-    "200",
-    "content",
-    "application/json",
-    "schema",
-    "$ref",
     "description",
-    "post",
     "operationId",
     "responses",
     "200",
@@ -2758,40 +2645,6 @@
     "format",
     "type",
     "description",
-    "post",
-    "description",
-    "operationId",
-    "responses",
-    "200",
-    "content",
-    "application/octet-stream",
-    "schema",
-    "format",
-    "type",
-    "description",
-    "/api/v1/media/{talker}/{media_type}/{file}",
-    "get",
-    "description",
-    "operationId",
-    "responses",
-    "200",
-    "content",
-    "application/octet-stream",
-    "schema",
-    "format",
-    "type",
-    "description",
-    "post",
-    "description",
-    "operationId",
-    "responses",
-    "200",
-    "content",
-    "application/octet-stream",
-    "schema",
-    "format",
-    "type",
-    "description",
     "/api/v1/messages",
     "get",
     "description",
@@ -2801,35 +2654,10 @@
     "content",
     "application/json",
     "schema",
-    "oneOf",
-    "$ref",
-    "$ref",
-    "description",
-    "post",
-    "description",
-    "operationId",
-    "responses",
-    "200",
-    "content",
-    "application/json",
-    "schema",
-    "oneOf",
-    "$ref",
     "$ref",
     "description",
     "/api/v1/push/messages",
     "get",
-    "description",
-    "operationId",
-    "responses",
-    "200",
-    "content",
-    "text/event-stream",
-    "schema",
-    "description",
-    "type",
-    "description",
-    "post",
     "description",
     "operationId",
     "responses",
@@ -2849,20 +2677,6 @@
     "content",
     "application/json",
     "schema",
-    "oneOf",
-    "$ref",
-    "$ref",
-    "description",
-    "post",
-    "description",
-    "operationId",
-    "responses",
-    "200",
-    "content",
-    "application/json",
-    "schema",
-    "oneOf",
-    "$ref",
     "$ref",
     "description",
     "/api/v1/sessions/{id}/messages",
@@ -2887,6 +2701,17 @@
     "$ref",
     "description",
     "post",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "application/json",
+    "schema",
+    "$ref",
+    "description",
+    "/chatlab/messages",
+    "get",
+    "description",
     "operationId",
     "responses",
     "200",

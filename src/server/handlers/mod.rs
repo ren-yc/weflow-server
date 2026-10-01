@@ -1,6 +1,7 @@
 //! Endpoint handlers (WeFlow-compatible shapes).
 
 pub mod accounts;
+pub mod chatlab_messages;
 pub mod chatlab_pull;
 pub mod chatlab_sessions;
 pub mod chatlab_push;
@@ -33,6 +34,12 @@ pub fn extract_params<T: serde::de::DeserializeOwned + serde::Serialize>(
         && let Ok(value) = serde_json::to_value(body.0)
             && let Some(map) = value.as_object() {
                 for (k, v) in map {
+                    // 判据只有一处（server::is_credential_key）：这条守卫与 server::merge_params、
+                    // 账号面自己那次合并必须同时生效 —— 只加在其中一处时，另一处仍是一条可用的
+                    // 鉴权通道，而不会有任何东西变红。
+                    if crate::server::is_credential_key(k) {
+                        continue;
+                    }
                     out.insert(
                         k.clone(),
                         match v {
@@ -46,8 +53,9 @@ pub fn extract_params<T: serde::de::DeserializeOwned + serde::Serialize>(
 }
 
 // Auth lives in `server::auth`; re-exported so handlers keep importing it
-// from `super::` unchanged.
-pub use crate::server::auth::{authorized, require_auth};
+// from `super::` unchanged. 只再导出 `require_auth`：`authorized` 是它的谓词形态，
+// 只在 auth 模块内部（含单测）使用，从这里再导出会变成一个没人用的公共别名。
+pub use crate::server::auth::require_auth;
 
 /// Require a registered, ready account; `wxid` from the `wxid` param, or else
 /// the bound account.

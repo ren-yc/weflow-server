@@ -290,7 +290,11 @@ impl AccountSync {
         if self.is_stopped() {
             return Ok(files.len());
         }
-        *self.store.write() = store;
+        {
+            let mut guard = self.store.write();
+            *guard = store;
+            guard.mark_index_built();
+        }
         // seed stamps so the next poll starts from a clean baseline
         self.stamps.clear();
         for f in &files {
@@ -608,6 +612,11 @@ impl AccountSync {
                 f.rel.clone(),
                 DbStamps { main, wal },
             );
+        }
+
+        // 只有这一轮确实动过索引才更新时刻：空转的一轮不该让 updatedAt 看起来更新了。
+        if applied_new > 0 || applied_revoke > 0 || !work.is_empty() {
+            self.store.write().mark_index_built();
         }
 
         Ok((applied_new, applied_revoke))

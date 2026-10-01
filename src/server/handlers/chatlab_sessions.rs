@@ -1,8 +1,8 @@
 //! `GET /chatlab/sessions` —— Pull 形状的**发现面**。
 //!
 //! 规范把 `baseUrl` 定义为 `/chatlab`，这条是其中的会话发现入口。与 `/api/v1/sessions`
-//! **共用同一份实现**（`sessions::respond`），差别只有默认语义：老面靠 `format=chatlab` 参数
-//! 切换，新面**天生就是** ChatLab 形状 —— 调用方不必知道还有另一种。**老面一行未改。**
+//! **共用同一份实现**（`sessions::respond`），差别只在**形状与分页参数**：老面只输出原生形状、
+//! 只认 `offset`；新面**天生就是** ChatLab 形状，并接受 `cursor`（`page.nextCursor` 的回传入参）。
 //!
 //! 响应形状（规范）：
 //!

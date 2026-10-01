@@ -91,7 +91,7 @@
 | `media/export.rs` | 媒体导出（含外部工具调用） | `export_*` | → `pathsafe` / 子进程 |
 | `keystore/mod.rs` | 密钥解析与镜像密钥（图片等） | `KeyMap` / `parse_db_key` | ← 无 |
 | `server/mod.rs` | 路由装配、鉴权、共享状态、SSE 总线 | `serve_with_shutdown` | → 全部 |
-| `server/handlers/mod.rs` | **handler 之间的共享件**：类型码映射、参数解析、信封 | `chatlab_type` / `parse_limit` / `merge_body` | — |
+| `server/handlers/mod.rs` | **handler 之间的共享件**：类型码映射、参数解析、信封 | `chatlab_type` / `parse_limit` / `extract_params`（`server::merge_params` 的薄包装） | — |
 | `server/handlers/*` | 各端点的实现（account / session / message / contact / media / push / sns） | — | → `store` / `sync` |
 
 ## 库面与 feature
@@ -133,7 +133,34 @@
 
 **依赖面的实际约束**（可测，不是口号）：`--no-default-features` 的依赖树里**不含 axum 与 tokio**。
 核心面（解析、存储）因此不得依赖可选面 —— 这条边界由 CI 上的一条检查守着。
+
 ## 服务层
+
+### 路由、方法与鉴权
+
+路由与方法的**唯一事实源**是 `server::routes::ROUTES`（`build_router` 由它构建，对等性怎么强制
+见「测试与夹具」）。方法口径是「**读端点只有 GET，动作端点保留 GET+POST**」：
+
+| 面 | 路由 | 方法 |
+|---|---|---|
+| 免鉴权 | `/health`、`/api/v1/health`、`/openapi.json` | 前两条 GET+POST、后者 GET |
+| 账号 | `/api/v1/accounts`（列表 / 注册）、`/api/v1/accounts/{wxid}`（注销） | GET+POST / DELETE |
+| 原生读面 | `/api/v1/messages`、`/api/v1/sessions`、`/api/v1/sessions/{id}/messages`、`/api/v1/contacts`、`/api/v1/group-members`、`/api/v1/media/{id}`、`/api/v1/push/messages` | GET |
+| ChatLab 面 | `/chatlab/sessions`、`/chatlab/messages`、`/chatlab/sessions/{id}/messages`、`/chatlab/push/messages` | GET |
+| 动作 | `/api/v1/sync`（触发一次增量对账，**不返回消息体**） | GET+POST |
+| 朋友圈 | `/api/v1/sns/*`（六条，**不进 `/openapi.json`**，见 `NOT_DOCUMENTED`） | GET+POST |
+
+读端点砍掉 POST 的理由：两个方法完全等价（POST 读请求与 GET 行为一致），多一个方法只多一份
+「两者不一致」的可能，换不来任何能力；而 `/api/v1/sync` 是**动作**不是读，两个方法都留。
+
+鉴权**只有两条通道**：`Authorization: Bearer <token>` 与 `?access_token=<token>`
+（`server/auth.rs::authorized`，常时比较）。`X-Api-Key`、`?token=` 与 POST JSON body 都**不是**
+通道——每多一条就多一处凭据会被复制到的地方（请求体、代理日志、客户端抓包），而 body 连
+「这是谁的凭据」都区分不出来：`handlers::extract_params` 从不把凭据键从 body 带进参数表。
+
+`/chatlab/*` 的四条与老面**共用同一份实现与同一条事件总线**，差别只在形状：老面只输出原生/
+富数据形状（`format=chatlab` / `chatlab=1` 开关已删除），ChatLab 形状一律走这四条——调用方不必
+知道还有另一种形状，也不会因为漏传一个开关而拿到另一种。
 
 ### 响应形状只有一个事实源：`server/dto.rs`
 
@@ -150,10 +177,10 @@
   要省略才加。客户端常靠「键在不在」判断（媒体导出与否、有没有引用），顺手统一风格会让
   这个判据失效。
 
-多形状端点**各建 struct**，不堆可选字段：`sessions` / `messages` / `accounts` 的响应形状由
-参数或状态决定，硬塞进一个「所有字段都可选」的类型会让它**看起来**合法而实际没有任何取值
-组合是对的。同名键类型不同时更是如此 —— `sessions` 的 `type` 在原生面是数字、在 ChatLab 面
-是字符串。
+多形状端点**各建 struct**，不堆可选字段：`accounts`（POST）与 `accounts/{wxid}`（DELETE）的响应
+形状由状态决定，硬塞进一个「所有字段都可选」的类型会让它**看起来**合法而实际没有任何取值组合
+是对的。同一个概念在两个面上类型不同时同理 —— `sessions` 的 `type` 在原生面是数字、在 ChatLab 面
+是字符串，因此是两个 struct，而不是一个字段带两种类型。
 
 ### 响应防线有三层，各管一件事
 
@@ -188,7 +215,8 @@ tag，再驱动上面的执行入口。另有一步只跑 `nails-*`（四条数�
 ### SSE 总线
 
 `GET /api/v1/push/messages` 是长连接：订阅 `AppState.events` 这条 broadcast 总线，迟到者靠
-重放缓冲补齐。三点必须知道：
+重放缓冲补齐。`/chatlab/push/messages` 挂在**同一条总线**上，只换了序列化器：它发的是通知帧
+（只带标识与时间，不带正文），连接机制（鉴权、重放、保活、基线）与老面完全一致。三点必须知道：
 
 - **载体是类型不是 `json!`**：`sync::events::Event` 是带 `skip_serializing_if` 的 struct，
   `PushMedia` 在**类型层面就没有** `aes_key` —— 密钥不会因为某次改动「忘了过滤」而泄露。
@@ -256,7 +284,7 @@ Python 只用于钩子与套件执行器，**纯标准库**——CI 与开发机
 ### 一致性套件
 
 `tests/conformance_runner.rs` 起真服务、造夹具，跑契约仓库（版本记在 `conformance.pin`）里的
-33 条用例。两条硬规矩：**带 `--fail-on-skip`**（有用例被跳过即失败，避免「夹具少声明一个端点」
+34 条用例。两条硬规矩：**带 `--fail-on-skip`**（有用例被跳过即失败，避免「夹具少声明一个端点」
 让用例静默变成不跑），**缺 `FLOW_CONTRACT_DIR` 即失败**（不是跳过）。夹具里的
 `contractVersion` 与 pin 由 `pinned_contract_version_matches_the_fixture` 钉在一起。
 
@@ -309,6 +337,15 @@ Python 只用于钩子与套件执行器，**纯标准库**——CI 与开发机
 
 这是延迟保护：一次请求导出过多会让响应时间不可控。下游若需要全量，必须自行翻页——
 **上限不会以错误形式告知，只会「剩下的没导出」**。
+
+### 媒体句柄只对「内容摘要派生」的名字下发
+
+按名取字节（`GET /api/v1/media/{id}`）要遍历**所有**会话的导出目录，所以它只服务**内容摘要派生**
+的名字：同名即同内容，遍历结果才是确定的。平台给的名字（视频按 `video_hardlink_info_v4.file_name`
+回落）与原始文件名回落只作**元数据**——把它们当句柄，会在别的会话里躺着一个同名异内容的文件时
+变成随机 404，或者更糟：服务了错的那一份。生成侧同理：只有本次请求确实写出了摘要派生的本地文件
+时才通告句柄（原生面的 `mediaId`、消息面回填的 `media.fileName`），非摘要派生的一律不给。
+
 ### 没有 `page` 块的响应会被读成「完整一页」
 
 会话列表默认只给 100 条，而 ChatLab 的约定是：**响应里没有 `page` 块，就表示「这就是全部」**。

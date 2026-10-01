@@ -118,7 +118,7 @@ pub struct SessionNative {
     pub username: String,
 }
 
-/// `GET /api/v1/sessions?chatlab=1`（或 `format=chatlab`）。
+/// `GET /chatlab/sessions`（Pull 形状的发现面）。
 ///
 /// **与原生面的键集不同**，且 `type` 在这里是字符串 —— 两个面不可能共用一个 struct。
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -139,18 +139,35 @@ pub struct Page {
 
 // ── 消息（ChatLab 混合面）─────────────────────────────────
 
-/// `GET|POST /api/v1/messages?chatlab=1`（或 `format=chatlab`）。
+/// `GET /chatlab/messages`（消息面）。
+///
+/// **不带 `success`**：它输出的是数据信封，而 `success` 是「操作结果」的语言 —— 两者同时
+/// 出现时，读者无法判断 `count`/`page` 是否可信。翻页信息一律走 `page`，与发现面同规。
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct MessagesChatlab {
+pub struct ChatlabMessages {
     pub chatlab: ChatlabHeader,
+    /// **本页条数**（不是总数）—— 总数不在这个面上表达，分页语义由 `page` 承担。
     pub count: usize,
-    pub has_more: bool,
     pub members: Vec<ChatlabMember>,
     pub messages: Vec<ChatlabMessage>,
     pub meta: ChatlabMeta,
-    pub success: bool,
+    pub page: Page,
     pub talker: String,
+}
+
+/// 一条消息的媒体**元数据**（拉取面与消息面同形）。
+///
+/// 它**不是**「字节可取」的承诺：无媒体时整个键省略；`fileName` 只有在导出确实写出了本地
+/// 副本之后才是可取句柄（那时它是**实际导出文件名**），否则它只是这条消息自带的文件名。
+/// `md5` 取不到时省略该键 —— 未导出不等于没有摘要。
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaBrief {
+    pub file_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub md5: Option<String>,
+    pub r#type: String,
 }
 
 /// ChatLab 信封头。`exportedAt` 是**墙钟**（每次请求都不同）——快照里靠时钟哨兵掩码。
@@ -190,9 +207,13 @@ pub struct ChatlabMessage {
     pub account_name: String,
     pub content: String,
     pub group_nickname: String,
+    /// 媒体元数据；无媒体时**整个键省略**（见 `MediaBrief`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media: Option<MediaBrief>,
     pub platform_message_id: String,
-    /// **本面是 `null`**（键始终出现）；**Pull 面是省略该键**。两个面的差异是
-    /// 有意的：本面的形状已被下游依赖，改它会破坏调用方。
+    /// **无引用时省略该键**（不是给 `null`）：规范把它列为可选 *string*，`null` 会让信任
+    /// 类型的读者拿到解析不了的值。三个面（原生面、消息面、拉取面）在这一键上同规。
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_to_message_id: Option<String>,
     pub sender: String,
     pub timestamp: i64,
@@ -248,9 +269,10 @@ pub struct EventMedia {
     pub r#type: String,
     /// **可直接取字节的 id** —— 单段路由 `GET /api/v1/media/{id}`。
     ///
-    /// **只在导出根下确有这个文件时才出现**（键随之消失，不是给 `null`）：承诺是「出现即可
-    /// 取」，不是尽力而为。通告一个取不到的 id，调用方会拿到 404 并以为是服务坏了；反过来
-    /// （能取到却没通告）只是少一个便捷入口，仍可走三段式路径。
+    /// **只在导出根下确有这个文件、且名字由内容摘要派生时才出现**（键随之消失，不是给
+    /// `null`）：承诺是「出现即可取」，不是尽力而为 —— 按名取字节是跨会话解析的，平台给的
+    /// 名字（语音的 svr_id、视频的 DB 名）在别的会话里可能有同名异内容的文件。通告一个取不到
+    /// 的 id，调用方会拿到 404 并以为是服务坏了。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_id: Option<String>,
 }
@@ -335,8 +357,9 @@ pub struct MessageNative {
     /// **始终出现**（无引用时为 `null`）。
     pub quote: Option<Quote>,
     pub raw_content: String,
-    /// **注意与 Pull 面的差异**：这里无引用时是 `null`，Pull 面是**省略该键**。
-    /// 这是有意保留的既有契约（下游已依赖本面的形状），不要「统一」。
+    /// **无引用时省略该键**（不是给 `null`）：下游若按「键在不在」判断引用关系，
+    /// 应改为「键在且非空」—— 这条与拉取面、消息面同规，三个面不再有形状差异。
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_to_message_id: Option<String>,
     pub sender_name: String,
     pub sender_username: String,
@@ -344,11 +367,13 @@ pub struct MessageNative {
     pub sort_seq: i64,
 }
 
-/// 消息的媒体元数据 —— **三种形状共用这一个 struct**。
+/// 消息的媒体元数据 —— **原生面专用**（拉取面与消息面用 `MediaBrief`，SSE 用 `EventMedia`）。
 ///
-/// - 未导出：`url` / `localPath` 是**空串**（不是省略），`exported` **不出现**；
-/// - 导出成功：`url` 是相对路径、`localPath` 是绝对路径，且**多出** `exported: true`；
-/// - SSE 版只有 `type` / `fileName` / `md5`（那两个空串字段在那边不序列化）。
+/// - 未导出：`url` / `localPath` / `mediaId` **都不出现**，`exported` 也不出现；
+/// - 导出成功：`url` 是根相对路径、`localPath` 是绝对路径，且多出 `exported: true`；
+///   其中**名字由内容摘要派生**的那些再多一个 `mediaId`（可直接喂给按名取字节的路由）；
+///   名字来自平台（视频的 DB 名回落）的那些**不给** `mediaId` —— 按名取字节是跨会话解析的，
+///   同名可能是别的会话的另一个文件。
 ///
 /// `exported` 是**条件键**：不导出时它**不出现**而不是 `false`。客户端靠「键在不在」
 /// 判断字节可不可取 —— 改成恒出现会让这个判据失效。
@@ -358,12 +383,21 @@ pub struct MediaObject {
     /// 字母序使然：`exported` 排在 `fileName` 之前，这样输出与 `json!` 的现状一致。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exported: Option<bool>,
-    /// 文件名**始终是字符串**；`md5` 解析不出时是 **`null`**（现状如此，勿统一成空串）。
+    /// 文件名**始终是字符串**；没有名字时是空串（不是 `null`）。
     pub file_name: String,
-    pub local_path: String,
+    /// 未导出时**省略**（不是空串）：空串会被读成「有路径、只是空的」。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_path: Option<String>,
+    /// **取不到摘要时才省略**（不是给 `null`）：未导出不等于没有摘要。
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub md5: Option<String>,
+    /// 可直接取字节的 id；只在**本次请求的导出批次**确实写出了摘要派生的本地文件时出现。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_id: Option<String>,
     pub r#type: String,
-    pub url: String,
+    /// 根相对路径；未导出时**省略**。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 /// 引用（回复）的渲染信息。
@@ -390,15 +424,19 @@ pub struct PullEnvelope {
 
 /// Pull 面的消息项。
 ///
-/// **与混合面（`ChatlabMessage`）不是同一个 struct**：本面的 `replyToMessageId` 在无引用时
-/// **省略该键**，而混合面输出 `null`。这个差异是有意的（混合面的形状已被下游依赖），
-/// 所以两处必须各建 struct —— 复用会把它们的契约绑在一起。
+/// **与消息面（`ChatlabMessage`）是两个 struct**，尽管字段目前一致：它们属于两个面 —— 一个
+/// 由 Pull 协议定义、一个由本服务的消息面定义，规范面加字段时不该顺带改到另一个面。
+/// 复用同一个 struct 会把两份契约绑在一起（这一批之前它们正是靠两个 struct 承载
+/// `replyToMessageId` 的形状差异，现在差异消失了，分建的理由仍在）。
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PullMessage {
     pub account_name: String,
     pub content: String,
     pub group_nickname: String,
+    /// 媒体元数据；无媒体时**整个键省略**（见 `MediaBrief`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media: Option<MediaBrief>,
     pub platform_message_id: String,
     /// **省略**（不是 `null`）：规范把它列为可选 *string*，`null` 会让信任类型的读者
     /// 拿到解析不了的值。
@@ -451,15 +489,22 @@ pub struct Contact {
 
 // ── 群成员 ────────────────────────────────────────────────
 
-/// `GET|POST /api/v1/group-members`。
+/// `GET /api/v1/group-members`。
+///
+/// 成员集合是**名册 ∪ 发言人**：从未发过言的名册成员（潜水成员）也会出现，其 `messageCount`
+/// 为 0。这是有意的 —— 只列发言人会让「群里有谁」这个问题的答案取决于谁最近说过话。
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupMembers {
     pub chatroom_id: String,
     pub count: usize,
+    /// 名册与消息都在内存索引里，本请求不读盘、也不触发同步 ⇒ 恒为 `false`。
+    pub from_cache: bool,
     pub members: Vec<GroupMember>,
-    pub refreshed: bool,
     pub success: bool,
+    /// 索引构建完成时刻（**毫秒**）：客户端据此判断这份成员表有多旧。秒级会让同一秒内的
+    /// 两次构建无法区分，而成员表的更新恰恰可能落在同一秒里。
+    pub updated_at: i64,
 }
 
 /// 群成员项。字段缺失同样压平成**空串**（与 `contacts` 同规）。
@@ -543,10 +588,10 @@ pub struct SessionChatlab {
 /// `eventId` 与 `platformMessageId` 是**两个不同的号**：前者是事件通道自己的标识，后者是那条
 /// 消息在平台上的 id（拉取时用它定位）。
 ///
-/// **本面当前不下发 `platformMessageId`**（键保留、值恒为 `null`）：事件里带的是各平台自己的
-/// 那套编号，把它翻成平台消息号需要在**推送热路径**上逐事件查一次索引，而规范里这个字段是
-/// **可选**的。定位消息请用**拉取面**返回的 `platformMessageId` —— 「收到通知后去拉那一页」
-/// 本来就是这条通道的用法。
+/// **`platformMessageId` 按事件类型给**：撤回帧带上（本仓事件里的 rawid 就是平台消息号），
+/// `message.new` 仍为 `null` —— 新消息要把事件里的编号翻成平台消息号，得在**推送热路径**上
+/// 逐事件查一次索引，而规范里这个字段是**可选**的；定位它请用**拉取面**返回的同名字段，
+/// 「收到通知后去拉那一页」本来就是这条通道的用法。
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct NotificationFrame {

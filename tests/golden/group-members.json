@@ -1,7 +1,8 @@
 {
   "body": {
     "chatroomId": "wxid_fake_group@chatroom",
-    "count": 2,
+    "count": 3,
+    "fromCache": false,
     "members": [
       {
         "alias": "",
@@ -26,14 +27,27 @@
         "nickname": "",
         "remark": "",
         "wxid": "wxid_fake000000000000001"
+      },
+      {
+        "alias": "zhangsan001",
+        "avatarUrl": "",
+        "displayName": "客户张三",
+        "groupNickname": "",
+        "isFriend": true,
+        "isOwner": false,
+        "messageCount": 0,
+        "nickname": "张三",
+        "remark": "客户张三",
+        "wxid": "wxid_friend_a"
       }
     ],
-    "refreshed": false,
-    "success": true
+    "success": true,
+    "updatedAt": "<volatile>"
   },
   "keys": [
     "chatroomId",
     "count",
+    "fromCache",
     "members",
     "alias",
     "avatarUrl",
@@ -55,8 +69,18 @@
     "nickname",
     "remark",
     "wxid",
-    "refreshed",
-    "success"
+    "alias",
+    "avatarUrl",
+    "displayName",
+    "groupNickname",
+    "isFriend",
+    "isOwner",
+    "messageCount",
+    "nickname",
+    "remark",
+    "wxid",
+    "success",
+    "updatedAt"
   ],
   "status": 200
 }

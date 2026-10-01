@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use axum::routing::{get, post, MethodRouter};
+use axum::routing::{get, MethodRouter};
 
 use crate::server::handlers;
 use crate::server::AppState;
@@ -50,11 +50,9 @@ pub enum Kind {
     Accounts,
     /// 注销（DELETE）。
     AccountItem,
-    /// 注销的别名（供无法发 DELETE 的客户端与代理）。
-    AccountDeregister,
-    /// 消息面：原生 / ChatLab 两形状由参数切换。
+    /// 消息面：**原生/富数据形状**（ChatLab 形状走 ChatlabMessages）。
     Messages,
-    /// 会话列表（原生 / ChatLab 两形状由参数切换）。
+    /// 会话列表：**原生形状**（ChatLab 形状走 ChatlabSessions）。
     Sessions,
     /// 游标拉取面（本身即 ChatLab 形状）。
     SessionsPull,
@@ -62,16 +60,16 @@ pub enum Kind {
     Contacts,
     /// 群成员面。
     GroupMembers,
-    /// 按导出文件名取字节。
+    /// 按导出文件名取字节（**唯一**的字节面）。
     MediaById,
-    /// 三段式取字节（talker/type/file）。
-    MediaNamed,
     /// 老面的 SSE 推送。
     PushMessages,
     /// ChatLab 通知面（只发元信息）。
     ChatlabPush,
     /// ChatLab 发现面。
     ChatlabSessions,
+    /// ChatLab 消息面。
+    ChatlabMessages,
     /// ChatLab 拉取面。
     ChatlabPull,
     /// 手动同步。
@@ -102,7 +100,6 @@ pub struct Route {
 
 const GET_POST: &[Method] = &[Method::Get, Method::Post];
 const GET_ONLY: &[Method] = &[Method::Get];
-const POST_ONLY: &[Method] = &[Method::Post];
 const DELETE_ONLY: &[Method] = &[Method::Delete];
 
 /// 全部路由。**加一条路由只改这里** —— 不在这里注册的路由根本不存在。
@@ -116,30 +113,23 @@ pub const ROUTES: &[Route] = &[
     Route { path: "/openapi.json", kind: Kind::OpenapiJson, methods: GET_ONLY },
     Route { path: "/api/v1/accounts", kind: Kind::Accounts, methods: GET_POST },
     Route { path: "/api/v1/accounts/{wxid}", kind: Kind::AccountItem, methods: DELETE_ONLY },
-    Route {
-        path: "/api/v1/accounts/{wxid}/deregister",
-        kind: Kind::AccountDeregister,
-        methods: POST_ONLY,
-    },
-    Route { path: "/api/v1/messages", kind: Kind::Messages, methods: GET_POST },
-    Route { path: "/api/v1/sessions", kind: Kind::Sessions, methods: GET_POST },
+    // 读端点只有 GET：多一个方法就多一份「两个方法行为不一致」的可能，而它换不来任何能力
+    // （POST 读请求与 GET 完全等价）。动作端点（注册、同步）与免鉴权的 /health 保留两个方法。
+    Route { path: "/api/v1/messages", kind: Kind::Messages, methods: GET_ONLY },
+    Route { path: "/api/v1/sessions", kind: Kind::Sessions, methods: GET_ONLY },
     Route { path: "/api/v1/sessions/{id}/messages", kind: Kind::SessionsPull, methods: GET_ONLY },
-    Route { path: "/api/v1/contacts", kind: Kind::Contacts, methods: GET_POST },
-    Route { path: "/api/v1/group-members", kind: Kind::GroupMembers, methods: GET_POST },
-    Route { path: "/api/v1/media/{id}", kind: Kind::MediaById, methods: GET_POST },
-    Route {
-        path: "/api/v1/media/{talker}/{media_type}/{file}",
-        kind: Kind::MediaNamed,
-        methods: GET_POST,
-    },
-    Route { path: "/api/v1/push/messages", kind: Kind::PushMessages, methods: GET_POST },
-    // ── ChatLab 适配面（新增，**不改老路由**）──────────────────────────────
+    Route { path: "/api/v1/contacts", kind: Kind::Contacts, methods: GET_ONLY },
+    Route { path: "/api/v1/group-members", kind: Kind::GroupMembers, methods: GET_ONLY },
+    Route { path: "/api/v1/media/{id}", kind: Kind::MediaById, methods: GET_ONLY },
+    Route { path: "/api/v1/push/messages", kind: Kind::PushMessages, methods: GET_ONLY },
+    // ── ChatLab 适配面 ─────────────────────────────────────────────────
     //
-    // 规范把 baseUrl 定义为 /chatlab，于是这三条是 Pull 形状的入口。它们与 /api/v1/*
-    // **共用同一份实现与同一条总线**，差别只在默认语义：老面靠 format=chatlab 参数切换，
-    // 新面**天生就是** ChatLab 形状（调用方不必知道还有另一种）。
+    // 规范把 baseUrl 定义为 /chatlab，于是这几条是 ChatLab 形状的入口。它们与 /api/v1/*
+    // **共用同一份实现与同一条总线**，差别只在形状：老面只输出原生/富数据形状，新面**天生就是**
+    // ChatLab 形状（调用方不必知道还有另一种，也不会因为漏传一个开关而拿到另一种）。
     Route { path: "/chatlab/push/messages", kind: Kind::ChatlabPush, methods: GET_ONLY },
     Route { path: "/chatlab/sessions", kind: Kind::ChatlabSessions, methods: GET_ONLY },
+    Route { path: "/chatlab/messages", kind: Kind::ChatlabMessages, methods: GET_ONLY },
     // Pull 面**本身就是** ChatLab 形状（它没有 format 参数）。挂到规范约定的
     // {baseUrl}/sessions/{id}/messages 上，于是 baseUrl=/chatlab 三条路由齐了。
     Route {
@@ -181,17 +171,16 @@ pub fn method_router(kind: Kind) -> MethodRouter<Arc<AppState>> {
         Kind::OpenapiJson => get(crate::server::openapi_handler),
         Kind::Accounts => get(accounts::list_handler).post(accounts::handler),
         Kind::AccountItem => axum::routing::delete(accounts::delete_handler),
-        Kind::AccountDeregister => post(accounts::delete_handler),
-        Kind::Messages => get(messages::handler).post(messages::handler),
-        Kind::Sessions => get(sessions::handler).post(sessions::handler),
+        Kind::Messages => get(messages::handler),
+        Kind::Sessions => get(sessions::handler),
         Kind::SessionsPull => get(chatlab_pull::handler),
-        Kind::Contacts => get(contacts::handler).post(contacts::handler),
-        Kind::GroupMembers => get(group_members::handler).post(group_members::handler),
-        Kind::MediaById => get(media::handler_by_id).post(media::handler_by_id),
-        Kind::MediaNamed => get(media::handler).post(media::handler),
-        Kind::PushMessages => get(push_events::handler).post(push_events::handler),
+        Kind::Contacts => get(contacts::handler),
+        Kind::GroupMembers => get(group_members::handler),
+        Kind::MediaById => get(media::handler_by_id),
+        Kind::PushMessages => get(push_events::handler),
         Kind::ChatlabPush => get(chatlab_push::handler),
         Kind::ChatlabSessions => get(chatlab_sessions::handler),
+        Kind::ChatlabMessages => get(chatlab_messages::handler),
         Kind::ChatlabPull => get(chatlab_pull::handler),
         Kind::Sync => get(sync::handler).post(sync::handler),
         Kind::SnsTimeline => get(sns::timeline).post(sns::timeline),

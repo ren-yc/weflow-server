@@ -1,14 +1,16 @@
 {
   "body": {
-    "index_cleared": false,
+    "index_cleared": true,
+    "previous_status": "ready",
     "purged_dirs": 0,
     "purged_media": false,
-    "state": "not_registered",
+    "state": "deregistered",
     "success": true,
     "wxid": "wxid_fake000000000000001"
   },
   "keys": [
     "index_cleared",
+    "previous_status",
     "purged_dirs",
     "purged_media",
     "state",

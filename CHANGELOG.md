@@ -2,22 +2,82 @@
 
 本文件从 0.5.0 起维护。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-## [未发布]
+## [0.7.0] - 2026-10-01
 
-### 文档（如实化，无行为变化）
+接口面的形状收敛：老面只做原生/富数据面，ChatLab 形状搬到 `/chatlab/*`；媒体只留一条按名取字节的路由；
+鉴权通道减到两条。**破坏性变更较多**，逐条迁移见文末「迁移」。
 
-- **通知帧的 `platformMessageId` 说明改为如实**：本面**不下发**该字段（键保留、值恒为 `null`）。
-  此前 DTO 文档承诺「撤回事件里它是被撤回那条的 id」，而两处实现都写 `null` —— 承诺与实现不符，
-  且规范里该字段本就是可选的。定位消息请用**拉取面**返回的 `platformMessageId`。
-- **注销函数里那段英文注释改回与代码一致**：它写着重放历史「保持不动」，而代码是**清空条目 ＋ 保留
-  id 计数器 ＋ 推进 `generation`**（迁移到统一语义时改了行为，没改这段注释）。
-- **补记**：老面 `GET /api/v1/sessions` 的 `cursor` 入参是随 0.6.0 的会话分页一起引入的（纯增量，
-  `offset` 照旧可用）。0.6.0 的条目里只点了 `count`/`page`，没点出这个入参 —— 接口文档里有，这里补上。
+### 新增
+
+- **`GET /chatlab/messages`** —— ChatLab 形状的消息面，也是原「混合面」
+  （`/api/v1/messages?chatlab=1`）的新家：参数 `talker`（必填）/ `limit` / `offset` / `cursor` / 
+  `start` / `end` / `media` / `keyword`；信封
+  `{talker,count,page,chatlab,meta,members,messages}`，**不带 `success`**，
+  `count` 是**本页条数**，消息**升序**，`page{hasMore,nextCursor}` 报告截断。
+  `media=1` **真正执行导出** —— 旧的混合面在收集导出任务**之前**就 return 了，
+  所以 `media=1` 在 ChatLab 形状上从未导出过；「先触发导出、再取字节」这条两步走在那个面上并不成立。
+- **消息的媒体元数据**：拉取面与消息面每条消息新增 `media{type,fileName,md5}`（无媒体省略整键；
+  `md5` 取不到时省略该键）。它是**元数据**：只有 `media=1` 且该条**确实写出了本地文件**时，
+  `fileName` 才是可取句柄。
+- 原生面 `media` 新增 `mediaId`：只在**本次请求的导出批次**确实写出了**内容摘要派生**的
+  本地文件时出现（DB 名回落、外链、导出失败、超每请求上限的一律不给）。
+- `group-members` 新增 `fromCache`（恒 `false`）与 `updatedAt`（**毫秒**，索引构建/更新完成时刻）。
+- 通知面的**撤回帧**带上 `platformMessageId`（本仓事件里的 `rawid` 就是平台消息号）；
+  `message.new` 仍为 `null` —— 给它要在推送热路径上逐事件查一次索引，而规范里该字段是可选的。
+
+### 变更（破坏性）
+
+- **老面不再输出 ChatLab 形状**：`/api/v1/messages` 与 `/api/v1/sessions` 上的
+  `format=chatlab` / `chatlab=1` 开关已删除，两个面只输出原生形状。
+- **读端点只有 GET**：`messages` / `sessions` / `contacts` / `group-members` / `media/{id}` /
+  `push/messages` 的 POST 变 405。`/api/v1/sync` 与 `/health`、
+  `/api/v1/accounts` 仍接受两个方法；`sns/*` 六条不变。
+- **鉴权只剩两条通道**：`Authorization: Bearer` 与 `?access_token=`。
+- **媒体字节只留 `GET /api/v1/media/{id}`**，三段式 `/api/v1/media/{talker}/{media_type}/{file}` 已删除。
+- **`group-members` 的成员集合改为名册 ∪ 发言人**：从未发过言的成员也会出现（`messageCount` 为 0），
+  `count` 会变大。同时删 `forceRefresh`（同步统一走 `/api/v1/sync`）与
+  `withCounts` 别名，`refreshed` 键换成 `fromCache` + `updatedAt`。
+- **`replyToMessageId` 在三个面统一为「无引用则省略该键」**（原生面此前是无引用给 `null`）。
+- 原生面 `media` 的 `url` / `localPath` 未导出时**省略**（此前是空串）；
+  `md5` 只在取不到时省略（已知摘要照给 —— 未导出不等于没有摘要）。
+- 删除参数别名：`meiti` / `tupian` / `vioce`；删除 `POST /api/v1/accounts/{wxid}/deregister` 别名。
+- 契约 pin 升到 `v0.4.0`（新增两条具名不变量与消息面用例；能力词表与端点登记同步）。
+
+### 修复
+
+- **按名取字节的同名多命中**：候选内容一致才服务（先比 size，必要时逐字节比较），不一致给 404。
+  此前是「取第一个」且目录遍历顺序不确定 —— 同名在别的会话里可能是另一个文件，随便挑一个等于把
+  「出现即可取」变成「出现即可取到某个东西」。只有**内容摘要派生**的名字才允许作为句柄下发，
+  平台名（视频的 DB 名回落）与原文件名回落只作元数据。
+- `group-members` 的排序稳定：先按 `messageCount` 降序、再按 uid 升序。只按计数排时，
+  一大批计数为 0 的潜水成员顺序随哈希遍历顺序抖动，同一个群两次请求的顺序可能不同。
+- **注销函数里那段英文注释改回与代码一致**：它写着重放历史「保持不动」，而代码是**清空条目 ＋
+  保留 id 计数器 ＋ 推进 `generation`**（迁移到统一语义时改了行为，没改这段注释）。
+
+### 文档
+
+- `docs/weflow-server-api.md` 与 `docs/architecture.md` 随本批改动同步：路由清单、
+  鉴权两条通道、`/chatlab` 四条路由、媒体按名解析与同名消歧规则、群成员集合。
+- **补记**：老面 `GET /api/v1/sessions` 的 `cursor` 入参是随 0.6.0 的会话分页一起引入的
+  （那时是纯增量）。本次它随「老面只认 offset」一起删掉了。
 - `/chatlab/sessions` 的响应示例补上漏掉的 `count` 键（实际响应一直有它）。
 
-### 变更（内部，输出逐字节不变）
+### 迁移
 
-- `/openapi.json` 里通知帧的 `description` 随上面第一条改动（DTO 文档注释直接进描述）。
+过渡期一律**立即生效**。
+
+| 改了什么 | 怎么迁 |
+|---|---|
+| 老面不再输出 ChatLab 形状（`chatlab=1` / `format=chatlab`） | 改用 `GET /chatlab/messages`（参数同名，见上）；会话发现面用 `/chatlab/sessions` |
+| 老面不再识别 `cursor` | 老面用 `offset`；**注意失败模式**：继续传 `cursor` 不会报错，而是**静默回到第一页** |
+| 旧参数拼写（`chatlab=1`、`format=chatlab`、`meiti`、`tupian`、`vioce`） | 一律**被静默忽略**（未知参数不报错）：改成 `media=1` 与类型参数，或改用新面 |
+| 三段式媒体路由已删 | 改用 `GET /api/v1/media/{id}`（`{id}` 是导出文件名）；未导出前先请求 `media=1` |
+| 鉴权只剩 Bearer 与 `?access_token=` | 删掉 `X-Api-Key`、`?token=` 与「把 token 放进 JSON body」的写法 |
+| 原生面的 `replyToMessageId` 由「恒出现、无引用给 `null`」改为**省略该键** | 按下标「键存在」判断引用关系的代码改为「键存在**且非空**」 |
+| `/chatlab/messages` 的外层没有 `hasMore`，改用 `page{hasMore,nextCursor}` | 按 `page.hasMore` 判断是否续页，用 `page.nextCursor` 回传 `cursor` |
+| 读端点的 POST 变 405 | 改用 GET（参数走查询串） |
+| `group-members` 的 `refreshed` 键没了，成员集合并了名册 | 改用 `fromCache` / `updatedAt`；按 `count` 分配 UI 的地方要接受更大的成员数 |
+| 原生面 `media` 的 `url` / `localPath` 未导出时省略 | 判空从「空串」改为「键不存在」 |
 ## [0.6.1] - 2026-10-01
 
 门禁与文档收口。**响应形状未变** —— 新增的是接口描述里的两条操作与更严的门禁。

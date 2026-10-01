@@ -119,7 +119,7 @@ aesKey=MD5(code+wxid)[:16]），或直接指定 `img_aes_key`/`img_xor_key`（�
 `GET /api/v1/accounts` 提供（该接口不受就绪门控）。客户端据此健康检查，避免「503 → 重注册 →
 再重建」风暴。
 
-SSE 推送（token 任一通道：`Authorization: Bearer` / `X-Api-Key` / 查询或 POST body 参数 `access_token`/`token`，比对为常时比较）：
+SSE 推送（鉴权只有两条通道：`Authorization: Bearer` 与查询参数 `?access_token=`，比对为常时比较）：
 
 ```bash
 curl -N "http://127.0.0.1:5033/api/v1/push/messages?access_token=<token>"

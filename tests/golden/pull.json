@@ -42,6 +42,11 @@
         "accountName": "李四",
         "content": "[图片]",
         "groupNickname": "四哥",
+        "media": {
+          "fileName": "00112233445566778899aabbccddeeff.jpg",
+          "md5": "00112233445566778899aabbccddeeff",
+          "type": "image"
+        },
         "platformMessageId": "8200000000000000002",
         "sender": "wxid_member_b",
         "timestamp": 1700000102,
@@ -103,6 +108,10 @@
     "accountName",
     "content",
     "groupNickname",
+    "media",
+    "fileName",
+    "md5",
+    "type",
     "platformMessageId",
     "sender",
     "timestamp",

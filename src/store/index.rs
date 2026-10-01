@@ -558,6 +558,19 @@ pub fn build_all_live(
     my_wxid: &str,
     db_files: &[DbFile],
 ) -> Result<Store> {
+    let mut store = build_all_live_inner(pool, keys, my_wxid, db_files)?;
+    // 时刻在**外层**记：内层有多条提前返回的路径（缺密钥、库打不开），漏掉任何一条都会让
+    // updatedAt 停在 0 —— 那种「字段在、值是零」比字段缺失更难查。
+    store.mark_index_built();
+    Ok(store)
+}
+
+fn build_all_live_inner(
+    pool: &mut LivePool,
+    keys: &KeyMap,
+    my_wxid: &str,
+    db_files: &[DbFile],
+) -> Result<Store> {
     let mut store = Store {
         my_wxid: my_wxid.to_string(),
         ..Default::default()

@@ -11,6 +11,8 @@ use weflow_server::media::{decrypt_dat, detect_format, DatFormat};
 
 const TALKER: &str = "000000000000@chatroom";
 const VID_MD5: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2";
+/// 库里没有 hardlink 行的视频：它的落盘名走 `{md5}.mp4` 回落。
+const VID_FALLBACK_MD5: &str = "ccccccccccccccccccccccccccccccc3";
 const SVR_ID: i64 = 8523931155911769344;
 
 fn md5_hex(bytes: &[u8]) -> String {
@@ -102,6 +104,9 @@ fn setup(dir: &Path) -> (ExportCtx, std::collections::HashMap<String, Connection
     let vdir = account.join("msg").join("video").join("2022-05");
     std::fs::create_dir_all(&vdir).unwrap();
     std::fs::write(vdir.join(format!("{VID_MD5}.mp4")), &mp4).unwrap();
+    // 第二个视频：库里**没有**它的行 ⇒ 落盘名走 `{md5}.mp4` 回落（摘要派生）。
+    // 它与上面那个的差别正是「名字从哪来」，而句柄只认摘要派生的那一支。
+    std::fs::write(vdir.join(format!("{VID_FALLBACK_MD5}.mp4")), &mp4).unwrap();
 
 // --- auxiliary dbs (hardlink + media)
 let snap = dir.join("aux").join(common::FAKE_WXID);
@@ -170,9 +175,16 @@ fn exports_image_voice_video() {
             333i64,
             TALKER.to_string(),
         ),
+        (
+            4i64,
+            weflow_server::parser::MediaKind::Video,
+            Some(VID_FALLBACK_MD5.to_string()),
+            444i64,
+            TALKER.to_string(),
+        ),
     ];
     let out = weflow_server::media::export::export_batch(&ctx, &aux, &jobs, 10);
-    assert_eq!(out.len(), 3, "all three kinds exported: {out:?}");
+    assert_eq!(out.len(), 4, "all jobs exported: {out:?}");
 
     let img = out.get(&1).unwrap();
     assert_eq!(img.kind_dir, "images");
@@ -188,6 +200,22 @@ fn exports_image_voice_video() {
     let vid = out.get(&3).unwrap();
     assert_eq!(vid.kind_dir, "videos");
     assert!(vid.local_path.is_file());
+
+    // 「名字是否**由内容摘要派生**」是句柄的判据，必须随导出结果一起带出来：
+    // 只有它为真的名字才允许当句柄下发（按名取字节是跨会话解析的，平台给的名字可能同名异内容）。
+    assert!(img.digest_named, "图片名是 32 位摘要 + 扩展名");
+    assert_eq!(img.file_name, format!("{}.jpg", img_md5()));
+    assert!(!voice.digest_named, "语音名来自服务端序号（voice_<svr_id>.silk）");
+    assert!(
+        !vid.digest_named,
+        "视频名来自平台库（video_hardlink_info_v4.file_name）—— 哪怕它长得像摘要"
+    );
+    let fallback = out.get(&4).unwrap();
+    assert!(
+        fallback.digest_named,
+        "库里查不到时的 <md5>.mp4 回落是摘要派生的"
+    );
+    assert_eq!(fallback.file_name, format!("{VID_FALLBACK_MD5}.mp4"));
 
     // idempotent: re-running yields the same paths without error
     let out2 = weflow_server::media::export::export_batch(&ctx, &aux, &jobs, 10);
