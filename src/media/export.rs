@@ -610,11 +610,19 @@ mod tests {
             write_out(&root, "wxid_a", "images", "a:b.jpg", b"x").is_none(),
             "Windows 备用数据流冒号也被拒"
         );
+        // 落点必须按 **join 链**算，不能凭直觉：`dir = root/wxid_a/images`，
+        // `dir.join("../pwn.jpg")` 归一化到 **root/wxid_a/pwn.jpg**（root 之内，不是 parent）；
+        // `root.join("../evil/images")` 归一化到 **root 的父目录下的 evil/**（root 之外）。
+        // 原来的两条断言分别查了 root.parent()/pwn.jpg 与 root/evil —— 两个位置都不对，
+        // 于是在守卫被移除时它们**仍然是绿的**，只有上面那两条 is_none() 会红。
         assert!(
-            !root.parent().unwrap().join("pwn.jpg").exists(),
-            "root 之外没有任何残留"
+            !root.join("wxid_a").join("pwn.jpg").exists(),
+            "越界 file_name 不得落在 root/wxid_a/ 下"
         );
-        assert!(!root.join("evil").exists(), "root 之内也没有越界产物");
+        assert!(
+            !root.parent().unwrap().join("evil").exists(),
+            "越界 talker 不得在 root 之外建出目录"
+        );
 
         // 正向对照：合法分量照常写入。
         assert!(write_out(&root, "wxid_a", "images", "ok.jpg", b"x").is_some());

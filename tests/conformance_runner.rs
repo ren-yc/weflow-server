@@ -157,6 +157,23 @@ fn req(method: &str, uri: &str) -> Request<Body> {
     r
 }
 
+/// `conformance.pin` 与夹具的 `contractVersion` **必须同改**。
+///
+/// 为什么需要它：runner 只比对**夹具**与契约仓库的 `VERSION`，它不读 git tag ——
+/// 于是「只改 pin、忘了夹具」在本地不会红（要到 CI 运行时才以 exit 2 拒绝），
+/// 反过来「只改夹具、忘了 pin」更隐蔽：本地跑本地 clone 的契约目录照样通过，
+/// 而 CI clone 的是旧 tag。两处一起改因此必须是可执行的，而不是靠记性。
+#[test]
+fn pinned_contract_version_matches_the_fixture() {
+    let pin = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/conformance.pin"))
+        .expect("conformance.pin 必须存在");
+    let pin = pin.trim().trim_start_matches('v');
+    assert_eq!(
+        pin, CONTRACT_VERSION,
+        "conformance.pin 与夹具的 contractVersion 不一致：升 pin 时两处必须同改"
+    );
+}
+
 /// 发一次鉴权探测，返回 (传输名, 状态码)。
 async fn probe(app: axum::Router, name: &str, r: Request<Body>) -> (String, u16) {
     let resp = app.oneshot(r).await.unwrap();
@@ -182,12 +199,20 @@ async fn wait_ready(app: &axum::Router) -> bool {
     false
 }
 
+/// 夹具声明的契约版本。**必须与 `conformance.pin` 同改** —— 见下面的
+/// `pinned_contract_version_matches_the_fixture`。
+const CONTRACT_VERSION: &str = "0.3.3";
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "由 CI 的一致性步骤显式运行：需要 FLOW_CONTRACT_DIR"]
 async fn conformance_suite_passes() {
+    // 缺目录**不是**「跳过」，是失败：这条测试唯一的存在理由就是跑那套用例，
+    // 而它此前在环境缺失时静默 return —— 于是 CI 里少配一个变量就会让整套门禁
+    // 变成「绿着什么都没验」。
     let Some(contract) = contract_dir() else {
-        println!("[conformance] 未设置 FLOW_CONTRACT_DIR（或其中没有 runner/run.py），跳过");
-        return;
+        panic!(
+            "[conformance] 未设置 FLOW_CONTRACT_DIR（或其中没有 runner/run.py）：             一致性套件是本仓库的门禁之一，缺环境必须失败而不是静默通过"
+        );
     };
     let dir = common::tmp_dir("conformance");
     let key = keystore::parse_db_key(common::FAKE_KEY_HEX).unwrap();
@@ -279,7 +304,7 @@ async fn conformance_suite_passes() {
         auth_probed.insert(n, json!(s));
     }
     let fx = json!({
-        "contractVersion": "0.3.0",
+        "contractVersion": CONTRACT_VERSION,
         "platform": "wechat",
         "generatedBy": "weflow-server tests/conformance_runner.rs",
         // schema 要求七项齐全（用例只用到其中两个，但夹具的完整性由 schema 校验）。
@@ -346,6 +371,9 @@ async fn conformance_suite_passes() {
         .arg("--token")
         .arg(TOKEN)
         .args(case_filter.iter().flat_map(|c| ["--case", c.as_str()]))
+        // 有跳过即失败：case 级 skip 此前不影响退出码，「夹具少声明一个端点」
+        // 会让用例静默变成不跑而 CI 全绿（见 runner 的同名开关）。
+        .arg("--fail-on-skip")
         .current_dir(&contract)
         .output()
         .expect("python 必须可用（提交路径本来就依赖它）");

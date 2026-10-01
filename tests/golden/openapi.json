@@ -1708,6 +1708,29 @@
               "description": "成功"
             }
           }
+        },
+        "post": {
+          "description": "同 GET（兼容不能发 GET 的调用方）。",
+          "operationId": "post__api_v1_sessions",
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "oneOf": [
+                      {
+                        "$ref": "#/components/schemas/SessionsNative"
+                      },
+                      {
+                        "$ref": "#/components/schemas/SessionsChatlab"
+                      }
+                    ]
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
         }
       },
       "/api/v1/sessions/{id}/messages": {
@@ -1729,6 +1752,21 @@
         }
       },
       "/api/v1/sync": {
+        "get": {
+          "operationId": "get__api_v1_sync",
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/SyncResult"
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
+        },
         "post": {
           "operationId": "post__api_v1_sync",
           "responses": {
@@ -2815,6 +2853,18 @@
     "$ref",
     "$ref",
     "description",
+    "post",
+    "description",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "application/json",
+    "schema",
+    "oneOf",
+    "$ref",
+    "$ref",
+    "description",
     "/api/v1/sessions/{id}/messages",
     "get",
     "description",
@@ -2827,6 +2877,15 @@
     "$ref",
     "description",
     "/api/v1/sync",
+    "get",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "application/json",
+    "schema",
+    "$ref",
+    "description",
     "post",
     "operationId",
     "responses",

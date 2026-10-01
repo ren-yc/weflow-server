@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use axum::Router;
 use parking_lot::{Mutex, RwLock};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 use weflow_server::db::scan::AccountInfo;
@@ -372,17 +372,98 @@ async fn sse_payload_keys_are_pinned() {
         "message.new 的键集是契约：{v}"
     );
 
-    // media 是**第三种形状**：只有元数据，没有路径、没有取字节用的键。
+    // media 是**第三种形状**：只有元数据，没有路径。取字节用的键是 `mediaId`，
+    // 它**只在导出根下确有该文件时才出现**（见下面那条正路径测试）—— 本用例的夹具
+    // 没有导出任何文件，因此这里钉的是「没有 mediaId」的那一支。
     let media = v["media"].as_object().expect("media object");
     let mut mkeys: Vec<&str> = media.keys().map(String::as_str).collect();
     mkeys.sort_unstable();
-    assert_eq!(mkeys, ["fileName", "md5", "type"], "SSE 的 media 只有元数据：{media:?}");
+    assert_eq!(
+        mkeys,
+        ["fileName", "md5", "type"],
+        "未导出时 SSE 的 media 只有元数据：{media:?}"
+    );
 
     // 密钥绝不出现 —— 查**整帧原文**，而不是只看解析后的键：
     // 藏在某个值里的密钥同样是泄露。
     assert!(!data.contains("SECRET-AES-KEY"), "推送载荷里出现了 aes_key：{data}");
     assert!(!data.contains("aes"), "推送载荷里出现了 aes 字样：{data}");
 }
+/// 发一个最小 HTTP GET，返回 (状态码, 正文)。媒体是二进制，不能用 `read_to_string`。
+async fn http_get(addr: &str, path: &str) -> (u16, Vec<u8>) {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    let head = String::from_utf8_lossy(&buf);
+    let status: u16 = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let body_at = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    (status, buf[body_at..].to_vec())
+}
+
+/// `mediaId` 的**正路径**：导出根下确有文件时必须出现，而且**出现即可取**。
+///
+/// 为什么单列一条：上面那条键集断言只在「夹具恰好没有导出文件」这一取值上通过
+/// ——它钉住的是**没有** mediaId 的形状，而取字节的入口恰恰是**有** mediaId 的那一支。
+/// 单元测试只能证明「一次 stat 的判据对」，证明不了「从导出文件到 SSE 帧、再到
+/// HTTP 取回字节」这条链是通的：链上任何一环断了，都只有端到端看得见。
+#[tokio::test]
+async fn sse_media_id_is_advertised_and_fetchable() {
+    let dir = common::tmp_dir("ssemedia");
+    let server = start(&dir).await;
+
+    // 导出根下摆好文件：<export_dir>/<session>/images/<file> —— 布局由
+    // `media::export` 决定，这里必须与它一致（不一致就会得到「没有 mediaId」）。
+    let file_name = "aabbccddeeff00112233445566778899.jpg";
+    let exported = dir.join("api-media").join(common::FAKE_GROUP).join("images");
+    std::fs::create_dir_all(&exported).unwrap();
+    let bytes: &[u8] = b"\xFF\xD8 sse jpeg \xFF\xD9";
+    std::fs::write(exported.join(file_name), bytes).unwrap();
+
+    let ev = weflow_server::sync::Event::New(weflow_server::sync::NewMessageEvent {
+        session_id: common::FAKE_GROUP.to_string(),
+        session_type: "group",
+        rawid: "media-1".into(),
+        source_name: "src".into(),
+        group_name: Some("项目群".into()),
+        content: "[图片]".into(),
+        timestamp: 1_700_000_002,
+        media: Some(weflow_server::sync::PushMedia::from(
+            &weflow_server::parser::MediaHint {
+                kind: weflow_server::parser::MediaKind::Image,
+                file_name: file_name.into(),
+                md5: Some("deadbeef".into()),
+                aes_key: Some("SECRET-AES-KEY".into()),
+            },
+        )),
+    });
+    let reader = sse_frames(&server, None, Duration::from_secs(8), 1);
+    let sender = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        server.state.events.send(ev).ok();
+    };
+    let frames = tokio::join!(reader, sender).0;
+    let (_, _, data) = frames
+        .iter()
+        .find(|(_, e, _)| e == "message.new")
+        .expect("a message.new frame");
+    let v: serde_json::Value = serde_json::from_str(data).expect("payload is JSON");
+    let media_id = v["media"]["mediaId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("导出根下有文件时 mediaId 必须出现：{v}"));
+    assert!(!media_id.is_empty(), "mediaId 不得为空串");
+    // 密钥的护栏在这条路径上同样成立。
+    assert!(!data.contains("SECRET-AES-KEY"), "推送载荷里出现了 aes_key：{data}");
+
+    // 「出现即可取」：拿这个 id 真的把字节取回来。
+    let (status, body) = http_get(&server.addr, &format!("/api/v1/media/{media_id}")).await;
+    assert_eq!(status, 200, "mediaId 是从该端点取的：{media_id}");
+    assert_eq!(body, bytes, "取回的字节必须与导出的一致");
+}
+
 /// `sync` 基线帧的**键集**是契约。
 ///
 /// 这条护栏此前不存在 —— `sync` 的载荷改动了在仓库里是静默的（上面那条只钉 `message.new`）。

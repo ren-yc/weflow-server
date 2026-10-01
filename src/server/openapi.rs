@@ -90,9 +90,12 @@ type Ep = (&'static str, HttpMethod, Media, &'static str);
 /// 端点表。**它是手写的**：`#[utoipa::path]` 要给每个 handler 加注解，而那些 handler 的
 /// 返回类型是 `Response` / `Value`（多形状所致），注解反而容易与真实形状脱节。
 ///
-/// 改路由时**必须**改这里 —— 与 `tests/api_smoke.rs` 的 golden 端点清单互为对照：
-/// 那边漏了是快照缺口，这边漏了是描述缺口（字节面与 SSE 面无法进 JSON 快照，由本表收录）。
-/// `sns/*` 按 DTO 豁免暂不列入（它排在 DTO 化的最后一批）。
+/// 本表与**真实路由**的对等关系由 `tests/api_smoke.rs` 的
+/// `documented_routes_match_the_openapi_table` 强制：路由集合（`server::routes::ROUTES`）
+/// 减去豁免集合（`server::routes::NOT_DOCUMENTED`）**必须**等于本表的 (路径, 方法) 集合，
+/// 且这里声明的每个方法都要被真实路由接受。豁免写在代码里，不写在注释里。
+///
+/// 字节面与 SSE 面进不了 golden 端点清单，由本表收录。
 const ENDPOINTS: &[Ep] = &[
     ("/health", HttpMethod::Get, Media::Json(&["Health"]), ""),
     ("/health", HttpMethod::Post, Media::Json(&["Health"]), ""),
@@ -128,6 +131,12 @@ const ENDPOINTS: &[Ep] = &[
         HttpMethod::Get,
         Media::Json(&["SessionsNative", "SessionsChatlab"]),
         "会话列表：`limit` 默认 100。",
+    ),
+    (
+        "/api/v1/sessions",
+        HttpMethod::Post,
+        Media::Json(&["SessionsNative", "SessionsChatlab"]),
+        "同 GET（兼容不能发 GET 的调用方）。",
     ),
     (
         "/api/v1/sessions/{id}/messages",
@@ -205,6 +214,7 @@ const ENDPOINTS: &[Ep] = &[
         Media::Json(&["PullEnvelope"]),
         "Pull 面（与 `/api/v1/sessions/{id}/messages` 同一实现）：`limit` 单页上限 5000。",
     ),
+    ("/api/v1/sync", HttpMethod::Get, Media::Json(&["SyncResult"]), ""),
     ("/api/v1/sync", HttpMethod::Post, Media::Json(&["SyncResult"]), ""),
 ];
 

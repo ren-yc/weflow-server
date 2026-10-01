@@ -9,6 +9,7 @@ pub mod auth;
 pub mod dto;
 pub mod error;
 pub mod openapi;
+pub mod routes;
 pub(crate) mod chatlab;
 pub mod handlers;
 
@@ -415,88 +416,13 @@ async fn openapi_handler() -> axum::response::Response {
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
-    use handlers::*;
-    Router::new()
-        .route("/health", axum::routing::get(health::handler).post(health::handler))
-        .route("/api/v1/health", axum::routing::get(health::handler).post(health::handler))
-        // 接口描述**免鉴权**：它描述的是形状，不含任何本机信息（账号、路径、密钥都不在
-        // 里面），而且正是给尚未拿到 token 的接入方看的。
-        .route("/openapi.json", axum::routing::get(openapi_handler))
-        .route(
-            "/api/v1/accounts",
-            axum::routing::get(accounts::list_handler).post(accounts::handler),
-        )
-        .route(
-            "/api/v1/accounts/{wxid}",
-            axum::routing::delete(accounts::delete_handler),
-        )
-        // Alias for clients and proxies that cannot issue DELETE.
-        .route(
-            "/api/v1/accounts/{wxid}/deregister",
-            axum::routing::post(accounts::delete_handler),
-        )
-        .route("/api/v1/messages", axum::routing::get(messages::handler).post(messages::handler))
-        .route("/api/v1/sessions", axum::routing::get(sessions::handler).post(sessions::handler))
-        .route(
-            "/api/v1/sessions/{id}/messages",
-            axum::routing::get(chatlab_pull::handler),
-        )
-        .route("/api/v1/contacts", axum::routing::get(contacts::handler).post(contacts::handler))
-        .route(
-            "/api/v1/group-members",
-            axum::routing::get(group_members::handler).post(group_members::handler),
-        )
-        .route(
-            "/api/v1/media/{id}",
-            axum::routing::get(media::handler_by_id).post(media::handler_by_id),
-        )
-        .route(
-            "/api/v1/media/{talker}/{media_type}/{file}",
-            axum::routing::get(media::handler).post(media::handler),
-        )
-        .route(
-            "/api/v1/push/messages",
-            axum::routing::get(push_events::handler).post(push_events::handler),
-        )
-        // ── ChatLab 适配面（新增，**不改老路由**）──────────────────────────
-        //
-        // 规范把 `baseUrl` 定义为 `/chatlab`，于是这三条是 Pull 形状的入口。它们与 `/api/v1/*`
-        // **共用同一份实现与同一条总线**，差别只在默认语义：老面靠 `format=chatlab` 参数切换，
-        // 新面**天生就是** ChatLab 形状（调用方不必知道还有另一种）。
-        .route(
-            "/chatlab/push/messages",
-            axum::routing::get(chatlab_push::handler),
-        )
-        .route(
-            "/chatlab/sessions",
-            axum::routing::get(chatlab_sessions::handler),
-        )
-        // Pull 面**本身就是** ChatLab 形状（它没有 `format` 参数）。挂到规范约定的
-        // `{baseUrl}/sessions/{id}/messages` 上，于是 `baseUrl=/chatlab` 三条路由齐了。
-        .route(
-            "/chatlab/sessions/{id}/messages",
-            axum::routing::get(chatlab_pull::handler),
-        )
-        .route("/api/v1/sync", axum::routing::get(sync::handler).post(sync::handler))
-        .route(
-            "/api/v1/sns/timeline",
-            axum::routing::get(sns::timeline).post(sns::timeline),
-        )
-        .route(
-            "/api/v1/sns/usernames",
-            axum::routing::get(sns::usernames).post(sns::usernames),
-        )
-        .route("/api/v1/sns/stats", axum::routing::get(sns::stats).post(sns::stats))
-        .route("/api/v1/sns/export", axum::routing::get(sns::export).post(sns::export))
-        .route(
-            "/api/v1/sns/export/stats",
-            axum::routing::get(sns::export_stats).post(sns::export_stats),
-        )
-        .route(
-            "/api/v1/sns/media/proxy",
-            axum::routing::get(sns::media_proxy).post(sns::media_proxy),
-        )
-        .fallback(unknown_path)
+    // **路由表是唯一事实源**（见 `routes`）：这里只负责把它挂上去。加路由改 routes.rs，
+    // 不在这里 —— 于是「真实路由」与「接口描述」不可能各自漂移（对等测试在 api_smoke）。
+    let mut app = Router::new();
+    for r in routes::ROUTES {
+        app = app.route(r.path, routes::method_router(r.kind));
+    }
+    app.fallback(unknown_path)
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(state)
 }

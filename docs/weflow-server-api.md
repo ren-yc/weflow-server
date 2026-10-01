@@ -464,6 +464,7 @@ qqflow-server 的 `type` 取值为 `1` 私聊 / `2` 群聊，数值含义与本�
 | `members[].aliases` | 可选，`string[]` | 未列出 | **不输出** | 原生形状已有 `alias` 单值，需要时从 `/api/v1/contacts` 取 |
 | `members[].avatar` | 可选，要求 Data URL | 真实 URL | HTTP URL 或 `""` | 直接透传联系人行的 `avatar_url`，**不是** Data URL；缺值为空串 |
 | `messages[].mediaPath` | 不在标准 | 字段清单里有 | **两个面都不输出** | 给不出有意义的值（导出受 `media=1` 控制且只回填原生形状）；媒体字节请走 `/api/v1/messages` 的 `media` 对象（`exported: true` 才是可取判据） |
+| `members[].roles` | 可选，`[{id}]`（中文表列出） | 未列出 | **不输出** | **有意不做**，不是遗漏：它与 `members[].isOwner` 是同一件事的两种表达，而 `isOwner` 已经在输出；且两者受同一个限制——群主不在本页时都无从判断。要判断群主请用 `isOwner` |
 
 **类型覆盖面与 qqflow-server 不对等。** 本项目能输出
 `0/1/2/3/4/5/7/8/24/25/27/80/81/99`；qqflow-server 只能输出 `0/1/2/3/80/81/99`
