@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
+use tower::ServiceExt;
 use parking_lot::{Mutex, RwLock};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -573,4 +574,49 @@ async fn chatlab_revoke_frame_carries_platform_message_id() {
     assert_eq!(v["eventId"], "9001", "事件 id 与平台号同值但不同义：{v}");
     assert_eq!(v["event"], "message.revoke");
     assert!(v.get("content").is_none(), "通知帧不带正文：{v}");
+}
+
+/// 流的**最后一批字节**必须以 SSE 的空行分隔符结尾（\n\n）。
+///
+/// 为什么钉它：SSE 的帧分隔是「空行」，而最后一帧后面没有下一帧来触发分隔写入时，
+/// 尾帧是否自带分隔完全取决于 axum 的编码行为——它随版本可能改变，升级是静默的。
+/// 最后一帧丢分隔时，按块解析的消费者要靠 EOF 冲刷才不丢尾帧（clients/python 行为层
+/// 的 `watch` 正是这么兜底的），按行解析的消费者则会**静默丢弃**没有换行收尾的
+/// 最后一行。这里把「线上的尾字节形状」钉住：它变红时说明分隔语义变了，上述消费者
+/// 都需要复核。
+///
+/// 经 tower `oneshot` 读响应体（与 api_smoke 同路），`to_bytes` 拿到的是**解码后**的
+/// 正文，断言不受 chunked 帧化的干扰。
+#[tokio::test]
+async fn stream_tail_ends_with_a_blank_line_separator() {
+    let dir = common::tmp_dir("ssetail");
+    let server = start(&dir).await;
+    let app: Router = server::build_router(server.state.clone());
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/api/v1/push/messages?access_token={TOKEN}"))
+                .header("Authorization", format!("Bearer {TOKEN}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // The stream closes itself via the shutdown watch: trigger it, then read
+    // the body to EOF.
+    server.state.shutdown.send_replace(true);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .expect("response body");
+    let body = &body[..];
+    assert!(
+        body.starts_with(b"event: ready"),
+        "流应从 ready 帧开始：{:?}",
+        String::from_utf8_lossy(&body[..body.len().min(80)]),
+    );
+    assert!(
+        body.ends_with(b"\n\n"),
+        "SSE 流的最后一帧必须自带空行分隔，否则按空行分块的消费者会丢尾帧：尾 40 字节 = {:?}",
+        String::from_utf8_lossy(&body[body.len().saturating_sub(40)..]),
+    );
 }
