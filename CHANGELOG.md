@@ -15,9 +15,13 @@
 - **`clients/python`（`weflow-sdk`）**：类型化 Python SDK（纯 Python，`httpx` + pydantic，`py.typed`）。
   模型由描述生成（`scripts/regen.py`，规范化后的 spec 一并入库，CI 断言「重生成无 diff」——
   spec 的来源是 Rust 侧生成工具的 `--dump-spec`，避免 golden 的占位掩码把易变值的真实类型烧成 string）；
-  行为面与 Rust 侧逐方法同构：`ensure_ready` / `drain_session` / `list_all_sessions` / `watch`
-  （SSE 重连带 `Last-Event-ID`；**修复：服务器断流时最后一帧若不带空行分隔会随缓冲丢失**——
-  现在 EOF 时冲刷残余块）/ `media_bytes`（404 后按「先 `media=1` 导出再取」重试一次）/ `search`。
+  行为面与 Rust 侧逐方法同构：`ensure_ready` / `wait_ready`（wait-only 就绪轮询，不做任何注册动作）/
+  `drain_session` / `list_all_sessions` / `watch` / `media_bytes`（404 后按「先 `media=1` 导出再取」重试一次）/`search`。
+  `ensure_ready` 现在把 200 响应体里 `state` 为拒绝态（`account_conflict` 等）的应答映射为 `StatusError`
+  快速失败，不再当作受理后空等到超时；`watch` 改为**单连接连续产出多帧**（原先每帧断开重连，空闲时
+  也无限重连且每次重连都重放基线帧），分帧改为**字节级 LF**（`aiter_lines` 的 splitlines 语义会把含
+  U+0085/U+2028/U+2029 的 JSON 正文拆断）并加 **1 MiB 未消费缓冲上限**（畸形无空行流不再无界膨胀），
+  单帧解码失败记 WARNING 跳过而不再杀流，EOF 时把未终结残行并入末帧冲刷。
   本轮不发布 PyPI；测试对进程内 ASGI mock 跑，不依赖真库。
 - **`clients/regen`（`weflow-regen`）**：生成工具（`cargo run -p weflow-regen`，`--check`
   供 CI 用）。它把服务端描述做确定性规范化（3.1 → 3.0：`type: [T, null]` 转 `nullable`、
