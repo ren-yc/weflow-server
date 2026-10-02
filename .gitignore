@@ -39,3 +39,8 @@ Desktop.ini
 conformance/
 conformance-suite/
 conformance-nails/
+
+# Python SDK 本地虚拟环境（测试用，不入库）
+clients/python/.venv/
+__pycache__/
+*.pyc

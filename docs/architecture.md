@@ -141,7 +141,8 @@
 | 成员 | 内容 | 维护方式 |
 |---|---|---|
 | `clients/rust`（`weflow-client`） | 类型与操作客户端 ＋ 手写行为层（就绪轮询 / 游标排空 / SSE 重连 / 媒体重试 / 检索） | `generated/` 只许生成器改（`clients/regen`，CI 断言重生成无 diff）；行为层手写并测 |
-| `clients/regen`（`weflow-regen`） | 生成工具：取 `server::openapi::document()`，做确定性规范化（3.1 → 3.0）后交给生成器 | 改规范化规则 = 改语义，需评审 |
+| `clients/regen`（`weflow-regen`） | 生成工具：取 `server::openapi::document()`，做确定性规范化（3.1 → 3.0）后交给生成器；`--dump-spec` 同时供 Python 侧取规范化 spec | 改规范化规则 = 改语义，需评审 |
+| `clients/python`（`weflow-sdk`） | Python 版：模型由 openapi-generator 从同一份规范化 spec 生成（`scripts/regen.py`）；行为层 `httpx.AsyncClient` 异步实现，与 Rust 侧逐方法同构 | 同上：生成物入库 + no-diff 门禁；行为层手写并测 |
 
 分层的理由：描述文档只声明「形状」，不声明「翻页到什么时候停、断线后从哪续」——后者是行为，
 生成不出来；而类型若靠手写，必然与描述静默分叉。所以形状交给生成器（入库 + no-diff 门禁），

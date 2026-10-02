@@ -41,6 +41,14 @@ fn main() {
     if let Some(obj) = value.as_object_mut() {
         obj.insert("openapi".into(), serde_json::json!("3.0.3"));
     }
+    if std::env::args().any(|a| a == "--dump-spec") {
+        // For sibling generators: the Python regen reads this instead of the
+        // golden snapshot, whose placeholder masking would burn the wrong
+        // types (a volatile integer property restored as string) into the
+        // generated models.
+        println!("{}", serde_json::to_string_pretty(&value).expect("spec must serialize"));
+        return;
+    }
     let spec: openapiv3::OpenAPI =
         serde_json::from_value(value).expect("normalized description must parse as OpenAPI 3.0");
 

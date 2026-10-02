@@ -176,7 +176,24 @@ jobs:
       # 该 crate 无原生依赖（无 vendored OpenSSL），直接 cargo 跑即可。
       - name: typed SDK tests
         if: runner.os != 'Windows'
-        run: cargo test --locked -p weflow-client      # ── 一致性套件（契约用例，两个仓库共用一份）────────────────────────────
+        run: cargo test --locked -p weflow-client
+
+      # Python SDK：模型生成物入库，regen --check 断言 spec 与生成管线无漂移
+      # （spec 取自 Rust 生成工具的 --dump-spec，绕开 golden 的占位掩码）；
+      # 行为层对进程内 ASGI mock 测，独立 venv 装包，不碰全局解释器。
+      - name: generated python models match their description
+        if: runner.os != 'Windows'
+        run: (cd clients/python && python3 scripts/regen.py --check)
+
+      - name: typed python SDK tests
+        if: runner.os != 'Windows'
+        run: |
+          cd clients/python
+          python3 -m venv .venv
+          .venv/bin/python -m pip install -q -e '.[dev]'
+          .venv/bin/python -m pytest tests/ -q
+
+      # ── 一致性套件（契约用例，两个仓库共用一份）────────────────────────────
       #
       # 此前关闭过一段时间：套件里有一条断言 404 响应体带 `error` 键，而本仓库统一成
       # `{success, code, message}`。那条分歧已裁决 —— **契约改断言对齐实现**（`v0.2.0`，minor，

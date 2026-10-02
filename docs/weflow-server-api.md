@@ -819,6 +819,9 @@ weflow-server.exe --port 5033 --watch-fallback-ms 5000 --log info
 
 ## 类型化客户端（SDK）
 
+本仓库提供两种语言的同构客户端：`clients/rust`（Rust）与 `clients/python`（Python，`weflow-sdk`）。
+两者分层一致：生成类型 + 手写行为层，行为方法的语义（503 是等待、游标原样回传、`Last-Event-ID` 重连、404 后先导出再取）在两侧保持相同。
+
 本仓库自带类型化 Rust 客户端：`clients/rust`（crate 名 `weflow-client`，workspace 成员）。
 
 - **类型与操作客户端是生成的**：出处是 `/openapi.json` 的描述（生成工具 `clients/regen`，
@@ -831,3 +834,8 @@ weflow-server.exe --port 5033 --watch-fallback-ms 5000 --log info
   导出再取」自动重试一次）、关键词检索（`search`，`YYYYMMDD` 客户端先校验）。
 - 鉴权走 `Authorization: Bearer`；客户端从不把 token 放进 URL。
 - 本轮**不发布** crates.io：本地 `cargo build -p weflow-client` 即可使用。
+
+- **Python 侧**：`clients/python`（包 `weflow-sdk`）。模型生成走 `scripts/regen.py`
+  （spec 经 Rust 生成工具的 `--dump-spec` 取得，绕开 golden 的占位掩码）；行为层是
+  `httpx.AsyncClient` 异步实现，`from weflow_sdk import Client` 即用。测试对进程内
+  ASGI mock 跑：`clients/python/.venv/Scripts/python -m pytest tests/`。
