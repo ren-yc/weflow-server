@@ -1,0 +1,16 @@
+{
+  "name": "weflow-server-ts-example",
+  "version": "0.7.0",
+  "private": true,
+  "description": "TypeScript example client for weflow-server (example only, not published to npm)",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "smoke": "node --experimental-fetch dist/smoke.js",
+    "build": "tsc"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.1",
+    "typescript": "^5.6.3"
+  }
+}
