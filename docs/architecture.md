@@ -142,7 +142,8 @@
 |---|---|---|
 | `clients/rust`（`weflow-client`） | 类型与操作客户端 ＋ 手写行为层（就绪轮询 / 游标排空 / SSE 重连 / 媒体重试 / 检索） | `generated/` 只许生成器改（`clients/regen`，CI 断言重生成无 diff）；行为层手写并测 |
 | `clients/regen`（`weflow-regen`） | 生成工具：取 `server::openapi::document()`，做确定性规范化（3.1 → 3.0）后交给生成器；`--dump-spec` 同时供 Python 侧取规范化 spec | 改规范化规则 = 改语义，需评审 |
-| `clients/python`（`weflow-sdk`） | Python 版：模型由 openapi-generator 从同一份规范化 spec 生成（`scripts/regen.py`）；行为层 `httpx.AsyncClient` 异步实现，与 Rust 侧逐方法同构 | 同上：生成物入库 + no-diff 门禁；行为层手写并测 |
+| `clients/python`（`weflow-sdk`） | Python 版：模型由 openapi-generator 从同一份规范化 spec 生成（`scripts/regen.py`）；行为层 `httpx.AsyncClient` 异步实现，与 Rust 侧逐方法同构：`wait_ready`（wait-only 就绪轮询，不做任何注册动作）、`ensure_ready`（注册应答里 200 拒绝态映射为 `StatusError` 快速失败，不再空等到超时）、`watch`（单连接连续产出多帧——每帧断开会让空闲心跳变成无限重连且每次重连都重放基线帧；字节级 LF 分帧，`aiter_lines` 的 splitlines 语义会把含 U+0085/U+2028/U+2029 的 JSON 正文拆断；1 MiB 未消费缓冲上限；单帧解码失败跳过不杀流；EOF 冲刷未终结残行） | 同上：生成物入库 + no-diff 门禁；行为层手写并测 |
+| `clients/ts` | TypeScript 示例客户端（仅示例，不发布 npm）：`wait_ready`/`ensure_ready`/`watch` 的演示级实现 + 可执行 smoke（对真实服务断言 HTTP 结果）。行为语义与 Rust/Python 行为层一致，但不承诺兼容性 | 不进 CI 产物矩阵；`tsc --noEmit` + smoke 手动跑 |
 
 分层的理由：描述文档只声明「形状」，不声明「翻页到什么时候停、断线后从哪续」——后者是行为，
 生成不出来；而类型若靠手写，必然与描述静默分叉。所以形状交给生成器（入库 + no-diff 门禁），
