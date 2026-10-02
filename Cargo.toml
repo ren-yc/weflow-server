@@ -81,3 +81,7 @@ debug = 0
 opt-level = 3
 lto = "thin"
 strip = true
+
+[workspace]
+members = ["clients/rust", "clients/regen"]
+resolver = "3"

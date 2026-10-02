@@ -161,7 +161,22 @@ jobs:
       - name: embed example builds without default features
         if: runner.os != 'Windows'
         run: bash scripts/build.sh build --locked --example embed --no-default-features
-      # ── 一致性套件（契约用例，两个仓库共用一份）────────────────────────────
+
+      # ── 类型化 SDK（clients/rust）──────────────────────────────────────────
+      #
+      # 生成的客户端类型入库；这一步断言「重生成后无 diff」——类型与描述静默分叉
+      # （改了服务端却忘了重新生成）会在这里红，而不是等到下游生成的代码缺类型。
+      # 生成本体是仓内工具（weflow-regen），它的规范化（3.1 → 3.0）是确定性的，
+      # 所以 diff 只能来自描述本身的语义变化。
+      - name: generated client matches its description
+        if: runner.os != 'Windows'
+        run: bash scripts/build.sh run --locked -p weflow-regen -- --check
+
+      # SDK 的行为面（游标排空、重连、就绪轮询）对着夹具 mock 测，不需要真库。
+      # 该 crate 无原生依赖（无 vendored OpenSSL），直接 cargo 跑即可。
+      - name: typed SDK tests
+        if: runner.os != 'Windows'
+        run: cargo test --locked -p weflow-client      # ── 一致性套件（契约用例，两个仓库共用一份）────────────────────────────
       #
       # 此前关闭过一段时间：套件里有一条断言 404 响应体带 `error` 键，而本仓库统一成
       # `{success, code, message}`。那条分歧已裁决 —— **契约改断言对齐实现**（`v0.2.0`，minor，

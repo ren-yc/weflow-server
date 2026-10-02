@@ -816,3 +816,18 @@ weflow-server.exe --port 5033 --watch-fallback-ms 5000 --log info
 `--watch-fallback-ms`、`--media-export-dir`、`--base-url`（全部仅命令行，无配置文件）。
 数据目录不可配置：Windows `%LOCALAPPDATA%\weflow-server`；媒体导出默认落在其下的
 `api-media`，仅 `--media-export-dir` 可改。
+
+## 类型化客户端（SDK）
+
+本仓库自带类型化 Rust 客户端：`clients/rust`（crate 名 `weflow-client`，workspace 成员）。
+
+- **类型与操作客户端是生成的**：出处是 `/openapi.json` 的描述（生成工具 `clients/regen`，
+  `cargo run -p weflow-regen` 重新生成；生成物入库，CI 断言「重生成无 diff」）。**不要手改**
+  `clients/rust/src/generated/` 下的任何文件。
+- **行为层是手写的**（`clients/rust/src/client.rs`）：就绪轮询（`ensure_ready`，503 是等待
+  而不是错误）、Pull 游标排空（`drain_session`，`nextSince`/`nextOffset` 原样回传）、
+  会话列表排空、SSE 订阅（`watch`，`Last-Event-ID` 重连、心跳注释帧过滤、`generation`
+  变化上报给调用方决定是否回退 Pull 补拉）、媒体字节（`media_bytes`，404 后按「先 `media=1`
+  导出再取」自动重试一次）、关键词检索（`search`，`YYYYMMDD` 客户端先校验）。
+- 鉴权走 `Authorization: Bearer`；客户端从不把 token 放进 URL。
+- 本轮**不发布** crates.io：本地 `cargo build -p weflow-client` 即可使用。
