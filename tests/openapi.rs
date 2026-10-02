@@ -84,6 +84,37 @@ fn openapi_document_is_self_consistent() {
         }
     }
 
+    // 3.5 路径模板里的每个占位符必须有同名的 path 参数声明（OpenAPI 规范要求）。
+    //    golden 快照记录的是「输出了什么」，不校验「描述是否合法」，所以缺声明的文档
+    //    能带着空参数表一路绿进 golden —— 直到客户端生成器把整份文档当非法输入拒绝。
+    for (path, item) in paths {
+        let want: Vec<&str> = path
+            .split('/')
+            .filter_map(|seg| seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')))
+            .collect();
+        if want.is_empty() {
+            continue;
+        }
+        for (method, op) in item.as_object().expect("path item 必须是对象") {
+            let declared: Vec<&str> = op["parameters"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|p| {
+                            p["in"].as_str().filter(|loc| *loc == "path").and_then(|_| p["name"].as_str())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            for name in &want {
+                assert!(
+                    declared.contains(name),
+                    "{method} {path} 的模板占位符 {{{name}}} 没有对应的 path 参数声明"
+                );
+            }
+        }
+    }
+
     // 4. 多形状端点必须用 `oneOf` —— 用「所有字段都可选」的单个 schema 会让描述看起来
     //    合法，而实际没有任何取值组合是对的。
     let accounts = &doc["paths"]["/api/v1/accounts"]["post"]["responses"]["200"]["content"]

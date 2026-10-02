@@ -1436,6 +1436,17 @@
         "delete": {
           "description": "注销账号。",
           "operationId": "delete__api_v1_accounts__wxid",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "wxid",
+              "required": true,
+              "schema": {
+                "type": "string"
+              },
+              "style": "simple"
+            }
+          ],
           "responses": {
             "200": {
               "content": {
@@ -1531,6 +1542,17 @@
         "get": {
           "description": "字节面（唯一入口）：只服务导出根下**摘要派生**的文件名；未导出的先经 `media=1`（每请求上限 200 项）导出。同名多命中时内容一致才服务、不一致给 404。",
           "operationId": "get__api_v1_media__id",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "id",
+              "required": true,
+              "schema": {
+                "type": "string"
+              },
+              "style": "simple"
+            }
+          ],
           "responses": {
             "200": {
               "content": {
@@ -1605,6 +1627,17 @@
         "get": {
           "description": "游标拉取：`limit` 单页上限 5000。",
           "operationId": "get__api_v1_sessions__id__messages",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "id",
+              "required": true,
+              "schema": {
+                "type": "string"
+              },
+              "style": "simple"
+            }
+          ],
           "responses": {
             "200": {
               "content": {
@@ -1710,6 +1743,17 @@
         "get": {
           "description": "Pull 面（与 `/api/v1/sessions/{id}/messages` 同一实现）：`limit` 单页上限 5000。",
           "operationId": "get__chatlab_sessions__id__messages",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "id",
+              "required": true,
+              "schema": {
+                "type": "string"
+              },
+              "style": "simple"
+            }
+          ],
           "responses": {
             "200": {
               "content": {
@@ -2583,6 +2627,13 @@
     "delete",
     "description",
     "operationId",
+    "parameters",
+    "in",
+    "name",
+    "required",
+    "schema",
+    "type",
+    "style",
     "responses",
     "200",
     "content",
@@ -2637,6 +2688,13 @@
     "get",
     "description",
     "operationId",
+    "parameters",
+    "in",
+    "name",
+    "required",
+    "schema",
+    "type",
+    "style",
     "responses",
     "200",
     "content",
@@ -2683,6 +2741,13 @@
     "get",
     "description",
     "operationId",
+    "parameters",
+    "in",
+    "name",
+    "required",
+    "schema",
+    "type",
+    "style",
     "responses",
     "200",
     "content",
@@ -2747,6 +2812,13 @@
     "get",
     "description",
     "operationId",
+    "parameters",
+    "in",
+    "name",
+    "required",
+    "schema",
+    "type",
+    "style",
     "responses",
     "200",
     "content",

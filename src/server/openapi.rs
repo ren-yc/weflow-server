@@ -244,6 +244,26 @@ fn success_response(media: &Media) -> serde_json::Value {
     })
 }
 
+/// 从路径模板机械推导 path 参数声明。参数名与模板占位符一一对应；漏写会让描述违反
+/// OpenAPI 规范（模板占位符必须有同名 path 参数），而按描述生成客户端类型的工具把
+/// 这种文档当非法输入直接拒绝 —— golden 快照不校验参数，缺了不会有任何东西变红。
+fn path_params(path: &str) -> serde_json::Value {
+    serde_json::Value::Array(
+        path.split('/')
+            .filter_map(|seg| seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')))
+            .map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "in": "path",
+                    "required": true,
+                    "style": "simple",
+                    "schema": { "type": "string" },
+                })
+            })
+            .collect(),
+    )
+}
+
 /// 生成完整描述。
 pub fn document() -> OpenApi {
     let base = ApiDoc::openapi();
@@ -260,6 +280,10 @@ pub fn document() -> OpenApi {
             "operationId": op_id,
             "responses": { "200": success_response(media) },
         });
+        let params = path_params(path);
+        if params.as_array().is_some_and(|a| !a.is_empty()) {
+            op["parameters"] = params;
+        }
         if !desc.is_empty() {
             op["description"] = serde_json::Value::String((*desc).to_string());
         }
