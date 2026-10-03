@@ -237,6 +237,15 @@ def main():
     fresh_spec = json.dumps(spec, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
 
     if args.check:
+        # The digest half of --check actually runs the generator (unlike the
+        # old spec-only check), so CI needs node/npx + a JRE. Fail with a
+        # readable line instead of a subprocess traceback.
+        import shutil as _shutil
+        npx = "npx.cmd" if sys.platform == "win32" else "npx"
+        if _shutil.which(npx) is None:
+            print("regen --check needs npx (Node.js) on PATH to regenerate the tree",
+                  file=sys.stderr)
+            return 1
         # Two comparisons, because "the spec did not change" is NOT the gate
         # it looks like: model output and whitespace can drift while the
         # description stays byte-identical (generator version, templates).

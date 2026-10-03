@@ -181,6 +181,25 @@ jobs:
       # Python SDK：模型生成物入库，regen --check 断言 spec 与生成管线无漂移
       # （spec 取自 Rust 生成工具的 --dump-spec，绕开 golden 的占位掩码）；
       # 行为层对进程内 ASGI mock 测，独立 venv 装包，不碰全局解释器。
+      # The Python no-diff gate regenerates the whole tree with the pinned
+      # openapi-generator jar (openapitools.json) - unlike the old spec-only
+      # check this needs node/npx AND a JRE, so both are pinned explicitly
+      # rather than trusting the image default (the same reason the Rust
+      # toolchain is pinned in rust-toolchain.toml: a moving default turns
+      # CI red or silently green on days nobody changed code).
+      - name: OpenAPI generator toolchain (node + jre)
+        if: runner.os != 'Windows'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Java runtime for openapi-generator
+        if: runner.os != 'Windows'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
       - name: generated python models match their description
         if: runner.os != 'Windows'
         run: (cd clients/python && python3 scripts/regen.py --check)
