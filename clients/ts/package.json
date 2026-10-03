@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "smoke": "node --experimental-fetch dist/smoke.js",
+    "smoke": "node dist/smoke.js",
     "build": "tsc"
   },
   "devDependencies": {
