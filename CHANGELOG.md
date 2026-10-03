@@ -4,8 +4,53 @@
 
 ## [未发布]
 
+### 变更
+
+- **`clients/python`（`weflow-sdk`）`watch()` 的缓冲上限语义**：1 MiB 上限现在同时
+  约束「单个完整帧」与「未成帧累计」——超限帧（无论格式是否合法）一律**不交付**，
+  本次流结束并退避重连（原先超限的完整帧会先被交付）。这是行为变化；SDK 未发布、
+  无迁移动作。回归位置：`clients/python/tests/test_behavior.py` 的
+  `test_watch_rejects_oversized_single_frame_whole_and_split`（对照
+  `test_watch_delivers_frame_just_under_the_cap`）。
+- **`clients/python`（`weflow-sdk`）`watch()` 的重连退避**：退避只在「干净结束」
+  （EOF、无超限、无传输错误）时复位到 0.5s，否则按 0.5→1→2→4… 升级到 30s 上限。
+  原先每建一次连接即复位：畸形但能建连的流永远 0.5s 一轮（实测 3 秒 6 连），退避
+  形同虚设。回归位置：`test_watch_backoff_escalates_on_persistent_overflow`（对照
+  `test_watch_backoff_returns_to_floor_after_clean_stream_end`）。
+- **`clients/python`（`weflow-sdk`）SSE 一帧多条 `data:` 行按规范以 LF 拼接**成单一
+  载荷（原先逐行覆盖、只保留末行）。当前服务端每帧恰一行 `data:`，对现有形状逐字节
+  中性；回归位置：`test_watch_joins_multiple_data_lines_per_frame`（三行边界对照
+  `test_watch_joins_three_data_lines_boundary`）。
+- **`clients/ts` 示例**：POST 显式携带 `Content-Type: application/json`（服务端 axum
+  Json 提取器对非 JSON 内容类型回 415，示例此前必然踩中）；`smoke.ts` 第 3 步改为
+  真断言——只接受「业务拒绝（StatusError 带 state）」或「受理后就绪等待超时
+  （NotReadyError）」两种合法结局，其它结局（415/5xx/网络错误/未知异常）非零退出；
+  新增可入库的 `stub-server.mjs`（无真实服务即可门禁：`STUB_STATUS=500` 必须让
+  smoke 变红）；`watch` 补齐真实帧组装（`id:`/`event:`/`data:` 切分、空行成帧、
+  `Last-Event-ID`、字节上限），与 qqflow 版同构（weflow 版为异步生成器、qqflow 版为
+  回调），README 写明两版等价。
+- **`clients/python`（`weflow-sdk`）`watch` 撤销从未生效的 `poll_interval` 形参
+  （破坏性）**：该形参在 0.7.0 引入后从未被函数体读取（Rust 侧亦无对应参数），
+  现已从签名移除。**迁移方式**：调用方删掉该实参即可，行为不变。SDK 未发布，
+  已核实在役调用点为零。
+
 ### 新增
 
+- **`clients/python` ruff 门禁**：`clients/python/pyproject.toml` 落显式的
+  `[tool.ruff]` 与 `[tool.ruff.lint]` 表（规则集写死在配置里、不依赖默认集；
+  生成层的排除只写在配置文件中——CLI 传相对排除按 cwd 解析、传 `--config` 会改变
+  配置内相对路径的基准，两种写法都会让排除静默失效并把生成层整套扫进去）；
+  CI `check.yml` 增加对 `src` 与 `tests` 的 ruff 步骤，并附「摘掉排除后命中必须
+  涨到千量级」的区分力自检（本地实测 2253 条）；`ruff` 以精确版本钉进 dev extras
+  （默认规则集随版本漂移，钉死才可复现）。手写层首批告警清零（pyupgrade 系与
+  `RUF022` 自动修后逐处人工过 diff；`watch` EOF 支路的裸 `except Exception` 收窄为
+  与主循环相同的 `(ShapeError, ValidationError, AttributeError)`）。
+- **`clients/python/src/weflow_sdk/LICENSE`**：仓库根许可证复制进包树，随构建产物
+  分发（消费方打包时由各自的 package-data 声明决定是否入 wheel）。
+- **`clients/python/scripts/regen.py --check` 改为对生成树做摘要比对**（此前只比
+  `spec.json`）：重生成到临时目录、与已提交生成树逐文件比摘要，模型层或空白层面的
+  漂移不再可能「spec 没变就算绿」。生成器版本钉在 npx 调用里（wrapper 2.41.0 →
+  openapi-generator 7.25.0），不再依赖可漂移的 latest。
 - **`clients/rust`（`weflow-client`）**：类型化 Rust SDK（workspace 成员，随根包版本 0.7.0）。
   类型与操作客户端由 `/openapi.json` 描述生成（生成物入库，CI 断言「重生成无 diff」）；
   行为面手写六件套：`ensure_ready`（注册 + 就绪轮询，吸收 503 语义）、`drain_session`
@@ -40,8 +85,6 @@
 
 接口面的形状收敛：老面只做原生/富数据面，ChatLab 形状搬到 `/chatlab/*`；媒体只留一条按名取字节的路由；
 鉴权通道减到两条。**破坏性变更较多**，逐条迁移见文末「迁移」。
-
-### 新增
 
 - **`GET /chatlab/messages`** —— ChatLab 形状的消息面，也是原「混合面」
   （`/api/v1/messages?chatlab=1`）的新家：参数 `talker`（必填）/ `limit` / `offset` / `cursor` / 
