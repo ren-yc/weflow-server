@@ -193,6 +193,37 @@ jobs:
           .venv/bin/python -m pip install -q -e '.[dev]'
           .venv/bin/python -m pytest tests/ -q
 
+      # Handwritten SDK layer lint: explicit rule set from
+      # clients/python/pyproject.toml (no default-set drift). Reuses the
+      # SDK-test venv (created immediately above), ruff pinned in dev
+      # extras - do not pip-install ruff here: an unpinned ruff rebinds
+      # rule behavior to whatever version CI happens to fetch. Do not add
+      # --config / --extend-exclude on the CLI: both change how the
+      # config's relative excludes resolve (cwd vs config dir) and would
+      # silently scan the generated tree.
+      - name: ruff (clients/python handwritten layer)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cd clients/python
+          .venv/bin/python -m ruff check src tests
+
+          # discriminating check of the EXCLUSION (the lint step passing
+          # alone does not prove generated/ is skipped): an isolated scan
+          # (no config, no exclude) over the same paths must find on the
+          # order of a thousand hits in the generated tree. Fewer than 100
+          # means the exclude is not what keeps the main check green -> fail.
+          # Measured locally: weflow 2253 / qqflow 2149 hits.
+          found=$(.venv/bin/python -m ruff check src tests \
+                 --isolated --select E4,E7,E9,F,I,RUF,G,LOG,BLE,UP 2>&1 \
+                 | sed -n "s/^Found \([0-9]*\) error.*/\1/p" | tail -1)
+          if [ -z "$found" ] || [ "$found" -lt 100 ]; then
+            echo "ruff exclusion guard FAILED: isolated scan found ${found:-0} hits" \
+                 "(expected ~2000 if generated/ is really scanned)" >&2
+            exit 1
+          fi
+          echo "ruff exclusion guard ok: generated tree scan = $found hits"
+
       # ── 一致性套件（契约用例，两个仓库共用一份）────────────────────────────
       #
       # 此前关闭过一段时间：套件里有一条断言 404 响应体带 `error` 键，而本仓库统一成
