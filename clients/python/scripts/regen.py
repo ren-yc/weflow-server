@@ -21,7 +21,7 @@ generated/ by hand.
 
 Usage:
     python scripts/regen.py            # regenerate (needs openapi-generator)
-    python scripts/regen.py --check    # exit 1 if a regen would change files
+    python scripts/regen.py --check    # exit 1 if a regen would change spec or tree
 """
 
 from __future__ import annotations
@@ -38,6 +38,13 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[3]
 GOLDEN = REPO / "tests" / "golden" / "openapi.json"
 OUT = Path(__file__).resolve().parents[1] / "src" / "weflow_sdk" / "generated"
+PKG = OUT.parent.name          # the generated package directory (its import root)
+PKGDIR = Path(__file__).resolve().parents[1]      # clients/python
+CONFIG = PKGDIR / "openapitools.json"             # pins the generator jar version
+# The wrapper version is pinned in the npx call itself: the floating default
+# would let a new wrapper (or its default jar) change generation without any
+# repo change - exactly what the no-diff gate must be able to blame.
+WRAPPER = "@openapitools/openapi-generator-cli@2.41.0"
 
 
 def normalize(node):
@@ -134,11 +141,18 @@ def build_spec() -> dict:
     return doc
 
 def tree_digest(root: Path) -> str:
+    # Byte-compiled artifacts are excluded deliberately: a local pytest run
+    # drops __pycache__/*.pyc INSIDE the generated tree (the scratch
+    # regeneration never makes them), and without this filter the digest
+    # gate reports a false "stale tree" on a byte-identical checkout.
     sha = hashlib.sha256()
     for path in sorted(root.rglob("*")):
-        if path.is_file():
-            sha.update(str(path.relative_to(root)).encode())
-            sha.update(path.read_bytes())
+        if not path.is_file():
+            continue
+        if "__pycache__" in path.parts or path.suffix == ".pyc":
+            continue
+        sha.update(str(path.relative_to(root)).encode())
+        sha.update(path.read_bytes())
     return sha.hexdigest()
 
 
@@ -174,69 +188,90 @@ def normalize_generated(root: Path) -> int:
     return changed
 
 
-def main() -> int:
+def write_spec(spec, path):
+    text = json.dumps(spec, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
+    path.write_text(text, encoding="utf-8")
+    return text
+
+
+def generate_tree(spec_path, dest_root):
+    # Run the generator from spec_path into dest_root/PKG, keeping only the
+    # library face, rewriting the absolute imports the generator emits
+    # (nested under our package they would resolve to the handwritten one),
+    # and normalizing whitespace. Returns the number of files normalized.
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_out = Path(tmp) / "gen"
+        cmd = ["npx.cmd" if sys.platform == "win32" else "npx",
+               "--yes", WRAPPER,
+               "--openapitools", str(CONFIG),
+               "generate",
+               "-i", str(spec_path),
+               "-g", "python",
+               "-o", str(tmp_out),
+               "--package-name", PKG,
+               "--library", "httpx"]
+        subprocess.run(cmd, check=True, cwd=str(PKGDIR))
+        shutil.copytree(tmp_out / PKG, dest_root / PKG)
+    pkg_dir = dest_root / PKG
+    for py_file in pkg_dir.rglob("*.py"):
+        text = py_file.read_text(encoding="utf-8")
+        fixed = (
+            text
+            .replace("from " + PKG + ".", "from " + PKG + ".generated." + PKG + ".")
+            .replace("from " + PKG + " import",
+                     "from " + PKG + ".generated." + PKG + " import")
+            .replace("import " + PKG + ".", "import " + PKG + ".generated." + PKG + ".")
+        )
+        if fixed != text:
+            py_file.write_text(fixed, encoding="utf-8")
+    return normalize_generated(dest_root)
+
+
+def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true",
-                        help="fail if a regeneration would change files")
+                        help="fail if a regeneration would change spec or the tree")
     args = parser.parse_args()
 
     spec = build_spec()
+    fresh_spec = json.dumps(spec, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
+
     if args.check:
-        # The no-diff gate compares the committed spec against a fresh build;
-        # the generated client is derived from that spec by the pinned
-        # generator version, so spec equality implies client equality.
-        committed = (OUT / "spec.json").read_text(encoding="utf-8")
-        fresh = json.dumps(spec, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
-        if committed != fresh:
-            print("generated spec is stale: rerun scripts/regen.py and commit", file=sys.stderr)
+        # Two comparisons, because "the spec did not change" is NOT the gate
+        # it looks like: model output and whitespace can drift while the
+        # description stays byte-identical (generator version, templates).
+        # The whole tree is regenerated into a scratch dir and compared by
+        # digest; spec equality alone could not see any of that.
+        committed_spec = (OUT / "spec.json").read_text(encoding="utf-8")
+        if committed_spec != fresh_spec:
+            print("generated spec is stale: rerun scripts/regen.py and commit",
+                  file=sys.stderr)
             return 1
-        print("generated spec is up to date:", OUT / "spec.json")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_spec = Path(tmp) / "spec.json"
+            tmp_spec.write_text(fresh_spec, encoding="utf-8")
+            gen_root = Path(tmp) / "tree"
+            gen_root.mkdir()
+            generate_tree(tmp_spec, gen_root)
+            fresh_digest = tree_digest(gen_root / PKG)
+        committed_digest = tree_digest(OUT / PKG)
+        if fresh_digest != committed_digest:
+            print("generated tree is stale: rerun scripts/regen.py and commit\n"
+                  "  committed    " + committed_digest + "\n"
+                  "  regenerated  " + fresh_digest, file=sys.stderr)
+            return 1
+        print("generated spec and tree are up to date:", OUT, fresh_digest[:12])
         return 0
 
     OUT.mkdir(parents=True, exist_ok=True)
     spec_path = OUT / "spec.json"
-    spec_path.write_text(json.dumps(spec, indent=2, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+    write_spec(spec, spec_path)
 
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_out = Path(tmp) / "gen"
-        cmd = [
-            sys.executable, "-m", "openapi_generator_cli"
-            if False else "npx.cmd" if sys.platform == "win32" else "npx",
-        ]
-        # npx invocation kept explicit: the wrapper resolves the pinned
-        # generator version through .openapi-generator/ in the package dir.
-        cmd = ["npx.cmd" if sys.platform == "win32" else "npx",
-               "--yes", "@openapitools/openapi-generator-cli", "generate",
-               "-i", str(spec_path),
-               "-g", "python",
-               "-o", str(tmp_out),
-               "--package-name", "weflow_sdk",
-               "--library", "httpx"]
-        subprocess.run(cmd, check=True, cwd=str(OUT))
-        # Keep only the library face: models, api, client plumbing. Docs,
-        # tests, CI recipes and the generator's own pyproject are dropped -
-        # the handwritten layer owns those.
-        if OUT.exists():
-            for child in OUT.iterdir():
-                if child.name != "spec.json":
-                    shutil.rmtree(child) if child.is_dir() else child.unlink()
-        shutil.copytree(tmp_out / "weflow_sdk", OUT / "weflow_sdk")
-        # The generator emits the package with absolute imports (``from
-        # weflow_sdk...``). Nested under our package those resolve to the
-        # handwritten package and crash; rewrite them to the generated
-        # subpackage.
-        for py_file in (OUT / "weflow_sdk").rglob("*.py"):
-            text = py_file.read_text(encoding="utf-8")
-            fixed = (
-                text
-                .replace("from weflow_sdk.", "from weflow_sdk.generated.weflow_sdk.")
-                .replace("from weflow_sdk import", "from weflow_sdk.generated.weflow_sdk import")
-                .replace("import weflow_sdk.", "import weflow_sdk.generated.weflow_sdk.")
-            )
-            if fixed != text:
-                py_file.write_text(fixed, encoding="utf-8")
-        normalized = normalize_generated(OUT)
-        print(f"regenerated: {OUT} (normalized {normalized} files)")
+    for child in OUT.iterdir():
+        if child.name != "spec.json":
+            shutil.rmtree(child) if child.is_dir() else child.unlink()
+    normalized = generate_tree(spec_path, OUT)
+    print("regenerated: " + str(OUT) + " (normalized " + str(normalized) + " files)")
     return 0
 
 
