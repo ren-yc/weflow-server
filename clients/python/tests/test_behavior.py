@@ -6,18 +6,20 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, Dict, List, Optional
+import logging
+from typing import Any
 
 import httpx
 import pytest
 
 from weflow_sdk import Client, ClientError, NotReady
+from weflow_sdk import client as sdkmod
 from weflow_sdk.generated.weflow_sdk import models as gen
 
 TOKEN = "test-token-0123456789abcdef"
 
 
-def auth_ok(headers: Dict[str, str]) -> None:
+def auth_ok(headers: dict[str, str]) -> None:
     assert headers.get("authorization") == f"Bearer {TOKEN}", "auth must go in the header"
 
 
@@ -25,20 +27,27 @@ class Mock:
     """Mutable fixture state shared between the test and the ASGI app."""
 
     def __init__(self) -> None:
-        self.states: List[str] = []
-        self.pull_pages: List[dict] = []
-        self.pull_queries: List[dict] = []
-        self.media_calls: List[str] = []
+        self.states: list[str] = []
+        self.pull_pages: list[dict] = []
+        self.pull_queries: list[dict] = []
+        self.media_calls: list[str] = []
         self.media_hit_first = True
-        self.chatlab_page: Optional[dict] = None
-        self.messages_query: Optional[dict] = None
+        self.chatlab_page: dict | None = None
+        self.messages_query: dict | None = None
         # Raw bytes for the SSE response body; str fixtures are encoded.
-        self.sse_frames: List[str] = []
-        self.sse_body: Optional[bytes] = None
+        self.sse_frames: list[str] = []
+        self.sse_body: bytes | None = None
+        # Per-connection bodies, popped in order; the last one repeats.
+        self.sse_seq: list[bytes] = []
+        # Split delivery: when set, sent as separate body messages.
+        self.sse_chunks: list[bytes] | None = None
         self.sse_connections: int = 0
-        self.sse_last_ids: List[Optional[str]] = []
+        self.sse_last_ids: list[str | None] = []
+        # Request counters: which endpoints a call actually touched.
+        self.post_calls: int = 0
+        self.get_accounts_calls: int = 0
         # The POST /api/v1/accounts response body (registration semantics).
-        self.register_body: Optional[dict] = None
+        self.register_body: dict | None = None
 
     def asgi_app(self):
         mock = self
@@ -46,7 +55,7 @@ class Mock:
         async def app(scope, receive, send):
             path = scope["path"]
             raw = scope.get("query_string", b"").decode()
-            query: Dict[str, str] = {}
+            query: dict[str, str] = {}
             for kv in raw.split("&"):
                 if kv:
                     k, _, v = kv.partition("=")
@@ -58,8 +67,10 @@ class Mock:
             auth_ok(headers)
             body: Any = None
             if path == "/api/v1/accounts" and scope["method"] == "POST":
+                mock.post_calls += 1
                 body = mock.register_body or {"success": True, "state": "indexing"}
             elif path == "/api/v1/accounts":
+                mock.get_accounts_calls += 1
                 state = mock.states.pop(0) if mock.states else "ready"
                 body = {
                     "success": True,
@@ -100,15 +111,27 @@ class Mock:
             elif path == "/api/v1/push/messages":
                 mock.sse_connections += 1
                 mock.sse_last_ids.append(headers.get("last-event-id"))
-                payload = mock.sse_body
-                if payload is None:
+                if mock.sse_seq:
+                    payload = mock.sse_seq.pop(0) if len(mock.sse_seq) > 1 else mock.sse_seq[0]
+                elif mock.sse_body is None:
                     payload = ("\n".join(mock.sse_frames) + "\n").encode()
+                else:
+                    payload = mock.sse_body
                 await send({
                     "type": "http.response.start",
                     "status": 200,
                     "headers": [(b"content-type", b"text/event-stream")],
                 })
-                await send({"type": "http.response.body", "body": payload})
+                if mock.sse_chunks is not None:
+                    last = len(mock.sse_chunks) - 1
+                    for i, part in enumerate(mock.sse_chunks):
+                        await send({
+                            "type": "http.response.body",
+                            "body": part,
+                            "more_body": i < last,
+                        })
+                else:
+                    await send({"type": "http.response.body", "body": payload})
                 return
             if body is None:
                 await send({"type": "http.response.start", "status": 404, "headers": []})
@@ -152,7 +175,7 @@ def msg(mid: int, ts: int) -> dict:
             "platformMessageId": str(mid), "sender": "alice", "timestamp": ts, "type": 1}
 
 
-def sse_frame(event: str, payload: dict, id_: int) -> List[str]:
+def sse_frame(event: str, payload: dict, id_: int) -> list[str]:
     return [
         f"id: {id_}",
         f"event: {event}",
@@ -207,16 +230,21 @@ async def test_ensure_ready_rejects_conflict_200_without_waiting() -> None:
                                   {"wxid": "wxid_mock", "db_path": "X:/db"},
                                   timeout=5)
     assert "account_conflict" in str(exc.value)
-    assert mock.states == []  # the readiness poll never ran
+    # The readiness poll never ran: counted GETs, not an empty list.
+    assert mock.get_accounts_calls == 0
     await client.aclose()
 
 
 async def test_wait_ready_is_wait_only() -> None:
     # wait_ready must not register: only the listing endpoint is polled.
+    # Counted, not inferred - an empty states list would also 'pass'
+    # if the poll simply never ran.
     mock = Mock()
     mock.states = ["indexing", "ready"]
     client = make_client(mock)
     await client.wait_ready("wxid_mock", timeout=5)
+    assert mock.post_calls == 0
+    assert mock.get_accounts_calls == 2
     await client.aclose()
 
 
@@ -391,20 +419,214 @@ async def test_watch_byte_framing_keeps_u2028_bodies_intact() -> None:
     await client.aclose()
 
 
-async def test_watch_caps_the_buffer_on_malformed_streams() -> None:
-    # A stream that never emits a blank line would grow the buffer without
+# ---- strengthened SSE guards: over-cap frames, multi-data join, backoff ----
+# (test_watch_caps_the_buffer_on_malformed_streams et al.)
+
+_NL = chr(10)  # LF spelled without escapes: fixtures below build raw frames
+
+
+class _StopWatch(Exception):
+    """Raised from a stubbed sleep to end watch() deterministically."""
+
+async def test_watch_caps_the_buffer_on_malformed_streams(monkeypatch, caplog) -> None:
+    # A stream that never closes a frame would grow the buffer without
     # bound; past the cap watch ends the stream and reconnects instead.
+    # NOTE: the in-process ASGITransport buffers the whole response body,
+    # so this test's signal is the cap WARNING + escalating reconnects, not
+    # connection timing. Deleting the cap logic makes assertion 1+2 fail.
     mock = Mock()
     mock.sse_body = b"data: " + b"x" * (1 << 21)  # 2 MiB, no blank line ever
     client = make_client(mock)
+    with caplog.at_level(logging.WARNING, logger="weflow_sdk.client"):
+        agen = client.watch()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(anext(agen), timeout=3)
+        await agen.aclose()
+        warned = [r.getMessage() for r in caplog.records]
+    await client.aclose()
+    cap_number = str(sdkmod._SSE_BUFFER_CAP)
+    # 1) loud: the guard names the cap in a WARNING
+    assert any(cap_number in m and "over" in m for m in warned)
+    # 2) the stream was abandoned, not buffered: the reconnect loop ran
+    assert mock.sse_connections >= 2
+    # 3) contrast: lift the cap - the same stream then goes through the
+    #    EOF-flush path (undecodable final frame), NOT the cap path: no
+    #    warning carrying the cap number.
+    monkeypatch.setattr(sdkmod, "_SSE_BUFFER_CAP", 1 << 30)
+    mock2 = Mock()
+    mock2.sse_body = b"data: " + b"x" * (1 << 21)
+    client2 = make_client(mock2)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="weflow_sdk.client"):
+        agen2 = client2.watch()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(anext(agen2), timeout=2)
+        await agen2.aclose()
+        warned2 = [r.getMessage() for r in caplog.records]
+    await client2.aclose()
+    assert not any(cap_number in m for m in warned2)
+
+
+async def test_watch_delivers_valid_frames_after_overflow_reconnect() -> None:
+    # Ending the over-cap stream is only half the guard: the reconnect
+    # must still deliver the legitimate frames that follow.
+    good = _NL.join(sse_frame("message.new", new_payload("11", "after"), 12)) + _NL + _NL
+    mock = Mock()
+    mock.sse_seq = [b"data: " + b"x" * (1 << 21), good.encode()]
+    client = make_client(mock)
     agen = client.watch()
-    with pytest.raises(asyncio.TimeoutError):
-        await asyncio.wait_for(anext(agen), timeout=3)
+    (event,) = await collect(agen, 1, timeout=10)
+    assert event.rawid == "11"
+    assert mock.sse_connections >= 2
     await agen.aclose()
     await client.aclose()
-    # The stream was ended (reconnect cycle started) rather than buffering
-    # forever - observable as a second connection attempt after the backoff.
-    assert mock.sse_connections >= 1
+
+
+async def test_watch_rejects_oversized_single_frame_whole_and_split() -> None:
+    # The cap bounds one *complete* frame too: an over-cap frame is not
+    # delivered and the stream reconnects - whether it lands as one chunk
+    # or is split across two body messages.
+    big = json.dumps(new_payload("9", "x" * ((1 << 20) + 8192)))
+    whole = ("id: 7" + _NL + "event: message.new" + _NL + "data: " + big
+             + _NL + _NL).encode()
+    mock = Mock()
+    mock.sse_body = whole
+    client = make_client(mock)
+    agen = client.watch()
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(anext(agen), timeout=2)
+    await agen.aclose()
+    await client.aclose()
+    assert mock.sse_connections >= 2, "over-cap whole frame must end the stream"
+
+    mock2 = Mock()
+    mock2.sse_chunks = [
+        ("id: 7" + _NL + "event: message.new" + _NL + "data: " + big + _NL).encode(),
+        _NL.encode(),
+    ]
+    client2 = make_client(mock2)
+    agen2 = client2.watch()
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(anext(agen2), timeout=2)
+    await agen2.aclose()
+    await client2.aclose()
+    assert mock2.sse_connections >= 2, "over-cap split frame must end the stream"
+
+
+async def test_watch_delivers_frame_just_under_the_cap() -> None:
+    # Contrast for the single-frame guard: a frame below the cap must still
+    # be delivered, else "reject over-cap frames" would just mean "reject
+    # everything" and the guard would have no observable upper bound.
+    body = json.dumps(new_payload("13", "fits"))
+    assert len(body) < sdkmod._SSE_BUFFER_CAP
+    mock = Mock()
+    mock.sse_body = ("id: 1" + _NL + "event: message.new" + _NL + "data: " + body
+                     + _NL + _NL).encode()
+    client = make_client(mock)
+    agen = client.watch()
+    (event,) = await collect(agen, 1)
+    assert event.rawid == "13"
+    await agen.aclose()
+    await client.aclose()
+
+
+async def test_watch_joins_multiple_data_lines_per_frame() -> None:
+    # SSE spec: several data lines in one frame join with LF into the one
+    # payload that gets dispatched. The old per-line overwrite kept only the
+    # last line and dropped the frame as undecodable - a shape the server
+    # does not emit today, pinned here as a guard.
+    text = json.dumps(new_payload("9", "joined"))
+    cut = text.index(",") + 1
+    mock = Mock()
+    mock.sse_body = ("id: 7" + _NL + "event: message.new" + _NL + "data: " + text[:cut]
+                     + _NL + "data: " + text[cut:] + _NL + _NL).encode()
+    client = make_client(mock)
+    agen = client.watch()
+    (event,) = await collect(agen, 1)
+    assert event.rawid == "9"
+    assert event.content == "joined"
+    await agen.aclose()
+    await client.aclose()
+
+
+async def test_watch_joins_three_data_lines_boundary() -> None:
+    text = json.dumps(new_payload("12", "three lines"))
+    c1 = text.index(",") + 1
+    c2 = text.index(",", c1) + 1
+    mock = Mock()
+    mock.sse_body = ("id: 7" + _NL + "data: " + text[:c1] + _NL + "data: " + text[c1:c2]
+                     + _NL + "data: " + text[c2:] + _NL + _NL).encode()
+    client = make_client(mock)
+    agen = client.watch()
+    (event,) = await collect(agen, 1)
+    assert event.rawid == "12"
+    assert event.content == "three lines"
+    await agen.aclose()
+    await client.aclose()
+
+
+async def test_watch_backoff_escalates_on_persistent_overflow(monkeypatch) -> None:
+    # A stream that overflows on every connection must escalate 0.5, 1, 2,
+    # 4... The old shape reset the delay on every 200, so a malformed-but-
+    # connectable server reconnected forever at a flat 0.5s (measured: 6
+    # connects in 3s). Sleep durations are captured through a stub, so the
+    # assertion is about the schedule, not wall-clock.
+    recorded: list = []
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(delay, *a, **kw):
+        recorded.append(delay)
+        if len(recorded) >= 4:
+            raise _StopWatch()
+        await real_sleep(0)
+
+    monkeypatch.setattr(sdkmod.asyncio, "sleep", fake_sleep)
+    mock = Mock()
+    mock.sse_seq = [b"data: " + b"x" * (1 << 21)]
+    client = make_client(mock)
+    agen = client.watch()
+    try:
+        with pytest.raises(_StopWatch):
+            await anext(agen)
+    finally:
+        monkeypatch.undo()
+        await agen.aclose()
+        await client.aclose()
+    assert recorded == [0.5, 1.0, 2.0, 4.0]
+
+
+async def test_watch_backoff_returns_to_floor_after_clean_stream_end(monkeypatch) -> None:
+    # The contrast assertion: a stream that ends cleanly (EOF, no overflow)
+    # reconnects from the 0.5s floor instead of carrying a stale doubled
+    # delay over. One frame per connection, three deliveries: without the
+    # clean-end reset the schedule would be [0.5, 1.0].
+    recorded: list = []
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(delay, *a, **kw):
+        recorded.append(delay)
+        if len(recorded) >= 2:
+            raise _StopWatch()
+        await real_sleep(0)
+
+    monkeypatch.setattr(sdkmod.asyncio, "sleep", fake_sleep)
+    mock = Mock()
+    mock.sse_body = (_NL.join(sse_frame("message.new", new_payload("9", "hi"), 7))
+                     + _NL + _NL).encode()
+    client = make_client(mock)
+    agen = client.watch()
+    try:
+        first = await anext(agen)
+        assert first.rawid == "9"
+        second = await anext(agen)
+        assert second.rawid == "9"
+        with pytest.raises(_StopWatch):
+            await anext(agen)
+    finally:
+        monkeypatch.undo()
+        await agen.aclose()
+        await client.aclose()
+    assert recorded == [0.5, 0.5]
 
 
 async def test_watch_flushes_the_final_frame_at_eof_without_a_trailing_blank_line() -> None:
@@ -422,3 +644,23 @@ async def test_watch_flushes_the_final_frame_at_eof_without_a_trailing_blank_lin
     assert event.content == "tail"
     await agen.aclose()
     await client.aclose()
+
+
+async def test_watch_drops_oversized_final_frame_at_eof_without_blank() -> None:
+    # A final frame that is over cap AND lacks the trailing blank line must
+    # not be delivered: the accumulation check (pending lines + buffer after
+    # each chunk) fires before the EOF flush can fold the tail, so the
+    # stream ends un-trusted and reconnects. Deleting the accumulation cap
+    # check would deliver this frame; that is covered by the cap test above
+    # - this pins the no-blank-line edge specifically.
+    big = json.dumps(new_payload("14", "x" * ((1 << 20) + 8192)))
+    body = ("id: 9" + _NL + "event: message.new" + _NL + "data: " + big).encode()
+    mock = Mock()
+    mock.sse_body = body
+    client = make_client(mock)
+    agen = client.watch()
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(anext(agen), timeout=2)
+    await agen.aclose()
+    await client.aclose()
+    assert mock.sse_connections >= 2, "over-cap EOF frame must not be delivered"
