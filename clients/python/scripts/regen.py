@@ -142,6 +142,38 @@ def tree_digest(root: Path) -> str:
     return sha.hexdigest()
 
 
+def normalize_generated(root: Path) -> int:
+    """Strip trailing whitespace and trailing blank lines from generated files.
+
+    The generator leaves trailing spaces inside docstrings and a blank line at the
+    end of several files. This repository checks whitespace with ``git diff
+    --check`` against the empty tree, so a committed file is inspected forever -
+    not only in the change that introduced it: a single unnormalized regeneration
+    turns the whole-repository check red and stays red until the bytes change.
+    Normalizing inside the pipeline keeps every regeneration clean without editing
+    ``generated/`` by hand, which the module docstring forbids.
+
+    Returns the number of files rewritten.
+    """
+    changed = 0
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        raw = path.read_bytes()
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        lines = [line.rstrip() for line in text.splitlines()]
+        while lines and not lines[-1]:
+            lines.pop()
+        fixed = ("\n".join(lines) + "\n").encode("utf-8") if lines else b""
+        if fixed != raw:
+            path.write_bytes(fixed)
+            changed += 1
+    return changed
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true",
@@ -203,7 +235,8 @@ def main() -> int:
             )
             if fixed != text:
                 py_file.write_text(fixed, encoding="utf-8")
-    print("regenerated:", OUT)
+        normalized = normalize_generated(OUT)
+        print(f"regenerated: {OUT} (normalized {normalized} files)")
     return 0
 
 
