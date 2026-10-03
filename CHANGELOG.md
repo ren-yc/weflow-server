@@ -21,6 +21,11 @@
   载荷（原先逐行覆盖、只保留末行）。当前服务端每帧恰一行 `data:`，对现有形状逐字节
   中性；回归位置：`test_watch_joins_multiple_data_lines_per_frame`（三行边界对照
   `test_watch_joins_three_data_lines_boundary`）。
+- **`clients/python`（`weflow-sdk`）拒绝态词表口径说明（无行为变化）**：`_REFUSAL_STATES` 是
+  两仓共用的**对称超集**（`account_conflict` + `invalid_key` / `invalid_db_path` / `unknown_qq`），
+  本仓服务端当前只产生 `account_conflict`——多出的三态本仓不产生，是刻意保留：词表按
+  「账号面／SSE 全量」的服务端共同语义收敛，而不是按单端点裁剪，服务端将来补拒绝态时
+  两侧 SDK 不必各改一遍。不构成误纳（不会把本仓合法应答误判成拒绝）。
 - **`clients/ts` 示例**：POST 显式携带 `Content-Type: application/json`（服务端 axum
   Json 提取器对非 JSON 内容类型回 415，示例此前必然踩中）；`smoke.ts` 第 3 步改为
   真断言——只接受「业务拒绝（StatusError 带 state）」或「受理后就绪等待超时
