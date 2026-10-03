@@ -233,9 +233,12 @@ jobs:
           # order of a thousand hits in the generated tree. Fewer than 100
           # means the exclude is not what keeps the main check green -> fail.
           # Measured locally: weflow 2253 / qqflow 2149 hits.
+          # || true: ruff exits 1 when it finds violations, and the job shell
+          # runs with -e -o pipefail - without this the guard aborts on the
+          # nonzero pipeline before reading the count it just captured.
           found=$(.venv/bin/python -m ruff check src tests \
                  --isolated --select E4,E7,E9,F,I,RUF,G,LOG,BLE,UP 2>&1 \
-                 | sed -n "s/^Found \([0-9]*\) error.*/\1/p" | tail -1)
+                 | sed -n "s/^Found \([0-9]*\) error.*/\1/p" | tail -1 || true)
           if [ -z "$found" ] || [ "$found" -lt 100 ]; then
             echo "ruff exclusion guard FAILED: isolated scan found ${found:-0} hits" \
                  "(expected ~2000 if generated/ is really scanned)" >&2
