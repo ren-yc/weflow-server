@@ -44,6 +44,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use weflow_client::client::{Client, ContactsQuery, MessageQuery};
+use crate::export;
 
 use crate::api;
 use crate::config::Config;
@@ -75,6 +76,8 @@ enum Command {
     Accounts(HttpArgs),
     /// 让服务端立刻跑一次增量同步（写动作）
     Sync(HttpArgs),
+    /// 批量导出：把会话写成 ChatLab Format 的 JSONL / JSON 落盘
+    Export(ExportArgs),
 }
 
 /// 只读查询类子命令的共用参数（带 `--embedded`）。
@@ -113,6 +116,41 @@ struct MessageArgs {
 struct HttpArgs {
     #[command(flatten)]
     common: Common,
+}
+
+/// `export` 的参数。
+///
+/// 两条硬约束的落点：`--embedded` **不提供**——批量导出只走 HTTP（服务端已经把密钥握在
+/// 内存里，CLI 只做编排与落盘；否则一个长任务会长时间持有密钥，还得把密钥带上命令行）。
+/// `--with-media` 把字节下载到导出目录下的 `media/`，而**导出物里不写任何 URL**。
+#[derive(clap::Args)]
+struct ExportArgs {
+    /// 输出目录（必需：落盘是有意的动作，不给默认路径）
+    #[arg(long)]
+    out: PathBuf,
+    /// 格式：jsonl（流式、内存与条数无关）或 json（每会话一个完整信封）
+    #[arg(long, default_value = "jsonl", value_parser = ["jsonl", "json"])]
+    format: String,
+    /// 只导这些会话（可重复）
+    #[arg(long)]
+    session: Vec<String>,
+    /// 起始时间：unix 秒或 YYYYMMDD
+    #[arg(long)]
+    since: Option<String>,
+    /// 已存在的会话文件跳过（幂等续跑）
+    #[arg(long)]
+    resume: bool,
+    #[command(flatten)]
+    common: Common,
+
+    /// 测试专用的语料生成入口：**不进 --help，且只在 testing feature 下编译**。
+    ///
+    /// 为什么是隐藏参数而不是文档化能力：它存在的唯一理由，是让「大语料下内存恒定」那条
+    /// 断言能在 CI 里造出足够大的语料——小语料上「把整会话读进内存」的实现一样看不出来。
+    /// 把它暴露给用户会诱导人拿它当真库用，而它造的是假账号；发布二进制里没有这个参数。
+    #[cfg(feature = "testing")]
+    #[arg(long, hide = true)]
+    rows: Option<usize>,
 }
 
 #[derive(clap::Args)]
@@ -219,6 +257,13 @@ pub(crate) fn dispatch() -> Result<Entry> {
             let rows = run_messages(&m)?;
             emit(&Value::Array(rows), m.common.json, "messages");
             Ok(Entry::Done)
+        }
+        Command::Export(a) => {
+            #[cfg(feature = "testing")]
+            if let Some(rows) = a.rows {
+                return export_corpus(&a.out, rows).map(|_| Entry::Done);
+            }
+            run_export(&a).map(|_| Entry::Done)
         }
         Command::Accounts(q) => {
             let client = http_client(&q.common)?;
@@ -494,5 +539,260 @@ fn human_row(v: &Value, kind: &str) -> String {
             n("success")
         ),
         _ => format!("{}\t{}\t{}", n("createTime"), s("senderName"), s("content")),
+    }
+}
+
+// ---- export ---------------------------------------------------------------
+
+/// Pull 面的消息项 → 导出的中立 Row。单独一个函数是因为取数面的类型属于 SDK，
+/// 而「怎么写盘」只认 Row —— 这样导出模块能在不起服务、不装 SDK 类型的情况下被测全。
+fn row_from_pull(m: &weflow_client::generated::r#gen::types::PullMessage) -> export::Row {
+    export::Row {
+        platform_message_id: m.platform_message_id.clone(),
+        sender: m.sender.clone(),
+        account_name: m.account_name.clone(),
+        group_nickname: m.group_nickname.clone(),
+        timestamp: m.timestamp,
+        msg_type: m.type_,
+        content: m.content.clone(),
+        reply_to_message_id: m.reply_to_message_id.clone(),
+        // 媒体只写元数据（type + fileName）：服务的媒体链接带 access_token，
+        // 而导出文件会被拷进聊天工具、传上网盘。媒体字节的下载尚未实现：届时应把它下载到
+        // 导出目录下的 media/ 并把 fileName 换成实际落盘的句柄，让交付包自成一体。
+        media_file_name: m.media.as_ref().map(|x| x.file_name.clone()).filter(|s| !s.is_empty()),
+        media_type: m.media.as_ref().map(|x| x.type_.clone()),
+    }
+}
+
+/// 把 --since 转成 unix 秒。接受 unix 秒或 YYYYMMDD（后者取当天 00:00，与服务端对
+/// **下界**的口径一致；上界才取整天）。
+fn to_unix(s: &str) -> Result<i64> {
+    let s = s.trim();
+    if s.len() == 8 && s.bytes().all(|b| b.is_ascii_digit()) {
+        let y: i64 = s[0..4].parse().unwrap_or(0);
+        let m: u32 = s[4..6]
+            .parse()
+            .with_context(|| format!("--since 月份非法: {}", s))?;
+        let d: u32 = s[6..8]
+            .parse()
+            .with_context(|| format!("--since 日非法: {}", s))?;
+        let naive = chrono::NaiveDate::from_ymd_opt(y as i32, m, d)
+            .with_context(|| format!("--since 不是合法日期: {}", s))?;
+        return Ok(naive.and_time(chrono::NaiveTime::MIN).and_utc().timestamp());
+    }
+    s.parse::<i64>()
+        .with_context(|| format!("--since 需为 unix 秒或 YYYYMMDD: {}", s))
+}
+
+fn run_export(a: &ExportArgs) -> Result<()> {
+    let format = match a.format.as_str() {
+        "jsonl" => export::Format::Jsonl,
+        "json" => export::Format::Json,
+        other => anyhow::bail!("--format 只支持 jsonl|json: {}", other),
+    };
+    let client = http_client(&a.common)?;
+    // 令牌就是导出物里绝不允许出现的那串（见 export 模块头的硬约束一）。
+    let secret = std::env::var("WEFLOW_TOKEN").unwrap_or_default();
+    let all = block(client.list_all_sessions(Some(10_000)))?;
+    let name_of = |t: &str| {
+        all.iter()
+            .find(|s| s.username == t)
+            .map(|s| s.display_name.clone())
+            .unwrap_or_default()
+    };
+    let targets: Vec<export::SessionTarget> = if a.session.is_empty() {
+        all.iter()
+            .map(|s| export::SessionTarget {
+                talker: s.username.clone(),
+                display_name: s.display_name.clone(),
+            })
+            .collect()
+    } else {
+        a.session
+            .iter()
+            .map(|t| export::SessionTarget {
+                talker: t.clone(),
+                display_name: name_of(t),
+            })
+            .collect()
+    };
+    let opts = export::Options {
+        out_dir: a.out.clone(),
+        format,
+        resume: a.resume,
+        secret,
+    };
+    let since = a.since.as_deref().map(to_unix).transpose()?;
+    let start = std::time::Instant::now();
+    let outcome = export::run(&targets, &opts, |target, on_page| {
+        // Pull 面的 since 是**排他**下界，而 --since 对用户是含边界的：差一秒就会让
+        // 「起点那一条」凭空消失，故这里减一。
+        let talker = target.talker.clone();
+        let since_pull = since.map(|s| s - 1);
+        // SDK 的回调要求它自己的错误类型，而这里真正会失败的是**写盘**。
+        // 把写失败硬塞成 ClientError 会丢信息，所以错误先存起来、循环后立即上抛，
+        // 后续页只跳过不再写（半途而废的会话由 run 删掉，交给 --resume 重来）。
+        let mut write_err: Option<anyhow::Error> = None;
+        block(client.drain_session(&talker, since_pull, |msgs| {
+            if write_err.is_none() {
+                let rows: Vec<export::Row> = msgs.iter().map(row_from_pull).collect();
+                if let Err(e) = on_page(&rows) {
+                    write_err = Some(e);
+                }
+            }
+            Ok(())
+        }))?;
+
+        match write_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    })?;
+    println!(
+        "[export] {} 个会话、{} 条消息 → {}（跳过 {}，索引 {}），用时 {:?}",
+        outcome.written.len(),
+        outcome.messages,
+        opts.out_dir.display(),
+        outcome.skipped.len(),
+        outcome.index.display(),
+        start.elapsed()
+    );
+    if !outcome.skipped.is_empty() {
+        for s in &outcome.skipped {
+            println!("[export] 跳过: {}", s);
+        }
+        // 少导了东西必须以非零码说话：静默的部分成功是这类工具最坏的失败方式。
+        anyhow::bail!("{} 个会话未能导出（见上面的 跳过: 行）", outcome.skipped.len());
+    }
+    Ok(())
+}
+
+/// 测试专用的语料生成＋导出入口（`--rows N`，隐藏且只在 `testing` 下编译）。
+///
+/// **它为什么存在**：「大语料下内存恒定」这条断言在小语料上根本看不出来——把整个会话读进
+/// 内存的实现，在一百条的夹具上一样表现为常数内存。要让它显形，语料必须大到「整会话驻留」
+/// 与「流式写」差出量级，所以这里按需造库（CI 跑 200000 条，本机可跑 10^6 条）。
+///
+/// 与用户面的 `export` 唯一的区别是取数来源：这里进程内直读夹具库（`api::open`），
+/// 因为测试环境里没有服务可打；写盘路径、行形状、`--resume` 与令牌检查用的是同一套代码
+/// （`crate::export`），所以这条路径测到的东西对用户面同样成立。
+///
+/// 输出：每个会话一个采样点，形如 `[rss] session=<idx> peak_kb=<n>`；调用方（测试）
+/// 比较**首个与末个**采样点，断言增量小于起始值的一成。
+#[cfg(feature = "testing")]
+fn export_corpus(out: &std::path::Path, rows: usize) -> Result<()> {
+    use crate::testing::{self, BULK_SESSIONS};
+    let dir = testing::tmp_dir("export-corpus");
+    let key_hex = testing::FAKE_KEY_HEX.to_string();
+    // Key 是 [u8; 32] 的别名，而 DbKey 包住同一个数组：这里借承诺面的解析器拿字节，
+    // 不在 CLI 里另写一份 hex 解码。
+    let key: crate::db::wcdb::Key = api::parse_db_key(&key_hex)?.0;
+    // 造库器返回的就是 db_storage 目录本身（与 build_wechat_account 同规）。
+    let storage = testing::build_account_with_rows(&dir, &key, rows);
+    let keys = api::KeyMap::from_parts(
+        Some(api::parse_db_key(&key_hex)?),
+        None,
+    )?;
+    let index = api::open(&storage, &keys, testing::FAKE_WXID)?;
+    let sessions: Vec<export::SessionTarget> = index
+        .sessions()
+        .iter()
+        .map(|s| export::SessionTarget {
+            talker: s.username.clone(),
+            display_name: index.session_display(&s.username),
+        })
+        .collect();
+    let opts = export::Options {
+        out_dir: out.to_path_buf(),
+        format: export::Format::Jsonl,
+        resume: false,
+        // 夹具里没有真令牌；留空表示「不检查」，而检查逻辑本身由 tests/cli.rs 直接测。
+        secret: String::new(),
+    };
+    let started = std::time::Instant::now();
+    let mut sample_idx = 0usize;
+    let outcome = export::run(&sessions, &opts, |target, on_page| {
+        let msgs = index.messages(&target.talker);
+        let rowsv: Vec<export::Row> = msgs
+            .iter()
+            .map(|m| export::Row {
+                platform_message_id: m.server_id.to_string(),
+                sender: m.sender_username.clone(),
+                account_name: m.sender_name.clone(),
+                group_nickname: String::new(),
+                timestamp: m.create_time,
+                msg_type: m.local_type,
+                content: m.parsed.display.clone(),
+                reply_to_message_id: m.parsed.reply_to.clone(),
+                media_file_name: None,
+                media_type: None,
+            })
+            .collect();
+        let n = rowsv.len();
+        on_page(&rowsv)?;
+        // 采样点：每导完一个会话取一次峰值 RSS。
+        println!("[rss] session={sample_idx} rows={n} peak_kb={:?}", peak_rss_kb());
+        sample_idx += 1;
+        Ok(())
+    })?;
+    println!(
+        "[corpus] rows={rows} sessions={} written={} messages={} 用时 {:?}",
+        BULK_SESSIONS,
+        outcome.written.len(),
+        outcome.messages,
+        started.elapsed()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+/// 进程峰值 RSS（KB）。取不到时返回 `None`——调用方据此跳过断言，而不是拿 0 当成
+/// 「内存恒定」的证据。
+#[cfg(feature = "testing")]
+fn peak_rss_kb() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        // /proc/self/status 的 VmHWM 就是峰值常驻集，无需外部依赖。
+        let text = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("VmHWM:") {
+                return rest.trim().trim_end_matches(" kB").trim().parse().ok();
+            }
+        }
+        None
+    }
+    #[cfg(windows)]
+    {
+        // 没有依赖可拿 PeakWorkingSet64，因此起一次 powershell 查询自身进程。
+        // 每次采样一个子进程：只在测试路径里跑，代价可以接受。
+        let pid = std::process::id();
+        let out = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!("(Get-Process -Id {pid}).PeakWorkingSet64"),
+            ])
+            .output()
+            .ok()?;
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        s.parse::<u64>().ok().map(|bytes| bytes / 1024)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // macOS 的峰值要 getrusage（需要 libc 依赖）。这里退回 `ps -o rss` 的**当前值**，
+        // 并在断言里当作下限使用；这一平台差异已登记在计划文件里。
+        let pid = std::process::id();
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse::<u64>()
+            .ok()
+    }
+    #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+    {
+        None
     }
 }

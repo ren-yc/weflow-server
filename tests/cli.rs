@@ -134,3 +134,31 @@ fn embedded_without_config_is_a_runtime_error() {
     assert_eq!(o.code, 1, "缺配置是运行期错误；stderr: {}", o.stderr);
     assert!(o.stderr.contains("WEFLOW_EMBED_CONFIG"), "报错要给出补救（环境变量名），实际: {}", o.stderr);
 }
+
+/// 步骤 0 第 2 项：`--rows` 是**测试专用隐藏参数**——不进 `--help`。
+///
+/// 为什么这条值得钉：参数一旦出现在帮助里，就会有用户拿它去「导出三十万条试试」，
+/// 而那造出来的是假账号语料。它存在的唯一理由，是让大语料的内存断言跑得起来。
+/// 另一半（发布二进制里根本没有这个参数）由 `#[cfg(feature = "testing")]` 在编译期
+/// 保证：默认 feature 的整轮 clippy/test 编译的就是不含它的版本。
+#[test]
+fn export_help_does_not_advertise_the_rows_param() {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_weflow-server"));
+    c.env_remove("WEFLOW_BASE_URL").env_remove("WEFLOW_TOKEN");
+    let r = c.args(["export", "--help"]).output().expect("spawn");
+    assert_eq!(r.status.code(), Some(0), "export --help 应成功");
+    let text = String::from_utf8_lossy(&r.stdout).to_string();
+    assert!(text.contains("--out"), "帮助里应有常规参数: {}", text);
+    assert!(!text.contains("--rows"), "--rows 不该出现在帮助里: {}", text);
+}
+
+/// `--out` 是必需参数：不给就是用法错误（2），而不是把导出物写到某个默认目录。
+///
+/// 为什么刻意不给默认路径：落盘是有意的动作，猜一个目录会把几百个文件写到用户没打算
+/// 放的地方，而那种事情发生时导出已经跑完了。
+#[test]
+fn export_requires_out_dir_as_usage_error() {
+    let o = bare(&["export"]);
+    assert_eq!(o.code, 2, "export 缺 --out 应为用法错误；stderr: {}", o.stderr);
+    assert!(o.stderr.contains("out"), "报错要点名 --out，实际: {}", o.stderr);
+}

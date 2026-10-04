@@ -427,8 +427,10 @@ pub const BULK_SESSIONS: usize = 8;
 /// `rows` 是**总量**：均分到各会话，除不尽的余数补给最后一个会话，所以多小的
 /// `rows` 都不丢行（小于会话数时前面几个会话为空）。
 pub fn build_account_with_rows(dir: &Path, key: &Key, rows: usize) -> PathBuf {
-    let root = build_wechat_account(dir, key);
-    let storage = root.join("db_storage");
+    // 返回值是 **db_storage 目录本身**（与 build_wechat_account 同规，既有调用方都把它当
+    // storage 用）。这里曾经多 join 一次 "db_storage"，于是生成器一跑就去开
+    // db_storage/db_storage/session.db —— 潜伏到第一次真跑才暴露。
+    let storage = build_wechat_account(dir, key);
     let session_path = storage.join("session/session.db");
     let msg_path = storage.join("message/message_0.db");
 
@@ -446,12 +448,17 @@ pub fn build_account_with_rows(dir: &Path, key: &Key, rows: usize) -> PathBuf {
         let mut conn = wx_conn(&session_path, key, false);
         let tx = conn.transaction().unwrap();
         {
+            // 表名与列集**必须**跟 build_wechat_account 造出来的那张一致：它是 Session
+            // （userName / displayName / sortTimeStamp / lastTimeStamp / lastMsg /
+            // lastMsgType / unread / type）。这里曾写成 SessionTable（那是
+            // rewrite_session_db_without_name_column 那张变体的名字），一跑就
+            // "no such table"。
             let mut stmt = tx
                 .prepare(
-                    "INSERT INTO SessionTable
-                       (username, type, unread_count, summary, last_timestamp, sort_timestamp,
-                        last_msg_type, last_sender_display_name)
-                     VALUES (?1, 2, 0, ?2, ?3, ?3, 1, ?4)",
+                    "INSERT INTO Session
+                       (userName, displayName, sortTimeStamp, lastTimeStamp, lastMsg,
+                        lastMsgType, unread, type)
+                     VALUES (?1, ?2, ?3, ?3, ?4, 1, 0, 2)",
                 )
                 .unwrap();
             for (i, u) in usernames.iter().enumerate() {
@@ -461,7 +468,7 @@ pub fn build_account_with_rows(dir: &Path, key: &Key, rows: usize) -> PathBuf {
                     u,
                     format!("批量会话{i}"),
                     base + n as i64,
-                    "群成员"
+                    "末条消息"
                 ])
                 .unwrap();
             }
@@ -525,5 +532,5 @@ pub fn build_account_with_rows(dir: &Path, key: &Key, rows: usize) -> PathBuf {
         }
         tx.commit().unwrap();
     }
-    root
+    storage
 }

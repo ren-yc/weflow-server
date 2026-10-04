@@ -885,6 +885,7 @@ feeds 条目字段（以源码 `sns.rs` 为准）：`tid/userName/content(明文
 | `contacts` | SDK `contacts` | 单页；要全量请自己带 `--limit`/`--offset` 翻页 |
 | `accounts` | SDK `accounts` | **只有 HTTP 形态**（没有 `--embedded`）：这一面问的是「服务端此刻实际绑定了什么」，进程内索引给的是另一个答案 |
 | `sync` | SDK `sync_now` | **写动作**：让服务端立刻跑一次增量同步；同样没有 `--embedded` |
+| `export` | SDK `list_all_sessions` ＋ `drain_session` | **只走 HTTP**（不提供 `--embedded`）：批量导出到 ChatLab Format 文件，见下一节 |
 
 环境变量：`WEFLOW_BASE_URL`（默认 `http://127.0.0.1:5033`）、`WEFLOW_TOKEN`（API token）。
 **token 一律不经命令行传递**——命令行会落进 shell history 与进程列表，而这个值能读出整份聊天记录。
@@ -895,6 +896,40 @@ feeds 条目字段（以源码 `sns.rs` 为准）：`tid/userName/content(明文
 
 输出：默认是人类可读的紧凑行（每类只挑最常看的几列），`--json` 给机器可读形状。
 
+## 批量导出（`export`）
+
+`weflow-server export --out <目录> [--format jsonl|json] [--session <id> …] [--since <t>] [--resume]`
+
+**只走 HTTP**：这个面不提供 `--embedded`。服务端已经把数据库密钥握在内存里，CLI 只做编排与
+落盘；否则一个可能跑几分钟的任务会长时间持有密钥，还得把密钥带上命令行（它会进 shell history
+与进程列表）。
+
+产物布局：
+
+- **每个会话一个文件**（`<slug>.jsonl` 或 `<slug>.json`）。`<slug>` 由会话显示名经
+  `pathsafe::slugify` 得到；**折叠后不含任何 ASCII 字母数字时**（纯中文群名会被折成一串下划线，
+  既不可读也极易互撞）**回落到会话 id 的 slug**；同名会话按出现顺序追加 `-2`／`-3`。文件名是
+  确定性函数——这是 `--resume` 成立的前提。
+- **JSONL 形态**：第一行是 `_type: header`（含 `chatlab` 与 `meta`），其后是 `_type: message` 行。
+  规范建议按时间升序，因此**页内**排序（跨页排序会把内存恒定这条承诺打破）。**不写 member 行**：
+  流式写不出「先集齐成员再写消息」的顺序，而规范说成员行可选、缺省时由导入器从消息收集；
+  本服务的消息行自带 `accountName` 与 `groupNickname`，信息不丢。
+- **JSON 形态**：一个会话一个完整信封（`chatlab`／`meta`／`members`／`messages`，不带行型标记）。
+  整会话留在内存，因此大语料请用 jsonl。
+- **`index.json`**：本服务自造的编排清单（会话 → 文件 → 条数）。**它不属于 ChatLab 规范，导入
+  请用单个 `<slug>.jsonl`／`.json`；整个目录不可导入。**
+
+两条硬约束：
+
+1. **导出物里不得出现访问令牌**。媒体在服务端是按带 `access_token` 的 URL 暴露的，而导出文件
+   会被拷进聊天工具、传上网盘。因此导出**不写任何 URL**，媒体只以 `{type, fileName}` 表达；
+   并且每一行写盘前会拿调用方给的令牌做一次子串检查，**命中即整轮中止**（不是跳过该会话）
+   并删掉半成品。回归位置：`export::tests::secret_in_output_aborts_and_removes_partial_file`。
+2. **会话级失败不静默**：取数失败的会话被跳过、半途产物被删除，而只要 `skipped` 非空，CLI
+   就以退出码 1 结束。静默少导几个会话是这类工具最坏的失败方式。
+
+内存：JSONL 逐页写盘、写完即丢，**峰值常驻集与条数无关**。大语料的实测口径与造库工具（隐藏的
+`--rows` 参数，仅 `testing` feature 下编译进二进制）见 `docs/architecture.md` 的「测试与夹具」。
 ## 启动示例
 
 ```powershell

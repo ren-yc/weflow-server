@@ -59,6 +59,11 @@ internal!(server);
 #[cfg(feature = "cli")]
 pub(crate) mod cli;
 
+/// 批量导出（ChatLab Format 落盘）。只在 `cli` 下编译：它是子命令 `export` 的实现，
+/// 不是承诺面，也不是服务运行期要用的东西（服务端只在内存里给数据）。
+#[cfg(feature = "cli")]
+pub(crate) mod export;
+
 /// 造库/造密钥夹具 —— **不是承诺面**，只随 `testing` feature 编译。
 ///
 /// 落点为什么在库里而不是 `tests/common`：需要它的有两个调用方，而它们互相
