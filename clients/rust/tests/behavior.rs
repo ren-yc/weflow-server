@@ -617,3 +617,30 @@ async fn media_bytes_by_id_fetches_a_single_segment_handle() {
         "one GET, no export side door: this call fetches a handle it was given"
     );
 }
+
+#[tokio::test]
+async fn ensure_ready_fails_fast_on_a_refusal_state() {
+    let mock = Mock::default();
+    *mock.register_response.lock().unwrap() = Some(serde_json::json!({
+        "success": false, "state": "account_conflict", "occupied_by": "wxid_other",
+    }));
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+    let err = client
+        .ensure_ready(
+            "wxid_mock",
+            &serde_json::json!({"wxid": "wxid_mock", "db_path": "X:/db"}),
+            Duration::from_millis(700),
+        )
+        .await
+        .expect_err("a refusal must not be waited on");
+    match err {
+        ClientError::Refused { state, .. } => assert_eq!(state, "account_conflict"),
+        other => panic!("expected Refused, got {other:?}"),
+    }
+    assert_eq!(
+        *mock.accounts_calls.lock().unwrap(),
+        0,
+        "a refusal is deterministic: nothing to poll for"
+    );
+}

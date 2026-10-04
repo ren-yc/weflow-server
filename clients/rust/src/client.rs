@@ -56,7 +56,31 @@ pub enum ClientError {
         /// What was expected, and what arrived instead.
         detail: String,
     },
+    /// The server answered 200 with a **business refusal** state.
+    ///
+    /// Waiting for `ready` after a refusal can only time out and hide the
+    /// cause, so the refusal surfaces here instead: the state name is the
+    /// actionable part (`account_conflict` names who holds the binding; the
+    /// extra fields are on the body of [`Client::register`]).
+    #[error("registration refused: state={state} ({url})")]
+    Refused {
+        /// The refusal state the server named.
+        state: String,
+        /// Request URL.
+        url: String,
+    },
 }
+
+/// 200-with-refusal vocabulary, shared verbatim with the Python SDK. The
+/// weflow server currently emits only `account_conflict`; the qqflow sibling
+/// adds the rest, and one shared set keeps the two SDKs symmetric against
+/// future server-side additions.
+const REFUSAL_STATES: [&str; 4] = [
+    "account_conflict",
+    "invalid_key",
+    "invalid_db_path",
+    "unknown_qq",
+];
 
 /// Result alias for the behavior layer.
 pub type Result<T> = std::result::Result<T, ClientError>;
@@ -285,7 +309,13 @@ impl Client {
         // Registration and waiting are two primitives; this is their
         // composition. One implementation per endpoint means a change to the
         // registration contract cannot land in half the SDK.
-        let _ = self.register(body).await?;
+        let outcome = self.register(body).await?;
+        if REFUSAL_STATES.contains(&outcome.state.as_str()) {
+            return Err(ClientError::Refused {
+                state: outcome.state,
+                url: self.url("/api/v1/accounts"),
+            });
+        }
         self.wait_ready(wxid, timeout).await
     }
 
@@ -431,45 +461,6 @@ impl Client {
                 return Ok(out);
             }
             offset += count;
-        }
-    }
-
-    // ---- search ------------------------------------------------------------
-
-    /// Keyword + time-window search over the native messages face.
-    ///
-    /// `YYYYMMDD` bounds are validated client-side with the same semantics as
-    /// the server: `end` covers the whole day.
-    pub async fn search(
-        &self,
-        talker: &str,
-        keyword: &str,
-        start: Option<&str>,
-        end: Option<&str>,
-    ) -> Result<gen_types::MessagesNative> {
-        for (field, value) in [("start", start), ("end", end)] {
-            if let Some(v) = value {
-                self.validate_date(field, v)?;
-            }
-        }
-        let mut q = BTreeMap::new();
-        q.insert("talker", talker.to_string());
-        q.insert("keyword", keyword.to_string());
-        if let Some(s) = start {
-            q.insert("start", s.to_string());
-        }
-        if let Some(e) = end {
-            q.insert("end", e.to_string());
-        }
-        self.get_json("/api/v1/messages", &q).await
-    }
-
-    fn validate_date(&self, field: &'static str, value: &str) -> Result<()> {
-        let ok = value.len() == 8 && value.bytes().all(|b| b.is_ascii_digit());
-        if ok {
-            Ok(())
-        } else {
-            Err(ClientError::BadDate { field, value: value.to_string() })
         }
     }
 

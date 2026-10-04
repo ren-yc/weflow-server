@@ -48,6 +48,17 @@ class Mock:
         self.get_accounts_calls: int = 0
         # The POST /api/v1/accounts response body (registration semantics).
         self.register_body: dict | None = None
+        # When set, GET /api/v1/accounts answers this page verbatim.
+        self.accounts_page: dict | None = None
+        # When set, GET /api/v1/messages answers this page verbatim.
+        self.native_page: dict | None = None
+        # When set, GET /api/v1/contacts answers this page verbatim.
+        self.contacts_page: dict | None = None
+        # FIFO pages for GET /api/v1/sessions.
+        self.sessions_pages: list[dict] = []
+        # Whether each /health hit carried credentials (it must not).
+        self.health_auth: list[bool] = []
+        self.health_body: dict | None = None
 
     def asgi_app(self):
         mock = self
@@ -64,21 +75,29 @@ class Mock:
                 k.decode().lower(): v.decode()
                 for k, v in scope.get("headers", [])
             }
-            auth_ok(headers)
+            if path == "/health":
+                # Unauthenticated by design: record whether credentials rode
+                # along (the SDK must not send any) instead of asserting them.
+                mock.health_auth.append("authorization" in headers)
+            else:
+                auth_ok(headers)
             body: Any = None
             if path == "/api/v1/accounts" and scope["method"] == "POST":
                 mock.post_calls += 1
                 body = mock.register_body or {"success": True, "state": "indexing"}
             elif path == "/api/v1/accounts":
                 mock.get_accounts_calls += 1
-                state = mock.states.pop(0) if mock.states else "ready"
-                body = {
-                    "success": True,
-                    "accounts": [
-                        {"wxid": "wxid_mock", "db_storage": "",
-                         "message_count": 1, "state": state}
-                    ],
-                }
+                if mock.accounts_page is not None:
+                    body = mock.accounts_page
+                else:
+                    state = mock.states.pop(0) if mock.states else "ready"
+                    body = {
+                        "success": True,
+                        "accounts": [
+                            {"wxid": "wxid_mock", "db_storage": "",
+                             "message_count": 1, "state": state}
+                        ],
+                    }
             elif path.endswith("/messages") and path.startswith("/api/v1/sessions/"):
                 mock.pull_queries.append(query)
                 if mock.pull_pages:
@@ -106,8 +125,22 @@ class Mock:
                 return
             elif path == "/api/v1/messages":
                 mock.messages_query = query
-                body = {"success": True, "count": 0, "has_more": False,
-                        "talker": "", "media": {}, "messages": []}
+                # The native face is camelCase on the wire; a fallback with
+                # snake_case keys (or a missing exportPath) decodes as a shape
+                # break for every caller of this route.
+                body = mock.native_page or {
+                    "success": True, "count": 0, "hasMore": False, "talker": "",
+                    "media": {"count": 0, "enabled": False, "exportPath": ""},
+                    "messages": [],
+                }
+            elif path == "/health":
+                body = mock.health_body or {
+                    "account": "ready", "status": "ok", "version": "0.0.0",
+                }
+            elif path == "/api/v1/contacts":
+                body = mock.contacts_page
+            elif path == "/api/v1/sessions":
+                body = mock.sessions_pages.pop(0) if mock.sessions_pages else None
             elif path == "/api/v1/push/messages":
                 mock.sse_connections += 1
                 mock.sse_last_ids.append(headers.get("last-event-id"))
@@ -664,3 +697,134 @@ async def test_watch_drops_oversized_final_frame_at_eof_without_blank() -> None:
     await agen.aclose()
     await client.aclose()
     assert mock.sse_connections >= 2, "over-cap EOF frame must not be delivered"
+
+
+# ---- health / accounts / register ---------------------------------------
+
+
+async def test_health_reports_version_and_account_phase() -> None:
+    mock = Mock()
+    mock.health_body = {"account": "ready", "status": "ok", "version": "9.9.9"}
+    client = make_client(mock)
+    health = await client.health()
+    assert health.version == "9.9.9"
+    assert health.status == "ok"
+    assert health.account is gen.AccountPhase.READY
+    assert mock.health_auth == [False], "/health is unauthenticated: no credentials"
+
+
+async def test_accounts_expose_state_error_and_message_count() -> None:
+    mock = Mock()
+    mock.accounts_page = {
+        "success": True,
+        "accounts": [
+            {"wxid": "wxid_a", "db_storage": "X:/a", "message_count": 12,
+             "state": "ready"},
+            {"wxid": "wxid_b", "db_storage": "X:/b", "message_count": 0,
+             "state": "error", "error": "bad key"},
+        ],
+    }
+    client = make_client(mock)
+    accounts = await client.accounts()
+    assert accounts[0].message_count == 12
+    assert accounts[1].error == "bad key", "the failure reason exists only on this face"
+
+
+async def test_register_returns_raw_state_without_polling() -> None:
+    mock = Mock()
+    mock.register_body = {
+        "success": False, "state": "account_conflict",
+        "occupied_by": "wxid_other", "occupied_status": "ready",
+    }
+    client = make_client(mock)
+    outcome = await client.register({"wxid": "wxid_mock", "db_path": "X:/db"})
+    assert outcome.state == "account_conflict"
+    assert outcome.status is None, "this state carries no status"
+    assert outcome.body["occupied_by"] == "wxid_other", "refusal extras stay reachable"
+    assert mock.post_calls == 1, "one POST, no retry"
+    assert mock.get_accounts_calls == 0, "register must not poll: waiting is wait_ready's job"
+
+
+# ---- list_messages / contacts / media_bytes_by_id ------------------------
+
+
+async def test_list_messages_pages_by_offset_and_exposes_native_fields() -> None:
+    mock = Mock()
+    mock.native_page = {
+        "success": True, "count": 1, "hasMore": True, "talker": "alice",
+        "media": {"count": 0, "enabled": False, "exportPath": "X:/export"},
+        "messages": [{
+            "appmsgSubtype": None, "baseType": 1, "content": "hi",
+            "createTime": 1_700_000_000, "isSend": 1, "localId": 7, "localType": 3,
+            "media": {"fileName": "abc.png", "mediaId": "abc123", "md5": "d41d8",
+                      "type": "image"},
+            "parsedContent": "hi", "quote": None, "rawContent": "<msg>hi</msg>",
+            "replyToMessageId": "41", "senderName": "张三", "senderUsername": "alice",
+            "serverId": "42", "sortSeq": 1,
+        }],
+    }
+    client = make_client(mock)
+    page = await client.list_messages("alice", limit=500, offset=1000, media=True)
+    assert page.has_more is True, "paging continues until has_more is false"
+    assert page.media.export_path == "X:/export"
+    message = page.messages[0]
+    assert message.raw_content == "<msg>hi</msg>", "the ChatLab shape drops rawContent"
+    assert message.is_send == 1
+    assert message.local_type == 3
+    assert message.media is not None and message.media.media_id == "abc123"
+    assert mock.messages_query == {
+        "talker": "alice", "limit": "500", "offset": "1000", "media": "1",
+    }
+
+
+async def test_list_messages_accepts_unix_seconds_and_rejects_garbage() -> None:
+    mock = Mock()
+    client = make_client(mock)
+    await client.list_messages("alice", start="1700000000")
+    assert mock.messages_query["start"] == "1700000000", "the server parses unix seconds too"
+    with pytest.raises(sdkmod.BadDate):
+        await client.list_messages("alice", end="2025-01-01")
+
+
+async def test_contacts_page_decodes_rows_and_paging_fields() -> None:
+    mock = Mock()
+    mock.contacts_page = {
+        "success": True, "count": 1, "total": 42, "hasMore": True,
+        "contacts": [{"alias": "", "avatarUrl": "", "displayName": "张三",
+                      "nickname": "三儿", "remark": "客户张三", "type": "friend",
+                      "username": "alice"}],
+    }
+    client = make_client(mock)
+    page = await client.contacts(limit=100, offset=0)
+    assert page.count == 1
+    assert page.total == 42
+    assert page.has_more is True
+    assert page.contacts[0].display_name == "张三"
+
+
+async def test_list_all_sessions_pages_and_collapses_cross_page_duplicates() -> None:
+    def session(username: str) -> dict:
+        return {"displayName": username, "lastTimestamp": 1, "messageCount": 0,
+                "sessionType": "private", "summary": None, "type": 0,
+                "unreadCount": 0, "username": username}
+
+    mock = Mock()
+    # A live list can shift between pages: "b" shows up twice. The loop stops
+    # on an empty page (this face has no has_more).
+    mock.sessions_pages = [
+        {"success": True, "count": 2, "sessions": [session("a"), session("b")]},
+        {"success": True, "count": 2, "sessions": [session("b"), session("c")]},
+        {"success": True, "count": 0, "sessions": []},
+    ]
+    client = make_client(mock)
+    all_sessions = await client.list_all_sessions()
+    assert [s.username for s in all_sessions] == ["a", "b", "c"]
+
+
+async def test_media_bytes_by_id_fetches_a_single_segment_handle() -> None:
+    mock = Mock()
+    mock.media_hit_first = False  # no export side door: the handle already resolves
+    client = make_client(mock)
+    data = await client.media_bytes_by_id("abc123.png")
+    assert data == b"png-bytes"
+    assert mock.media_calls == ["abc123.png"], "one GET for the handle it was given"

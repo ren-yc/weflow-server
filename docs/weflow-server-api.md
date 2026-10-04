@@ -874,12 +874,29 @@ weflow-server.exe --port 5033 --watch-fallback-ms 5000 --log info
 - **类型与操作客户端是生成的**：出处是 `/openapi.json` 的描述（生成工具 `clients/regen`，
   `cargo run -p weflow-regen` 重新生成；生成物入库，CI 断言「重生成无 diff」）。**不要手改**
   `clients/rust/src/generated/` 下的任何文件。
-- **行为层是手写的**（`clients/rust/src/client.rs`）：就绪轮询（`ensure_ready`，503 是等待
-  而不是错误）、Pull 游标排空（`drain_session`，`nextSince`/`nextOffset` 原样回传）、
-  会话列表排空、SSE 订阅（`watch`，`Last-Event-ID` 重连、心跳注释帧过滤、`generation`
-  变化上报给调用方决定是否回退 Pull 补拉）、媒体字节（`media_bytes`，404 后按「先 `media=1`
-  导出再取」自动重试一次）、关键词检索（`search`，`YYYYMMDD` 客户端先校验）。
-- 鉴权走 `Authorization: Bearer`；客户端从不把 token 放进 URL。
+- **行为层是手写的**（`clients/rust/src/client.rs`）：下面这张表就是**公共面**——
+  每个方法都有具名测试（Rust 在 `clients/rust/tests/behavior.rs`，Python 在
+  `clients/python/tests/test_behavior.py`），没有测试的能力不进这张表。
+
+  | 方法 | 打哪个面 | 语义要点 |
+  | --- | --- | --- |
+  | `health()` | `GET /health` | **免鉴权**，只给标量阶段与版本；客户端不带凭据（有测试钉住） |
+  | `accounts()` | `GET /api/v1/accounts` | 账号明细；`error` 与 `messageCount` 只在这里 |
+  | `register(body)` | `POST /api/v1/accounts` | **非阻塞**，返回原始 `state`/`status`（`RegisterOutcome`）；拒绝态是**值**不是错误 |
+  | `ensure_ready(account, body, timeout)` | 注册 ＋ 轮询 | `register` ＋ `wait_ready` 的组合；**200 的拒绝态立即失败**，不等超时 |
+  | `wait_ready(account, timeout)` | `GET /api/v1/accounts` | **只等待、不注册**（wait-only）；中间态是等待不是错误 |
+  | `drain_session(talker, since, on_page)` | Pull 面 | 游标（`nextSince`/`nextOffset`）原样回传，按 (时间组, offset) 翻页 |
+  | `list_messages(query)` | `GET /api/v1/messages` | **原生面，一页语义**：`offset` 进、`hasMore` 出；带 `rawContent`/`isSend`/`localType`，且只有它能 `media=1` 导出。时间界收 `YYYYMMDD` 或 unix 秒，客户端先校验 |
+  | `contacts(query)` | `GET /api/v1/contacts` | **一页语义**；ChatLab 面完全不覆盖联系人 |
+  | `list_all_sessions()` | `GET /api/v1/sessions` | **取尽语义**（内部翻页到空页），跨页重复折叠并告警 |
+  | `media_bytes(message)` | `GET /api/v1/media/{id}` | 从 ChatLab 消息取；404 后按「先 `media=1` 导出再取」自动重试一次 |
+  | `media_bytes_by_id(id)` | `GET /api/v1/media/{id}` | 按**单段句柄**取（原生面的 `mediaId`，或 `media.url` 末段）；不触发导出 |
+  | `watch()` | SSE `/api/v1/push/messages` | `Last-Event-ID` 重连、心跳注释帧过滤、`generation` 变化上报给调用方决定是否回退 Pull 补拉 |
+
+  **两个容易读错的地方**：① `list_all_sessions` 是取尽，而 `list_messages`/`contacts`
+  只取一页（那个面没有 `hasMore`，翻页由调用方按 `offset` 推进）；② 时间界收
+  `YYYYMMDD` **或** unix 秒，`end` 作为上界时裸日期覆盖**整天**。
+- 鉴权走 `Authorization: Bearer`；客户端从不把 token 放进 URL（`/health` 是唯一免鉴权端点）。
 - 本轮**不发布** crates.io：本地 `cargo build -p weflow-client` 即可使用。
 
 - **Python 侧**：`clients/python`（包 `weflow-sdk`）。模型生成走 `scripts/regen.py`
