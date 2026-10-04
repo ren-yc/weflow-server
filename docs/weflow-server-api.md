@@ -468,21 +468,68 @@ qqflow-server 的 `type` 取值为 `1` 私聊 / `2` 群聊，数值含义与本�
 
 #### 与标准 / 安装版的已知差异
 
-以下是有意不实现或受数据限制的部分，下游不要依赖这些字段存在：
+以下是有意不实现、或按本仓数据条件取舍的部分。这些字段**要么永不输出，要么按本仓条件给空串**
+（`members[].avatar`）——**没有一个是「键恒出现、值为 `null`」**（三种表示的完整清单见下一节）：
 
 | 字段 | 标准 | 安装版 | 本项目 | 原因 |
 | ---- | ---- | ------ | ------ | ---- |
-| `meta.groupAvatar` | 可选，要求 Data URL | 字段清单里有 | **不输出** | 库里只有 HTTP 头像 URL，转 Data URL 需要额外下载与转码；给 HTTP URL 会违反标准的 Data URL 约定 |
+| `meta.groupId` | 群 ID（**仅群聊**） | 字段清单里有 | **私聊也输出**，值等于会话 id | 省略键、给空串、给会话 id 是三种不同的契约，改动会波及已按现状实现的下游；改用「群聊时 `groupId` 等于路径 id」限定语义（契约套件的 `meta_groupId_matches_id`） |
+| `meta.groupAvatar` | 可选；CN 的「头像格式说明」接受 Data URL 与网络 URL 两种，EN 字段表只写 Data URL | 字段清单里有 | **不输出** | 本仓没有解析群头像来源（contact 行的 `avatar_url` 是用户头像，不是群头像）；即使有，转 Data URL 还要额外下载与转码 |
 | `members[].aliases` | 可选，`string[]` | 未列出 | **不输出** | 原生形状已有 `alias` 单值，需要时从 `/api/v1/contacts` 取 |
-| `members[].avatar` | 可选，要求 Data URL | 真实 URL | HTTP URL 或 `""` | 直接透传联系人行的 `avatar_url`，**不是** Data URL；缺值为空串 |
-| `messages[].mediaPath` | 不在标准 | 字段清单里有 | **消息面与拉取面都不输出** | 给不出有意义的值：它描述的是批量导出的落盘位置，而本服务只做按需导出；媒体元数据走 `messages[].media`，取字节走 `media=1` 导出后的 `mediaId` / `fileName` 加 `GET /api/v1/media/{id}` |
-| `members[].roles` | 可选，`[{id}]`（中文表列出） | 未列出 | **不输出** | **有意不做**，不是遗漏：它与 `members[].isOwner` 是同一件事的两种表达，而 `isOwner` 已经在输出；且两者受同一个限制——群主不在本页时都无从判断。要判断群主请用 `isOwner` |
+| `members[].avatar` | 可选；**CN 的「头像格式说明」明确接受网络 URL**，EN 字段表只写 Data URL | 真实 URL | HTTP URL 或 `""` | 直接透传联系人行的 `avatar_url`；缺值为空串。规范版本之间不一致处按 CN 表取向（与 `replyToMessageId` 同一条取向） |
+| `messages[].mediaPath` | **规范里没有这个字段**（EN / CN 字段表都没有） | 字段清单里有 | **消息面与拉取面都不输出** | 给不出有意义的值：它描述的是批量导出的落盘位置，而本服务只做按需导出；媒体元数据走 `messages[].media`，取字节走 `media=1` 导出后的 `mediaId` / `fileName` 加 `GET /api/v1/media/{id}` |
+| `members[].roles` | 可选，`[{id}]`（CN 表列出，EN 表未列） | 未列出 | **不输出** | **有意不做**，不是遗漏：它与 `members[].isOwner` 是同一件事的两种表达，而 `isOwner` 已经在输出；且两者受同一个限制——群主不在本页时都无从判断。要判断群主请用 `isOwner` |
 
 **类型覆盖面与 qqflow-server 不对等。** 本项目能输出
 `0/1/2/3/4/5/7/8/24/25/27/80/81/99`；qqflow-server 只能输出 `0/1/2/3/80/81/99`
 （QQ 侧没有引用关系抽取，也没有名片/位置/链接的细分解析）。同一个逻辑消息在两个平台上
 可能一边是 `25` REPLY、另一边落到 `99` OTHER。下游做类型分支时应把未覆盖码按 `99` 兜底，
 不要假设两个上游的枚举分布一致。
+
+#### 字段无值时怎么表示：省略键 / `null` / 空串
+
+同一个响应里会出现三种「没有值」，它们是**三种不同的契约**：**省略键**＝这个对象不存在或本次没请求；
+**`null`**＝有这个概念、此刻没有值；**空串**＝类型上恒为字符串的字段没有内容。
+下游按「有没有这个键」分支时，必须区分前两者——把 `null` 当成「键不存在」会让本来就该走的分支永远走不到。
+
+| 面 | 字段 | 表示 | 说明 |
+| --- | --- | --- | --- |
+| `GET /api/v1/sessions` | `sessions[].summary` | 键恒出现，无摘要时 `null` | 库里没有摘要列；「有键但为空」与「没有这个键」的区别是有意的 |
+| `GET /api/v1/messages` | `messages[].appmsgSubtype`、`messages[].media`、`messages[].quote` | 键恒出现，无该物时 `null` | |
+| `GET /api/v1/messages` | `messages[].replyToMessageId` | 无引用时**省略键** | 可选字符串，给 `null` 会让按「可选 string」写的读者拿到类型不符的值 |
+| `GET /api/v1/messages` | `media.md5`、`media.url`、`media.localPath`、`media.mediaId`、`media.exported` | 无值时**省略键** | 「出现即可取」是承诺（判据见 `docs/architecture.md` 的「媒体句柄只对『内容摘要派生』的名字下发」） |
+| `GET /api/v1/messages` | `media.exportPath`、`media.enabled`、`media.count` | **恒出现**（`enabled: false` 时也给） | `exportPath` 是本次会话的导出根目录 |
+| `GET /chatlab/sessions` | `sessions[].memberCount` | 不掌握名册时**省略键** | 可选字段，断言不得写成必填 |
+| `GET /chatlab/sessions`、`GET /chatlab/messages` | `page.nextCursor` | 键恒出现，已排空时 `null` | 与「整个 `page` 块不存在」（＝完整单页）是两件事 |
+| `GET /chatlab/messages`、拉取面（两条路径同形） | `messages[].replyToMessageId`、`messages[].media` | 无值时**省略键** | `media.md5` 取不到摘要时也省略 |
+| 拉取面 | `page` | **不出现在响应里** | 进度走 `sync` 块（`hasMore` / `nextSince` / `nextOffset` / `watermark`），四个键恒出现 |
+| SSE `message.new` | `groupName`、`media` | 键恒出现，无该物时 `null` | 键集本身是契约（回归见 `sse_payload_keys_are_pinned`） |
+| SSE `message.new` | `media.md5` | 键恒出现，取不到摘要时 `null` | |
+| SSE `message.new` | `media.mediaId` | 只在导出根下确有该文件时出现（否则**省略键**） | 承诺是「出现即可取」 |
+| SSE `message.revoke` | `groupName` | 键恒出现，私聊时 `null` | |
+| 通知面 `/chatlab/push/messages` | `platformMessageId` | 键恒出现：`message.new` 为 `null`，`message.revoke` 为**被撤回那条消息**的平台号 | 本仓事件里的 `rawid` 就是平台号，所以撤回帧不必另查；拉取面用它定位被撤回的那条（回归见 `chatlab_revoke_frame_carries_platform_message_id`） |
+| SNS `GET /api/v1/sns/stats` | `stats.timeRange` | 时间线为空时 `null` | 该面不属 ChatLab 承诺面（见「SNS」一节） |
+
+**空串是另一套约定**：`/api/v1/contacts`、`/api/v1/group-members` 与 ChatLab 的 `members[]` 在
+没有该值时给空串而不是 `null`（`nickname` / `remark` / `alias` / `avatarUrl` / `avatar` 等，
+见各端点小节）。判据是这些字段在类型上恒为字符串——给 `null` 会破坏「恒字符串」这条形状承诺。
+
+**为什么要区分三者**：省略键让「可选字段」的读者不必写 `if v is None` 两套分支；`null` 保留
+「键在、概念在、值此刻为空」这层信息（例如 `summary`、`quote`）；空串则让字符串字段永远可以直接
+参与拼接与比较。三者混用才是问题——同一字段在不同面用不同表示，是本仓**刻意避免**的事。
+
+**跨仓的允许差异**（两仓各自都成立，但取值不同；按一端写判空逻辑会在另一端出错）：
+
+| 项 | 本仓 | qqflow-server |
+| --- | --- | --- |
+| 未请求导出时的 `media.exportPath` | 键恒出现（值是导出根） | 省略键 |
+| SSE `message.new` 的 `groupName` / `media` | 键恒出现，无值时 `null` | 条件键（没有就不出现） |
+| 通知帧 `platformMessageId` | 键恒出现：`message.new` 为 `null`，`message.revoke` 为平台号 | 恒省略 |
+| 未请求计数时的 `members[].messageCount` | 键恒出现，值为 `0` | 省略键 |
+
+**回归位置**：原生面的省略与保留由 `tests/golden/*.json` 逐字节钉住（`accounts.json` …
+`messages-native.json` 等 23 份快照）；SSE 三类帧的键集在 `tests/sse_replay.rs`；
+ChatLab 两面的形状由 `tests/api_smoke.rs` 与一致性套件共同钉住。
 
 ### GET `/api/v1/contacts` — 联系人
 
