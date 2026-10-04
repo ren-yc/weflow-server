@@ -50,6 +50,8 @@ struct Mock {
     sessions_queries: Arc<StdMutex<Vec<String>>>,
     /// How many times `/health` was hit, and whether it carried credentials.
     health_calls: Arc<StdMutex<Vec<bool>>>,
+    /// How many times `POST /api/v1/sync` was hit (asserts "no polling").
+    sync_calls: Arc<StdMutex<usize>>,
 }
 
 fn parse_query(q: &Option<String>) -> Vec<(String, String)> {
@@ -73,6 +75,7 @@ async fn spawn_mock(mock: Mock) -> String {
         .route("/api/v1/messages", get(messages_route))
         .route("/api/v1/contacts", get(contacts_route))
         .route("/api/v1/sessions", get(sessions_route))
+        .route("/api/v1/sync", post(sync_post))
         .route("/health", get(health_route))
         .route("/api/v1/push/messages", get(sse_route))
         .with_state(mock.clone());
@@ -97,6 +100,21 @@ async fn accounts_post(
         .clone()
         .unwrap_or_else(|| serde_json::json!({"success": true, "state": "indexing"}));
     Json(body).into_response()
+}
+
+/// `POST /api/v1/sync` — counts calls and requires the bearer token.
+///
+/// The counter is the point: the SDK must trigger a sync **only** when the
+/// caller asked for one, never from a polling path.
+async fn sync_post(State(mock): State<Mock>, headers: HeaderMap) -> Response {
+    assert_bearer(&headers);
+    *mock.sync_calls.lock().unwrap() += 1;
+    Json(serde_json::json!({
+        "success": true,
+        "newMessages": 7,
+        "revokeMessages": 2,
+    }))
+    .into_response()
 }
 
 fn assert_bearer(headers: &HeaderMap) {
@@ -662,5 +680,47 @@ async fn ensure_ready_fails_fast_on_a_refusal_state() {
         *mock.accounts_calls.lock().unwrap(),
         0,
         "a refusal is deterministic: nothing to poll for"
+    );
+}
+
+// ---- sync_now -----------------------------------------------------------
+
+/// `sync_now` is a **write** (it advances watermarks and may export media), so
+/// the contract has two halves: it POSTs with the bearer token and decodes the
+/// counters, and nothing else in the client ever triggers it.
+#[tokio::test]
+async fn sync_now_posts_with_the_bearer_token_and_decodes_counters() {
+    let mock = Mock::default();
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+    let result = client.sync_now().await.expect("decode SyncResult");
+    assert!(result.success);
+    assert_eq!(result.new_messages, 7);
+    assert_eq!(result.revoke_messages, 2);
+    assert_eq!(*mock.sync_calls.lock().unwrap(), 1, "exactly one POST /api/v1/sync");
+}
+
+/// The other half: the polling paths must not sync on their own. A client that
+/// synced while merely asking for readiness would turn every probe into a disk
+/// scan of the live database.
+#[tokio::test]
+async fn no_polling_path_triggers_a_sync() {
+    let mock = Mock::default();
+    let mut always = mock.clone();
+    always.always_indexing = true;
+    let base = spawn_mock(always).await;
+    let client = Client::new(&base, TOKEN);
+    let _ = client.health().await;
+    let _ = client
+        .ensure_ready(
+            "wxid_mock",
+            &serde_json::json!({"wxid": "wxid_mock", "db_path": "X:/db"}),
+            Duration::from_millis(300),
+        )
+        .await;
+    assert_eq!(
+        *mock.sync_calls.lock().unwrap(),
+        0,
+        "readiness probing must never sync"
     );
 }

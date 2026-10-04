@@ -46,6 +46,9 @@ class Mock:
         # Request counters: which endpoints a call actually touched.
         self.post_calls: int = 0
         self.get_accounts_calls: int = 0
+        # POST /api/v1/sync hits: a manual sync is a *write*, so the counter is
+        # what proves no read path triggers one on its own.
+        self.sync_calls: int = 0
         # The POST /api/v1/accounts response body (registration semantics).
         self.register_body: dict | None = None
         # When set, GET /api/v1/accounts answers this page verbatim.
@@ -87,6 +90,9 @@ class Mock:
             if path == "/api/v1/accounts" and scope["method"] == "POST":
                 mock.post_calls += 1
                 body = mock.register_body or {"success": True, "state": "indexing"}
+            elif path == "/api/v1/sync":
+                mock.sync_calls += 1
+                body = {"success": True, "newMessages": 7, "revokeMessages": 2}
             elif path == "/api/v1/accounts":
                 mock.get_accounts_calls += 1
                 if mock.accounts_page is not None:
@@ -839,3 +845,36 @@ async def test_media_bytes_by_id_fetches_a_single_segment_handle() -> None:
     data = await client.media_bytes_by_id("abc123.png")
     assert data == b"png-bytes"
     assert mock.media_calls == ["abc123.png"], "one GET for the handle it was given"
+
+
+# ---- sync_now -----------------------------------------------------------
+
+
+async def test_sync_now_posts_with_the_bearer_token_and_decodes_counters() -> None:
+    """``sync_now`` is a write: one POST, bearer auth, counters decoded."""
+    mock = Mock()
+    client = make_client(mock)
+    result = await client.sync_now()
+    assert result.success is True
+    assert result.new_messages == 7
+    assert result.revoke_messages == 2
+    assert mock.sync_calls == 1
+    await client.aclose()
+
+
+async def test_no_read_path_triggers_a_sync() -> None:
+    """Readiness probing must never sync on its own.
+
+    A client that synced while merely asking whether the server is up would turn
+    every probe into a disk scan of the live database.
+    """
+    mock = Mock()
+    mock.states = ["indexing"] * 100
+    client = make_client(mock)
+    await client.health()
+    with pytest.raises(NotReady):
+        await client.ensure_ready("wxid_mock",
+                                  {"wxid": "wxid_mock", "db_path": "X:/db"},
+                                  timeout=0.6)
+    assert mock.sync_calls == 0
+    await client.aclose()

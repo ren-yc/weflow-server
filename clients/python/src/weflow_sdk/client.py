@@ -286,6 +286,23 @@ class Client:
             body=payload,
         )
 
+    async def sync_now(self) -> gen.SyncResult:
+        """``POST /api/v1/sync`` - run one manual incremental sync and return
+        its counters.
+
+        The watcher runs the same sync on file changes, so this exists for a
+        caller that must have a fresh read *now* rather than eventually (the
+        `sync` CLI subcommand and the `sync_now` MCP tool both do). It is a
+        write against the server's state - it advances watermarks and may export
+        media - so it is deliberately absent from every polling path: only a
+        caller that asked for it triggers it.
+        """
+        url = self._url("/api/v1/sync")
+        resp = await self._http.post(
+            url, headers={"Authorization": f"Bearer {self._token}"}
+        )
+        return gen.SyncResult.model_validate(await self._decode(resp, url))
+
     # ---- drain_session --------------------------------------------------
 
     async def drain_session(

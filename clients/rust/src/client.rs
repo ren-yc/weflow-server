@@ -361,6 +361,21 @@ impl Client {
         RegisterOutcome::from_body(&url, value)
     }
 
+    /// `POST /api/v1/sync` — run one manual incremental sync and return its
+    /// counters.
+    ///
+    /// The watcher runs the same sync on file changes, so this exists for a
+    /// caller that must have a fresh read *now* rather than eventually (the
+    /// `sync` CLI subcommand and the `sync_now` MCP tool both do). It is a
+    /// write against the server's state — it advances watermarks and may export
+    /// media — so it is deliberately absent from every polling path: only a
+    /// caller that asked for it triggers it.
+    pub async fn sync_now(&self) -> Result<gen_types::SyncResult> {
+        let url = self.url("/api/v1/sync");
+        let resp = self.http.post(&url).bearer_auth(&self.token).send().await?;
+        Self::decode(resp, &url).await
+    }
+
     /// Poll until `wxid` reports `ready`. **Wait-only**: never registers.
     ///
     /// Intermediate states are waiting, not errors — only the deadline and the
