@@ -52,6 +52,19 @@ internal!(sync);
 #[cfg(feature = "server")]
 internal!(server);
 
+/// 造库/造密钥夹具 —— **不是承诺面**，只随 `testing` feature 编译。
+///
+/// 落点为什么在库里而不是 `tests/common`：需要它的有两个调用方，而它们互相
+/// 看不见对方的代码 —— 集成测试是独立 crate（链库），**根包二进制同样是独立
+/// crate**，批量导出的夹具生成入口（CLI 的 `--rows`）够不着只在 `tests/` 下
+/// 存在的模块。一份造库器、两个调用方、一个 feature 门。
+///
+/// 豁免文档门：它随 `testing` 编译，语义等同上面 `internal!` 的 testing 分支
+/// （把实现面转 `pub` 只为让本仓自己的二进制与集成测试够得着），不是对外承诺。
+#[cfg(feature = "testing")]
+#[allow(missing_docs)]
+pub mod testing;
+
 #[cfg(feature = "server")]
 use std::sync::Arc;
 
