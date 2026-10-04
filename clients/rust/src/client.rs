@@ -40,18 +40,149 @@ pub enum ClientError {
         /// Final observed phase, so the caller can tell polling from stuck.
         last_state: String,
     },
-    /// `search` was given a malformed date bound.
-    #[error("invalid date bound {field}={value:?}: expected YYYYMMDD")]
+    /// A time bound was neither `YYYYMMDD` nor unix seconds.
+    #[error("invalid time bound {field}={value:?}: expected YYYYMMDD or unix seconds")]
     BadDate {
         /// Which parameter.
         field: &'static str,
         /// What was passed.
         value: String,
     },
+    /// The body decoded as JSON but did not carry what this call requires.
+    #[error("{url}: {detail}")]
+    UnexpectedBody {
+        /// Request URL, for the operator reading the log.
+        url: String,
+        /// What was expected, and what arrived instead.
+        detail: String,
+    },
 }
 
 /// Result alias for the behavior layer.
 pub type Result<T> = std::result::Result<T, ClientError>;
+
+/// Raw `POST /api/v1/accounts` outcome.
+///
+/// HTTP 200 covers several business states with **different shapes**
+/// (`accepted` / `in_progress` / `already_ready` carry a status; a conflict
+/// carries who holds the binding; a mismatch carries neither). Only the two
+/// fields every state has are typed here; the decoded body stays available so
+/// a refusal keeps its extra fields.
+///
+/// A refusal is a **value**, not an error: what to do about it (retry, give
+/// up, tell the operator which account holds the binding) is the caller's
+/// decision — the caller is the one holding the configuration to compare
+/// against.
+#[derive(Debug, Clone)]
+pub struct RegisterOutcome {
+    /// Business state string (`accepted` / `in_progress` / `already_ready` /
+    /// `account_conflict` / `wxid_mismatch` / …).
+    pub state: String,
+    /// Account status, when the state carries one (`ready` / `indexing` /
+    /// `error`).
+    pub status: Option<String>,
+    /// The whole decoded body.
+    pub body: serde_json::Value,
+}
+
+impl RegisterOutcome {
+    fn from_body(url: &str, body: serde_json::Value) -> Result<Self> {
+        let Some(state) = body.get("state").and_then(|v| v.as_str()) else {
+            return Err(ClientError::UnexpectedBody {
+                url: url.to_string(),
+                detail: format!("no string `state` in the body: {body}"),
+            });
+        };
+        // Read the status as a string rather than through the generated enum:
+        // the enum only covers the states this build knows, and an unknown one
+        // must not fail the whole call.
+        let status = body.get("status").and_then(|v| v.as_str()).map(str::to_string);
+        Ok(Self { state: state.to_string(), status, body })
+    }
+}
+
+/// Query for the native messages face ([`Client::list_messages`]).
+///
+/// Time bounds accept either unix seconds or `YYYYMMDD`; as an upper bound a
+/// bare date covers its **whole day**. Bounds are validated here so a typo
+/// fails fast with [`ClientError::BadDate`] instead of a 400.
+#[derive(Debug, Clone, Default)]
+pub struct MessageQuery {
+    /// Conversation key (`…@chatroom` for groups).
+    pub talker: String,
+    /// Substring filter over the message body.
+    pub keyword: Option<String>,
+    /// Inclusive lower bound.
+    pub start: Option<String>,
+    /// Inclusive upper bound.
+    pub end: Option<String>,
+    /// Page size (server default 100, maximum 10000).
+    pub limit: Option<u32>,
+    /// Offset cursor: advance it by the page size until `has_more` is false.
+    pub offset: Option<u64>,
+    /// Export this page's media before answering (`media=1`); the files land
+    /// under the envelope's `media.exportPath`.
+    pub media: bool,
+}
+
+impl MessageQuery {
+    /// A query for one conversation, server defaults everywhere else.
+    pub fn new(talker: impl Into<String>) -> Self {
+        Self { talker: talker.into(), ..Self::default() }
+    }
+
+    fn params(&self) -> Result<BTreeMap<&'static str, String>> {
+        if self.talker.is_empty() {
+            return Err(ClientError::UnexpectedBody {
+                url: "/api/v1/messages".to_string(),
+                detail: "talker must not be empty".to_string(),
+            });
+        }
+        let mut p = BTreeMap::new();
+        p.insert("talker", self.talker.clone());
+        if let Some(k) = &self.keyword {
+            p.insert("keyword", k.clone());
+        }
+        for (field, value) in [("start", &self.start), ("end", &self.end)] {
+            if let Some(v) = value {
+                validate_time_bound(field, v)?;
+                p.insert(field, v.clone());
+            }
+        }
+        if let Some(l) = self.limit {
+            p.insert("limit", l.to_string());
+        }
+        if let Some(o) = self.offset {
+            p.insert("offset", o.to_string());
+        }
+        if self.media {
+            p.insert("media", "1".to_string());
+        }
+        Ok(p)
+    }
+}
+
+/// Query for [`Client::contacts`].
+#[derive(Debug, Clone, Default)]
+pub struct ContactsQuery {
+    /// Page size (server default 100, maximum 10000).
+    pub limit: Option<u32>,
+    /// Offset cursor: advance it by the page size until `has_more` is false.
+    pub offset: Option<u64>,
+    /// Substring filter over display name / remark / nickname.
+    pub keyword: Option<String>,
+}
+
+/// A time bound is either a bare `YYYYMMDD` date or unix seconds — the server
+/// parses both, so this check accepts both and rejects everything else.
+fn validate_time_bound(field: &'static str, value: &str) -> Result<()> {
+    let digits = !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
+    if digits {
+        Ok(())
+    } else {
+        Err(ClientError::BadDate { field, value: value.to_string() })
+    }
+}
 
 /// One live server event, decoded from the SSE stream.
 #[derive(Debug, Clone)]
@@ -151,6 +282,43 @@ impl Client {
         body: &serde_json::Value,
         timeout: Duration,
     ) -> Result<()> {
+        // Registration and waiting are two primitives; this is their
+        // composition. One implementation per endpoint means a change to the
+        // registration contract cannot land in half the SDK.
+        let _ = self.register(body).await?;
+        self.wait_ready(wxid, timeout).await
+    }
+
+    // ---- health / accounts / register / wait_ready --------------------------
+
+    /// `GET /health` — liveness and account phase. **Unauthenticated.**
+    ///
+    /// Deliberately carries no account identity: confirming *which* account is
+    /// bound requires [`Client::accounts`]. Useful as a cheap "is it up, and
+    /// what is it doing" probe before spending an authenticated call.
+    pub async fn health(&self) -> Result<gen_types::Health> {
+        let url = self.url("/health");
+        let resp = self.http.get(&url).send().await?;
+        Self::decode(resp, &url).await
+    }
+
+    /// `GET /api/v1/accounts` — one entry per bound account.
+    ///
+    /// The failure reason (`error`) and the message count live only here;
+    /// `/health` collapses everything to a scalar phase.
+    pub async fn accounts(&self) -> Result<Vec<gen_types::AccountStateView>> {
+        let listing: gen_types::AccountsList =
+            self.get_json("/api/v1/accounts", &BTreeMap::new()).await?;
+        Ok(listing.accounts)
+    }
+
+    /// `POST /api/v1/accounts` — register, returning the raw outcome
+    /// **without waiting**.
+    ///
+    /// The waiting half is [`Client::wait_ready`]. Callers that classify the
+    /// answer themselves (a refusal is a business state, not an HTTP error)
+    /// use this pair instead of [`Client::ensure_ready`].
+    pub async fn register(&self, body: &serde_json::Value) -> Result<RegisterOutcome> {
         let url = self.url("/api/v1/accounts");
         let resp = self
             .http
@@ -159,17 +327,21 @@ impl Client {
             .json(body)
             .send()
             .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(ClientError::Status { status: status.as_u16(), url });
-        }
+        let value: serde_json::Value = Self::decode(resp, &url).await?;
+        RegisterOutcome::from_body(&url, value)
+    }
+
+    /// Poll until `wxid` reports `ready`. **Wait-only**: never registers.
+    ///
+    /// Intermediate states are waiting, not errors — only the deadline and the
+    /// `error` state fail. Registration belongs to the caller because the
+    /// caller holds the key material and the configuration that identity is
+    /// compared against.
+    pub async fn wait_ready(&self, wxid: &str, timeout: Duration) -> Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
-        let mut last_state;
         loop {
-            let accounts: gen_types::AccountsList =
-                self.get_json("/api/v1/accounts", &BTreeMap::new()).await?;
-            let mine = accounts.accounts.iter().find(|a| a.wxid == wxid);
-            match mine {
+            let accounts = self.accounts().await?;
+            let last_state = match accounts.iter().find(|a| a.wxid == wxid) {
                 Some(a) if a.state == gen_types::AccountStatus::Ready => return Ok(()),
                 Some(a) if a.state == gen_types::AccountStatus::Error => {
                     return Err(ClientError::NotReady {
@@ -177,10 +349,9 @@ impl Client {
                         last_state: format!("error: {}", a.error.clone().unwrap_or_default()),
                     });
                 }
-                Some(a) => last_state = a.state.to_string(),
-                None => last_state = "not-registered".into(),
-            }
-            let _ = &last_state;
+                Some(a) => a.state.to_string(),
+                None => "not-registered".to_string(),
+            };
             if tokio::time::Instant::now() >= deadline {
                 return Err(ClientError::NotReady { timeout, last_state });
             }
@@ -339,6 +510,52 @@ impl Client {
             return Err(ClientError::Status { status: status.as_u16(), url: url.to_string() });
         }
         Ok(resp.bytes().await?)
+    }
+
+    // ---- list_messages / contacts / media_bytes_by_id -----------------------
+
+    /// `GET /api/v1/messages` — the **native** messages face.
+    ///
+    /// Descending by time, offset-paged: advance `offset` by the page size
+    /// until `has_more` is false. This is the face that carries what the
+    /// ChatLab shape drops — `rawContent`, `isSend`, `localType` — and the
+    /// only one that can export media (`media = true`).
+    ///
+    /// Prefer [`Client::drain_session`] when both faces would do: the Pull
+    /// cursor is stable across a live database, while offset paging over a
+    /// growing table can shift.
+    pub async fn list_messages(&self, q: &MessageQuery) -> Result<gen_types::MessagesNative> {
+        self.get_json("/api/v1/messages", &q.params()?).await
+    }
+
+    /// `GET /api/v1/contacts` — one page of the contact list.
+    ///
+    /// Contact detail is not part of the ChatLab shape at all; this is the
+    /// only source for display names, remarks and aliases.
+    pub async fn contacts(&self, q: &ContactsQuery) -> Result<gen_types::Contacts> {
+        let mut params = BTreeMap::new();
+        if let Some(l) = q.limit {
+            params.insert("limit", l.to_string());
+        }
+        if let Some(o) = q.offset {
+            params.insert("offset", o.to_string());
+        }
+        if let Some(k) = &q.keyword {
+            params.insert("keyword", k.clone());
+        }
+        self.get_json("/api/v1/contacts", &params).await
+    }
+
+    /// `GET /api/v1/media/{id}` — bytes for a handle the server advertised.
+    ///
+    /// `id` is a **single path segment**: the native face's `mediaId`, or the
+    /// last segment of `media.url` / `media.mediaUrl`. Prefer
+    /// [`Client::media_bytes`] when a ChatLab message is at hand — that one
+    /// also triggers an export and retries once on a 404.
+    pub async fn media_bytes_by_id(&self, id: &str) -> Result<bytes::Bytes> {
+        let url = self.url(&format!("/api/v1/media/{id}"));
+        let resp = self.http.get(&url).bearer_auth(&self.token).send().await?;
+        Self::decode_bytes(resp, &url).await
     }
 
     // ---- watch ------------------------------------------------------------

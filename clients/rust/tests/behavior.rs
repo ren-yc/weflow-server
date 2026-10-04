@@ -12,7 +12,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use weflow_client::client::{Client, ClientError, ServerEvent};
+use weflow_client::client::{Client, ClientError, ContactsQuery, MessageQuery, ServerEvent};
 
 const TOKEN: &str = "test-token-0123456789abcdef";
 
@@ -30,6 +30,24 @@ struct Mock {
     messages_query: Arc<StdMutex<Option<String>>>,
     /// When set, the accounts route answers `indexing` forever (timeout test).
     always_indexing: bool,
+    /// When set, `GET /api/v1/accounts` answers this page verbatim.
+    accounts_page: Arc<StdMutex<Option<serde_json::Value>>>,
+    /// How many times the accounts route was hit (asserts "no polling").
+    accounts_calls: Arc<StdMutex<usize>>,
+    /// When set, `POST /api/v1/accounts` answers this body verbatim.
+    register_response: Arc<StdMutex<Option<serde_json::Value>>>,
+    /// How many times the register route was hit (asserts "no registration").
+    post_calls: Arc<StdMutex<usize>>,
+    /// When set, `GET /api/v1/messages` answers this page verbatim.
+    native_page: Arc<StdMutex<Option<serde_json::Value>>>,
+    /// Query strings seen by the native messages route, in order.
+    native_queries: Arc<StdMutex<Vec<String>>>,
+    /// When set, `GET /api/v1/contacts` answers this page verbatim.
+    contacts_page: Arc<StdMutex<Option<serde_json::Value>>>,
+    /// FIFO pages for `GET /api/v1/sessions`.
+    sessions_pages: Arc<StdMutex<Vec<serde_json::Value>>>,
+    /// How many times `/health` was hit, and whether it carried credentials.
+    health_calls: Arc<StdMutex<Vec<bool>>>,
 }
 
 fn parse_query(q: &Option<String>) -> Vec<(String, String)> {
@@ -37,9 +55,9 @@ fn parse_query(q: &Option<String>) -> Vec<(String, String)> {
         .unwrap_or("")
         .split('&')
         .filter(|s| !s.is_empty())
-        .filter_map(|kv| {
+        .map(|kv| {
             let (k, v) = kv.split_once('?').unwrap_or(kv.split_once('=').unwrap_or((kv, "")));
-            Some((k.to_string(), v.to_string()))
+            (k.to_string(), v.to_string())
         })
         .collect()
 }
@@ -51,6 +69,9 @@ async fn spawn_mock(mock: Mock) -> String {
         .route("/chatlab/messages", get(chatlab_route))
         .route("/api/v1/media/{id}", get(media_route))
         .route("/api/v1/messages", get(messages_route))
+        .route("/api/v1/contacts", get(contacts_route))
+        .route("/api/v1/sessions", get(sessions_route))
+        .route("/health", get(health_route))
         .route("/api/v1/push/messages", get(sse_route))
         .with_state(mock.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -66,8 +87,14 @@ async fn accounts_post(
     headers: HeaderMap,
 ) -> Response {
     assert_bearer(&headers);
-    let _ = mock;
-    Json(serde_json::json!({"success": true, "state": "indexing"})).into_response()
+    *mock.post_calls.lock().unwrap() += 1;
+    let body = mock
+        .register_response
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({"success": true, "state": "indexing"}));
+    Json(body).into_response()
 }
 
 fn assert_bearer(headers: &HeaderMap) {
@@ -77,6 +104,10 @@ fn assert_bearer(headers: &HeaderMap) {
 
 async fn accounts_get(State(mock): State<Mock>, headers: HeaderMap) -> Response {
     assert_bearer(&headers);
+    *mock.accounts_calls.lock().unwrap() += 1;
+    if let Some(page) = mock.accounts_page.lock().unwrap().clone() {
+        return Json(page).into_response();
+    }
     let state = if mock.always_indexing {
         "indexing".to_string()
     } else {
@@ -156,12 +187,50 @@ async fn messages_route(
     headers: HeaderMap,
 ) -> Response {
     assert_bearer(&headers);
-    *mock.messages_query.lock().unwrap() = query;
+    *mock.messages_query.lock().unwrap() = query.clone();
+    mock.native_queries.lock().unwrap().push(query.unwrap_or_default());
+    if let Some(page) = mock.native_page.lock().unwrap().clone() {
+        return Json(page).into_response();
+    }
+    // The native face is camelCase on the wire; the fallback must decode as
+    // `MessagesNative` or every caller of this route looks like a shape break.
     Json(serde_json::json!({
-        "success": true, "count": 0, "has_more": false,
-        "talker": "", "media": {}, "messages": [],
+        "success": true, "count": 0, "hasMore": false,
+        "talker": "", "media": {"count": 0, "enabled": false, "exportPath": ""}, "messages": [],
     }))
     .into_response()
+}
+
+/// `/health` is unauthenticated: the mock records whether a bearer arrived,
+/// so the test can pin "the SDK does not send credentials to it".
+async fn health_route(State(mock): State<Mock>, headers: HeaderMap) -> Response {
+    let carried = headers.contains_key("authorization");
+    mock.health_calls.lock().unwrap().push(carried);
+    Json(serde_json::json!({"account": "ready", "status": "ok", "version": "9.9.9"}))
+        .into_response()
+}
+
+async fn contacts_route(
+    State(mock): State<Mock>,
+    headers: HeaderMap,
+) -> Response {
+    assert_bearer(&headers);
+    match mock.contacts_page.lock().unwrap().clone() {
+        Some(p) => Json(p).into_response(),
+        None => (StatusCode::NOT_FOUND, "fixture missing").into_response(),
+    }
+}
+
+async fn sessions_route(State(mock): State<Mock>, headers: HeaderMap) -> Response {
+    assert_bearer(&headers);
+    let page = {
+        let mut q = mock.sessions_pages.lock().unwrap();
+        if q.is_empty() { None } else { Some(q.remove(0)) }
+    };
+    match page {
+        Some(p) => Json(p).into_response(),
+        None => (StatusCode::NOT_FOUND, "fixture exhausted").into_response(),
+    }
 }
 
 async fn sse_route(
@@ -348,5 +417,203 @@ async fn watch_decodes_frames_and_reconnects_with_last_event_id() {
     assert!(
         reconnects.iter().any(|id| id.as_deref() == Some("7")),
         "reconnect must carry Last-Event-ID: 7, got {reconnects:?}"
+    );
+}
+
+// ---- health / accounts / register / wait_ready ---------------------------
+
+#[tokio::test]
+async fn health_reports_version_and_account_phase() {
+    let mock = Mock::default();
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+    let h = client.health().await.expect("health must decode");
+    assert_eq!(h.version, "9.9.9");
+    assert_eq!(h.status, "ok");
+    assert_eq!(
+        serde_json::to_string(&h.account).unwrap(),
+        "\"ready\"",
+        "the scalar phase is the whole point of this endpoint"
+    );
+    assert_eq!(
+        mock.health_calls.lock().unwrap().clone(),
+        vec![false],
+        "/health is unauthenticated: the SDK must not send credentials to it"
+    );
+}
+
+#[tokio::test]
+async fn accounts_expose_state_error_and_message_count() {
+    let mock = Mock::default();
+    *mock.accounts_page.lock().unwrap() = Some(serde_json::json!({
+        "success": true,
+        "accounts": [
+            {"wxid": "wxid_a", "db_storage": "X:/a", "message_count": 12, "state": "ready"},
+            {"wxid": "wxid_b", "db_storage": "X:/b", "message_count": 0, "state": "error",
+             "error": "bad key"},
+        ],
+    }));
+    let base = spawn_mock(mock).await;
+    let client = Client::new(&base, TOKEN);
+    let accounts = client.accounts().await.expect("accounts must decode");
+    assert_eq!(accounts.len(), 2);
+    assert_eq!(accounts[0].message_count, 12);
+    assert_eq!(
+        accounts[1].error.as_deref(),
+        Some("bad key"),
+        "the failure reason exists only on this face, not on /health"
+    );
+}
+
+#[tokio::test]
+async fn register_returns_raw_state_without_polling() {
+    let mock = Mock::default();
+    *mock.register_response.lock().unwrap() = Some(serde_json::json!({
+        "success": false, "state": "account_conflict",
+        "occupied_by": "wxid_other", "occupied_status": "ready",
+    }));
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+    let outcome = client
+        .register(&serde_json::json!({"wxid": "wxid_mock", "db_path": "X:/db"}))
+        .await
+        .expect("a refusal is a value, not an error");
+    assert_eq!(outcome.state, "account_conflict");
+    assert_eq!(outcome.status, None, "this state carries no status");
+    assert_eq!(
+        outcome.body["occupied_by"], "wxid_other",
+        "refusal extras stay reachable in the body"
+    );
+    assert_eq!(*mock.post_calls.lock().unwrap(), 1, "one POST, no retry");
+    assert_eq!(
+        *mock.accounts_calls.lock().unwrap(),
+        0,
+        "register must not poll: waiting is wait_ready's job"
+    );
+}
+
+#[tokio::test]
+async fn wait_ready_polls_without_registering() {
+    let mock = Mock::default();
+    *mock.states.lock().unwrap() = vec!["indexing".into(), "indexing".into()];
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+    client
+        .wait_ready("wxid_mock", Duration::from_secs(5))
+        .await
+        .expect("must reach ready through indexing");
+    let polls = *mock.accounts_calls.lock().unwrap();
+    assert!(polls >= 3, "it polls the listing until ready, saw {polls}");
+    assert_eq!(*mock.post_calls.lock().unwrap(), 0, "wait_ready is wait-only");
+}
+
+// ---- list_messages / contacts / media_bytes_by_id ------------------------
+
+#[tokio::test]
+async fn list_messages_pages_by_offset_and_exposes_native_fields() {
+    let mock = Mock::default();
+    *mock.native_page.lock().unwrap() = Some(serde_json::json!({
+        "success": true, "count": 1, "hasMore": true, "talker": "alice",
+        "media": {"count": 0, "enabled": false, "exportPath": "X:/export"},
+        "messages": [{
+            "appmsgSubtype": null, "baseType": 1, "content": "hi",
+            "createTime": 1_700_000_000, "isSend": 1, "localId": 7, "localType": 3,
+            "media": {"fileName": "abc.png", "mediaId": "abc123", "md5": "d41d8", "type": "image"},
+            "parsedContent": "hi", "quote": null, "rawContent": "<msg>hi</msg>",
+            "replyToMessageId": "41", "senderName": "张三", "senderUsername": "alice",
+            "serverId": "42", "sortSeq": 1,
+        }],
+    }));
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+    let mut q = MessageQuery::new("alice");
+    q.limit = Some(500);
+    q.offset = Some(1000);
+    q.media = true;
+    let page = client.list_messages(&q).await.expect("native page must decode");
+    assert!(page.has_more, "paging continues until has_more is false");
+    assert_eq!(page.media.export_path, "X:/export");
+    let m = &page.messages[0];
+    assert_eq!(m.raw_content, "<msg>hi</msg>", "the ChatLab shape drops rawContent");
+    assert_eq!(m.is_send, 1);
+    assert_eq!(m.local_type, 3);
+    assert_eq!(
+        m.media.as_ref().and_then(|x| x.media_id.as_deref()),
+        Some("abc123"),
+        "the fetchable handle rides inside media"
+    );
+    let queries = mock.native_queries.lock().unwrap().clone();
+    assert_eq!(queries.len(), 1);
+    let pairs = parse_query(&Some(queries[0].clone()));
+    for want in [("talker", "alice"), ("limit", "500"), ("offset", "1000"), ("media", "1")] {
+        assert!(
+            pairs.iter().any(|(k, v)| k == want.0 && v == want.1),
+            "query must carry {want:?}: {}",
+            queries[0]
+        );
+    }
+}
+
+#[tokio::test]
+async fn contacts_page_decodes_rows_and_paging_fields() {
+    let mock = Mock::default();
+    *mock.contacts_page.lock().unwrap() = Some(serde_json::json!({
+        "success": true, "count": 1, "total": 42, "hasMore": true,
+        "contacts": [{
+            "alias": "", "avatarUrl": "", "displayName": "张三",
+            "nickname": "三儿", "remark": "客户张三", "type": "friend", "username": "alice",
+        }],
+    }));
+    let base = spawn_mock(mock).await;
+    let client = Client::new(&base, TOKEN);
+    let page = client
+        .contacts(&ContactsQuery { limit: Some(100), offset: Some(0), keyword: None })
+        .await
+        .expect("contacts must decode");
+    assert_eq!(page.count, 1);
+    assert_eq!(page.total, 42);
+    assert!(page.has_more);
+    assert_eq!(page.contacts[0].display_name, "张三");
+}
+
+#[tokio::test]
+async fn list_all_sessions_pages_and_collapses_cross_page_duplicates() {
+    let mock = Mock::default();
+    let sess = |u: &str| {
+        serde_json::json!({
+            "displayName": u, "lastTimestamp": 1, "messageCount": 0,
+            "sessionType": "private", "summary": null, "type": 0,
+            "unreadCount": 0, "username": u,
+        })
+    };
+    // A live list can shift between pages: "b" shows up twice. The loop stops
+    // on an empty page (this face has no has_more).
+    *mock.sessions_pages.lock().unwrap() = vec![
+        serde_json::json!({"success": true, "count": 2, "sessions": [sess("a"), sess("b")]}),
+        serde_json::json!({"success": true, "count": 2, "sessions": [sess("b"), sess("c")]}),
+        serde_json::json!({"success": true, "count": 0, "sessions": []}),
+    ];
+    let base = spawn_mock(mock).await;
+    let client = Client::new(&base, TOKEN);
+    let all = client.list_all_sessions().await.expect("both pages must be read");
+    let users: Vec<&str> = all.iter().map(|s| s.username.as_str()).collect();
+    assert_eq!(users, vec!["a", "b", "c"], "the repeated b collapses exactly once");
+}
+
+#[tokio::test]
+async fn media_bytes_by_id_fetches_a_single_segment_handle() {
+    let mock = Mock::default();
+    *mock.media_bytes.lock().unwrap() = Some(b"png-bytes".to_vec());
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+    let bytes = client
+        .media_bytes_by_id("abc123.png")
+        .await
+        .expect("must fetch the advertised handle");
+    assert_eq!(bytes.as_ref(), b"png-bytes");
+    assert_eq!(
+        mock.media_calls.lock().unwrap().clone(),
+        vec!["abc123.png"],
+        "one GET, no export side door: this call fetches a handle it was given"
     );
 }
