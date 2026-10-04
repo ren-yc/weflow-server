@@ -296,8 +296,14 @@ impl AccountSync {
             guard.mark_index_built();
         }
         // seed stamps so the next poll starts from a clean baseline
+        // 只给**成功打开过**的文件记基线：构建期间打不开的库（缺 key / busy）
+        // 若也被记上戳，poll 会把它的存量数据判成「未变」—— 存量就被卡死到
+        // 文件下次变化为止。没记基线的文件 classify 必判变，首轮 poll 即补读。
         self.stamps.clear();
         for f in &files {
+            if !self.pool.is_open(&f.rel) {
+                continue;
+            }
             let main = src_stamp(&f.abs);
             let wal = f.wal.as_deref().and_then(src_stamp);
             self.stamps.insert(
@@ -326,19 +332,28 @@ impl AccountSync {
         let files = self.rescan();
         let mut work: Vec<Work> = Vec::new();
         for f in &files {
-            let main = src_stamp(&f.abs);
-            let wal = f.wal.as_deref().and_then(src_stamp);
-            let cur = DbStamps {
-                main,
-                wal,
-            };
-            let unchanged = self
-                .stamps
-                .get(&f.rel)
-                .map(|prev| *prev == cur)
-                .unwrap_or(false);
-            if unchanged {
-                continue;
+            // 两级检测：**已打开**的文件走 `data_version`（别的连接提交后必然
+            // 变化，与文件系统时间戳无关 —— Windows 高负载下 mtime/size 回读
+            // 滞后不会再把一次写入误判成「未变」）；**未打开**的文件没有连接，
+            // 只能继续用 mtime/size 戳做前置门。无基线（首见文件）一律判变。
+            if self.pool.is_open(&f.rel) {
+                // 只**窥探**不推进基线：这一轮若因无 key / 打开失败而读不到数据，
+                // 基线必须保持原样，否则变更同样会被吞掉（换了个机制的同一 bug）。
+                let changed = self.pool.foreign_commit_pending(&f.rel).unwrap_or(true);
+                if !changed {
+                    continue;
+                }
+            } else {
+                let main = src_stamp(&f.abs);
+                let wal = f.wal.as_deref().and_then(src_stamp);
+                let cur = DbStamps { main, wal };
+                let unchanged = self
+                    .stamps
+                    .get(&f.rel)
+                    .is_some_and(|prev| *prev == cur);
+                if unchanged {
+                    continue;
+                }
             }
             match f.kind {
                 DbKind::Message => work.push(Work::Messages(f.clone())),
@@ -371,6 +386,10 @@ impl AccountSync {
         let mut new_rows: Vec<(String, MessageRecord)> = Vec::new();
         let mut new_watermarks: Vec<(String, Watermark)> = Vec::new();
         let mut revoke_rows: Vec<(String, MessageRecord)> = Vec::new();
+        // 本轮**真正读过数据**的文件：只有它们才允许在 phase 4 记账
+        // （戳与 data_version 基线）。读失败/无 key/打开失败的文件不记账，
+        // 下一轮 classify 才会把它再当「已变更」重查。
+        let mut read_done: Vec<String> = Vec::new();
 
         for w in &work {
             match w {
@@ -382,7 +401,12 @@ impl AccountSync {
                     let conn = match self.pool.get_or_open(f, key) {
                         Ok(c) => c,
                         Err(AcquireError::WrongKey) => {
+                            // 确定性失败进退避：busy_timeout 5 秒 × watch 350ms
+                            // 高频触发会让坏 key 的文件拖垮整个 poll 节奏。
+                            // 瞬时 Io 失败（下一分支）保持逐轮重试 —— 那类失败
+                            // 不记戳，天然就是「下一轮重查」。
                             tracing::warn!("live open failed for {} (wrong key?)", f.rel);
+                            self.pool.mark_keyless(&f.rel);
                             continue;
                         }
                         Err(e) => {
@@ -425,6 +449,7 @@ impl AccountSync {
                             new_watermarks.push((wm_key.clone(), wm));
                         }
                     }
+                    read_done.push(f.rel.clone());
                 }
             }
         }
@@ -603,15 +628,24 @@ impl AccountSync {
             }
         }
 
-        // phase 4: remember stamps for everything we processed
+        // phase 4: remember stamps for everything we **actually read**.
+        // 记账规则与「失败即 continue」是成对的：一个文件这一轮没读到数据
+        // （无 key / 打开失败），它的戳就必须保持原样 —— 否则这轮的变更会被
+        // 下一轮的「未变」判定永久吞掉。已打开连接的文件改由 data_version
+        // 基线盯增量（open 时建立），mtime/size 只服务未打开的文件。
         for w in &work {
             let f = w.file();
+            if !read_done.contains(&f.rel) {
+                continue;
+            }
             let main = src_stamp(&f.abs);
             let wal = f.wal.as_deref().and_then(src_stamp);
             self.stamps.insert(
                 f.rel.clone(),
                 DbStamps { main, wal },
             );
+            // data_version 基线同理：只在**真读过**的文件上推进。
+            self.pool.advance_data_version(&f.rel);
         }
 
         // 只有这一轮确实动过索引才更新时刻：空转的一轮不该让 updatedAt 看起来更新了。
@@ -728,6 +762,157 @@ mod tests {
         let found = find_original(&store, "sess", &revoke);
         assert!(found.is_some());
         assert_eq!(found.unwrap().server_id, 100);
+    }
+
+    // ---- 廉价跳过的时序竞态回归（修复前各有一条会红）----
+
+    use rusqlite::Connection;
+
+    const KEY_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const WXID: &str = "wxid_fake000000000000001";
+    const GROUP: &str = "wxid_fake_group@chatroom";
+
+    fn md5_hex(s: &str) -> String {
+        use md5::Digest;
+        let mut h = md5::Md5::new();
+        h.update(s.as_bytes());
+        format!("{:x}", h.finalize())
+    }
+
+    /// 造一个**只含 message_0.db** 的加密账号（表结构与真库同形：Name2Id0 +
+    /// `Msg_<md5(群)>`），返回 `db_storage` 目录。夹具只能造库，不造索引。
+    fn build_message_account(dir: &Path, key: &[u8; 32]) -> PathBuf {
+        let storage = dir.join("db_storage");
+        std::fs::create_dir_all(storage.join("message")).unwrap();
+        std::fs::create_dir_all(storage.join("session")).unwrap();
+        // 会话表：消息到会话的解析靠 md5 前缀匹配 sessions 里的 username，
+        // 没有 session.db 时会落到 md5 后缀本身 —— 夹具必须带上它。
+        {
+            let sconn = Connection::open(storage.join("session/session.db")).unwrap();
+            let key_hex = hex::encode(key);
+            sconn
+                .execute_batch(&format!(
+                    "PRAGMA cipher_page_size = 4096;\n                 PRAGMA key = \"x'{key_hex}'\";\n                 PRAGMA journal_mode = DELETE;\n                 CREATE TABLE Session (\n                    userName TEXT PRIMARY KEY,\n                    displayName TEXT NOT NULL,\n                    sortTimeStamp INTEGER NOT NULL DEFAULT 0,\n                    lastTimeStamp INTEGER NOT NULL DEFAULT 0,\n                    lastMsg TEXT,\n                    lastMsgType INTEGER NOT NULL DEFAULT 0,\n                    unread INTEGER NOT NULL DEFAULT 0,\n                    type INTEGER NOT NULL DEFAULT 0\n                 );\n                 INSERT INTO Session VALUES ('{GROUP}', '项目群', 1700000015, 1700000015, '[图片]', 3, 0, 2);"
+                ))
+                .unwrap();
+            drop(sconn);
+        }
+        let conn = Connection::open(storage.join("message/message_0.db")).unwrap();
+        let key_hex = hex::encode(key);
+        conn.execute_batch(&format!(
+            "PRAGMA cipher_page_size = 4096;\n             PRAGMA key = \"x'{key_hex}'\";\n             PRAGMA journal_mode = DELETE;"
+        ))
+        .unwrap();
+        let group_md5 = md5_hex(GROUP);
+        conn.execute_batch(&format!(
+            "CREATE TABLE \"Name2Id0\" (user_name TEXT);\n             INSERT INTO \"Name2Id0\" (rowid, user_name) VALUES (1, 'a'), (2, 'b');\n             CREATE TABLE \"Msg_{group_md5}\" (\n                local_id INTEGER PRIMARY KEY AUTOINCREMENT,\n                server_id INTEGER NOT NULL,\n                local_type INTEGER NOT NULL,\n                create_time INTEGER NOT NULL,\n                sort_seq INTEGER NOT NULL DEFAULT 0,\n                real_sender_id INTEGER NOT NULL,\n                message_content TEXT,\n                compress_content BLOB\n             );"
+        ))
+        .unwrap();
+        conn.execute(
+            &format!(
+                "INSERT INTO \"Msg_{group_md5}\" (server_id, local_type, create_time, sort_seq, real_sender_id, message_content) VALUES (?1, 1, ?2, 0, 2, '第一层')"
+            ),
+            rusqlite::params![8_100_000_000_000_000_001i64, 1_700_000_100i64],
+        )
+        .unwrap();
+        drop(conn);
+        storage
+    }
+
+    fn append_row(storage: &Path, key: &[u8; 32], server_id: i64) {
+        let conn = Connection::open(storage.join("message/message_0.db")).unwrap();
+        let key_hex = hex::encode(key);
+        conn
+            .execute_batch(&format!(
+                "PRAGMA cipher_page_size = 4096;\n             PRAGMA key = \"x'{key_hex}'\";\n             PRAGMA journal_mode = DELETE;"
+            ))
+            .unwrap();
+        let group_md5 = md5_hex(GROUP);
+        conn.execute(
+            &format!(
+                "INSERT INTO \"Msg_{group_md5}\" (server_id, local_type, create_time, sort_seq, real_sender_id, message_content) VALUES (?1, 1, ?2, 0, 2, '新消息')"
+            ),
+            rusqlite::params![server_id, 1_700_000_200i64],
+        )
+        .unwrap();
+    }
+
+    fn unique_dir(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "weflow-sync-race-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    /// 候选 1 路：**mtime/size 戳与基线相同**（模拟 Windows 高负载下元数据回读滞后）
+    /// 但数据已提交 ⇒ 廉价跳过不得吞掉这一行。修复前：戳相同 ⇒ classify 判「未变」⇒
+    /// poll 返回 0 ⇒ 红；修复后：已打开的文件改查 data_version ⇒ 仍能捡到 ⇒ 绿。
+    #[test]
+    fn stamp_unchanged_but_committed_row_is_still_polled() {
+        let dir = unique_dir("stale-stamp");
+        let key = crate::keystore::parse_db_key(KEY_HEX).unwrap().0;
+        let storage = build_message_account(&dir, &key);
+        let store = Arc::new(RwLock::new(Store::default()));
+        let mut sync = AccountSync::new(WXID, &storage, crate::keystore::KeyMap::from(crate::keystore::DbKey(key)), store.clone());
+        sync.full_sync().unwrap();
+        assert_eq!(store.read().convs[GROUP].len(), 1, "基线一行");
+
+        // 模拟微信写入：另一条连接追加一行。
+        append_row(&storage, &key, 8_100_000_000_000_000_002);
+
+        // 把该文件的戳改写为**当前真实戳**（等于「写入前后文件系统看起来没变」）。
+        let rel = "message/message_0.db";
+        {
+            let files = scan::enum_db_files(&storage);
+            let f = files.iter().find(|f| f.rel == rel).unwrap();
+            let main = src_stamp(&f.abs);
+            let wal = f.wal.as_deref().and_then(src_stamp);
+            sync.stamps.insert(
+                rel.to_string(),
+                DbStamps { main, wal },
+            );
+        }
+
+        let (n, _) = sync.poll_once().unwrap();
+        assert_eq!(n, 1, "戳相同但数据已提交：必须仍被捡到（不能靠文件戳跳过）");
+        assert_eq!(store.read().convs[GROUP].len(), 2);
+    }
+
+    /// 候选 2 路：本轮打开失败（WrongKey）⇒ 打开失败的文件**不得记戳**，否则下一轮
+    /// 判「未变」把这次变更永久吞掉。修复前：phase 4 无条件重记戳 ⇒ 第二次 poll 返回 0
+    /// ⇒ 红；修复后：失败文件的戳保持基线 ⇒ 第二次 poll 重查 ⇒ 绿。
+    #[test]
+    fn failed_open_does_not_swallow_the_next_poll() {
+        let dir = unique_dir("failed-open");
+        let key = crate::keystore::parse_db_key(KEY_HEX).unwrap().0;
+        let storage = build_message_account(&dir, &key);
+        let store = Arc::new(RwLock::new(Store::default()));
+        let mut sync = AccountSync::new(WXID, &storage, crate::keystore::KeyMap::from(crate::keystore::DbKey(key)), store.clone());
+        sync.full_sync().unwrap();
+
+        // 写入一行（此时文件戳必然变化）。
+        append_row(&storage, &key, 8_100_000_000_000_000_003);
+
+        // 让下一轮**读不到这一行**：换上空密钥表 —— 该文件在 phase 1 的
+        // 「无 key ⇒ continue」与「打开失败 ⇒ continue」走同一条跳过路径
+        // （Windows 下池连接还开着，改名会 EBUSY，密钥注入是等价且可行的构造）。
+        // 修复前的失败模式：这一轮结束 phase 4 无条件重记戳 ⇒ 下一轮判「未变」
+        // ⇒ 这一行被永久吞掉。修复后：没读过数据的文件不记戳 ⇒ 恢复后重查 ⇒ 捡到。
+        sync.keys = crate::keystore::KeyMap::Empty;
+        let (n1, _) = sync.poll_once().unwrap();
+        assert_eq!(n1, 0, "无密钥轮次读不到行");
+
+        // 恢复正确密钥：这一轮必须把上一轮的行捡回来。
+        sync.keys = crate::keystore::KeyMap::Single(crate::keystore::DbKey(key));
+        let (n2, _) = sync.poll_once().unwrap();
+        assert_eq!(n2, 1, "无密钥的那一轮不得吞掉变更：恢复后必须重查");
+        assert_eq!(store.read().convs[GROUP].len(), 2);
     }
 }
 // touch

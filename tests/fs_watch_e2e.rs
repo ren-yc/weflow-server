@@ -42,6 +42,10 @@ async fn file_event_triggers_sync_and_message_event() {
     };
     let handle = tokio::spawn(watch::spawn(sync.clone(), storage.clone(), cfg, shutdown_rx));
 
+    // Give the watcher backend thread time to attach（与 qqflow 同构的等待；
+    // 50ms fallback 兜底虽能自愈，但等待能把「靠兜底捡到」从路径里去掉）。
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
     // simulate WeChat writing a new message
     common::append_group_message(&storage, &key.0);
     let files_before = scan::enum_db_files(&storage);

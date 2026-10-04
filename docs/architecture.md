@@ -325,6 +325,17 @@ Python 只用于钩子与套件执行器，**纯标准库**——CI 与开发机
 永远为假；`sync/watch.rs` 因此只看 mtime。反过来说：**mtime 变了不代表真有新消息**，
 水位线才是权威。
 
+### 增量检测是两级：已开连接看 `data_version`，文件戳只是前置门
+
+已打开的库改用 SQLite `PRAGMA data_version` 探测外部提交：它是**连接本地**属性，只在同一连接的
+两个时点之间比较才有意义（基线随连接生死），且别的连接提交后**必然不同但不保证递增**——比较用
+不等，不用大小。文件 mtime/size 戳退为未打开文件的前置门；Windows 高负载下元数据回读可能滞后，
+只靠文件戳会把一次写入误判成「未变」。与之配套的记账规则：**只有真正读到数据的文件才记账**
+（记文件戳 ＋ 推进 data_version 基线）——无密钥、打开失败的文件不记账，下一轮才不会把它判成
+「未变」而把变更永久吞掉（全量构建的基线播种同理）。qqflow 侧语义天然如此（读失败置 retry、
+连接未打开强制视为已变），无需同构。回归见 `src/sync/mod.rs` 的
+`stamp_unchanged_but_committed_row_is_still_polled` 与 `failed_open_does_not_swallow_the_next_poll`。
+
 ### 群名片的来源在另一个库，且两库的 id 空间互相独立
 
 群名片不在 `contact.db`，而在 **`contact/contact_fts.db`** 的全文索引表里；

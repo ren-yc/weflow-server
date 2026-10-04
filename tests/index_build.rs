@@ -112,26 +112,7 @@ fn incremental_poll_picks_up_new_rows_after_watermark() {
     sync.full_sync().unwrap();
 
     // simulated WeChat write: a new group message lands in the source
-    if std::path::Path::new(&storage.join("message")).exists() {
-        for e in std::fs::read_dir(storage.join("message")).unwrap() {
-            let e = e.unwrap();
-            eprintln!("DBGFILE {:?} len={} mtime={:?}", e.file_name(), e.metadata().unwrap().len(), e.metadata().unwrap().modified());
-        }
-    }
     common::append_group_message(&storage, &key);
-    {
-        let path = storage.join("message/message_0.db");
-        let conn = common::wx_conn(&path, &key, false);
-        let n: i64 = conn.query_row(
-            &format!("SELECT count(*) FROM \"Msg_{}\"", common::md5_hex(common::FAKE_GROUP)),
-            [], |r| r.get(0)).unwrap();
-        eprintln!("AFTER-APPEND COUNT={}", n);
-        drop(conn);
-        for e in std::fs::read_dir(storage.join("message")).unwrap() {
-            let e = e.unwrap();
-            eprintln!("DBGFILE-AFTER {:?} len={} mtime={:?}", e.file_name(), e.metadata().unwrap().len(), e.metadata().unwrap().modified());
-        }
-    }
 
     let (n, revokes) = sync.poll_once().unwrap();
     assert_eq!(n, 1, "one new row picked up");
