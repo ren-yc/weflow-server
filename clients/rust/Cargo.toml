@@ -1,6 +1,6 @@
 [package]
 name = "weflow-client"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 description = "Typed Rust client for weflow-server's HTTP API (generated types + handwritten behavior layer)"
 license = "MIT"

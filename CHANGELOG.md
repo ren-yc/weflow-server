@@ -2,10 +2,45 @@
 
 本文件从 0.5.0 起维护。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-## [未发布]
+## [0.8.0] - 2026-10-04
 
 ### 变更
 
+- **`clients/rust`（`weflow-client`）与 `clients/python`（`weflow-sdk`）删除 `search`（破坏性）**：
+  同一端点上它已被 `list_messages` 完全覆盖——后者的参数是前者的超集（多了
+  `limit`/`offset`/`media`），且两仓此前都没有任何测试盯着 `search`。**迁移方式**：
+  `search(talker, keyword, start, end)` 改写为
+  `list_messages(talker, keyword=…, start=…, end=…)`，语义不变（`end` 覆盖整天）。
+  回归位置：`list_messages_pages_by_offset_and_exposes_native_fields`。
+- **`ensure_ready` 对 200 拒绝态立即失败（行为变化）**：注册端点用 HTTP 200 表达业务拒绝
+  （`account_conflict` / `invalid_key` / `invalid_db_path` / `unknown_qq`）。此前只有 Python 侧
+  分类，Rust 侧不看响应体，会把确定性的拒绝一路轮询到超时并报「not-registered」——
+  把根因（绑定被占、密钥被拒）伪装成「还没就绪」。现在两仓同规：Rust 返回
+  `ClientError::Refused { state, .. }`，Python 抛 `StatusError(200, …state=…)`。
+  **迁移方式**：对错误做穷尽匹配的调用方补一条 `Refused` 分支并读 `state`；原有的
+  `NotReady` 分支保留，它仍覆盖真正未就绪而超时的情形。回归位置：
+  `ensure_ready_fails_fast_on_a_refusal_state`。
+- **`ensure_ready` 改为 `register` + `wait_ready` 的组合**：同一端点只有一处实现，
+  注册契约变更不会只落在半个 SDK 里。行为不变。
+- **时间界校验放宽为「`YYYYMMDD` 或 unix 秒」**：服务端两种都收，此前客户端只放行
+  8 位日期，把合法的 unix 秒上界挡在本地（`end` 为裸日期时覆盖整天，这条不变）。
+
+### 新增
+
+- **两个 SDK 的公共面扩展（七项，Rust 与 Python 同名同义）**：`health()`（`/health`，
+  **免鉴权且不发送凭据**）、`accounts()`（账号明细——`error` 与 `messageCount` 只在这个面）、
+  `register(body)`（**非阻塞**注册，原始 `state`/`status` 作为值返回的 `RegisterOutcome`）、
+  `wait_ready()`（Rust 侧补齐，wait-only，与 Python 对称）、`list_messages(MessageQuery)`
+  （原生消息面：`start`/`end`/`limit`/`offset`/`media`，带 `rawContent`/`isSend`/`localType`）、
+  `contacts(ContactsQuery)`、`media_bytes_by_id(id)`（按单段句柄取字节，不触发导出）。
+  这些正是「就绪门控 / 轮询 / 媒体」三类消费者此前只能自己拼 HTTP 的部分。
+- **`clients/rust` 的 `list_all_sessions` 补测试**：它以「空页」为终止条件（该面没有
+  `hasMore`），此前没有任何断言盯着——停止条件写错会静默截断会话列表。回归位置：
+  `list_all_sessions_pages_and_collapses_cross_page_duplicates`。
+- **`docs/weflow-server-api.md` 的「类型化客户端（SDK）」一节改为公共面清单**：逐方法列出
+  打哪个面与语义要点，并点出两处容易读错的地方——`list_all_sessions` 是取尽而
+  `list_messages`/`contacts` 只取一页；时间界收 `YYYYMMDD` **或** unix 秒且 `end` 的裸日期
+  覆盖整天。
 - **同步引擎的增量变更检测加固**：已建立连接的库改以 SQLite `data_version`
   探测外部提交（连接本地基线，仅在同一连接上比较，故只在连接存续期有效），
   文件 mtime/size 戳退为未打开文件的前置门。原先仅靠文件戳：Windows 高负载下

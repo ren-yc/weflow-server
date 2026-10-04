@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "weflow-sdk"
-version = "0.7.0"
+version = "0.8.0"
 description = "Typed Python client for weflow-server's HTTP API (generated models + handwritten behavior layer)"
 license = "MIT"
 requires-python = ">=3.10"
