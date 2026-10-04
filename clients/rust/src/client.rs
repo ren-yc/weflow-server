@@ -440,13 +440,25 @@ impl Client {
     /// is "usernames within a page are unique" (the server guarantees that),
     /// so duplicates *across* pages are recorded as a warning and collapsed -
     /// losing data silently is the failure mode this loop must not have.
-    pub async fn list_all_sessions(&self) -> Result<Vec<gen_types::SessionNative>> {
+    ///
+    /// `page_size` is the server-side page size (the server caps it at
+    /// 10000). Leave it `None` for the server default; a polling consumer
+    /// that re-reads the list every cycle should ask for the maximum instead,
+    /// because the request count is `sessions / page_size` and the server's
+    /// default page is two orders of magnitude smaller than the cap.
+    pub async fn list_all_sessions(
+        &self,
+        page_size: Option<u32>,
+    ) -> Result<Vec<gen_types::SessionNative>> {
         let mut out: Vec<gen_types::SessionNative> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut offset = 0usize;
         loop {
             let mut q = BTreeMap::new();
             q.insert("offset", offset.to_string());
+            if let Some(n) = page_size {
+                q.insert("limit", n.to_string());
+            }
             let page: gen_types::SessionsNative =
                 self.get_json("/api/v1/sessions", &q).await?;
             let count = page.sessions.len();

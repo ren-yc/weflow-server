@@ -56,6 +56,8 @@ class Mock:
         self.contacts_page: dict | None = None
         # FIFO pages for GET /api/v1/sessions.
         self.sessions_pages: list[dict] = []
+        # Query params seen by the sessions route, in order.
+        self.sessions_queries: list[dict] = []
         # Whether each /health hit carried credentials (it must not).
         self.health_auth: list[bool] = []
         self.health_body: dict | None = None
@@ -140,6 +142,7 @@ class Mock:
             elif path == "/api/v1/contacts":
                 body = mock.contacts_page
             elif path == "/api/v1/sessions":
+                mock.sessions_queries.append(query)
                 body = mock.sessions_pages.pop(0) if mock.sessions_pages else None
             elif path == "/api/v1/push/messages":
                 mock.sse_connections += 1
@@ -817,8 +820,16 @@ async def test_list_all_sessions_pages_and_collapses_cross_page_duplicates() -> 
         {"success": True, "count": 0, "sessions": []},
     ]
     client = make_client(mock)
-    all_sessions = await client.list_all_sessions()
+    # The polling consumer asks for the server's maximum page size: the request
+    # count is sessions / page_size, and the default page is two orders of
+    # magnitude smaller than the cap.
+    all_sessions = await client.list_all_sessions(page_size=10000)
     assert [s.username for s in all_sessions] == ["a", "b", "c"]
+    assert len(mock.sessions_queries) == 3, "one request per page, plus the empty terminator"
+    for i, q in enumerate(mock.sessions_queries):
+        assert q.get("limit") == "10000", f"page {i} must carry the page size: {q}"
+    assert mock.sessions_queries[0]["offset"] == "0"
+    assert mock.sessions_queries[1]["offset"] == "2", "offset advances by rows returned"
 
 
 async def test_media_bytes_by_id_fetches_a_single_segment_handle() -> None:

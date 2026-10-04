@@ -46,6 +46,8 @@ struct Mock {
     contacts_page: Arc<StdMutex<Option<serde_json::Value>>>,
     /// FIFO pages for `GET /api/v1/sessions`.
     sessions_pages: Arc<StdMutex<Vec<serde_json::Value>>>,
+    /// Query strings seen by the sessions route, in order.
+    sessions_queries: Arc<StdMutex<Vec<String>>>,
     /// How many times `/health` was hit, and whether it carried credentials.
     health_calls: Arc<StdMutex<Vec<bool>>>,
 }
@@ -221,8 +223,13 @@ async fn contacts_route(
     }
 }
 
-async fn sessions_route(State(mock): State<Mock>, headers: HeaderMap) -> Response {
+async fn sessions_route(
+    State(mock): State<Mock>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+    headers: HeaderMap,
+) -> Response {
     assert_bearer(&headers);
+    mock.sessions_queries.lock().unwrap().push(query.unwrap_or_default());
     let page = {
         let mut q = mock.sessions_pages.lock().unwrap();
         if q.is_empty() { None } else { Some(q.remove(0)) }
@@ -593,11 +600,24 @@ async fn list_all_sessions_pages_and_collapses_cross_page_duplicates() {
         serde_json::json!({"success": true, "count": 2, "sessions": [sess("b"), sess("c")]}),
         serde_json::json!({"success": true, "count": 0, "sessions": []}),
     ];
-    let base = spawn_mock(mock).await;
+    let base = spawn_mock(mock.clone()).await;
     let client = Client::new(&base, TOKEN);
-    let all = client.list_all_sessions().await.expect("both pages must be read");
+    // The polling consumer asks for the server's maximum page size: the
+    // request count is sessions / page_size, and the default page is two
+    // orders of magnitude smaller than the cap.
+    let all = client
+        .list_all_sessions(Some(10000))
+        .await
+        .expect("both pages must be read");
     let users: Vec<&str> = all.iter().map(|s| s.username.as_str()).collect();
     assert_eq!(users, vec!["a", "b", "c"], "the repeated b collapses exactly once");
+    let queries = mock.sessions_queries.lock().unwrap().clone();
+    assert_eq!(queries.len(), 3, "one request per page, including the empty terminator");
+    for (i, q) in queries.iter().enumerate() {
+        assert!(q.contains("limit=10000"), "page {i} must carry the page size: {q}");
+    }
+    assert!(queries[0].contains("offset=0") && queries[1].contains("offset=2"),
+        "the offset advances by the rows actually returned: {queries:?}");
 }
 
 #[tokio::test]
