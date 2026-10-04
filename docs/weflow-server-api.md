@@ -853,10 +853,54 @@ feeds 条目字段（以源码 `sns.rs` 为准）：`tid/userName/content(明文
 - **媒体**：图片 dat(V1/V2/XOR) 解密、语音 silk 合并、视频明文直通、wxgf(HEVC)→PNG 需
   ffmpeg（环境变量 `WEFLOW_SERVER_FFMPEG` → WeFlow 内置 ffmpeg → PATH）。
 
+## 命令行子命令（`cli` feature）
+
+同一个二进制带一个子命令面。**默认 feature 是 `["server", "cli"]`**，所以 `cargo install weflow-server`
+装出来即有；`--no-default-features` 时整面消失（连 `clap` 与 SDK 都不进依赖树）。
+
+**兼容口径（重要）**：
+
+- **裸跑仍等于 `serve`**：`weflow-server --port 5033` 一个字符都不用改；
+- 以旗标开头的写法、以及 `serve` 后面的旗标，**原样交给既有参数解析器**——因此 `--help`／
+  `--version`／`--show-token`／配置文件加载的行为逐字不变，`serve --port 6002` 与 `--port 6002` 等价；
+- `token` 子命令 = 既有的 `--show-token`；
+- 第一个参数既不是旗标也不是已知子命令时，由 clap 报「未知子命令」并以 **2** 退出。老解析器
+  遇到这种情况只会说「参数 bogus 缺少值」（退出 1），那是把用法错误伪装成取值错误。
+
+退出码约定（回归位置：`tests/cli.rs`）：
+
+| 码 | 含义 | 例子 |
+| --- | --- | --- |
+| `0` | 成功 | `weflow-server sessions` |
+| `1` | 运行期错误：连不上、被拒、缺密钥、缺配置文件 | 未设 `WEFLOW_TOKEN` 就跑查询 |
+| `2` | 用法错误：未知子命令、缺必需参数 | `weflow-server bogus`、`search` 不带 `--keyword` |
+
+| 子命令 | 打哪个面 | 要点 |
+| --- | --- | --- |
+| `serve` | — | 起服务；等价裸跑 |
+| `token` | 系统凭据库 | 打印 API token 并退出 |
+| `sessions` | SDK `list_all_sessions` | `page_size=10000`（服务端硬上限），一次取尽 |
+| `messages` | SDK `list_messages` | HTTP 形态必须给 `--talker`（服务端按会话查询）；`--since` 接受 unix 秒或 `YYYYMMDD` |
+| `search` | SDK `list_messages` 带 `keyword` | `--keyword` 必填；搜不到不是错误（退出 0） |
+| `contacts` | SDK `contacts` | 单页；要全量请自己带 `--limit`/`--offset` 翻页 |
+| `accounts` | SDK `accounts` | **只有 HTTP 形态**（没有 `--embedded`）：这一面问的是「服务端此刻实际绑定了什么」，进程内索引给的是另一个答案 |
+| `sync` | SDK `sync_now` | **写动作**：让服务端立刻跑一次增量同步；同样没有 `--embedded` |
+
+环境变量：`WEFLOW_BASE_URL`（默认 `http://127.0.0.1:5033`）、`WEFLOW_TOKEN`（API token）。
+**token 一律不经命令行传递**——命令行会落进 shell history 与进程列表，而这个值能读出整份聊天记录。
+
+`--embedded`（进程内直读本地库，不起也不打 HTTP）**只开放给只读查询类**（`sessions`／`messages`／
+`search`／`contacts`）。它读与 `examples/embed.rs` **同一个**配置文件（`{"wxid":…, "db_path":…,
+"keys":{…}}`），路径由 `WEFLOW_EMBED_CONFIG` 给出；密钥仍只从环境变量／磁盘配置来。
+
+输出：默认是人类可读的紧凑行（每类只挑最常看的几列），`--json` 给机器可读形状。
+
 ## 启动示例
 
 ```powershell
 weflow-server.exe --port 5033 --watch-fallback-ms 5000 --log info
+weflow-server.exe serve --port 5033      # 与上一行等价
+weflow-server.exe sessions --json        # 子命令面
 ```
 
 参数：`--show-token`、`--port`、`--host`、`--log`、`--watch-debounce-ms`、

@@ -52,6 +52,13 @@ internal!(sync);
 #[cfg(feature = "server")]
 internal!(server);
 
+/// 命令行子命令面（`cli` feature）。
+///
+/// `pub(crate)`：CLI 是**二进制的面**，不是嵌入者的承诺面——把它做成 `pub` 会让只服务于
+/// `run_cli` 分流的类型进入 semver 契约。
+#[cfg(feature = "cli")]
+pub(crate) mod cli;
+
 /// 造库/造密钥夹具 —— **不是承诺面**，只随 `testing` feature 编译。
 ///
 /// 落点为什么在库里而不是 `tests/common`：需要它的有两个调用方，而它们互相
@@ -74,7 +81,7 @@ use anyhow::{Context, Result};
 #[cfg(feature = "server")]
 use crate::config::Config;
 
-/// CLI 入口：读参数、初始化日志、起服务。
+/// CLI 入口：分流子命令、初始化日志、起服务。
 ///
 /// **二进制走这里，而不是直接用 `config`/`logging`。** 原因是一个容易被忽略的事实：
 /// `src/main.rs` 是**独立 crate**，只能看见 `pub` —— 而实现面默认是 `pub(crate)`（边界由编译器
@@ -82,7 +89,23 @@ use crate::config::Config;
 /// 嵌入者能做的事，二进制没有多一分。
 ///
 /// 需要 `server` feature —— 它建 tokio 运行时并起 HTTP 服务。
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", feature = "cli"))]
+pub fn run_cli() -> Result<()> {
+    match cli::dispatch()? {
+        cli::Entry::Serve(cfg) => {
+            logging::init(&cfg.log);
+            run(cfg)
+        }
+        // 子命令已经把活干完（token / 查询 / sync），或 --help/--version 已经打印过。
+        cli::Entry::Done => Ok(()),
+    }
+}
+
+/// 同上，但 `cli` 关掉时只剩「旗标」这一条老路。
+///
+/// 保留这个分支是有意的：`--no-default-features` 的依赖树必须不含 clap 与 SDK（CI 的 embed
+/// 钉子守着），所以那条路上不能引用 `cli` 模块，只能直接走 `config::load()`。
+#[cfg(all(feature = "server", not(feature = "cli")))]
 pub fn run_cli() -> Result<()> {
     let Some(cfg) = config::load()? else {
         return Ok(()); // --help / --version 已经打印过了

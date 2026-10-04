@@ -130,8 +130,9 @@
 | `sync` | watcher 与水位线增量：tokio ＋ notify | 没有增量同步；`api::Sync` 随之消失 |
 | `media` | 媒体导出（外部 ffmpeg 在**运行时**探测，缺失则降级） | 没有导出与媒体代理 |
 | `testing` | 把实现面转成 `pub`（见上） | 集成测试够不着实现面 |
+| `cli`（默认）| 命令行子命令面：`clap` ＋ 复用 workspace 的 `weflow-client`（隐含 `server`） | 只剩「旗标」这一条老路；`--no-default-features` 的依赖树里连 `clap`／`reqwest` 都不出现 |
 
-**依赖面的实际约束**（可测，不是口号）：`--no-default-features` 的依赖树里**不含 axum 与 tokio**。
+**依赖面的实际约束**（可测，不是口号）：`--no-default-features` 的依赖树里**不含 axum 与 tokio**（加了 `cli`/`mcp` 之后同样不含 `clap`／`reqwest`／`rmcp`；实测口径见 `docs/weflow-server-api.md` 的命令行一节与本文件的 embed 钉子行）。
 核心面（解析、存储）因此不得依赖可选面 —— 这条边界由 CI 上的一条检查守着。
 
 ### `clients/`：类型化 SDK（workspace 成员）
