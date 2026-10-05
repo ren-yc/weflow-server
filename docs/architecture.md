@@ -270,6 +270,21 @@ Linux 与 Windows 双平台跑 `clippy --all-targets -D warnings` ＋ 全量测�
 
 Python 只用于钩子与套件执行器，**纯标准库**——CI 与开发机都不需要装第三方包。
 
+### 已登记的两类构建告警（预期内，处置＝维持现状）
+
+门禁是 `-D warnings`，所以这里登记的是**不会**让门禁变红、但直接 `cargo build` 时会出现在日志里的两类
+噪声。两者都被诊断过，结论是**无功能影响**；一并写下「为什么维持现状」，避免下次有人把它当成缺陷重查一遍。
+
+1. **默认 feature 组合下的 `dead_code`**：一批**内部**模块里的辅助函数（如 `db/wcdb.rs` 的 `decrypt_page`、
+   `db/open.rs` 的 `open_snapshot`／`quick_check`）在默认构建里看似未用 —— 它们只被 `testing` 夹具或
+   `#[cfg(test)]` 单测调用。CI 的 `clippy --all-targets` 由包装脚本补了 `--features testing`，所以看不到；
+   直接用 `cargo build` 会打印。**判据是两条路径都能编译**（默认 feature 与 `--no-default-features`，后者由
+   `examples/embed.rs` 那道门盯着），**不是**「日志里没有 warning」。
+2. **链接期 `LNK4099`（找不到 `ossl_static.pdb`）**：vendored OpenSSL 的静态库引用了自己的调试信息，而
+   发布物里没有那份 PDB。**只影响调试信息，不影响代码**。
+   （**为什么不消掉**：给 Windows 链接器加 `/ignore:4099` 能一并静音，但也会**隐藏将来真实的 LNK4099**；
+   让 vendored OpenSSL 不带调试信息实测不可靠。两害相权，选择保留噪声。）
+
 ## 测试与夹具
 
 ### 三类测试，三种诚实

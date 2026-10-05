@@ -707,7 +707,7 @@ ChatLab 两面的形状由 `tests/api_smoke.rs` 与一致性套件共同钉住�
 |---|---|
 | `GET /chatlab/sessions` | 发现面：`keyword`/`limit`/`cursor`；带 `count` 与 `page{hasMore,nextCursor}` |
 | `GET /chatlab/messages` | 消息面：`talker` 必填，`limit`/`offset`/`cursor`/`start`/`end`/`media`/`keyword`；无 `success`，消息**升序** |
-| `GET /chatlab/sessions/{id}/messages` | 拉取面：`since=0`／缺省 = 全量（必带 `chatlab+meta+members+messages`）；`since>0` = 增量（只带 `messages`） |
+| `GET /chatlab/sessions/{id}/messages` | 拉取面：`since=0`／缺省 = 全量，`since>0` = 增量。**两种请求都返回完整信封**（`chatlab`／`members`／`meta`／`sync`／`messages` 恒在）——差别只在 `messages` 是「自 `since` 起」还是「自最早起」；`members` 始终是**本页发言人**的去重集合。这条此前写作「`since>0` 只带 `messages`」，与实现不符（真库复验时实测到信封恒在），已按实现更正 |
 | `GET /chatlab/push/messages` | SSE **通知面**：只发元信息，不发消息体 |
 
 鉴权、错误信封、`Last-Event-ID` 重放与保活都与老面**完全一致**（同一条总线、同一套连接机制）。
