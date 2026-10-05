@@ -29,7 +29,7 @@
 //!    `<slug>.jsonl`／`.json`，目录本身不可导入。这句话写在这里是为了下一个改这里的人
 //!    不会以为「多写一份元数据没坏处」。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
@@ -195,12 +195,41 @@ impl std::fmt::Display for SecretLeak {
 impl std::error::Error for SecretLeak {}
 
 /// 检查一行是否带着不该出现的秘密。
+///
+/// 为什么不止比原文：写盘的是**序列化后**的文本，而秘密可能以转义或百分号编码的形态出现 ——
+/// 只比原文会放过 `a\"b`（JSON 转义）与 `SEKRIT%2B123`（URL 编码）这类**可还原**的落盘形态。
+/// 这里逐个比较同一份秘密的几种可还原表示，「都不命中」才算干净。
 fn assert_no_secret(line: &str, secret: &str, file: &Path) -> Result<()> {
-    if !secret.is_empty() && line.contains(secret) {
+    if secret.is_empty() {
+        return Ok(());
+    }
+    let json_escaped = serde_json::to_string(secret).unwrap_or_default();
+    let json_escaped = json_escaped.trim_matches('"');
+    let percent_encoded = percent_encode(secret);
+    let leak = line.contains(secret)
+        || (json_escaped != secret && line.contains(json_escaped))
+        || (percent_encoded != secret && line.contains(&percent_encoded));
+    if leak {
         return Err(anyhow::Error::new(SecretLeak)
             .context(format!("写入被中止: {}", file.display())));
     }
     Ok(())
+}
+
+/// 百分号编码（unreserved 集之外一律 `%XX`）。
+///
+/// 只用于「秘密是否以编码形态落盘」这一次比较，所以与具体实现策略无关地取**最保守**的那种：
+/// 任何真实的编码器对同一串的编码结果都是它的子集或等价，而全编码能命中 `SEKRIT%2B123` 这类形态。
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(*b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// 一个会话的流式写手：`begin` → 若干次 `page` → `finish`。
@@ -261,7 +290,13 @@ impl SessionWriter {
             seen: BTreeSet::new(),
         };
         // 规范：第一行必须是 header（JSONL 的「Must be first line」）。
-        w.put(&json!({ "_type": "header", "chatlab": chatlab, "meta": meta }))?;
+        //
+        // **建了文件就要负责回收**：jsonl 的 File::create 在这一步之前已经落盘，若首行检查失败
+        // （例如 display_name 里带着令牌），把空文件留在盘上等于给 --resume 挖一个「已完成」的坑。
+        if let Err(e) = w.put(&json!({ "_type": "header", "chatlab": chatlab, "meta": meta })) {
+            let _ = std::fs::remove_file(&w.path);
+            return Err(e);
+        }
         Ok(w)
     }
 
@@ -317,7 +352,11 @@ impl SessionWriter {
     fn finish_inner(&mut self) -> Result<u64> {
         match &mut self.sink {
             Sink::Lines(f) => {
-                f.flush().ok();
+                // **不能吞错**：磁盘满或 I/O 错误会让缓冲尾部丢失，留下一个截断的 .jsonl，
+                // 而本轮以「成功」收场（随后还会被 --resume 永久跳过）。上抛会走到 finish 的
+                // 删半成品分支。
+                f.flush()
+                    .with_context(|| format!("flush 失败: {}", self.path.display()))?;
             }
             Sink::Buffer(b) => {
                 // 头一行是 header，其余是消息；成员单独成组（规范：members 是数组字段）。
@@ -369,6 +408,59 @@ pub fn write_index(
     Ok(index)
 }
 
+/// 读上一轮的 `index.json`：`talker → 条目`。
+///
+/// **为什么需要它**：文件名里的编号是**按本次输入列表的顺序**算的 —— 列表一变（增删会话、某会话
+/// 改名），同一个会话就会被算成另一个名字，于是在盘上留下第二份产物；而 `--resume` 跳过的会话若不进
+/// 新清单，上一轮的 `index.json` 会被这一轮整个覆盖掉。两者都靠「先读上一轮」解决。
+fn previous_index(out_dir: &Path) -> BTreeMap<String, Value> {
+    let path = out_dir.join("index.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return BTreeMap::new();
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        // 清单坏了就当作没有：它不是规范的一部分，坏掉不该让整轮导出失败。
+        return BTreeMap::new();
+    };
+    v.get("sessions")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| {
+                    r.get("talker")
+                        .and_then(Value::as_str)
+                        .map(|t| (t.to_string(), r.clone()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 既有产物是否**完整到可以跳过**。
+///
+/// 判据刻意便宜，但能抓住真实半成品：空文件（建了文件却失败、或进程在写首行前被杀），以及 jsonl
+/// 末尾没有换行（flush 丢失、进程被杀留下的半行）。json 形态只查非空 —— 它的完整性要整份解析才
+/// 知道，而「为一次跳过读整个文件」与本函数存在的理由相悖。
+fn file_is_complete(path: &Path, format: Format) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    match std::fs::metadata(path) {
+        Ok(m) if m.len() == 0 => false,
+        Ok(_) => match format {
+            Format::Json => true,
+            Format::Jsonl => {
+                let Ok(mut f) = std::fs::File::open(path) else {
+                    return false;
+                };
+                if f.seek(SeekFrom::End(-1)).is_err() {
+                    return false;
+                }
+                let mut last = [0u8; 1];
+                f.read_exact(&mut last).is_ok() && last[0] == b'\n'
+            }
+        },
+        Err(_) => false,
+    }
+}
 /// 跑一次导出。
 ///
 /// `fetch` 由调用方给：它负责「把这一会话的页喂进 `on_page`」。签名是回调而不是
@@ -397,14 +489,45 @@ where
     let mut skipped = Vec::new();
     let mut total = 0u64;
     let mut index_rows: Vec<Value> = Vec::new();
+    // `--resume` 要真是「续跑」：文件名与清单都必须以上一轮为准（见 previous_index 的说明）。
+    let previous = if opts.resume { previous_index(&opts.out_dir) } else { BTreeMap::new() };
 
     for target in targets {
-        let stem = file_name_for(target, &mut taken);
+        let stem = match previous
+            .get(&target.talker)
+            .and_then(|r| r.get("file"))
+            .and_then(Value::as_str)
+        {
+            Some(file) => {
+                // 沿用上一轮的名字（去掉扩展名，本轮用当前格式的扩展名）。
+                let stem = file
+                    .rsplit_once('.')
+                    .map(|(s, _)| s)
+                    .unwrap_or(file)
+                    .to_string();
+                taken.insert(stem.clone());
+                stem
+            }
+            None => file_name_for(target, &mut taken),
+        };
         // 文件名先算出来才能判断 --resume：确定性（同样的输入→同样的名字）是续跑的前提。
         let path = opts.out_dir.join(format!("{stem}.{ext}"));
         if opts.resume && path.exists() {
-            skipped.push(target.talker.clone());
-            continue;
+            if !file_is_complete(&path, opts.format) {
+                // 半成品**不能**当成已完成：否则 --resume 会永久跳过它。
+                tracing::warn!("{} 的既有产物不完整（空文件或被截断），本轮重写它", target.talker);
+            } else {
+                skipped.push(target.talker.clone());
+                // 跳过的会话也要进新清单，否则这次写出的 index.json 会把上一轮的条目抹掉。
+                match previous.get(&target.talker) {
+                    Some(row) => index_rows.push(row.clone()),
+                    None => tracing::warn!(
+                        "{} 有既有产物但上一轮清单里没有它，本次 index 不收录（无法得知条数）",
+                        target.talker
+                    ),
+                }
+                continue;
+            }
         }
         let mut w = SessionWriter::begin(target.clone(), opts, stem)?;
         let failed = fetch(target, &mut |rows| w.page(rows)).err();
@@ -650,6 +773,75 @@ mod tests {
         assert_eq!(got.skipped, vec!["wxid_bad".to_string()], "失败会话要出现在 skipped 里");
         let left = files_with(&dir, ".jsonl");
         assert_eq!(left, vec!["Good.jsonl".to_string()], "半途而废的产物必须被删掉");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn secret_check_covers_escaped_and_percent_encoded_forms() {
+        let dir = tmp("secret-forms");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("x.jsonl");
+        // 原文命中
+        assert!(assert_no_secret("prefix SEKRIT123 suffix", "SEKRIT123", &f).is_err());
+        // JSON 转义形态：秘密含引号时盘上是 a\"b（只比原文会放过它）
+        assert!(
+            assert_no_secret("{\"c\":\"a\\\"b\"}", "a\"b", &f).is_err(),
+            "转义形态必须命中"
+        );
+        // 百分号编码形态
+        assert!(
+            assert_no_secret("?access_token=SEKRIT%2B123", "SEKRIT+123", &f).is_err(),
+            "编码形态必须命中"
+        );
+        // 干净的行不误报
+        assert!(assert_no_secret("{\"c\":\"hello\"}", "a\"b", &f).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn begin_failure_removes_the_created_file() {
+        let dir = tmp("begin-cleanup");
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = SessionTarget { talker: "wxid_leak".into(), display_name: "LEAKY-NAME".into() };
+        let o = opts(&dir, Format::Jsonl, false, "LEAKY-NAME");
+        assert!(SessionWriter::begin(t, &o, "probe".to_string()).is_err(), "首行带秘密时必须失败");
+        let left = files_with(&dir, ".jsonl");
+        assert!(left.is_empty(), "失败后不该留下空文件（--resume 会把它当已完成）: {left:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_reuses_the_previous_file_name_and_keeps_the_index_row() {
+        let dir = tmp("resume-stable");
+        let a = SessionTarget { talker: "wxid_1".into(), display_name: "Team".into() };
+        let b = SessionTarget { talker: "wxid_2".into(), display_name: "Team".into() };
+        let o = opts(&dir, Format::Jsonl, false, "");
+        run(&[a, b.clone()], &o, |_t, on_page| on_page(&[row("1", 1, "u1", "")])).unwrap();
+        assert_eq!(files_with(&dir, ".jsonl").len(), 2, "同名会话应落到两个文件");
+        // 第二轮只带 B：它必须沿用上一轮的 Team-2.jsonl，而不是重算成 Team.jsonl
+        let o2 = opts(&dir, Format::Jsonl, true, "");
+        let got = run(&[b], &o2, |_t, on_page| on_page(&[row("2", 2, "u2", "")])).unwrap();
+        assert_eq!(got.skipped, vec!["wxid_2".to_string()], "B 应被识别为已完成");
+        let idx: Value = serde_json::from_str(&std::fs::read_to_string(&got.index).unwrap()).unwrap();
+        let rows = idx["sessions"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "跳过的会话也要留在清单里，否则上一轮的 index 被抹掉: {idx}");
+        assert_eq!(rows[0]["file"], "Team-2.jsonl", "文件名必须沿用上一轮而不是重算漂移: {idx}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_rewrites_an_incomplete_artifact() {
+        let dir = tmp("resume-incomplete");
+        std::fs::create_dir_all(&dir).unwrap();
+        // 造一个「存在但为空」的产物（建了文件却失败的现场）
+        std::fs::write(dir.join("A.jsonl"), b"").unwrap();
+        let o = opts(&dir, Format::Jsonl, true, "");
+        let t = SessionTarget { talker: "wxid_a".into(), display_name: "A".into() };
+        let got = run(&[t], &o, |_t, on_page| on_page(&[row("1", 1, "u1", "")])).unwrap();
+        assert!(got.skipped.is_empty(), "空产物不该被当成已完成");
+        assert_eq!(got.messages, 1);
+        let body = std::fs::read_to_string(dir.join("A.jsonl")).unwrap();
+        assert!(body.contains("\"_type\":\"message\""), "应当被重写: {body}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
