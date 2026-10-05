@@ -121,7 +121,12 @@ fn links(text: &str) -> Vec<String> {
 /// 扫描目标：这几份文档受守卫保护。
 fn targets() -> Vec<PathBuf> {
     let root = repo_root();
-    let mut out = vec![root.join("README.md"), root.join("AGENTS.md"), root.join("docs/architecture.md")];
+    let mut out = vec![
+        root.join("README.md"),
+        root.join("AGENTS.md"),
+        root.join("docs/architecture.md"),
+        root.join("docs/mcp.md"),
+    ];
     if let Ok(entries) = fs::read_dir(root.join("docs")) {
         let mut api: Vec<PathBuf> = entries
             .filter_map(|e| e.ok().map(|e| e.path()))

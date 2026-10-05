@@ -4,10 +4,14 @@
 WCDB/SQLCipher-4 风格加密）。独立纯 Rust 实现，架构参考同目录 `qqflow-server`，接口契约对齐
 **WeFlow HTTP API**（本仓库接口细节见 `docs/weflow-server-api.md`；上游为 WeFlow 的 `docs/HTTP-API.md`）。
 
-> **作为库嵌入**：`default-features = false`。默认 feature 是 `["server"]`（连带 axum 与 tokio）——
-> 嵌入者必须显式关掉默认 feature，否则会把整个服务栈拉进依赖树。feature 矩阵、承诺面
-> （`pub mod api`）与真库示例见 [docs/architecture.md](docs/architecture.md) 的「库面与 feature」
-> 与 [examples/embed.rs](examples/embed.rs)（CI 以 `--no-default-features` 编译它作为守门）。
+> **作为库嵌入**：`default-features = false`。默认 feature 是 `["server", "cli", "mcp"]`
+> （连带 axum、tokio、clap 与 rmcp）——嵌入者必须显式关掉默认 feature，否则会把整个服务栈
+> 拉进依赖树。feature 矩阵、承诺面（`pub mod api`）与真库示例见
+> [docs/architecture.md](docs/architecture.md) 的「库面与 feature」与
+> [examples/embed.rs](examples/embed.rs)（CI 以 `--no-default-features` 编译它作为守门）。
+>
+> **MCP（agent 客户端）**：`weflow-server mcp` 在 stdio 上暴露只读查询工具，见
+> [docs/mcp.md](docs/mcp.md)。**工具输出会进入模型上下文 —— 也就是对话内容离开本机。**
 
 ## 范围
 

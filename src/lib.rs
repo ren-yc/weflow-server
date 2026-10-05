@@ -64,6 +64,13 @@ pub(crate) mod cli;
 #[cfg(feature = "cli")]
 pub(crate) mod export;
 
+/// MCP 工具面（`mcp` feature）：在 stdio 上把本服务的只读查询暴露成 MCP 工具。
+///
+/// `pub(crate)`：它是**二进制的面**，不是嵌入者的承诺面。工具的输出会进入模型上下文，
+/// 这条提示写在工具的 description 与其 get_info 的 instructions 里。
+#[cfg(feature = "mcp")]
+pub(crate) mod mcp;
+
 /// 造库/造密钥夹具 —— **不是承诺面**，只随 `testing` feature 编译。
 ///
 /// 落点为什么在库里而不是 `tests/common`：需要它的有两个调用方，而它们互相

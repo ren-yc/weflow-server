@@ -78,6 +78,19 @@ enum Command {
     Sync(HttpArgs),
     /// 批量导出：把会话写成 ChatLab Format 的 JSONL / JSON 落盘
     Export(ExportArgs),
+    /// 以 MCP（stdio）方式暴露只读查询工具，供 agent 客户端调用
+    #[cfg(feature = "mcp")]
+    Mcp(McpArgs),
+}
+
+/// `mcp` 的参数。刻意只有服务地址：token 只从环境变量取（与其它子命令同一口径），
+/// 而 MCP 进程不碰数据库密钥 —— 那是服务端的事。
+#[cfg(feature = "mcp")]
+#[derive(clap::Args)]
+struct McpArgs {
+    /// 服务地址；默认取环境变量 WEFLOW_BASE_URL，再默认 http://127.0.0.1:5033
+    #[arg(long, env = "WEFLOW_BASE_URL")]
+    base_url: Option<String>,
 }
 
 /// 只读查询类子命令的共用参数（带 `--embedded`）。
@@ -288,6 +301,12 @@ pub(crate) fn dispatch() -> Result<Entry> {
             emit(&json!({"success": r.success, "newMessages": r.new_messages, "revokeMessages": r.revoke_messages}), q.common.json, "sync");
             Ok(Entry::Done)
         }
+        #[cfg(feature = "mcp")]
+        Command::Mcp(a) => {
+            let base = a.base_url.unwrap_or_else(|| "http://127.0.0.1:5033".to_string());
+            crate::mcp::run(base, env_token()?)?;
+            Ok(Entry::Done)
+        }
     }
 }
 
@@ -337,10 +356,14 @@ fn run_messages(m: &MessageArgs) -> Result<Vec<Value>> {
 
 fn http_client(c: &Common) -> Result<Client> {
     let base = c.base_url.clone().unwrap_or_else(|| "http://127.0.0.1:5033".to_string());
-    let token = std::env::var("WEFLOW_TOKEN").map_err(|_| {
+    Ok(Client::new(base, env_token()?))
+}
+
+/// API token 只从环境变量取：它不经命令行传递，以免落进 shell history 与进程列表。
+fn env_token() -> Result<String> {
+    std::env::var("WEFLOW_TOKEN").map_err(|_| {
         anyhow::anyhow!("缺少 API token：请设环境变量 WEFLOW_TOKEN（值可用 `weflow-server token` 取）；token 不经命令行传递，以免落进 shell history 与进程列表")
-    })?;
-    Ok(Client::new(base, token))
+    })
 }
 
 /// SDK 的方法都是 async；子命令是「跑一次就退出」，所以用一个当前线程运行时把 future 拉完。
