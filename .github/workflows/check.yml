@@ -277,6 +277,10 @@ jobs:
       - name: test
         if: runner.os != 'Windows'
         run: bash scripts/build.sh test --locked
+      - name: build wrapper passthrough (scripts/tests)
+        run: |
+          python -m pip install -q pytest
+          python -m pytest scripts/tests/ -q
 
       - name: conformance suite (flow-contract cases)
         if: runner.os != 'Windows'

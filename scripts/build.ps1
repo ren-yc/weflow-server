@@ -100,7 +100,10 @@ Set-Location $PSScriptRoot\..
 $needsTesting = $args.Count -gt 0 -and ($args[0] -eq 'test' -or ($args[0] -eq 'clippy' -and $args -contains '--all-targets'))
 $alreadyHas = $args -contains '--features' -or $args -contains '--all-features' -or $args -contains '--no-default-features'
 if ($needsTesting -and -not $alreadyHas) {
-    $args = @($args[0]) + @('--features', 'testing') + @($args[1..($args.Count - 1)])
+    # Select-Object 而非下标区间：单参数调用会算出区间 1..0，PowerShell 把端点
+    # 取整回绕成「再取一次首元素」，调用方的首参被注入第二遍——build.ps1 test
+    # 变成 cargo test test，第二个 test 沦为过滤词，全量测试被静默换成零匹配。
+    $args = @($args[0]) + @('--features', 'testing') + @($args | Select-Object -Skip 1)
     Write-Host 'build.ps1: 已补 --features testing（集成测试需要它才看得见实现面）'
 }
 & cargo @args
