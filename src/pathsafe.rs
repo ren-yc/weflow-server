@@ -35,6 +35,24 @@ use std::path::Path;
 /// joined path past the platform limit and turning containment into an IO error.
 const MAX_SEGMENT: usize = 128;
 
+/// True when `s` names a Win32 **device** rather than a file.
+///
+/// Win32 resolves `CON` / `NUL` / `COM1` … (case-insensitively, and **with any
+/// extension**: `NUL.jpg` is still the device) before it touches the
+/// filesystem. Writing `NUL` silently discards the bytes and opening `COM1` can
+/// block. That is not an escape, but the artifact does not land where the caller
+/// asked — and these names come from the chat database, so a sender picks them.
+/// Win32 normalizes on the base name, so strip a trailing extension and any
+/// trailing spaces/dots before comparing.
+fn is_reserved_device(s: &str) -> bool {
+    let base = s.split('.').next().unwrap_or(s).trim_end_matches([' ', '.']);
+    let upper = base.to_ascii_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && matches!(upper.as_bytes()[3], b'1'..=b'9'))
+}
+
 /// True when `s` is safe to use as exactly one path component.
 ///
 /// Rejects: empty, `.`, `..`, anything holding `/` `\` or `:`, control
@@ -52,6 +70,9 @@ pub fn safe_segment(s: &str) -> bool {
         && !s.contains(|c: char| c.is_control())
         && !s.ends_with('.')
         && !s.ends_with(' ')
+        // 设备名（`NUL`／`COM1`…）会被 Win32 解析成设备而不是文件 —— 写 `NUL` 静默丢弃、
+        // 开 `COM1` 可能阻塞。名字来自聊天库，发消息的人能选。
+        && !is_reserved_device(s)
 }
 
 /// Fold an arbitrary string into one safe path component.
@@ -80,6 +101,11 @@ pub fn slugify(s: &str, fallback: &str) -> String {
         .collect();
     if out.is_empty() {
         return fallback.to_string();
+    }
+    // 折叠后的名字仍可能是 Win32 设备名（`CON`／`nul`／`COM1` —— 它们都是字母数字，折叠动不了），
+    // 一个前导下划线就让它变成普通文件，而且名字仍然认得出来。
+    if is_reserved_device(&out) {
+        return format!("_{}", out.chars().take(63).collect::<String>());
     }
     out
 }
@@ -143,6 +169,18 @@ mod tests {
         assert!(!safe_segment("evil\0.jpg"));
         assert!(!safe_segment("evil\n.jpg"));
 
+        // Win32 device names resolve to devices, not files: writing NUL silently
+        // discards the bytes and opening COM1 can block. They are alphanumeric, so
+        // the separator/dot rules above never touch them.
+        assert!(!safe_segment("NUL"), "device, not a file");
+        assert!(!safe_segment("nul.jpg"), "the device name wins over any extension");
+        assert!(!safe_segment("CON"));
+        assert!(!safe_segment("COM1"));
+        assert!(!safe_segment("lpt9.txt"));
+        // near-misses are ordinary names
+        assert!(safe_segment("COM0"), "COM0 is not a device");
+        assert!(safe_segment("NULL"));
+        assert!(safe_segment("console"));
         assert!(!safe_segment(&"a".repeat(MAX_SEGMENT + 1)));
         assert!(safe_segment(&"a".repeat(MAX_SEGMENT)));
     }
@@ -162,7 +200,11 @@ mod tests {
         assert_eq!(slugify("", "scope"), "scope");
         // group ids keep their shape well enough to stay readable
         assert_eq!(slugify("12345678@chatroom", "scope"), "12345678_chatroom");
-        // every output is usable as one component
+        // 折叠后的名字仍可能是 Win32 设备名（全字母数字，折叠动不了它）：一个前导下划线让它成为文件
+        assert_eq!(slugify("CON", "scope"), "_CON");
+        assert_eq!(slugify("nul", "scope"), "_nul");
+        assert_eq!(slugify("COM1", "scope"), "_COM1");
+        assert_eq!(slugify("CON.txt", "scope"), "CON_txt", "点被折叠后已不是设备名");        // every output is usable as one component
         for probe in ["..", "../x", r"..\x", "a:b", "x.", "", "..."] {
             assert!(safe_segment(&slugify(probe, "scope")), "slug of {probe:?} must be a safe segment");
         }
