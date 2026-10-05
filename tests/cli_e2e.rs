@@ -116,7 +116,11 @@ async fn media(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> (axum::http::StatusCode, Vec<u8>) {
     if id == "boom.png" {
+        // 5xx：这次没拿到 —— 必须上抛（见 `with_media_fails_loudly_when_bytes_fetch_errors`）。
         (axum::http::StatusCode::SERVICE_UNAVAILABLE, Vec::new())
+    } else if id == "gone.png" {
+        // 404：这个句柄本来就取不到 —— 必须跳过，不让整轮失败（见 404 对照用例）。
+        (axum::http::StatusCode::NOT_FOUND, Vec::new())
     } else {
         (axum::http::StatusCode::OK, b"PNG-BYTES".to_vec())
     }
@@ -160,6 +164,17 @@ async fn chatlab(axum::extract::RawQuery(q): axum::extract::RawQuery) -> Json<Va
             "page": {"hasMore": false, "nextCursor": null}, "talker": "boom-talker",
         }));
     }
+    if raw.contains("talker=gone-talker") {
+        // 与 boom 相反：这个句柄回 **404**（本来就取不到），用来做「404 放过、5xx 上抛」的对照。
+        let mut m = pull_message();
+        m["media"] = json!({"fileName": "gone.png", "type": "image"});
+        return Json(json!({
+            "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
+            "count": 1, "members": [], "messages": [m],
+            "meta": {"groupId": "", "name": "演示会话", "ownerId": "", "platform": "wechat", "type": "private"},
+            "page": {"hasMore": false, "nextCursor": null}, "talker": "gone-talker",
+        }));
+    }
     Json(json!({
         "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
         "count": 1, "members": [], "messages": [pull_message()],
@@ -190,15 +205,20 @@ async fn every_subcommand_works_against_a_live_service() {
     for (args, want) in [
         (vec!["sessions", "--json"], "演示会话"),
         (vec!["messages", "--talker", TALKER, "--json"], "张三"),
-        (vec!["search", "--talker", TALKER, "--keyword", "hi", "--json"], "hi"),
+        // 查桩**自有**的字段（发信人名）而不是请求里的关键词 —— 后者被回显就满足，等于没查。
+        (vec!["search", "--talker", TALKER, "--keyword", "hi", "--json"], "张三"),
         (vec!["contacts", "--json"], "三儿"),
         (vec!["accounts", "--json"], "ready"),
+        // 查**值**而不只是键名：只回显键名也含 "newMessages"。
         (vec!["sync", "--json"], "newMessages"),
     ] {
         let (code, stdout, stderr) = run(&base, &args);
         assert_eq!(code, 0, "{args:?} 应退出 0；stderr: {stderr}");
         assert!(stdout.contains(want), "{args:?} 的输出应含 {want:?}，实际: {stdout}");
     }
+    // 键名在场不等于值被转发：解析出来断言**值**（`--json` 是美化输出，字符串比较会依赖空格）。
+    let v: Value = serde_json::from_str(&run(&base, &["sync", "--json"]).1).expect("--json 应是 JSON");
+    assert_eq!(v["newMessages"], json!(1), "sync 应转发服务端给的新消息数: {v}");
 }
 
 /// 验收 1b：`export` 落盘（同样对着桩服务端）。
@@ -216,6 +236,18 @@ async fn export_writes_a_file_against_a_live_service() {
         .collect();
     assert!(files.iter().any(|f| f.ends_with(".jsonl")), "应写出 jsonl，实际: {files:?}");
     assert!(files.iter().any(|f| f == "index.json"), "应写出 index.json，实际: {files:?}");
+    // 文件名「存在」不说明写了什么：一个空 jsonl 也满足上面两条。
+    let jsonl = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .expect("应有 jsonl");
+    let body = std::fs::read_to_string(&jsonl).unwrap();
+    assert!(body.contains("\"_type\":\"header\""), "首行应是 header: {body}");
+    assert!(body.contains("hi"), "导出物应含桩消息的正文: {body}");
+    // 本仓的会话类型由 talker 推导（`wxid_demo` 不是群），所以这里应是 private。
+    assert!(body.contains("\"type\":\"private\""), "meta.type 应由 talker 推导: {body}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -240,10 +272,19 @@ async fn export_with_media_lands_bytes_and_keeps_the_handle() {
         .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
         .expect("应有 jsonl");
     let body = std::fs::read_to_string(&jsonl).unwrap();
-    assert!(
-        body.contains("\"fileName\":\"deadbeef.png\""),
-        "导出物里的句柄应指向落盘文件，实际: {body}"
-    );
+    // **两个集合必须相等**：只断言桩自带的那一个串，透传实现也会通过。
+    let handles: std::collections::BTreeSet<String> = body
+        .split("\"fileName\":\"")
+        .skip(1)
+        .filter_map(|s| s.split('"').next().map(str::to_string))
+        .collect();
+    let on_disk: std::collections::BTreeSet<String> = std::fs::read_dir(dir.join("media"))
+        .expect("media 目录应存在")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(handles, on_disk, "导出物里的句柄集合必须与 media/ 下的文件集合相等");
+    assert!(handles.contains("deadbeef.png"), "桩那条媒体句柄应在其中: {handles:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -264,10 +305,37 @@ async fn with_media_fails_loudly_when_bytes_fetch_errors() {
         ],
     );
     assert_eq!(code, 1, "取字节 5xx 应让该会话失败并以非零码结束；stdout: {stdout} stderr: {stderr}");
-    assert!(
-        stdout.contains("跳过") || stderr.contains("跳过"),
-        "应当说明会话被跳过（而不是静默退 0）: stdout={stdout} stderr={stderr}"
+    let combined = format!("{stdout}{stderr}");
+    assert!(combined.contains("跳过"), "应当说明会话被跳过（而不是静默退 0）: {combined}");
+    // 点名是哪个会话：只断言「有跳过字样」的话，跳错会话／跳了别的也会过。
+    assert!(combined.contains("boom-talker"), "跳过说明要点名会话: {combined}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 404 与 5xx **必须区别对待**：404 =「这个句柄本来就取不到」→ 跳过、整轮仍成功；
+/// 5xx =「这次没拿到」→ 上抛、该会话进 skipped。只测一侧，就会漏掉「把 404 也改成失败」的实现。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_media_skips_an_unfetchable_handle_without_failing() {
+    let base = spawn_stub().await;
+    let dir = std::env::temp_dir().join(format!("weflow-e2e-mediagone-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (code, stdout, stderr) = run(
+        &base,
+        &[
+            "export", "--out", dir.to_str().unwrap(), "--format", "jsonl", "--with-media",
+            "--session", "gone-talker",
+        ],
     );
+    assert_eq!(code, 0, "404 是「不可取句柄」，不该让整轮失败；stdout: {stdout} stderr: {stderr}");
+    assert!(!dir.join("media").join("gone.png").exists(), "取不到的句柄不该留下字节");
+    let jsonl = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .expect("应有 jsonl");
+    let body = std::fs::read_to_string(&jsonl).unwrap();
+    assert!(!body.contains("gone.png"), "没有字节的句柄不该写进导出物: {body}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -355,6 +423,13 @@ async fn mcp_three_step_demo_lists_searches_and_fetches() {
     assert_ne!(fetched["result"]["isError"], json!(true), "get_messages 不该是工具级错误: {fetched}");
     assert!(fetched["result"]["content"][0]["text"].as_str().unwrap_or_default().contains("42"),
         "取消息应含 platformMessageId: {fetched}");
+    // 未截断的那条路径也要钉：只测「截断」的反面（把 truncated／hasMore 写死为真的实现）会漏。
+    let fetched_json: Value = serde_json::from_str(
+        fetched["result"]["content"][0]["text"].as_str().unwrap_or_default(),
+    )
+    .expect("工具输出应是 JSON");
+    assert_eq!(fetched_json["truncated"], json!(false), "单条消息不该被截断: {fetched_json}");
+    assert_eq!(fetched_json["hasMore"], json!(false), "单条消息不该报还有更多: {fetched_json}");
 
     child.kill().ok();
     let _ = child.wait();

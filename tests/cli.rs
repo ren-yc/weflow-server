@@ -108,9 +108,15 @@ fn messages_over_http_requires_talker() {
 /// 非确定性的。
 #[test]
 fn missing_token_fails_before_touching_the_network() {
-    let o = bare(&["sessions"]);
+    // 指向一个**保证没有监听**的端口：若实现是「先连、连不上再报鉴权」，错误文案会退化成连接失败，
+    // 下面那条「不得出现连接失败措辞」的断言就会抓住它 —— 只断言「退 1 ＋ 提到变量名」抓不住。
+    let o = run(&["sessions"], &[("WEFLOW_BASE_URL", "http://127.0.0.1:1")]);
     assert_eq!(o.code, 1, "缺 token 是运行期错误；stderr: {}", o.stderr);
     assert!(o.stderr.contains("WEFLOW_TOKEN"), "报错要给出补救（环境变量名），实际: {}", o.stderr);
+    let lower = o.stderr.to_lowercase();
+    for wording in ["connection refused", "tcp connect", "error sending request", "connect error"] {
+        assert!(!lower.contains(wording), "缺 token 不该走到网络（出现「{wording}」）: {}", o.stderr);
+    }
 }
 
 /// --embedded 只开放给只读查询类：accounts 与 sync 没有这个开关。
