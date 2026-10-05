@@ -113,7 +113,25 @@ async fn media(axum::extract::Path(_id): axum::extract::Path<String>) -> Vec<u8>
     b"PNG-BYTES".to_vec()
 }
 
-async fn chatlab() -> Json<Value> {
+async fn chatlab(axum::extract::RawQuery(q): axum::extract::RawQuery) -> Json<Value> {
+    // `keyword=big` 时给一页**远超字符预算**的消息，用来钉「截断时 hasMore 必须为真」。
+    if q.unwrap_or_default().contains("keyword=big") {
+        let messages: Vec<Value> = (0..60)
+            .map(|i| {
+                json!({
+                    "accountName": "alice", "content": "x".repeat(2000), "groupNickname": "",
+                    "platformMessageId": format!("{i}"), "sender": "alice",
+                    "timestamp": 1_700_000_000, "type": 0,
+                })
+            })
+            .collect();
+        return Json(json!({
+            "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
+            "count": 60, "members": [], "messages": messages,
+            "meta": {"groupId": TALKER, "name": "演示会话", "ownerId": "", "platform": "wechat", "type": "group"},
+            "page": {"hasMore": false, "nextCursor": null}, "talker": TALKER,
+        }));
+    }
     Json(json!({
         "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
         "count": 1, "members": [], "messages": [pull_message()],
@@ -288,6 +306,53 @@ async fn mcp_three_step_demo_lists_searches_and_fetches() {
 
     child.kill().ok();
     let _ = child.wait();
+}
+
+/// 起一个 `mcp` 子进程、握手、调一次工具，返回 `result` 对象后杀掉进程。
+async fn mcp_call(base: &str, tool: &str, args: Value) -> Value {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_weflow-server"))
+        .arg("mcp")
+        .env("WEFLOW_BASE_URL", base)
+        .env("WEFLOW_TOKEN", TOKEN)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn weflow-server mcp");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+    send(&mut stdin, json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                   "clientInfo": {"name": "e2e", "version": "0.1.0"}},
+    }));
+    let _ = read_until(&mut out, 1);
+    send(&mut stdin, json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    send(&mut stdin, json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": tool, "arguments": args},
+    }));
+    let resp = read_until(&mut out, 2);
+    child.kill().ok();
+    let _ = child.wait();
+    resp["result"].clone()
+}
+
+/// 预算截断时必须让调用方知道「还有」，否则 agent 会把截断当成「取完了」并静默丢掉消息。
+///
+/// 钉的是 `hasMore` 与 `truncated` 的一致性：只置 `truncated` 而 `hasMore=false`，按 hasMore 判停的
+/// 调用方会停在一个不完整的结果上。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mcp_truncation_reports_has_more_so_the_caller_does_not_stop() {
+    let base = spawn_stub().await;
+    let r = mcp_call(&base, "search_messages", json!({"talker": TALKER, "keyword": "big"})).await;
+    assert_ne!(r["isError"], json!(true), "不该是工具级错误: {r}");
+    let text = r["content"][0]["text"].as_str().unwrap_or_default();
+    let v: Value = serde_json::from_str(text).unwrap_or_else(|e| panic!("工具输出应是 JSON: {e} / {text}"));
+    assert_eq!(v["truncated"], json!(true), "60 条 2KB 消息应超预算: {v}");
+    assert_eq!(v["hasMore"], json!(true), "截断时 hasMore 必须为真: {v}");
+    assert!(v["nextCursor"].is_null(), "预算截断时不能给整页游标: {v}");
+    assert!(v["count"].as_u64().unwrap_or(99) < 60, "count 应少于总条数: {v}");
 }
 
 // ---- --rows 的 RSS 平坦（验收时显式跑）--------------------------------------

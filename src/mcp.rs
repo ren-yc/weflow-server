@@ -303,7 +303,9 @@ impl WeflowMcp {
             "count": proj.items.len(),
             "pageSize": page_size,
             "truncated": cut,
-            "hasMore": page.sync.has_more,
+            // 预算截断时**必须**为真：只置 `truncated` 而 `hasMore=false`，按 hasMore 判停的调用方
+            // 会把「被预算砍掉的条」当成「没有了」。游标仍然不给（见上）。
+            "hasMore": page.sync.has_more || cut,
             "nextSince": if cut { Value::Null } else { json!(page.sync.next_since) },
             "nextOffset": if cut { Value::Null } else { json!(page.sync.next_offset) },
             "hint": if cut { json!("本页超过字符预算，已少给若干条：请用更小的 limit 重取本页（游标未给，按整页游标续拉会跳过未给出的条）") } else { Value::Null },
@@ -363,7 +365,7 @@ impl WeflowMcp {
             "keyword": a.keyword,
             "count": proj.items.len(),
             "truncated": proj.truncated,
-            "hasMore": page.page.has_more,
+            "hasMore": page.page.has_more || proj.truncated,
             "nextCursor": if proj.truncated { Value::Null } else { json!(page.page.next_cursor) },
             "messages": proj.items,
         })))
@@ -401,7 +403,8 @@ impl WeflowMcp {
         Ok(CallToolResult::structured(json!({
             "count": proj.items.len(),
             "truncated": proj.truncated,
-            "hasMore": page.has_more,
+            // 同 search_messages：截断时 hasMore 必须为真，否则调用方会当作取完了。
+            "hasMore": page.has_more || proj.truncated,
             "contacts": proj.items,
         })))
     }
