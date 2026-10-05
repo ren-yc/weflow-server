@@ -578,6 +578,25 @@ impl Client {
         self.get_json("/api/v1/messages", &q.params()?).await
     }
 
+    /// `GET /chatlab/messages` — the **ChatLab-shaped** messages face.
+    ///
+    /// Same query surface as [`Client::list_messages`] (`talker` required;
+    /// `keyword`/`start`/`end`/`limit`/`offset`/`media`), different envelope:
+    /// ascending by time, ChatLab type codes, `media` on the message,
+    /// `count`/`page` for paging, and **no** `success` key. Project from this
+    /// face when the caller wants ChatLab field names; the native face is the
+    /// only one carrying `rawContent`/`isSend`.
+    ///
+    /// `offset` is this face's paging cursor (the wire also accepts `cursor`;
+    /// the two are the same integer, so advancing by the page size and
+    /// passing `page.nextCursor` are equivalent).
+    pub async fn chatlab_messages(
+        &self,
+        q: &MessageQuery,
+    ) -> Result<gen_types::ChatlabMessages> {
+        self.get_json("/chatlab/messages", &q.params()?).await
+    }
+
     /// `GET /api/v1/contacts` — one page of the contact list.
     ///
     /// Contact detail is not part of the ChatLab shape at all; this is the

@@ -653,6 +653,47 @@ async fn list_messages_pages_by_offset_and_exposes_native_fields() {
 }
 
 #[tokio::test]
+async fn chatlab_messages_decodes_the_chatlab_envelope_and_paging() {
+    let mock = Mock::default();
+    *mock.chatlab_page.lock().unwrap() = Some(serde_json::json!({
+        "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
+        "count": 1,
+        "members": [{
+            "accountName": "张三", "avatar": "", "groupNickname": "",
+            "platformId": "alice", "username": "alice",
+        }],
+        "messages": [{
+            "accountName": "alice", "content": "hi", "groupNickname": "",
+            "platformMessageId": "42", "sender": "alice", "timestamp": 1700000000,
+            "type": 1,
+        }],
+        "meta": {"groupId": "", "name": "", "ownerId": "", "platform": "weflow", "type": "private"},
+        "page": {"hasMore": true, "nextCursor": "1000"},
+        "talker": "alice",
+    }));
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+    let mut q = MessageQuery::new("alice");
+    q.keyword = Some("hi".to_string());
+    q.limit = Some(50);
+
+    let page = client.chatlab_messages(&q).await.expect("chatlab page must decode");
+    assert_eq!(page.count, 1);
+    assert!(page.page.has_more);
+    assert_eq!(page.page.next_cursor.as_deref(), Some("1000"));
+    assert_eq!(page.messages[0].platform_message_id, "42");
+    assert_eq!(page.messages[0].type_, 1, "ChatLab type codes, not the native localType");
+
+    let recorded = mock.messages_query.lock().unwrap().clone();
+    let pairs = parse_query(&recorded);
+    for want in [("talker", "alice"), ("keyword", "hi"), ("limit", "50")] {
+        assert!(
+            pairs.iter().any(|(k, v)| k == want.0 && v == want.1),
+            "query must carry {want:?}: {recorded:?}"
+        );
+    }
+}
+#[tokio::test]
 async fn contacts_page_decodes_rows_and_paging_fields() {
     let mock = Mock::default();
     *mock.contacts_page.lock().unwrap() = Some(serde_json::json!({

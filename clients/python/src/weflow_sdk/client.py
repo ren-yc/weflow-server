@@ -113,6 +113,40 @@ def _validate_time_bound(field: str, value: str) -> None:
         )
 
 
+def _message_query_params(
+    talker: str,
+    keyword: str | None,
+    start: str | None,
+    end: str | None,
+    limit: int | None,
+    offset: int | None,
+    media: bool,
+) -> dict[str, str]:
+    """Query for either messages face.
+
+    The native face (``/api/v1/messages``) and the ChatLab face
+    (``/chatlab/messages``) take the **same** query surface - only the
+    envelope differs. Building it in two places is how the two faces end up
+    answering the same request with different pages.
+    """
+    if not talker:
+        raise ShapeError("talker must not be empty")
+    query: dict[str, str] = {"talker": talker}
+    if keyword is not None:
+        query["keyword"] = keyword
+    for field, value in (("start", start), ("end", end)):
+        if value is not None:
+            _validate_time_bound(field, value)
+            query[field] = value
+    if limit is not None:
+        query["limit"] = str(limit)
+    if offset is not None:
+        query["offset"] = str(offset)
+    if media:
+        query["media"] = "1"
+    return query
+
+
 @dataclass(frozen=True)
 class _SseFrame:
     event: str | None
@@ -456,23 +490,42 @@ class Client:
         is stable across a live database, while offset paging over a growing
         table can shift.
         """
-        if not talker:
-            raise ShapeError("talker must not be empty")
-        query: dict[str, str] = {"talker": talker}
-        if keyword is not None:
-            query["keyword"] = keyword
-        for field, value in (("start", start), ("end", end)):
-            if value is not None:
-                _validate_time_bound(field, value)
-                query[field] = value
-        if limit is not None:
-            query["limit"] = str(limit)
-        if offset is not None:
-            query["offset"] = str(offset)
-        if media:
-            query["media"] = "1"
+        query = _message_query_params(
+            talker, keyword, start, end, limit, offset, media
+        )
         return gen.MessagesNative.model_validate(
             await self._get_json("/api/v1/messages", query)
+        )
+
+    async def chatlab_messages(
+        self,
+        talker: str,
+        *,
+        keyword: str | None = None,
+        start: str | None = None,
+        end: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+        media: bool = False,
+    ) -> gen.ChatlabMessages:
+        """``GET /chatlab/messages`` - the **ChatLab-shaped** messages face.
+
+        Same query surface as :meth:`list_messages`, different envelope:
+        ascending by time, ChatLab type codes, ``media`` on the message,
+        ``count``/``page`` for paging and **no** ``success`` key. Project from
+        this face when the caller wants ChatLab field names; the native face
+        is the only one carrying ``raw_content``/``is_send``.
+
+        ``offset`` is this face's paging cursor: the wire also accepts
+        ``cursor``, but the two are the same integer, so advancing by the page
+        size and passing ``page.next_cursor`` are equivalent - and it keeps
+        the two faces from growing different paging parameters for one list.
+        """
+        query = _message_query_params(
+            talker, keyword, start, end, limit, offset, media
+        )
+        return gen.ChatlabMessages.model_validate(
+            await self._get_json("/chatlab/messages", query)
         )
 
     async def contacts(

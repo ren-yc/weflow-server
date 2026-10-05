@@ -827,6 +827,31 @@ async def test_list_messages_accepts_unix_seconds_and_rejects_garbage() -> None:
         await client.list_messages("alice", end="2025-01-01")
 
 
+async def test_chatlab_messages_decodes_the_chatlab_envelope_and_paging() -> None:
+    mock = Mock()
+    mock.chatlab_page = {
+        "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
+        "count": 1,
+        "members": [{"accountName": "张三", "avatar": "", "groupNickname": "",
+                     "platformId": "alice", "username": "alice"}],
+        "messages": [{"accountName": "alice", "content": "hi",
+                      "groupNickname": "", "platformMessageId": "42",
+                      "sender": "alice", "timestamp": 1700000000, "type": 1}],
+        "meta": {"groupId": "", "name": "", "ownerId": "",
+                 "platform": "weflow", "type": "private"},
+        "page": {"hasMore": True, "nextCursor": "1000"},
+        "talker": "alice",
+    }
+    client = make_client(mock)
+    page = await client.chatlab_messages("alice", keyword="hi", limit=50)
+    assert page.count == 1
+    assert page.page.has_more is True
+    assert page.page.next_cursor == "1000"
+    assert page.messages[0].platform_message_id == "42"
+    assert page.messages[0].type == 1, "ChatLab type codes, not the native localType"
+    assert mock.messages_query == {"talker": "alice", "keyword": "hi", "limit": "50"}
+
+
 async def test_contacts_page_decodes_rows_and_paging_fields() -> None:
     mock = Mock()
     mock.contacts_page = {
