@@ -909,7 +909,14 @@ feeds 条目字段（以源码 `sns.rs` 为准）：`tid/userName/content(明文
 - **每个会话一个文件**（`<slug>.jsonl` 或 `<slug>.json`）。`<slug>` 由会话显示名经
   `pathsafe::slugify` 得到；**折叠后不含任何 ASCII 字母数字时**（纯中文群名会被折成一串下划线，
   既不可读也极易互撞）**回落到会话 id 的 slug**；同名会话按出现顺序追加 `-2`／`-3`。文件名是
-  确定性函数——这是 `--resume` 成立的前提。
+  确定性函数——这是 `--resume` 成立的前提。两个补充口径：
+
+  - **去重按大小写折叠**（Windows 卷默认大小写不敏感，`Team` 与 `team` 是同一个文件），而交付名
+    保留原大小写；
+  - **编排文件名 `index` 永远留给清单**：显示名恰好是 `index` 的会话拿到 `index-2`，否则 json 形态下
+    会话信封会被清单原地覆盖。
+
+  回归位置：`export::tests::slug_collision_gets_deterministic_suffix`。
 - **JSONL 形态**：第一行是 `_type: header`（含 `chatlab` 与 `meta`），其后是 `_type: message` 行。
   规范建议按时间升序，因此**页内**排序（跨页排序会把内存恒定这条承诺打破）。**不写 member 行**：
   流式写不出「先集齐成员再写消息」的顺序，而规范说成员行可选、缺省时由导入器从消息收集；
@@ -921,20 +928,35 @@ feeds 条目字段（以源码 `sns.rs` 为准）：`tid/userName/content(明文
 - **`--with-media`**：把本会话用到的媒体字节下载到 `<目录>/media/`，并把导出物里的
   `media.fileName` **限定为确实落盘的那些句柄**。实现上先走 `/chatlab/messages?media=1` 触发导出
   （该面**每请求最多导出 200 项**，超出部分靠翻页续传），再取字节；顺序不能反 —— 服务端只有在真的
-  写出了本地副本之后，才把 `fileName` 回填成可取句柄。外链媒体与未能导出的媒体**不会**留下句柄：
-  宁可少一个 `media` 字段，也不给一个指向不存在文件的句柄。单个媒体取不到只跳过，不升级成会话级失败。
-  回归位置：`export::tests::with_media_keeps_only_handles_whose_bytes_are_on_disk` 与
-  `export::tests::message_line_omits_media_without_a_handle`。
+  写出了本地副本之后，才把 `fileName` 回填成可取句柄。注意**两个面给的名字不必相同**：消息面回填的是
+  导出后的内容摘要名，拉取面携带的仍是索引里的原始名，所以句柄**按消息 id 对账**（不是按名字比对），
+  导出物里写的是实际落盘的那个名字。外链媒体与未能导出的媒体**不会**留下句柄：宁可少一个 `media`
+  字段，也不给一个指向不存在文件的句柄。单个媒体取不到只跳过，不升级成会话级失败。
+- **响应里的媒体名要过本地路径校验**：服务端回传的 `media.fileName` 要拿去拼 `<目录>/media/` 下的路径，
+  `../`、盘符、ADS、Win32 设备名这类值配合 `join` 能写到导出目录之外（URL 段编码只防 HTTP 层）。
+  因此落盘前先过 `pathsafe::safe_segment`，非法名按 404 同级跳过**并计数可见**（汇总行给出个数）。
+  回归位置：`export::tests::with_media_keeps_only_handles_whose_bytes_are_on_disk`、
+  `export::tests::message_line_omits_media_without_a_handle`、
+  `cli_e2e::with_media_rejects_unsafe_response_file_names` 与
+  `cli_e2e::with_media_maps_exported_names_back_to_message_ids`。
 
-两条硬约束：
+三条硬约束：
 
 1. **导出物里不得出现访问令牌**。服务端的媒体是**根相对路径**（`/api/v1/media/<file>`，**不含
    令牌** —— 令牌只走请求头或 `?access_token=`，响应体从不嵌它）。导出仍然**不写任何 URL**
    （相对路径换台机器就失效），媒体只以 `{type, fileName}` 表达；
    并且每一行写盘前会拿调用方给的令牌做一次子串检查，**命中即整轮中止**（不是跳过该会话）
    并删掉半成品。回归位置：`export::tests::secret_in_output_aborts_and_removes_partial_file`。
-2. **会话级失败不静默**：取数失败的会话被跳过、半途产物被删除，而只要 `skipped` 非空，CLI
-   就以退出码 1 结束。静默少导几个会话是这类工具最坏的失败方式。
+2. **会话级失败不静默**：取数失败的会话被记入 `skipped`，而只要 `skipped` 非空，CLI 就以退出码 1
+   结束。静默少导几个会话是这类工具最坏的失败方式。**`--resume` 的命中不算失败**：记入 `reused`
+   （幂等完成），同参数续跑以退出码 0 收场。
+3. **最终名是唯一的完成标记**：会话先写 `<slug>.<格式>.part`，整个会话成功收尾后才 `rename` 成最终名。
+   因此 `.part` 残留意味着「没写完」，续跑一律重写；失败的那一轮只删 `.part`，**不会**碰上一轮已经
+   交付的完整产物。
+
+   回归位置：`export::tests::resume_rewrites_an_incomplete_artifact`、
+   `export::tests::failed_rerun_keeps_the_previous_complete_artifact`、
+   `cli_e2e::export_writes_a_file_against_a_live_service`（含续跑第二次退 0）。
 
 内存：JSONL 逐页写盘、写完即丢，**峰值常驻集与条数无关**。大语料的实测口径与造库工具（隐藏的
 `--rows` 参数，仅 `testing` feature 下编译进二进制）见 `docs/architecture.md` 的「测试与夹具」。

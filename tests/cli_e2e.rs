@@ -84,10 +84,29 @@ async fn sessions(axum::extract::RawQuery(q): axum::extract::RawQuery) -> Json<V
     }
 }
 
-async fn pull() -> Json<Value> {
+async fn pull(axum::extract::Path(id): axum::extract::Path<String>) -> Json<Value> {
+    // map-talker：拉取面给**原始名**（photo.png），而消息面给回填名（digest.png，见 chatlab 分支），
+    // 同一条消息 id——CLI 必须按消息 id 把导出物的句柄对回实际落盘的名字。
+    let messages = if id == "map-talker" {
+        let mut m = pull_message();
+        m["media"] = json!({"fileName": "photo.png", "type": "image"});
+        vec![m]
+    } else if id == "evil-talker" {
+        // 与消息面同 id：100 带的原始名就是那个穿越名（它从未落盘，绝不能进导出物），
+        // 101 的原始名 photo2.png 要能被对回成实际落盘的 digest.png。
+        let mut evil = pull_message();
+        evil["platformMessageId"] = json!("100");
+        evil["media"] = json!({"fileName": "../../escape.png", "type": "image"});
+        let mut good = pull_message();
+        good["platformMessageId"] = json!("101");
+        good["media"] = json!({"fileName": "photo2.png", "type": "image"});
+        vec![evil, good]
+    } else {
+        vec![pull_message()]
+    };
     Json(json!({
         "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
-        "members": [], "messages": [pull_message()],
+        "members": [], "messages": messages,
         "meta": {"groupId": "", "name": "演示会话", "ownerId": "", "platform": "wechat", "type": "private"},
         "sync": {"hasMore": false, "nextSince": 1_700_000_000, "nextOffset": 0, "watermark": 1_700_000_000},
     }))
@@ -175,6 +194,39 @@ async fn chatlab(axum::extract::RawQuery(q): axum::extract::RawQuery) -> Json<Va
             "page": {"hasMore": false, "nextCursor": null}, "talker": "gone-talker",
         }));
     }
+    if raw.contains("talker=evil-talker") {
+        // 名字来自响应、要拿去拼本地路径：穿越形态必须被拒（不落盘、不引用、计数可见），
+        // 同一页里的合法名字作对照。
+        let evil = json!({
+            "accountName": "alice", "content": "x", "groupNickname": "",
+            "media": {"fileName": "../../escape.png", "type": "image"},
+            "platformMessageId": "100", "sender": "alice",
+            "timestamp": 1_700_000_000, "type": 1,
+        });
+        let good = json!({
+            "accountName": "alice", "content": "x", "groupNickname": "",
+            "media": {"fileName": "digest.png", "type": "image"},
+            "platformMessageId": "101", "sender": "alice",
+            "timestamp": 1_700_000_001, "type": 1,
+        });
+        return Json(json!({
+            "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
+            "count": 2, "members": [], "messages": [evil, good],
+            "meta": {"groupId": "", "name": "演示会话", "ownerId": "", "platform": "wechat", "type": "private"},
+            "page": {"hasMore": false, "nextCursor": null}, "talker": "evil-talker",
+        }));
+    }
+    if raw.contains("talker=map-talker") {
+        // 同一条消息：消息面给回填名，拉取面给原始名（见 pull 的 map-talker 分支）。
+        let mut m = pull_message();
+        m["media"] = json!({"fileName": "digest.png", "type": "image"});
+        return Json(json!({
+            "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
+            "count": 1, "members": [], "messages": [m],
+            "meta": {"groupId": "", "name": "演示会话", "ownerId": "", "platform": "wechat", "type": "private"},
+            "page": {"hasMore": false, "nextCursor": null}, "talker": "map-talker",
+        }));
+    }
     Json(json!({
         "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
         "count": 1, "members": [], "messages": [pull_message()],
@@ -248,6 +300,15 @@ async fn export_writes_a_file_against_a_live_service() {
     assert!(body.contains("hi"), "导出物应含桩消息的正文: {body}");
     // 本仓的会话类型由 talker 推导（`wxid_demo` 不是群），所以这里应是 private。
     assert!(body.contains("\"type\":\"private\""), "meta.type 应由 talker 推导: {body}");
+    // 同参数 --resume 的第二次运行是**幂等完成**：产物全部完整就要退 0。
+    // 此前续跑命中被记成 skipped 并以非零码说话——脚本分不出「重复运行成功」与「真的失败了」。
+    let (code2, stdout2, stderr2) = run(
+        &base,
+        &["export", "--out", dir.to_str().unwrap(), "--format", "jsonl", "--resume"],
+    );
+    assert_eq!(code2, 0, "续跑命中既有产物不该报错；stdout: {stdout2} stderr: {stderr2}");
+    assert!(stdout2.contains("复用 1"), "续跑计数要可见: {stdout2}");
+    assert!(!stdout2.contains("未能导出"), "幂等完成不是失败: {stdout2}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -336,6 +397,90 @@ async fn with_media_skips_an_unfetchable_handle_without_failing() {
         .expect("应有 jsonl");
     let body = std::fs::read_to_string(&jsonl).unwrap();
     assert!(!body.contains("gone.png"), "没有字节的句柄不该写进导出物: {body}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 响应回传的媒体名字要拿去拼本地路径：穿越名不得落盘（更不得写出导出目录），
+/// 按 404 同级跳过、整轮退 0，且拒绝要计数可见。合法名字作对照。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_media_rejects_unsafe_response_file_names() {
+    let base = spawn_stub().await;
+    let dir = std::env::temp_dir().join(format!("weflow-e2e-evilname-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    // 这条用例断言的是「某处不存在某个文件」，那就必须先把历史残留清掉：否则一次旧运行
+    // 留下的逃逸文件会让用例在**修复态**下也变红（判据与被测代码脱钩）。
+    let escape_targets = [
+        dir.join("escape.png"),
+        dir.parent().unwrap().join("escape.png"),
+        dir.parent().unwrap().parent().unwrap().join("escape.png"),
+    ];
+    for p in &escape_targets {
+        let _ = std::fs::remove_file(p);
+    }
+    let (code, stdout, stderr) = run(
+        &base,
+        &[
+            "export", "--out", dir.to_str().unwrap(), "--format", "jsonl", "--with-media",
+            "--session", "evil-talker",
+        ],
+    );
+    assert_eq!(code, 0, "非法名按 404 同级跳过，不该让整轮失败；stdout: {stdout} stderr: {stderr}");
+    let combined = format!("{stdout}{stderr}");
+    assert!(combined.contains("拒绝 1 个非法媒体文件名"), "拒绝要计数可见: {combined}");
+    assert!(!dir.join("media").join("escape.png").exists(), "非法名不得落在 media/ 里");
+    // join("../..") 的逃逸目标在导出目录之外——三个候选位置都不得出现 escape.png。
+    for p in &escape_targets {
+        assert!(!p.exists(), "穿越名不得写出导出目录之外: {}", p.display());
+    }
+    assert!(dir.join("media").join("digest.png").exists(), "合法对照必须正常落盘");
+    let jsonl = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .expect("应有 jsonl");
+    let body = std::fs::read_to_string(&jsonl).unwrap();
+    assert!(!body.contains("escape"), "被拒的名字不得以句柄形式进导出物: {body}");
+    assert!(body.contains("digest.png"), "合法媒体要按消息 id 对回落盘名: {body}");
+    assert!(!body.contains("photo2.png"), "原始名不得留在导出物里: {body}");
+    let _ = std::fs::remove_dir_all(&dir);
+    // 收尾也清一遍：不把逃逸残留留给下一次运行。
+    for p in &escape_targets {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// 消息面回填的导出名与拉取面携带的原始名可以不同（未识别的图片元数据默认 X.jpg，实际按
+/// 内容嗅探导出成 X.png）：字节按消息面的名字落盘后，导出行必须按**消息 id** 对回实际名字，
+/// 而不是因为两边对不上就把成功的媒体引用整个删掉。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_media_maps_exported_names_back_to_message_ids() {
+    let base = spawn_stub().await;
+    let dir = std::env::temp_dir().join(format!("weflow-e2e-namemap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (code, stdout, stderr) = run(
+        &base,
+        &[
+            "export", "--out", dir.to_str().unwrap(), "--format", "jsonl", "--with-media",
+            "--session", "map-talker",
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {stdout} stderr: {stderr}");
+    assert_eq!(
+        std::fs::read(dir.join("media").join("digest.png")).unwrap(),
+        b"PNG-BYTES",
+        "字节按消息面的回填名落盘"
+    );
+    let jsonl = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .expect("应有 jsonl");
+    let body = std::fs::read_to_string(&jsonl).unwrap();
+    assert!(body.contains("digest.png"), "导出物必须引用实际落盘的名字: {body}");
+    assert!(!body.contains("photo.png"), "拉取面的原始名不得留在导出物里: {body}");
+    assert!(!dir.join("media").join("photo.png").exists(), "原始名从未落盘");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

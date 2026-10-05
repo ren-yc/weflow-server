@@ -150,7 +150,7 @@ struct ExportArgs {
     /// 起始时间：unix 秒或 YYYYMMDD
     #[arg(long, value_parser = parse_since)]
     since: Option<String>,
-    /// 已存在的会话文件跳过（幂等续跑）
+    /// 跳过上一轮**完整交付**过的会话（幂等续跑；残缺或中断的一律重写）
     #[arg(long)]
     resume: bool,
     /// 下载本会话用到的媒体字节到 <out>/media/，并把导出物里的 fileName 限定为确实落盘的句柄
@@ -592,19 +592,27 @@ fn row_from_pull(m: &weflow_client::generated::r#gen::types::PullMessage) -> exp
         msg_type: m.type_,
         content: m.content.clone(),
         reply_to_message_id: m.reply_to_message_id.clone(),
-        // 媒体只写元数据（type + fileName）：服务的媒体链接带 access_token，
-        // 而导出文件会被拷进聊天工具、传上网盘。媒体字节的下载尚未实现：届时应把它下载到
-        // 导出目录下的 media/ 并把 fileName 换成实际落盘的句柄，让交付包自成一体。
+        // 媒体先按拉取面给的原始名落行；--with-media 时 retain_downloaded_media 会按消息 id
+        // 把它改写成实际落盘的内容摘要名。不带 --with-media 时 fileName 只是元数据，不是可取
+        // 承诺（服务的媒体链接也刻意不写进导出物——导出文件会被拷进聊天工具、传上网盘）。
         media_file_name: m.media.as_ref().map(|x| x.file_name.clone()).filter(|s| !s.is_empty()),
         media_type: m.media.as_ref().map(|x| x.type_.clone()),
     }
 }
 
-/// 把一个会话的媒体导出并下载到 `<out>/media/`，返回**确实落盘**的句柄集合。
+/// 把一个会话的媒体导出并下载到 `<out>/media/`，返回「消息 id → 确实落盘的文件名」映射与被
+/// 拒的非法名字个数。
 ///
 /// 为什么先走 `/chatlab/messages?media=1`：服务端**只有在真的写出了本地副本之后**才把
 /// `fileName` 回填成可取句柄（外链与平台名给不出跨会话唯一的句柄），所以「触发导出」与
 /// 「拿到句柄」是同一次请求的两面。该面每请求最多导出 200 项，超出部分靠翻页续传。
+///
+/// 返回**映射**而不是名字集合：消息面回填的 fileName 是导出后的内容摘要名，拉取面携带的是
+/// 索引里的原始名，两者不必相同——只有消息 id 能把两边对上（`retain_downloaded_media` 按 id 改写句柄）。
+///
+/// 名字来自 HTTP 响应，却要拿去拼本地路径：`../`、盘符、设备名这类值配合 `join` 能写到导出目录之外。
+/// `media_bytes_by_id` 会做 URL 段编码，那防的是 HTTP 层，替代不了本地写盘前的 `safe_segment`。
+/// 非法名按 404 同级跳过并计数：静默少下载而整体退 0，是不可发现的失败。
 ///
 /// 单个媒体拿不到（404）只跳过，不升级成会话级失败：外链媒体本来就没有可取句柄，把它
 /// 升格会让「这个群里有一个表情包不是本地文件」变成「这个群一条都没导出」。
@@ -612,8 +620,12 @@ async fn download_session_media(
     client: &Client,
     talker: &str,
     media_dir: &std::path::Path,
-) -> Result<std::collections::BTreeSet<String>> {
-    let mut downloaded: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+) -> Result<(std::collections::BTreeMap<String, String>, usize)> {
+    // 键是消息 id（映射），另留一份落盘名集合做去重：同一条媒体可能被多条消息引用。
+    let mut by_message: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    let mut on_disk: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut rejected = 0usize;
     let mut offset = 0u64;
     loop {
         let mut q = MessageQuery::new(talker.to_string());
@@ -625,7 +637,18 @@ async fn download_session_media(
         for m in &page.messages {
             let Some(media) = &m.media else { continue };
             let name = media.file_name.clone();
-            if name.is_empty() || downloaded.contains(&name) {
+            if name.is_empty() {
+                continue;
+            }
+            // 本地路径校验先于取字节与写盘：非法名根本不进下载，也就不可能被 `join` 带出目录。
+            if !crate::pathsafe::safe_segment(&name) {
+                rejected += 1;
+                tracing::warn!("媒体文件名不是安全的单路径分量，跳过: {name}");
+                continue;
+            }
+            if on_disk.contains(&name) {
+                // 同一份媒体被多条消息引用：字节只下一份，映射逐条补。
+                by_message.insert(m.platform_message_id.clone(), name);
                 continue;
             }
             match client.media_bytes_by_id(&name).await {
@@ -635,7 +658,8 @@ async fn download_session_media(
                     let path = media_dir.join(&name);
                     std::fs::write(&path, &bytes)
                         .with_context(|| format!("写媒体失败: {}", path.display()))?;
-                    downloaded.insert(name);
+                    on_disk.insert(name.clone());
+                    by_message.insert(m.platform_message_id.clone(), name);
                 }
                 // **只有 404 才算「不是可取句柄」**（外链、或服务端没写出副本）。
                 //
@@ -649,7 +673,7 @@ async fn download_session_media(
             }
         }
         if !page.page.has_more || count == 0 {
-            return Ok(downloaded);
+            return Ok((by_message, rejected));
         }
         offset += count as u64;
     }
@@ -727,19 +751,22 @@ fn run_export(a: &ExportArgs) -> Result<()> {
     let start = std::time::Instant::now();
     let media_dir = a.out.join("media");
     let mut media_total = 0usize;
+    let mut media_rejected = 0usize;
     let outcome = export::run(&targets, &opts, |target, on_page| {
         // Pull 面的 since 是**排他**下界，而 --since 对用户是含边界的：差一秒就会让
         // 「起点那一条」凭空消失，故这里减一。
         let talker = target.talker.clone();
         let since_pull = since.map(|s| s - 1);
-        // --with-media：**先**触发导出并把字节落盘，**再**拉行。顺序不能反 —— 服务端只有
-        // 在真的写出了本地副本之后，才把 Pull 面的 fileName 回填成可取句柄。
+        // --with-media：**先**触发导出并把字节落盘，**再**拉行。顺序不能反 —— 消息面只有在
+        // 真的写出了本地副本之后才给得出可取句柄；拉取面给行的仍是原始名，句柄靠消息 id 对回。
         let downloaded = if a.with_media {
-            let got = block_anyhow(download_session_media(&client, &talker, &media_dir))?;
+            let (got, rejected) =
+                block_anyhow(download_session_media(&client, &talker, &media_dir))?;
             media_total += got.len();
+            media_rejected += rejected;
             got
         } else {
-            std::collections::BTreeSet::new()
+            std::collections::BTreeMap::new()
         };
         // SDK 的回调要求它自己的错误类型，而这里真正会失败的是**写盘**。
         // 把写失败硬塞成 ClientError 会丢信息，所以错误先存起来、循环后立即上抛，
@@ -766,15 +793,20 @@ fn run_export(a: &ExportArgs) -> Result<()> {
         }
     })?;
     println!(
-        "[export] {} 个会话、{} 条消息、{} 个媒体 → {}（跳过 {}，索引 {}），用时 {:?}",
+        "[export] {} 个会话、{} 条消息、{} 个媒体 → {}（复用 {}，跳过 {}，索引 {}），用时 {:?}",
         outcome.written.len(),
         outcome.messages,
         media_total,
         opts.out_dir.display(),
+        outcome.reused.len(),
         outcome.skipped.len(),
         outcome.index.display(),
         start.elapsed()
     );
+    if media_rejected > 0 {
+        // 计数要可见：静默拒绝与静默少下载一样糟——交付物少了东西却不能被发现。
+        println!("[export] 拒绝 {media_rejected} 个非法媒体文件名（不落盘、不写进导出物）");
+    }
     if !outcome.skipped.is_empty() {
         for s in &outcome.skipped {
             println!("[export] 跳过: {}", s);
