@@ -44,6 +44,10 @@ struct Mock {
     native_queries: Arc<StdMutex<Vec<String>>>,
     /// When set, `GET /api/v1/contacts` answers this page verbatim.
     contacts_page: Arc<StdMutex<Option<serde_json::Value>>>,
+    /// When set, `GET /api/v1/group-members` answers this page verbatim.
+    group_members_page: Arc<StdMutex<Option<serde_json::Value>>>,
+    /// Query strings seen by the group-members route, in order.
+    group_members_queries: Arc<StdMutex<Vec<String>>>,
     /// FIFO pages for `GET /api/v1/sessions`.
     sessions_pages: Arc<StdMutex<Vec<serde_json::Value>>>,
     /// Query strings seen by the sessions route, in order.
@@ -74,6 +78,7 @@ async fn spawn_mock(mock: Mock) -> String {
         .route("/api/v1/media/{id}", get(media_route))
         .route("/api/v1/messages", get(messages_route))
         .route("/api/v1/contacts", get(contacts_route))
+        .route("/api/v1/group-members", get(group_members_route))
         .route("/api/v1/sessions", get(sessions_route))
         .route("/api/v1/sync", post(sync_post))
         .route("/health", get(health_route))
@@ -236,6 +241,19 @@ async fn contacts_route(
 ) -> Response {
     assert_bearer(&headers);
     match mock.contacts_page.lock().unwrap().clone() {
+        Some(p) => Json(p).into_response(),
+        None => (StatusCode::NOT_FOUND, "fixture missing").into_response(),
+    }
+}
+
+async fn group_members_route(
+    State(mock): State<Mock>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    assert_bearer(&headers);
+    mock.group_members_queries.lock().unwrap().push(query.unwrap_or_default());
+    match mock.group_members_page.lock().unwrap().clone() {
         Some(p) => Json(p).into_response(),
         None => (StatusCode::NOT_FOUND, "fixture missing").into_response(),
     }
@@ -599,6 +617,56 @@ async fn contacts_page_decodes_rows_and_paging_fields() {
     assert_eq!(page.total, 42);
     assert!(page.has_more);
     assert_eq!(page.contacts[0].display_name, "张三");
+}
+
+#[tokio::test]
+async fn group_members_decodes_roster_page_and_sends_chatroom_param() {
+    let mock = Mock::default();
+    *mock.group_members_page.lock().unwrap() = Some(serde_json::json!({
+        "success": true, "chatroomId": "123@chatroom", "count": 2, "fromCache": false,
+        "updatedAt": 1_700_000_000_123i64,
+        "members": [
+            { "alias": "", "avatarUrl": "", "displayName": "潜水者", "groupNickname": "",
+              "isFriend": false, "isOwner": false, "messageCount": 0,
+              "nickname": "", "remark": "", "wxid": "quiet" },
+            { "alias": "a", "avatarUrl": "", "displayName": "张三", "groupNickname": "张三",
+              "isFriend": true, "isOwner": true, "messageCount": 9,
+              "nickname": "三儿", "remark": "客户张三", "wxid": "alice" }
+        ],
+    }));
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+    let page = client
+        .group_members("123@chatroom", true)
+        .await
+        .expect("group members must decode");
+    assert_eq!(page.count, 2);
+    assert_eq!(page.updated_at, 1_700_000_000_123, "updatedAt is **milliseconds** — a seconds truncation silently halves freshness precision");
+    // The roster includes silent members: a zero-count row is legal, not an error.
+    assert_eq!(page.members[0].message_count, 0);
+    assert!(page.members[1].is_owner, "exactly one owner when the roster carries one");
+    let queries = mock.group_members_queries.lock().unwrap().clone();
+    assert_eq!(queries.len(), 1, "exactly one GET /api/v1/group-members");
+    assert!(queries[0].contains("chatroomId=123%40chatroom"), "the chatroom rides as a query param: {}", queries[0]);
+    assert!(queries[0].contains("includeMessageCounts=1"), "counts asked for: {}", queries[0]);
+}
+
+/// The off switch: `include_message_counts = false` must **omit the parameter**
+/// rather than send `0` — the server reads it through a flexible bool parser,
+/// and the wire shape for "don't scan the conversation" is absence.
+#[tokio::test]
+async fn group_members_omits_include_message_counts_when_false() {
+    let mock = Mock::default();
+    *mock.group_members_page.lock().unwrap() = Some(serde_json::json!({
+        "success": true, "chatroomId": "123@chatroom", "count": 0, "fromCache": false,
+        "updatedAt": 0, "members": [],
+    }));
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+    client.group_members("123@chatroom", false).await.expect("empty page decodes");
+    let queries = mock.group_members_queries.lock().unwrap().clone();
+    assert_eq!(queries.len(), 1);
+    assert!(!queries[0].contains("includeMessageCounts"), "absent, not 0: {}", queries[0]);
 }
 
 #[tokio::test]

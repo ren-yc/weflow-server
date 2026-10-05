@@ -57,6 +57,10 @@ class Mock:
         self.native_page: dict | None = None
         # When set, GET /api/v1/contacts answers this page verbatim.
         self.contacts_page: dict | None = None
+        # When set, GET /api/v1/group-members answers this page verbatim.
+        self.group_members_page: dict | None = None
+        # Query params seen by the group-members route, in order.
+        self.group_members_queries: list[dict] = []
         # FIFO pages for GET /api/v1/sessions.
         self.sessions_pages: list[dict] = []
         # Query params seen by the sessions route, in order.
@@ -147,6 +151,9 @@ class Mock:
                 }
             elif path == "/api/v1/contacts":
                 body = mock.contacts_page
+            elif path == "/api/v1/group-members":
+                mock.group_members_queries.append(query)
+                body = mock.group_members_page
             elif path == "/api/v1/sessions":
                 mock.sessions_queries.append(query)
                 body = mock.sessions_pages.pop(0) if mock.sessions_pages else None
@@ -809,6 +816,56 @@ async def test_contacts_page_decodes_rows_and_paging_fields() -> None:
     assert page.total == 42
     assert page.has_more is True
     assert page.contacts[0].display_name == "张三"
+
+
+async def test_group_members_decodes_roster_page_and_sends_chatroom_param() -> None:
+    mock = Mock()
+    mock.group_members_page = {
+        "success": True, "chatroomId": "123@chatroom", "count": 2,
+        "fromCache": False, "updatedAt": 1700000000123,
+        "members": [
+            {"alias": "", "avatarUrl": "", "displayName": "潜水者",
+             "groupNickname": "", "isFriend": False, "isOwner": False,
+             "messageCount": 0, "nickname": "", "remark": "", "wxid": "quiet"},
+            {"alias": "a", "avatarUrl": "", "displayName": "张三",
+             "groupNickname": "张三", "isFriend": True, "isOwner": True,
+             "messageCount": 9, "nickname": "三儿", "remark": "客户张三",
+             "wxid": "alice"},
+        ],
+    }
+    client = make_client(mock)
+    page = await client.group_members("123@chatroom", include_message_counts=True)
+    assert page.count == 2
+    assert page.updated_at == 1700000000123, (
+        "updatedAt is **milliseconds** — a seconds truncation silently halves "
+        "freshness precision")
+    # The roster includes silent members: a zero-count row is legal, not an error.
+    assert page.members[0].message_count == 0
+    assert page.members[1].is_owner, "exactly one owner when the roster carries one"
+    assert len(mock.group_members_queries) == 1
+    q = mock.group_members_queries[0]
+    # The mock reads the raw ASGI query string without percent-decoding, so
+    # this is the wire form: httpx encodes the '@' in the chatroom id.
+    assert q["chatroomId"] == "123%40chatroom"
+    assert q.get("includeMessageCounts") == "1", "counts asked for"
+    await client.aclose()
+
+
+async def test_group_members_omits_include_message_counts_when_false() -> None:
+    """The off switch: absence, not ``0`` — the server reads it through a
+    flexible bool parser, and the wire shape for "don't scan the conversation"
+    is absence."""
+    mock = Mock()
+    mock.group_members_page = {
+        "success": True, "chatroomId": "123@chatroom", "count": 0,
+        "fromCache": False, "updatedAt": 0, "members": [],
+    }
+    client = make_client(mock)
+    page = await client.group_members("123@chatroom")
+    assert page.members == []
+    assert len(mock.group_members_queries) == 1
+    assert "includeMessageCounts" not in mock.group_members_queries[0]
+    await client.aclose()
 
 
 async def test_list_all_sessions_pages_and_collapses_cross_page_duplicates() -> None:

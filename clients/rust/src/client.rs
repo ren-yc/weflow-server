@@ -564,6 +564,25 @@ impl Client {
         self.get_json("/api/v1/contacts", &params).await
     }
 
+    /// `GET /api/v1/group-members` — 群成员（**名册 ∪ 发言人**）。
+    ///
+    /// 潜水成员（名册里、从未发言）也会出现，`message_count` 为 0 —— 只列发言人
+    /// 会让「群里有谁」的答案取决于谁最近说过话。`include_message_counts` 为
+    /// `true` 时服务端才数真实计数（否则整列回 0：计数是全会话扫描，不是免费的）。
+    /// 名册与消息都在内存索引里：本请求不读盘、也不触发同步。
+    pub async fn group_members(
+        &self,
+        chatroom: &str,
+        include_message_counts: bool,
+    ) -> Result<gen_types::GroupMembers> {
+        let mut params = BTreeMap::new();
+        params.insert("chatroomId", chatroom.to_string());
+        if include_message_counts {
+            params.insert("includeMessageCounts", "1".to_string());
+        }
+        self.get_json("/api/v1/group-members", &params).await
+    }
+
     /// `GET /api/v1/media/{id}` — bytes for a handle the server advertised.
     ///
     /// `id` is a **single path segment**: the native face's `mediaId`, or the

@@ -475,6 +475,30 @@ class Client:
             await self._get_json("/api/v1/contacts", query)
         )
 
+    async def group_members(
+        self,
+        chatroom: str,
+        *,
+        include_message_counts: bool = False,
+    ) -> gen.GroupMembers:
+        """``GET /api/v1/group-members`` - group members (**roster union speakers**).
+
+        Silent members (in the roster, never spoke) appear too, with
+        ``message_count`` 0 - listing only speakers would make "who is in this
+        group" depend on who talked last. The server counts real numbers only
+        when ``include_message_counts`` is true (otherwise the whole column
+        reads 0: counting scans the entire conversation, which is not free);
+        when off the parameter is **omitted**, not sent as ``0``. Roster and
+        messages live in the memory index: this request neither reads disks
+        nor triggers a sync.
+        """
+        query: dict[str, str] = {"chatroomId": chatroom}
+        if include_message_counts:
+            query["includeMessageCounts"] = "1"
+        return gen.GroupMembers.model_validate(
+            await self._get_json("/api/v1/group-members", query)
+        )
+
     async def media_bytes_by_id(self, media_id: str) -> bytes:
         """``GET /api/v1/media/{id}`` - bytes for a handle the server advertised.
 

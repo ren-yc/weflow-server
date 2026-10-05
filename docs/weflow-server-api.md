@@ -967,10 +967,12 @@ weflow-server.exe sessions --json        # 子命令面
   | `drain_session(talker, since, on_page)` | Pull 面 | 游标（`nextSince`/`nextOffset`）原样回传，按 (时间组, offset) 翻页 |
   | `list_messages(query)` | `GET /api/v1/messages` | **原生面，一页语义**：`offset` 进、`hasMore` 出；带 `rawContent`/`isSend`/`localType`，且只有它能 `media=1` 导出。时间界收 `YYYYMMDD` 或 unix 秒，客户端先校验 |
   | `contacts(query)` | `GET /api/v1/contacts` | **一页语义**；ChatLab 面完全不覆盖联系人 |
+  | `group_members(chatroom, include_message_counts)` | `GET /api/v1/group-members` | 成员集合＝**名册 ∪ 发言人**（潜水成员出现、计数 0）；计数开关**关闭时不发参数**而非发 `0`；不读盘、不触发同步 |
   | `list_all_sessions()` | `GET /api/v1/sessions` | **取尽语义**（内部翻页到空页），跨页重复折叠并告警 |
   | `media_bytes(message)` | `GET /api/v1/media/{id}` | 从 ChatLab 消息取；404 后按「先 `media=1` 导出再取」自动重试一次 |
   | `media_bytes_by_id(id)` | `GET /api/v1/media/{id}` | 按**单段句柄**取（原生面的 `mediaId`，或 `media.url` 末段）；不触发导出 |
   | `watch()` | SSE `/api/v1/push/messages` | `Last-Event-ID` 重连、心跳注释帧过滤、`generation` 变化上报给调用方决定是否回退 Pull 补拉 |
+  | `sync_now()` | `POST /api/v1/sync` | **写动作**（推进水位、可能导出媒体）：刻意不进入任何轮询路径，只有显式调用才触发（有测试钉住读路径零命中） |
 
   **两个容易读错的地方**：① `list_all_sessions` 是取尽，而 `list_messages`/`contacts`
   只取一页（那个面没有 `hasMore`，翻页由调用方按 `offset` 推进）；② 时间界收
