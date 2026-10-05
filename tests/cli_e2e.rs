@@ -275,21 +275,30 @@ fn export_rows_keeps_peak_rss_flat() {
         .expect("spawn weflow-server");
     assert!(out.status.success(), "export --rows 应退 0；stderr: {}", String::from_utf8_lossy(&out.stderr));
     let text = String::from_utf8_lossy(&out.stdout);
-    let samples: Vec<u64> = text
+    // 采样行是 `[rss] session=<i> rows=<n> peak_kb=Some(<kb>)`；取不到峰值时打印 `None`，那种点跳过。
+    let samples: Vec<(u64, u64)> = text
         .lines()
         .filter(|l| l.starts_with("[rss]"))
-        // 采样行是 `peak_kb=Some(N)`（Option 的 Debug）；取不到时打印 `None`，那种点直接跳过。
         .filter_map(|l| {
+            let rows = l.split("rows=").nth(1)?.split(' ').next()?.parse::<u64>().ok()?;
             let raw = l.rsplit("peak_kb=").next()?.trim();
-            raw.strip_prefix("Some(")?.strip_suffix(')')?.parse::<u64>().ok()
+            let peak = raw.strip_prefix("Some(")?.strip_suffix(')')?.parse::<u64>().ok()?;
+            Some((rows, peak))
         })
         .collect();
-    assert!(samples.len() >= 2, "至少要有两个采样点，实际: {samples:?}\n{text}");
-    let first = samples[0];
-    let last = *samples.last().unwrap();
+    // 只比**大**会话：夹具里排在前面的是种子会话（几条消息），它们的采样点是 warm-up —— 拿它们当
+    // 「起点」会把「第一次导入一个大群」的一次性开销当成增长。内存恒定要看的是**大群之间**。
+    let big: Vec<u64> = samples
+        .iter()
+        .filter(|(rows, _)| *rows >= 1_000)
+        .map(|(_, peak)| *peak)
+        .collect();
+    assert!(big.len() >= 2, "至少要有两个大会话的采样点，实际: {samples:?}\n{text}");
+    let first = big[0];
+    let peak = *big.iter().max().unwrap();
     assert!(
-        last < first + first / 10,
-        "峰值 RSS 应平坦：首 {first} KB → 末 {last} KB（增量超过一成）"
+        peak < first + first / 10,
+        "峰值 RSS 应平坦：首个大群 {first} KB → 全局峰值 {peak} KB（增量超过一成）"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
