@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json as _json
 import logging
+import urllib.parse
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -54,6 +55,15 @@ _SSE_BUFFER_CAP = 1 << 20
 
 class ClientError(Exception):
     """Base error for the behavior layer."""
+
+
+class TransportError(ClientError):
+    """The request never produced an HTTP response (connect, timeout, reset).
+
+    Why this exists: ``httpx`` raises its own exception family, so a caller doing
+    ``except ClientError`` used to miss **every** network failure while catching
+    every server refusal. Wrapping puts both under one root.
+    """
 
 
 class StatusError(ClientError):
@@ -104,10 +114,23 @@ class RegisterOutcome:
     body: dict[str, Any]
 
 
+def _encode_path_segment(s: str) -> str:
+    """Percent-encode one path segment (unreserved set plus ``@``, which ids use).
+
+    Why: an id containing ``#`` or ``?`` interpolated straight into a URL string is
+    read as a fragment or query, so the request silently targets a different path.
+    The Rust client encodes too - the same input must not mean two things.
+    """
+    return urllib.parse.quote(s, safe="-._~@")
+
+
 def _validate_time_bound(field: str, value: str) -> None:
     """Accept a bare ``YYYYMMDD`` date or unix seconds - the server parses
     both, so rejecting either here would block a legal request."""
-    if not value.isdigit():
+    # `str.isdigit()` also accepts non-ASCII digits (full-width, superscript),
+    # which the server rejects with a 400. The Rust client refuses them locally,
+    # so the same input must yield the same error class on both sides.
+    if not value.isascii() or not value.isdigit():
         raise BadDate(
             f"invalid time bound {field}={value!r}: expected YYYYMMDD or unix seconds"
         )
@@ -206,9 +229,16 @@ class Client:
     def _url(self, path: str) -> str:
         return self._base + path
 
+    async def _http_get(self, url: str, **kwargs: Any) -> httpx.Response:
+        """GET that maps `httpx` transport failures into :class:`TransportError`."""
+        try:
+            return await self._http.get(url, **kwargs)
+        except httpx.HTTPError as exc:
+            raise TransportError(f"{type(exc).__name__} on {url}: {exc}") from exc
+
     async def _get_json(self, path: str, query: dict[str, str]):
         url = self._url(path)
-        resp = await self._http.get(
+        resp = await self._http_get(
             url,
             headers={"Authorization": f"Bearer {self._token}"},
             params=query,
@@ -217,7 +247,10 @@ class Client:
 
     @staticmethod
     async def _decode(resp: httpx.Response, url: str):
-        if resp.status_code >= 400:
+        # Non-2xx, not just 4xx/5xx: the Rust client treats anything outside
+        # 200..300 as an error, and a surfaced 3xx would otherwise fall into
+        # `resp.json()` and come out as a shape error instead of a status error.
+        if not 200 <= resp.status_code < 300:
             raise StatusError(resp.status_code, url)
         try:
             return resp.json()
@@ -366,7 +399,9 @@ class Client:
         if limit is not None:
             query["limit"] = str(limit)
         return gen.PullEnvelope.model_validate(
-            await self._get_json(f"/api/v1/sessions/{talker}/messages", query)
+            await self._get_json(
+            f"/api/v1/sessions/{_encode_path_segment(talker)}/messages", query
+        )
         )
 
     async def drain_session(
@@ -454,7 +489,7 @@ class Client:
         if message.media is None:
             raise StatusError(404, "(no media on message)")
         name = message.media.file_name
-        url = self._url(f"/api/v1/media/{name}")
+        url = self._url(f"/api/v1/media/{_encode_path_segment(name)}")
         resp = await self._http.get(url, headers={"Authorization": f"Bearer {self._token}"})
         if resp.status_code == 404:
             await self._get_json(
@@ -568,6 +603,11 @@ class Client:
         messages live in the memory index: this request neither reads disks
         nor triggers a sync.
         """
+        if not chatroom:
+            # Same fail-fast as `talker` everywhere else: an empty key asks the
+            # server a different question, and a 200 with an empty roster would
+            # read as "this group has no members".
+            raise ShapeError("chatroom must not be empty")
         query: dict[str, str] = {"chatroomId": chatroom}
         if include_message_counts:
             query["includeMessageCounts"] = "1"
@@ -583,11 +623,11 @@ class Client:
         :meth:`media_bytes` when a ChatLab message is at hand - that one also
         triggers an export and retries once on a 404.
         """
-        url = self._url(f"/api/v1/media/{media_id}")
-        resp = await self._http.get(
+        url = self._url(f"/api/v1/media/{_encode_path_segment(media_id)}")
+        resp = await self._http_get(
             url, headers={"Authorization": f"Bearer {self._token}"}
         )
-        if resp.status_code >= 400:
+        if not 200 <= resp.status_code < 300:
             raise StatusError(resp.status_code, url)
         return resp.content
 

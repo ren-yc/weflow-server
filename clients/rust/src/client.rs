@@ -155,10 +155,13 @@ impl MessageQuery {
         Self { talker: talker.into(), ..Self::default() }
     }
 
-    fn params(&self) -> Result<BTreeMap<&'static str, String>> {
+    fn params(&self, endpoint: &str) -> Result<BTreeMap<&'static str, String>> {
         if self.talker.is_empty() {
             return Err(ClientError::UnexpectedBody {
-                url: "/api/v1/messages".to_string(),
+                // The endpoint this query is about to hit. One query struct serves
+                // both faces, so a hardcoded URL pointed a `chatlab_messages`
+                // failure at the other endpoint.
+                url: endpoint.to_string(),
                 detail: "talker must not be empty".to_string(),
             });
         }
@@ -199,6 +202,24 @@ pub struct ContactsQuery {
 
 /// A time bound is either a bare `YYYYMMDD` date or unix seconds — the server
 /// parses both, so this check accepts both and rejects everything else.
+/// Percent-encode one path segment (unreserved set plus `@`, which real wxids use).
+///
+/// Why: `format!("/api/v1/sessions/{talker}/messages")` sends a `#` or `?` inside
+/// an id straight through — the server reads the rest as a fragment or query and
+/// answers 404 — while the Python client's httpx percent-encodes it. The same
+/// input must not mean two things in two languages.
+fn encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'@') {
+            out.push(*b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 fn validate_time_bound(field: &'static str, value: &str) -> Result<()> {
     let digits = !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
     if digits {
@@ -437,7 +458,7 @@ impl Client {
         if let Some(l) = limit {
             q.insert("limit", l.to_string());
         }
-        self.get_json(&format!("/api/v1/sessions/{talker}/messages"), &q)
+        self.get_json(&format!("/api/v1/sessions/{}/messages", encode_path_segment(talker)), &q)
             .await
     }
 
@@ -537,7 +558,7 @@ impl Client {
             return Err(ClientError::Status { status: 404, url: "(no media on message)".into() });
         };
         let name = &m.file_name;
-        let url_path = format!("/api/v1/media/{name}");
+        let url_path = format!("/api/v1/media/{}", encode_path_segment(name));
         let url = self.url(&url_path);
         let resp = self.http.get(&url).bearer_auth(&self.token).send().await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -575,7 +596,7 @@ impl Client {
     /// cursor is stable across a live database, while offset paging over a
     /// growing table can shift.
     pub async fn list_messages(&self, q: &MessageQuery) -> Result<gen_types::MessagesNative> {
-        self.get_json("/api/v1/messages", &q.params()?).await
+        self.get_json("/api/v1/messages", &q.params("/api/v1/messages")?).await
     }
 
     /// `GET /chatlab/messages` — the **ChatLab-shaped** messages face.
@@ -594,7 +615,7 @@ impl Client {
         &self,
         q: &MessageQuery,
     ) -> Result<gen_types::ChatlabMessages> {
-        self.get_json("/chatlab/messages", &q.params()?).await
+        self.get_json("/chatlab/messages", &q.params("/chatlab/messages")?).await
     }
 
     /// `GET /api/v1/contacts` — one page of the contact list.
@@ -641,7 +662,7 @@ impl Client {
     /// [`Client::media_bytes`] when a ChatLab message is at hand — that one
     /// also triggers an export and retries once on a 404.
     pub async fn media_bytes_by_id(&self, id: &str) -> Result<bytes::Bytes> {
-        let url = self.url(&format!("/api/v1/media/{id}"));
+        let url = self.url(&format!("/api/v1/media/{}", encode_path_segment(id)));
         let resp = self.http.get(&url).bearer_auth(&self.token).send().await?;
         Self::decode_bytes(resp, &url).await
     }
@@ -755,5 +776,29 @@ fn decode_event(kind: &str, v: &serde_json::Value) -> Result<ServerEvent> {
                 timestamp: 0,
             }))
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_path_segment_escapes_delimiters_but_keeps_real_id_shapes() {
+        // 真实形态原样保留：wxid 的 `@`、群号的 `-`、下划线与点
+        assert_eq!(encode_path_segment("12345678@chatroom"), "12345678@chatroom");
+        assert_eq!(encode_path_segment("wxid_ab-c.d~e"), "wxid_ab-c.d~e");
+        // URL 定界符必须编码：否则 `a#b` 会被当成片段、`a?b` 会被当成查询，请求打到别的路径
+        assert_eq!(encode_path_segment("a#b"), "a%23b");
+        assert_eq!(encode_path_segment("a?b"), "a%3Fb");
+        assert_eq!(encode_path_segment("a b"), "a%20b");
+        assert_eq!(encode_path_segment("中文"), "%E4%B8%AD%E6%96%87");
+    }
+
+    #[test]
+    fn empty_talker_error_names_the_endpoint_that_was_actually_called() {
+        let q = MessageQuery::new("");
+        let msg = format!("{}", q.params("/chatlab/messages").unwrap_err());
+        assert!(msg.contains("/chatlab/messages"), "报错要指向真正被调用的端点: {msg}");
+        assert!(!msg.contains("/api/v1/messages"), "不该指向另一个端点: {msg}");
     }
 }

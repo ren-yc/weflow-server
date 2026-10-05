@@ -985,3 +985,42 @@ async def test_no_read_path_triggers_a_sync() -> None:
                                   timeout=0.6)
     assert mock.sync_calls == 0
     await client.aclose()
+
+# ---- three behaviours fixed by the fourth serial-review round ----------------
+
+
+async def test_time_bounds_are_ascii_only() -> None:
+    """Full-width digits are not a time bound.
+
+    `str.isdigit()` accepts them, so such input used to slip through and be
+    refused by the server with a 400 - while the Rust client rejects it locally.
+    The same input yielding two error classes is the divergence being fixed.
+    """
+    client = make_client(Mock())
+    with pytest.raises(sdkmod.BadDate):
+        # Written as escapes so the source carries no ambiguous literal.
+        await client.chatlab_messages("wxid_a", end="\uff11\uff12\uff13")
+
+
+async def test_group_members_rejects_an_empty_chatroom() -> None:
+    """An empty chatroomId asks the server a different question.
+
+    A 200 with an empty roster would read as "this group has no members", so the
+    client refuses locally - the same fail-fast `talker` gets everywhere else.
+    """
+    client = make_client(Mock())
+    with pytest.raises(sdkmod.ShapeError):
+        await client.group_members("")
+
+
+async def test_transport_failures_are_client_errors() -> None:
+    """A refused connection must land inside the ClientError tree.
+
+    httpx raises its own family, so `except ClientError` used to catch every
+    server refusal while missing every network failure.
+    """
+    client = Client("http://127.0.0.1:1", TOKEN, timeout=2.0)
+    with pytest.raises(sdkmod.TransportError):
+        await client.group_members("10001")
+    with pytest.raises(sdkmod.ClientError):
+        await client.group_members("10001")
