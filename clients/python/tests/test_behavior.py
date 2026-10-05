@@ -320,6 +320,31 @@ async def test_drain_session_echoes_cursors_verbatim() -> None:
     await client.aclose()
 
 
+async def test_pull_page_decodes_the_sync_block_and_sends_the_cursors() -> None:
+    mock = Mock()
+    mock.pull_pages = [pull_page([msg(1, 1000)], True, 1000, 4)]
+    client = make_client(mock)
+    page = await client.pull_page("alice", 500, offset=7, limit=3)
+    assert [m.platform_message_id for m in page.messages] == ["1"]
+    assert page.sync.has_more is True
+    assert page.sync.next_since == 1000
+    assert page.sync.next_offset == 4
+    assert page.sync.watermark == 2000
+    assert mock.pull_queries[0] == {"since": "500", "offset": "7", "limit": "3"}
+    await client.aclose()
+
+
+async def test_pull_page_omits_defaulted_cursors_instead_of_sending_zero() -> None:
+    """Absence, not ``0``: the server defaults both cursors, so a client that
+    sends ``since=0`` is claiming a cursor it never read."""
+    mock = Mock()
+    mock.pull_pages = [pull_page([], False, 0, 0)]
+    client = make_client(mock)
+    await client.pull_page("alice", None)
+    assert mock.pull_queries[0] == {}
+    await client.aclose()
+
+
 # ---- media --------------------------------------------------------------
 
 

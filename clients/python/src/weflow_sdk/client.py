@@ -303,7 +303,37 @@ class Client:
         )
         return gen.SyncResult.model_validate(await self._decode(resp, url))
 
-    # ---- drain_session --------------------------------------------------
+    # ---- pull_page / drain_session --------------------------------------
+
+    async def pull_page(
+        self,
+        talker: str,
+        since: int | None,
+        offset: int = 0,
+        limit: int | None = None,
+    ) -> gen.PullEnvelope:
+        """Fetch **one page** of the ChatLab Pull cursor loop.
+
+        :meth:`drain_session` is this in a loop; the single-page entry exists
+        for callers that must bound a single request. ``since`` is
+        **exclusive** and ``offset`` advances within one timestamp group.
+        Both cursors come back in ``sync`` and must be echoed verbatim: the
+        server pages by (timestamp group, offset), and a client-derived
+        cursor is how pages get silently skipped or replayed.
+
+        ``limit`` is a per-page cap (the server caps it at 5000). ``None``
+        means the server default, which is also 5000.
+        """
+        query: dict[str, str] = {}
+        if since is not None:
+            query["since"] = str(since)
+        if offset:
+            query["offset"] = str(offset)
+        if limit is not None:
+            query["limit"] = str(limit)
+        return gen.PullEnvelope.model_validate(
+            await self._get_json(f"/api/v1/sessions/{talker}/messages", query)
+        )
 
     async def drain_session(
         self,
@@ -319,17 +349,10 @@ class Client:
         get silently skipped or replayed.
         """
         next_since = since
-        next_offset: int | None = None
+        next_offset = 0
         total = 0
         while True:
-            query: dict[str, str] = {}
-            if next_since is not None:
-                query["since"] = str(next_since)
-            if next_offset is not None:
-                query["offset"] = str(next_offset)
-            page = gen.PullEnvelope.model_validate(
-                await self._get_json(f"/api/v1/sessions/{talker}/messages", query)
-            )
+            page = await self.pull_page(talker, next_since, next_offset)
             total += len(page.messages)
             on_page(page.messages)
             if not page.sync.has_more:

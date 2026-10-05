@@ -964,7 +964,8 @@ weflow-server.exe sessions --json        # 子命令面
   | `register(body)` | `POST /api/v1/accounts` | **非阻塞**，返回原始 `state`/`status`（`RegisterOutcome`）；拒绝态是**值**不是错误 |
   | `ensure_ready(account, body, timeout)` | 注册 ＋ 轮询 | `register` ＋ `wait_ready` 的组合；**200 的拒绝态立即失败**，不等超时 |
   | `wait_ready(account, timeout)` | `GET /api/v1/accounts` | **只等待、不注册**（wait-only）；中间态是等待不是错误 |
-  | `drain_session(talker, since, on_page)` | Pull 面 | 游标（`nextSince`/`nextOffset`）原样回传，按 (时间组, offset) 翻页 |
+  | `pull_page(talker, since, offset, limit)` | Pull 面 | **一页语义**：`since` 排他、`offset` 是同一时间组内的游标；两游标必须原样回传。`limit` 是单页上限（服务端封顶 5000），`None` 即服务端默认 |
+  | `drain_session(talker, since, on_page)` | Pull 面 | **取尽语义**（内部逐页调到 `hasMore=false`，每页回调）；游标（`nextSince`/`nextOffset`）原样回传，按 (时间组, offset) 翻页 |
   | `list_messages(query)` | `GET /api/v1/messages` | **原生面，一页语义**：`offset` 进、`hasMore` 出；带 `rawContent`/`isSend`/`localType`，且只有它能 `media=1` 导出。时间界收 `YYYYMMDD` 或 unix 秒，客户端先校验 |
   | `contacts(query)` | `GET /api/v1/contacts` | **一页语义**；ChatLab 面完全不覆盖联系人 |
   | `group_members(chatroom, include_message_counts)` | `GET /api/v1/group-members` | 成员集合＝**名册 ∪ 发言人**（潜水成员出现、计数 0）；计数开关**关闭时不发参数**而非发 `0`；不读盘、不触发同步 |
@@ -974,8 +975,8 @@ weflow-server.exe sessions --json        # 子命令面
   | `watch()` | SSE `/api/v1/push/messages` | `Last-Event-ID` 重连、心跳注释帧过滤、`generation` 变化上报给调用方决定是否回退 Pull 补拉 |
   | `sync_now()` | `POST /api/v1/sync` | **写动作**（推进水位、可能导出媒体）：刻意不进入任何轮询路径，只有显式调用才触发（有测试钉住读路径零命中） |
 
-  **两个容易读错的地方**：① `list_all_sessions` 是取尽，而 `list_messages`/`contacts`
-  只取一页（那个面没有 `hasMore`，翻页由调用方按 `offset` 推进）；② 时间界收
+  **两个容易读错的地方**：① `list_all_sessions` 与 `drain_session` 是取尽，而 `pull_page`/
+  `list_messages`/`contacts` 只取一页（后两者那个面没有 `hasMore`，翻页由调用方按 `offset` 推进）；② 时间界收
   `YYYYMMDD` **或** unix 秒，`end` 作为上界时裸日期覆盖**整天**。
 - 鉴权走 `Authorization: Bearer`；客户端从不把 token 放进 URL（`/health` 是唯一免鉴权端点）。
 - 本轮**不发布** crates.io：本地 `cargo build -p weflow-client` 即可使用。

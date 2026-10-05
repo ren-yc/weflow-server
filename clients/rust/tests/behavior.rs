@@ -395,6 +395,61 @@ async fn drain_session_echoes_cursors_verbatim_until_exhausted() {
         "second request echoes the server's cursors verbatim: {}", queries[1]);
 }
 
+// ---- pull_page -----------------------------------------------------------
+
+#[tokio::test]
+async fn pull_page_decodes_the_sync_block_and_sends_the_cursors() {
+    let mock = Mock::default();
+    *mock.pull_pages.lock().unwrap() = vec![serde_json::json!({
+        "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
+        "members": [],
+        "messages": [{
+            "accountName": "alice", "content": "m1", "groupNickname": "",
+            "platformMessageId": "1", "sender": "alice", "timestamp": 1000, "type": 1,
+        }],
+        "meta": {"groupId": "", "name": "", "ownerId": "", "platform": "weflow", "type": "chat"},
+        "sync": {"hasMore": true, "nextSince": 1000, "nextOffset": 4, "watermark": 2000},
+    })];
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+
+    let page = client.pull_page("alice", Some(500), 7, Some(3)).await.unwrap();
+    assert_eq!(page.messages.len(), 1);
+    assert_eq!(page.messages[0].platform_message_id, "1");
+    assert!(page.sync.has_more);
+    assert_eq!(page.sync.next_since, 1000);
+    assert_eq!(page.sync.next_offset, 4);
+    assert_eq!(page.sync.watermark, 2000);
+
+    let queries = mock.pull_queries.lock().unwrap().clone();
+    assert_eq!(queries.len(), 1, "one page is one request");
+    assert!(queries[0].contains("since=500"), "since rides the query: {}", queries[0]);
+    assert!(queries[0].contains("offset=7"), "the group cursor rides the query: {}", queries[0]);
+    assert!(queries[0].contains("limit=3"), "the per-page cap rides the query: {}", queries[0]);
+}
+
+#[tokio::test]
+async fn pull_page_omits_defaulted_cursors_instead_of_sending_zero() {
+    let mock = Mock::default();
+    *mock.pull_pages.lock().unwrap() = vec![serde_json::json!({
+        "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
+        "members": [],
+        "messages": [],
+        "meta": {"groupId": "", "name": "", "ownerId": "", "platform": "weflow", "type": "chat"},
+        "sync": {"hasMore": false, "nextSince": 0, "nextOffset": 0, "watermark": 0},
+    })];
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+
+    client.pull_page("alice", None, 0, None).await.unwrap();
+    let queries = mock.pull_queries.lock().unwrap().clone();
+    assert_eq!(queries.len(), 1);
+    for key in ["since=", "offset=", "limit="] {
+        assert!(!queries[0].contains(key),
+            "{key} must be absent, not defaulted on the wire: {}", queries[0]);
+    }
+}
+
 // ---- media_bytes ---------------------------------------------------------
 
 #[tokio::test]

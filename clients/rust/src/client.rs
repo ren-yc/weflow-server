@@ -404,7 +404,42 @@ impl Client {
         }
     }
 
-    // ---- drain_session ---------------------------------------------------
+    // ---- pull_page / drain_session ---------------------------------------
+
+    /// Fetch **one page** of the ChatLab Pull cursor loop.
+    ///
+    /// [`Client::drain_session`] is this in a loop; the single-page entry
+    /// exists for callers that must bound a single request — an MCP tool has
+    /// a per-call budget, and "drain everything" is exactly what it must not
+    /// do.
+    ///
+    /// `since` is **exclusive** and `offset` advances within one timestamp
+    /// group. Both cursors come back in `sync` and must be echoed verbatim:
+    /// the server pages by (timestamp group, offset), and a client-derived
+    /// cursor is how pages get silently skipped or replayed.
+    ///
+    /// `limit` is a per-page cap (the server caps it at 5000). `None` means
+    /// the server default, which is also 5000.
+    pub async fn pull_page(
+        &self,
+        talker: &str,
+        since: Option<i64>,
+        offset: u64,
+        limit: Option<u32>,
+    ) -> Result<gen_types::PullEnvelope> {
+        let mut q = BTreeMap::new();
+        if let Some(s) = since {
+            q.insert("since", s.to_string());
+        }
+        if offset != 0 {
+            q.insert("offset", offset.to_string());
+        }
+        if let Some(l) = limit {
+            q.insert("limit", l.to_string());
+        }
+        self.get_json(&format!("/api/v1/sessions/{talker}/messages"), &q)
+            .await
+    }
 
     /// Drain one session through the ChatLab Pull cursor loop, calling
     /// `on_page` per page. Cursors are echoed verbatim: `next_since` /
@@ -424,19 +459,7 @@ impl Client {
         let mut next_offset = 0u64;
         let mut total = 0u64;
         loop {
-            let mut q = BTreeMap::new();
-            if let Some(s) = next_since {
-                q.insert("since", s.to_string());
-            }
-            if next_offset != 0 {
-                q.insert("offset", next_offset.to_string());
-            }
-            let page: gen_types::PullEnvelope = self
-                .get_json(
-                    &format!("/api/v1/sessions/{talker}/messages"),
-                    &q,
-                )
-                .await?;
+            let page = self.pull_page(talker, next_since, next_offset, None).await?;
             total += page.messages.len() as u64;
             on_page(&page.messages)?;
             if !page.sync.has_more {
