@@ -885,7 +885,7 @@ feeds 条目字段（以源码 `sns.rs` 为准）：`tid/userName/content(明文
 | `contacts` | SDK `contacts` | 单页；要全量请自己带 `--limit`/`--offset` 翻页 |
 | `accounts` | SDK `accounts` | **只有 HTTP 形态**（没有 `--embedded`）：这一面问的是「服务端此刻实际绑定了什么」，进程内索引给的是另一个答案 |
 | `sync` | SDK `sync_now` | **写动作**：让服务端立刻跑一次增量同步；同样没有 `--embedded` |
-| `export` | SDK `list_all_sessions` ＋ `drain_session` | **只走 HTTP**（不提供 `--embedded`）：批量导出到 ChatLab Format 文件，见下一节 |
+| `export` | SDK `list_all_sessions` ＋ `drain_session` ＋ `chatlab_messages` | **只走 HTTP**（不提供 `--embedded`）：批量导出到 ChatLab Format 文件；`--with-media` 时另用 `chatlab_messages(media=1)` 触发导出并下载字节，见下一节 |
 
 环境变量：`WEFLOW_BASE_URL`（默认 `http://127.0.0.1:5033`）、`WEFLOW_TOKEN`（API token）。
 **token 一律不经命令行传递**——命令行会落进 shell history 与进程列表，而这个值能读出整份聊天记录。
@@ -898,7 +898,7 @@ feeds 条目字段（以源码 `sns.rs` 为准）：`tid/userName/content(明文
 
 ## 批量导出（`export`）
 
-`weflow-server export --out <目录> [--format jsonl|json] [--session <id> …] [--since <t>] [--resume]`
+`weflow-server export --out <目录> [--format jsonl|json] [--session <id> …] [--since <t>] [--resume] [--with-media]`
 
 **只走 HTTP**：这个面不提供 `--embedded`。服务端已经把数据库密钥握在内存里，CLI 只做编排与
 落盘；否则一个可能跑几分钟的任务会长时间持有密钥，还得把密钥带上命令行（它会进 shell history
@@ -918,6 +918,13 @@ feeds 条目字段（以源码 `sns.rs` 为准）：`tid/userName/content(明文
   整会话留在内存，因此大语料请用 jsonl。
 - **`index.json`**：本服务自造的编排清单（会话 → 文件 → 条数）。**它不属于 ChatLab 规范，导入
   请用单个 `<slug>.jsonl`／`.json`；整个目录不可导入。**
+- **`--with-media`**：把本会话用到的媒体字节下载到 `<目录>/media/`，并把导出物里的
+  `media.fileName` **限定为确实落盘的那些句柄**。实现上先走 `/chatlab/messages?media=1` 触发导出
+  （该面**每请求最多导出 200 项**，超出部分靠翻页续传），再取字节；顺序不能反 —— 服务端只有在真的
+  写出了本地副本之后，才把 `fileName` 回填成可取句柄。外链媒体与未能导出的媒体**不会**留下句柄：
+  宁可少一个 `media` 字段，也不给一个指向不存在文件的句柄。单个媒体取不到只跳过，不升级成会话级失败。
+  回归位置：`export::tests::with_media_keeps_only_handles_whose_bytes_are_on_disk` 与
+  `export::tests::message_line_omits_media_without_a_handle`。
 
 两条硬约束：
 

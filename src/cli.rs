@@ -153,6 +153,9 @@ struct ExportArgs {
     /// 已存在的会话文件跳过（幂等续跑）
     #[arg(long)]
     resume: bool,
+    /// 下载本会话用到的媒体字节到 <out>/media/，并把导出物里的 fileName 限定为确实落盘的句柄
+    #[arg(long)]
+    with_media: bool,
     #[command(flatten)]
     common: Common,
 
@@ -364,6 +367,16 @@ fn env_token() -> Result<String> {
     std::env::var("WEFLOW_TOKEN").map_err(|_| {
         anyhow::anyhow!("缺少 API token：请设环境变量 WEFLOW_TOKEN（值可用 `weflow-server token` 取）；token 不经命令行传递，以免落进 shell history 与进程列表")
     })
+}
+
+/// 与 [`block`] 同形，但面向返回 `anyhow::Result` 的 future：`anyhow::Error` 不实现
+/// `std::error::Error`，塞不进 `block` 的约束里（那条约束是为了把 SDK 的错误类型接过来）。
+fn block_anyhow<T>(f: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("建 tokio 运行时失败")?;
+    rt.block_on(f)
 }
 
 /// SDK 的方法都是 async；子命令是「跑一次就退出」，所以用一个当前线程运行时把 future 拉完。
@@ -587,6 +600,54 @@ fn row_from_pull(m: &weflow_client::generated::r#gen::types::PullMessage) -> exp
     }
 }
 
+/// 把一个会话的媒体导出并下载到 `<out>/media/`，返回**确实落盘**的句柄集合。
+///
+/// 为什么先走 `/chatlab/messages?media=1`：服务端**只有在真的写出了本地副本之后**才把
+/// `fileName` 回填成可取句柄（外链与平台名给不出跨会话唯一的句柄），所以「触发导出」与
+/// 「拿到句柄」是同一次请求的两面。该面每请求最多导出 200 项，超出部分靠翻页续传。
+///
+/// 单个媒体拿不到（404）只跳过，不升级成会话级失败：外链媒体本来就没有可取句柄，把它
+/// 升格会让「这个群里有一个表情包不是本地文件」变成「这个群一条都没导出」。
+async fn download_session_media(
+    client: &Client,
+    talker: &str,
+    media_dir: &std::path::Path,
+) -> Result<std::collections::BTreeSet<String>> {
+    let mut downloaded: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut offset = 0u64;
+    loop {
+        let mut q = MessageQuery::new(talker.to_string());
+        q.media = true;
+        q.limit = Some(200);
+        q.offset = Some(offset);
+        let page = client.chatlab_messages(&q).await?;
+        let count = page.messages.len();
+        for m in &page.messages {
+            let Some(media) = &m.media else { continue };
+            let name = media.file_name.clone();
+            if name.is_empty() || downloaded.contains(&name) {
+                continue;
+            }
+            match client.media_bytes_by_id(&name).await {
+                Ok(bytes) => {
+                    std::fs::create_dir_all(media_dir)
+                        .with_context(|| format!("创建媒体目录失败: {}", media_dir.display()))?;
+                    let path = media_dir.join(&name);
+                    std::fs::write(&path, &bytes)
+                        .with_context(|| format!("写媒体失败: {}", path.display()))?;
+                    downloaded.insert(name);
+                }
+                // 不是可取句柄（外链、或服务端没写出副本）：跳过该条，继续。
+                Err(e) => tracing::debug!("跳过不可取句柄 {name}: {e}"),
+            }
+        }
+        if !page.page.has_more || count == 0 {
+            return Ok(downloaded);
+        }
+        offset += count as u64;
+    }
+}
+
 /// 把 --since 转成 unix 秒。接受 unix 秒或 YYYYMMDD（后者取当天 00:00，与服务端对
 /// **下界**的口径一致；上界才取整天）。
 fn to_unix(s: &str) -> Result<i64> {
@@ -647,18 +708,34 @@ fn run_export(a: &ExportArgs) -> Result<()> {
     };
     let since = a.since.as_deref().map(to_unix).transpose()?;
     let start = std::time::Instant::now();
+    let media_dir = a.out.join("media");
+    let mut media_total = 0usize;
     let outcome = export::run(&targets, &opts, |target, on_page| {
         // Pull 面的 since 是**排他**下界，而 --since 对用户是含边界的：差一秒就会让
         // 「起点那一条」凭空消失，故这里减一。
         let talker = target.talker.clone();
         let since_pull = since.map(|s| s - 1);
+        // --with-media：**先**触发导出并把字节落盘，**再**拉行。顺序不能反 —— 服务端只有
+        // 在真的写出了本地副本之后，才把 Pull 面的 fileName 回填成可取句柄。
+        let downloaded = if a.with_media {
+            let got = block_anyhow(download_session_media(&client, &talker, &media_dir))?;
+            media_total += got.len();
+            got
+        } else {
+            std::collections::BTreeSet::new()
+        };
         // SDK 的回调要求它自己的错误类型，而这里真正会失败的是**写盘**。
         // 把写失败硬塞成 ClientError 会丢信息，所以错误先存起来、循环后立即上抛，
         // 后续页只跳过不再写（半途而废的会话由 run 删掉，交给 --resume 重来）。
         let mut write_err: Option<anyhow::Error> = None;
         block(client.drain_session(&talker, since_pull, |msgs| {
             if write_err.is_none() {
-                let rows: Vec<export::Row> = msgs.iter().map(row_from_pull).collect();
+                let mut rows: Vec<export::Row> = msgs.iter().map(row_from_pull).collect();
+                if a.with_media {
+                    for r in rows.iter_mut() {
+                        export::retain_downloaded_media(r, &downloaded);
+                    }
+                }
                 if let Err(e) = on_page(&rows) {
                     write_err = Some(e);
                 }
@@ -672,9 +749,10 @@ fn run_export(a: &ExportArgs) -> Result<()> {
         }
     })?;
     println!(
-        "[export] {} 个会话、{} 条消息 → {}（跳过 {}，索引 {}），用时 {:?}",
+        "[export] {} 个会话、{} 条消息、{} 个媒体 → {}（跳过 {}，索引 {}），用时 {:?}",
         outcome.written.len(),
         outcome.messages,
+        media_total,
         opts.out_dir.display(),
         outcome.skipped.len(),
         outcome.index.display(),

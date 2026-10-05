@@ -150,6 +150,19 @@ fn message_line(r: &Row) -> Value {
     v
 }
 
+/// 把一行的媒体句柄**限定为确实落盘的那些**。
+///
+/// `--with-media` 给出的承诺是「导出物里出现的每一个 `fileName`，其字节都在同目录 `media/`
+/// 下」。外链媒体与未能导出的媒体给不出这样的句柄，于是宁可**少一个 media 字段**，也不留下
+/// 一个指向不存在文件的句柄 —— 后者会让导入器在几万条消息之后才发现缺件。
+pub fn retain_downloaded_media(row: &mut Row, downloaded: &BTreeSet<String>) {
+    if let Some(name) = row.media_file_name.as_ref()
+        && !downloaded.contains(name)
+    {
+        row.media_file_name = None;
+    }
+}
+
 /// 成员行（**只有 json 形态写**，理由见模块头）。
 fn member_line(r: &Row) -> Value {
     let mut v = json!({
@@ -520,6 +533,34 @@ mod tests {
         // 半成品必须被删掉：留着它，--resume 会把这个坏文件当成已完成而永久跳过。
         assert!(files_with(&dir, ".jsonl").is_empty(), "失败后仍留下产物");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn with_media_keeps_only_handles_whose_bytes_are_on_disk() {
+        let mut have: BTreeSet<String> = BTreeSet::new();
+        have.insert("deadbeef.png".to_string());
+
+        let mut kept = row("1", 1, "u1", "");
+        kept.media_file_name = Some("deadbeef.png".into());
+        kept.media_type = Some("image".into());
+        retain_downloaded_media(&mut kept, &have);
+        assert_eq!(kept.media_file_name.as_deref(), Some("deadbeef.png"));
+
+        let mut dropped = row("2", 2, "u1", "");
+        dropped.media_file_name = Some("https-external.png".into());
+        dropped.media_type = Some("image".into());
+        retain_downloaded_media(&mut dropped, &have);
+        assert!(dropped.media_file_name.is_none(), "没有本地副本就不能留下句柄");
+    }
+
+    #[test]
+    fn message_line_omits_media_without_a_handle() {
+        let mut r = row("1", 1, "u1", "");
+        r.media_type = Some("image".into());
+        assert!(
+            message_line(&r).get("media").is_none(),
+            "只有 type 没有落盘句柄时不该写出 media"
+        );
     }
 
     #[test]
