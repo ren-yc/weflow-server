@@ -747,7 +747,7 @@ async fn list_all_sessions_pages_and_collapses_cross_page_duplicates() {
     // request count is sessions / page_size, and the default page is two
     // orders of magnitude smaller than the cap.
     let all = client
-        .list_all_sessions(Some(10000))
+        .list_all_sessions(Some(10000), Some("ali"))
         .await
         .expect("both pages must be read");
     let users: Vec<&str> = all.iter().map(|s| s.username.as_str()).collect();
@@ -756,6 +756,7 @@ async fn list_all_sessions_pages_and_collapses_cross_page_duplicates() {
     assert_eq!(queries.len(), 3, "one request per page, including the empty terminator");
     for (i, q) in queries.iter().enumerate() {
         assert!(q.contains("limit=10000"), "page {i} must carry the page size: {q}");
+        assert!(q.contains("keyword=ali"), "page {i} must carry the keyword: {q}");
     }
     assert!(queries[0].contains("offset=0") && queries[1].contains("offset=2"),
         "the offset advances by the rows actually returned: {queries:?}");

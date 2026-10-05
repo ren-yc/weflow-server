@@ -206,7 +206,7 @@ pub(crate) fn dispatch() -> Result<Entry> {
                 embedded_sessions()?
             } else {
                 let client = http_client(&q.common)?;
-                block(client.list_all_sessions(Some(10_000)))?
+                block(client.list_all_sessions(Some(10_000), None))?
                     .iter()
                     .map(|s| {
                         json!({
@@ -593,7 +593,7 @@ fn run_export(a: &ExportArgs) -> Result<()> {
     let client = http_client(&a.common)?;
     // 令牌就是导出物里绝不允许出现的那串（见 export 模块头的硬约束一）。
     let secret = std::env::var("WEFLOW_TOKEN").unwrap_or_default();
-    let all = block(client.list_all_sessions(Some(10_000)))?;
+    let all = block(client.list_all_sessions(Some(10_000), None))?;
     let name_of = |t: &str| {
         all.iter()
             .find(|s| s.username == t)

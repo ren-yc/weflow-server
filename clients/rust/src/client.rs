@@ -484,9 +484,15 @@ impl Client {
     /// that re-reads the list every cycle should ask for the maximum instead,
     /// because the request count is `sessions / page_size` and the server's
     /// default page is two orders of magnitude smaller than the cap.
+    ///
+    /// `keyword` filters **server-side** (case-insensitive), so pagination
+    /// walks the filtered list rather than trimming after the fact — trimming
+    /// after the fact would stop at the first short page and silently drop
+    /// matches that live further out.
     pub async fn list_all_sessions(
         &self,
         page_size: Option<u32>,
+        keyword: Option<&str>,
     ) -> Result<Vec<gen_types::SessionNative>> {
         let mut out: Vec<gen_types::SessionNative> = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -496,6 +502,9 @@ impl Client {
             q.insert("offset", offset.to_string());
             if let Some(n) = page_size {
                 q.insert("limit", n.to_string());
+            }
+            if let Some(k) = keyword {
+                q.insert("keyword", k.to_string());
             }
             let page: gen_types::SessionsNative =
                 self.get_json("/api/v1/sessions", &q).await?;
