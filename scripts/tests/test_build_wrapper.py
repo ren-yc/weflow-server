@@ -20,7 +20,14 @@ from pathlib import Path
 SCRIPTS = Path(__file__).resolve().parent.parent
 REPO = SCRIPTS.parent
 
-PY_CODE = "import sys,json;print(json.dumps(sys.argv[1:]))"
+STUB_ARGV_PREFIX = "STUB_ARGV:"
+# The prefix is baked into the stub source at write time; referencing a
+# test-process variable there would be a NameError at stub runtime. The cmd
+# launcher keeps the Python string single-quoted inside its double quotes,
+# while the sh launcher wraps the same code in single quotes and therefore
+# needs the double-quoted variant.
+PY_CODE_NT = "import sys,json;print('" + STUB_ARGV_PREFIX + "'+json.dumps(sys.argv[1:]))"
+PY_CODE_POSIX = 'import sys,json;print("' + STUB_ARGV_PREFIX + '"+json.dumps(sys.argv[1:]))'
 
 
 def _run_wrapper(argv: list[str]) -> list[str]:
@@ -32,7 +39,7 @@ def _run_wrapper(argv: list[str]) -> list[str]:
         if os.name == "nt":
             # cmd forwards %* verbatim; Python re-splits it into argv.
             (stub_dir / "cargo.cmd").write_text(
-                "@echo off\r\npython -c \"" + PY_CODE + "\" %*\r\n",
+                "@echo off\r\npython -c \"" + PY_CODE_NT + "\" %*\r\n",
                 encoding="ascii",
             )
             vcvars = stub_dir / "vcvars64.bat"
@@ -50,12 +57,22 @@ def _run_wrapper(argv: list[str]) -> list[str]:
         else:
             cargo = stub_dir / "cargo"
             cargo.write_text(
-                "#!/bin/sh\nexec python3 -c '" + PY_CODE + "' \"$@\"\n",
+                "#!/bin/sh\nexec python3 -c '" + PY_CODE_POSIX + "' \"$@\"\n",
                 encoding="ascii",
             )
             cargo.chmod(0o755)
             cmd = ["bash", str(REPO / "scripts" / "build.sh"), *argv]
-        proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=180)
+        # errors="replace": the wrappers print CJK banners; a runner codepage
+        # mismatch must not crash the harness (that would be a false red).
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            timeout=180,
+        )
         combined = proc.stdout + proc.stderr
         if proc.returncode != 0:
             raise AssertionError(
@@ -63,8 +80,8 @@ def _run_wrapper(argv: list[str]) -> list[str]:
             )
         for line in combined.splitlines():
             line = line.strip()
-            if line.startswith("["):
-                parsed = json.loads(line)
+            if STUB_ARGV_PREFIX in line:
+                parsed = json.loads(line.split(STUB_ARGV_PREFIX, 1)[1])
                 assert all(isinstance(x, str) for x in parsed), parsed
                 return parsed
         raise AssertionError(f"stub cargo was not invoked; tail of output:\n{combined[-2000:]}")
