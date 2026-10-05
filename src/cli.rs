@@ -43,7 +43,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
-use weflow_client::client::{Client, ContactsQuery, MessageQuery};
+use weflow_client::client::{Client, ClientError, ContactsQuery, MessageQuery};
 use crate::export;
 
 use crate::api;
@@ -111,7 +111,7 @@ struct MessageArgs {
     #[arg(long)]
     talker: Option<String>,
     /// 起始时间：unix 秒或 `YYYYMMDD`（含边界）
-    #[arg(long)]
+    #[arg(long, value_parser = parse_since)]
     since: Option<String>,
     /// 关键词子串
     #[arg(long)]
@@ -148,7 +148,7 @@ struct ExportArgs {
     #[arg(long)]
     session: Vec<String>,
     /// 起始时间：unix 秒或 YYYYMMDD
-    #[arg(long)]
+    #[arg(long, value_parser = parse_since)]
     since: Option<String>,
     /// 已存在的会话文件跳过（幂等续跑）
     #[arg(long)]
@@ -637,8 +637,15 @@ async fn download_session_media(
                         .with_context(|| format!("写媒体失败: {}", path.display()))?;
                     downloaded.insert(name);
                 }
-                // 不是可取句柄（外链、或服务端没写出副本）：跳过该条，继续。
-                Err(e) => tracing::debug!("跳过不可取句柄 {name}: {e}"),
+                // **只有 404 才算「不是可取句柄」**（外链、或服务端没写出副本）。
+                //
+                // 其余错误（瞬时 5xx、传输层、鉴权）必须上抛：把它们一并当成「不可取」会静默
+                // 少下载若干媒体、而整体仍退 0 —— 交付物少了东西却没有任何信号，比直接失败更坏。
+                Err(ClientError::Status { status: 404, .. }) => {
+                    tracing::debug!("跳过不可取句柄 {name}: 404（外链或未落盘）");
+                }
+                // 其余错误（瞬时 5xx、传输层、鉴权）**上抛**：让该会话进 skipped，CLI 以非零码说话。
+                Err(e) => return Err(e.into()),
             }
         }
         if !page.page.has_more || count == 0 {
@@ -646,6 +653,16 @@ async fn download_session_media(
         }
         offset += count as u64;
     }
+}
+
+
+/// clap 层的 `--since` 校验：非法取值必须是**用法错误（退出码 2）**。
+///
+/// 为什么不能留给运行期：`--limit abc`／`--format xyz` 这类非法取值走 clap 的 value_parser、退 2，
+/// 而 `--since abc` 若只在后面手工解析就会退 1 —— 同一类「用法写错了」给出两种退出码，
+/// 脚本没法按码分流（`1` 是「连不上/被拒」那类可重试的运行期错误）。
+fn parse_since(s: &str) -> Result<String, String> {
+    to_unix(s).map(|_| s.to_string()).map_err(|e| format!("{e:#}"))
 }
 
 /// 把 --since 转成 unix 秒。接受 unix 秒或 YYYYMMDD（后者取当天 00:00，与服务端对

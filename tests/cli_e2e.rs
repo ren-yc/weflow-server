@@ -109,8 +109,17 @@ async fn contacts() -> Json<Value> {
 }
 
 /// 媒体字节：`--with-media` 的下载目标。
-async fn media(axum::extract::Path(_id): axum::extract::Path<String>) -> Vec<u8> {
-    b"PNG-BYTES".to_vec()
+///
+/// `boom.png` 刻意回 **503**（不是 404）：用来钉「取字节失败必须响亮失败」—— 把瞬时 5xx 也当成
+/// 「不是可取句柄」会静默少下载若干媒体、而整体仍退 0。
+async fn media(
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> (axum::http::StatusCode, Vec<u8>) {
+    if id == "boom.png" {
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, Vec::new())
+    } else {
+        (axum::http::StatusCode::OK, b"PNG-BYTES".to_vec())
+    }
 }
 
 async fn chatlab(axum::extract::RawQuery(q): axum::extract::RawQuery) -> Json<Value> {
@@ -138,6 +147,17 @@ async fn chatlab(axum::extract::RawQuery(q): axum::extract::RawQuery) -> Json<Va
             "count": messages.len(), "members": [], "messages": messages,
             "meta": {"groupId": TALKER, "name": "演示会话", "ownerId": "", "platform": "wechat", "type": "group"},
             "page": {"hasMore": more, "nextCursor": null}, "talker": TALKER,
+        }));
+    }
+    if raw.contains("talker=boom-talker") {
+        // 该会话的媒体**取不到字节**（见 `media` 的 503 分支），用来验 --with-media 的失败口径。
+        let mut m = pull_message();
+        m["media"] = json!({"fileName": "boom.png", "type": "image"});
+        return Json(json!({
+            "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
+            "count": 1, "members": [], "messages": [m],
+            "meta": {"groupId": "", "name": "演示会话", "ownerId": "", "platform": "wechat", "type": "private"},
+            "page": {"hasMore": false, "nextCursor": null}, "talker": "boom-talker",
         }));
     }
     Json(json!({
@@ -223,6 +243,30 @@ async fn export_with_media_lands_bytes_and_keeps_the_handle() {
     assert!(
         body.contains("\"fileName\":\"deadbeef.png\""),
         "导出物里的句柄应指向落盘文件，实际: {body}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 取字节失败（5xx）必须让导出**响亮失败**，而不是静默少下载几个媒体还退 0。
+///
+/// 此前任何错误都被当作「不是可取句柄」跳过（注释口径却只说 404），于是瞬时 5xx 会让交付物少
+/// 媒体、而退出码仍是 0 —— 没有任何信号。现在只有 404 才跳过，其余上抛、该会话进 skipped。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_media_fails_loudly_when_bytes_fetch_errors() {
+    let base = spawn_stub().await;
+    let dir = std::env::temp_dir().join(format!("weflow-e2e-mediaboom-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (code, stdout, stderr) = run(
+        &base,
+        &[
+            "export", "--out", dir.to_str().unwrap(), "--format", "jsonl", "--with-media",
+            "--session", "boom-talker",
+        ],
+    );
+    assert_eq!(code, 1, "取字节 5xx 应让该会话失败并以非零码结束；stdout: {stdout} stderr: {stderr}");
+    assert!(
+        stdout.contains("跳过") || stderr.contains("跳过"),
+        "应当说明会话被跳过（而不是静默退 0）: stdout={stdout} stderr={stderr}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

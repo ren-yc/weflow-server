@@ -162,3 +162,20 @@ fn export_requires_out_dir_as_usage_error() {
     assert_eq!(o.code, 2, "export 缺 --out 应为用法错误；stderr: {}", o.stderr);
     assert!(o.stderr.contains("out"), "报错要点名 --out，实际: {}", o.stderr);
 }
+
+/// 非法的 `--since` 是**用法错误（退出码 2）**，不是运行期错误（1）。
+///
+/// 为什么这条要紧：`--limit abc` 与 `--format xyz` 这类非法取值走 clap 的 value_parser、退 2；
+/// 而 `--since` 此前只在后面手工解析、退 1。同一类「用法写错了」给出两种退出码，脚本就没法
+/// 按码分流 —— `1` 在这套契约里是「连不上／被拒」那类可重试的运行期错误。
+#[test]
+fn invalid_since_is_a_usage_error_exit_2() {
+    for args in [
+        vec!["export", "--out", "unused-out-dir", "--since", "20240230"],
+        vec!["messages", "--talker", "x", "--since", "abc"],
+    ] {
+        let o = bare(&args);
+        assert_eq!(o.code, 2, "{args:?} 应为用法错误；stderr: {}", o.stderr);
+        assert!(o.stderr.contains("since"), "报错要点名 --since，实际: {}", o.stderr);
+    }
+}
