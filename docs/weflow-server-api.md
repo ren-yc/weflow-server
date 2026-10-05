@@ -928,8 +928,9 @@ feeds 条目字段（以源码 `sns.rs` 为准）：`tid/userName/content(明文
 
 两条硬约束：
 
-1. **导出物里不得出现访问令牌**。媒体在服务端是按带 `access_token` 的 URL 暴露的，而导出文件
-   会被拷进聊天工具、传上网盘。因此导出**不写任何 URL**，媒体只以 `{type, fileName}` 表达；
+1. **导出物里不得出现访问令牌**。服务端的媒体是**根相对路径**（`/api/v1/media/<file>`，**不含
+   令牌** —— 令牌只走请求头或 `?access_token=`，响应体从不嵌它）。导出仍然**不写任何 URL**
+   （相对路径换台机器就失效），媒体只以 `{type, fileName}` 表达；
    并且每一行写盘前会拿调用方给的令牌做一次子串检查，**命中即整轮中止**（不是跳过该会话）
    并删掉半成品。回归位置：`export::tests::secret_in_output_aborts_and_removes_partial_file`。
 2. **会话级失败不静默**：取数失败的会话被跳过、半途产物被删除，而只要 `skipped` 非空，CLI
