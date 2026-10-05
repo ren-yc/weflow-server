@@ -126,6 +126,8 @@ struct SearchMessagesArgs {
     keyword: String,
     /// 单页条数（默认 50，上限 200）
     limit: Option<usize>,
+    /// 翻页游标：原样回传上一次的 `nextOffset`
+    offset: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -298,17 +300,25 @@ impl WeflowMcp {
         // 本页被预算截短时不能给出整页游标：Pull 的 nextSince 是整页最后一条的时间，用它
         // 续拉会跳过我们没给出去的那些条。
         let cut = proj.truncated;
+        let start = a.offset.unwrap_or(0);
         Ok(CallToolResult::structured(json!({
             "talker": a.talker,
             "count": proj.items.len(),
             "pageSize": page_size,
             "truncated": cut,
             // 预算截断时**必须**为真：只置 `truncated` 而 `hasMore=false`，按 hasMore 判停的调用方
-            // 会把「被预算砍掉的条」当成「没有了」。游标仍然不给（见上）。
+            // 会把「被预算砍掉的条」当成「没有了」。
             "hasMore": page.sync.has_more || cut,
+            // 截断时**不**给 `nextSince`（它指整页末条，会跳过没给出的条），但**给** `nextOffset`：
+            // 这一面从 `offset` 起是连续切片，所以 `start + 给出条数` 恰指向被砍掉的第一条 —— 否则
+            // 一个纯按字段续拉的调用方会永远重取同一页。
             "nextSince": if cut { Value::Null } else { json!(page.sync.next_since) },
-            "nextOffset": if cut { Value::Null } else { json!(page.sync.next_offset) },
-            "hint": if cut { json!("本页超过字符预算，已少给若干条：请用更小的 limit 重取本页（游标未给，按整页游标续拉会跳过未给出的条）") } else { Value::Null },
+            "nextOffset": if cut {
+                json!(start + proj.items.len() as u64)
+            } else {
+                json!(page.sync.next_offset)
+            },
+            "hint": if cut { json!("本页超过字符预算，已少给若干条：保持同一 since、用 nextOffset 续拉即可（不要用整页的 nextSince，那会跳过未给出的条）；也可用更小的 limit 重取本页，此时按 platformMessageId 去重") } else { Value::Null },
             "messages": proj.items,
         })))
     }
@@ -350,9 +360,11 @@ impl WeflowMcp {
         Parameters(a): Parameters<SearchMessagesArgs>,
     ) -> Result<CallToolResult, McpError> {
         let limit = clamp_limit(a.limit);
+        let start = a.offset.unwrap_or(0);
         let mut q = MessageQuery::new(a.talker.clone());
         q.keyword = Some(a.keyword.clone());
         q.limit = Some(limit as u32);
+        q.offset = Some(start);
         let page = match self.client.chatlab_messages(&q).await {
             Ok(p) => p,
             Err(e) => return sdk_outcome(e),
@@ -360,13 +372,19 @@ impl WeflowMcp {
         let raw: Vec<Value> =
             page.messages.iter().filter_map(|m| serde_json::to_value(m).ok()).collect();
         let proj = project_messages(project_list(&raw, CHATLAB_MESSAGE_KEYS), limit, CHAR_BUDGET);
+        // **给出调用方真能用的游标**：这一面按 `offset` 翻页且本页是连续切片，所以「下一个偏移」
+        // 就是 `start + 实际给出条数`（预算截断时它恰好指向被砍掉的第一条）。
+        //
+        // 刻意**不返回** `page.nextCursor`：ChatLab 的 cursor 只能经 `cursor=` 回传，而这个工具的参数
+        // 与 SDK 的查询结构都没有 cursor 字段 —— 给一个回传不了的游标，等于告诉调用方「翻页可用」，
+        // 而实际上第 2 页永远取不到。
         Ok(CallToolResult::structured(json!({
             "talker": a.talker,
             "keyword": a.keyword,
             "count": proj.items.len(),
             "truncated": proj.truncated,
             "hasMore": page.page.has_more || proj.truncated,
-            "nextCursor": if proj.truncated { Value::Null } else { json!(page.page.next_cursor) },
+            "nextOffset": start + proj.items.len() as u64,
             "messages": proj.items,
         })))
     }
@@ -377,6 +395,7 @@ impl WeflowMcp {
         Parameters(a): Parameters<GetContactsArgs>,
     ) -> Result<CallToolResult, McpError> {
         let limit = clamp_limit(a.limit);
+        let start = a.offset.unwrap_or(0);
         let q = ContactsQuery {
             limit: Some(limit as u32),
             offset: a.offset,
@@ -405,6 +424,8 @@ impl WeflowMcp {
             "truncated": proj.truncated,
             // 同 search_messages：截断时 hasMore 必须为真，否则调用方会当作取完了。
             "hasMore": page.has_more || proj.truncated,
+            // 同 search_messages：给调用方一个**能回传**的游标（入参里有 `offset`）。
+            "nextOffset": start + proj.items.len() as u64,
             "contacts": proj.items,
         })))
     }

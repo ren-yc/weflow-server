@@ -377,6 +377,11 @@ pub fn write_index(
 ///
 /// 会话级失败不中断整轮（记进 `skipped` 继续下一个），但调用方**必须**因为
 /// `skipped` 非空而以非零退出码说话：静默少导出几个会话是这类工具最坏的失败方式。
+///
+/// **调用方契约（本模块无法自己强制）**：若这次导出会留下媒体句柄（例如 CLI 的 `--with-media`），
+/// 调用方必须在把每一行交给 `on_page` 之前调用 `retain_downloaded_media`，并把「确实落盘的名字集合」
+/// 传进去。本模块不持有那个集合（下载发生在调用方），所以它写不出「有句柄必有字节」这条不变量；
+/// 漏调的结果是**外链媒体也会原样落成 `media.fileName`** —— 导入器随后找不到那个文件。
 pub fn run<F>(targets: &[SessionTarget], opts: &Options, mut fetch: F) -> Result<Outcome>
 where
     F: FnMut(&SessionTarget, &mut dyn FnMut(&[Row]) -> Result<()>) -> Result<()>,

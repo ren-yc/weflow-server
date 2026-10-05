@@ -114,9 +114,16 @@ async fn media(axum::extract::Path(_id): axum::extract::Path<String>) -> Vec<u8>
 }
 
 async fn chatlab(axum::extract::RawQuery(q): axum::extract::RawQuery) -> Json<Value> {
-    // `keyword=big` 时给一页**远超字符预算**的消息，用来钉「截断时 hasMore 必须为真」。
-    if q.unwrap_or_default().contains("keyword=big") {
-        let messages: Vec<Value> = (0..60)
+    let raw = q.unwrap_or_default();
+    // `keyword=big` 时给一页**远超字符预算**的消息，用来钉「截断时 hasMore 必须为真」与
+    // 「按 nextOffset 续拉确实前进」。所以这里**尊重 `offset`**：从 offset 起给出剩下的消息。
+    if raw.contains("keyword=big") {
+        let offset: usize = raw
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("offset="))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let messages: Vec<Value> = (offset..60)
             .map(|i| {
                 json!({
                     "accountName": "alice", "content": "x".repeat(2000), "groupNickname": "",
@@ -125,11 +132,12 @@ async fn chatlab(axum::extract::RawQuery(q): axum::extract::RawQuery) -> Json<Va
                 })
             })
             .collect();
+        let more = offset + messages.len() < 60;
         return Json(json!({
             "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
-            "count": 60, "members": [], "messages": messages,
+            "count": messages.len(), "members": [], "messages": messages,
             "meta": {"groupId": TALKER, "name": "演示会话", "ownerId": "", "platform": "wechat", "type": "group"},
-            "page": {"hasMore": false, "nextCursor": null}, "talker": TALKER,
+            "page": {"hasMore": more, "nextCursor": null}, "talker": TALKER,
         }));
     }
     Json(json!({
@@ -351,8 +359,37 @@ async fn mcp_truncation_reports_has_more_so_the_caller_does_not_stop() {
     let v: Value = serde_json::from_str(text).unwrap_or_else(|e| panic!("工具输出应是 JSON: {e} / {text}"));
     assert_eq!(v["truncated"], json!(true), "60 条 2KB 消息应超预算: {v}");
     assert_eq!(v["hasMore"], json!(true), "截断时 hasMore 必须为真: {v}");
-    assert!(v["nextCursor"].is_null(), "预算截断时不能给整页游标: {v}");
+    assert!(
+        v["nextOffset"].as_u64().is_some_and(|n| n > 0),
+        "必须给一个**能回传**的续拉游标（此前的 nextCursor 无处回传）: {v}"
+    );
     assert!(v["count"].as_u64().unwrap_or(99) < 60, "count 应少于总条数: {v}");
+}
+/// 起一个 mcp 子进程后，从工具结果里取出结构化 JSON。
+fn tool_json(r: &Value) -> Value {
+    let text = r["content"][0]["text"].as_str().unwrap_or_default();
+    serde_json::from_str(text).unwrap_or_else(|e| panic!("工具输出应是 JSON: {e} / {text}"))
+}
+
+/// `search_messages` 必须给出一个**能回传**的游标，且按它续拉要真的前进。
+///
+/// 此前它返回 ChatLab 的 `nextCursor`，而这个工具的参数与 SDK 的查询结构都没有 cursor 字段 ——
+/// 那个游标无处可传，第 2 页永远取不到（等于分页承诺不可兑现）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mcp_search_pagination_actually_advances() {
+    let base = spawn_stub().await;
+    let first =
+        tool_json(&mcp_call(&base, "search_messages", json!({"talker": TALKER, "keyword": "big"})).await);
+    assert_eq!(first["truncated"], json!(true), "首屏应被预算截断: {first}");
+    let next = first["nextOffset"].as_u64().expect("必须给可回传的 nextOffset");
+    assert!(next > 0, "nextOffset 必须前进: {first}");
+    let second = tool_json(
+        &mcp_call(&base, "search_messages", json!({"talker": TALKER, "keyword": "big", "offset": next}))
+            .await,
+    );
+    let a = first["messages"][0]["platformMessageId"].as_str().unwrap_or_default().to_string();
+    let b = second["messages"][0]["platformMessageId"].as_str().unwrap_or_default().to_string();
+    assert_ne!(a, b, "按 nextOffset 续拉必须前进，而不是取回同一页");
 }
 
 // ---- --rows 的 RSS 平坦（验收时显式跑）--------------------------------------
