@@ -30,6 +30,44 @@
 - **发布流水线新增质量门**：release 前在同 tag 重跑 clippy、全量测试与契约 nails，
   构建依赖该门——测试红着打 tag 会被拒绝。
 
+### 新增
+
+- **两个 SDK 各补五项公共面（Rust 与 Python 同名同义）**：`sync_now()`（手动触发一次增量同步）、`pull_page(talker, since, offset, limit)`（**单页** Pull 入口，`drain_session` 改为复用它 ⇒ 游标装配从两处回到一处）、`chatlab_messages(...)`（ChatLab 形状的消息面，此前该面只被内部当触发导出用、没有公共入口）、`group_members(chatroom_id, include_message_counts)`、`list_all_sessions` 的关键词与页大小。
+  回归位置：`sync_now_posts_with_the_bearer_token_and_decodes_counters`、`pull_page_decodes_the_sync_block_and_sends_the_cursors`、`pull_page_omits_defaulted_cursors_instead_of_sending_zero`、`chatlab_messages_decodes_the_chatlab_envelope_and_paging`、`group_members_decodes_roster_page_and_sends_chatroom_param`、`list_all_sessions_pages_and_collapses_cross_page_duplicates`。
+  行为变化：`drain_session` 的请求序列不变；Python 侧原先从第二页起发 `offset=0`，现与 Rust 一致地省略（服务端默认值即 0，取到的页相同）。
+  **Rust 侧的 `list_all_sessions` 此前只有页大小、没有关键词**（提交信息声称有，实现里没有）——调用方只能取回全量再本地过滤，而该面**以空页为终止条件**，过滤会缩短某一页、排在后面的命中项永远读不到。现已修平。
+
+- **CLI 子命令面（`cli` feature，已进 `default`）**：`serve`／`token`／`sessions`／`messages`／`search`／`contacts`／`sync`／`export`。**裸跑仍等于 `serve`**（默认动作，既有启动方式不变）；退出码 `0/1/2` 的用法错误口径由 `tests/cli.rs` 逐例钉住。`--embedded` 只给只读查询类子命令——写动作与账号类没有该字段。
+  **迁移方式**：`run_cli()` 由 `async fn` 改为同步分流入口（`main.rs` 随之不再自建运行时）。
+- **`export` 子命令**：ChatLab Format 批量落盘，带 `--format json|jsonl`、`--session` 多选、`--resume` 续跑、`--limit`／`--since`／`--end`。`--with-media` 先经消息面触发服务端导出、再取字节落盘到 `<out>/media/`，**导出物里的 `media.fileName` 只保留确实落盘的句柄**（外链、未导出、导出失败的一律不写该字段——宁可少一个字段，也不给一个指向不存在文件的句柄）。回归位置：`with_media_keeps_only_handles_whose_bytes_are_on_disk`、`message_line_omits_media_without_a_handle`、`export_with_media_lands_bytes_and_keeps_the_handle`。导出物不写任何 URL；每行写盘前做令牌子串检查，命中即整轮中止并删除半成品。
+- **MCP 工具面（`mcp` feature，已进 `default`）**：`mcp` 子命令在 stdio 上暴露 8 个**只读**查询工具（`list_sessions`／`get_messages`／`get_messages_raw`／`search_messages`／`get_contacts`／`get_media`／`group_members`／`sync_now`）。单次输出约 32 KB 字符预算，超预算少给条数并置 `truncated`；「数据离机」提示写进 instructions、每个工具的 description、README 顶部与新增的 `docs/mcp.md`（模型看不到 README）。依赖 `rmcp`／`schemars` 均为可选 ⇒ `--no-default-features` 的零 tokio 嵌入契约不受影响。
+- **造库器移入库内（`testing` feature）**：批量导出的夹具要能真实生成会话库供 `tests/` 复用，此前只能靠测试内联的临时构造（夹具只能造库、不能造索引）。
+
+### 修复
+
+- **MCP：预算截断时 `hasMore` 必须为真**。`get_messages`／`search_messages`／`get_contacts` 此前透出**页面自身的** `hasMore`，于是 `truncated: true` 与 `hasMore: false` 会同时出现——按 `hasMore` 判停的调用方会**静默停在不完整结果上**。现改为 `has_more || truncated`。回归位置：`mcp_truncation_reports_has_more_so_the_caller_does_not_stop`。
+- **MCP：`search_messages` 的续拉游标此前无处回传**。响应给出 ChatLab 的 `nextCursor`，但该工具的参数里既无 cursor 也无 offset ⇒ **第 2 页永远取不到**。现改为 `offset` 入参 ＋ 响应给 `nextOffset`（本页是连续切片，该值恰指向被砍掉的第一条），并**移除**那个回传不了的 `nextCursor`；`get_contacts`／`get_messages` 在预算截断时同步补 `nextOffset`（此前两个游标都置 null，纯按字段续拉的调用方会永远重取同一页）。回归位置：`mcp_search_pagination_actually_advances`。
+- **CLI：非法 `--since` 现在以用法错误退 2**。此前 clap 放行、手工解析再 anyhow 上抛退 1，而 `--limit abc` 走 value_parser 退 2——同一种「用法写错」两种退出码。回归位置：`invalid_since_is_a_usage_error_exit_2`。
+- **CLI：取媒体字节只有 404 才算「句柄不可取」**。此前任何错误都被当成不可取而跳过，瞬时 5xx／网络错会**静默少下载媒体而整体仍退 0**。现只有 `Status { status: 404, .. }` 跳过、其余上抛。回归位置：`with_media_fails_loudly_when_bytes_fetch_errors`。
+- **`export --resume` 要真是续跑**：① `begin` 建了文件后首行检查失败不回收 ⇒ 留下的空文件让 `--resume` 永久跳过该会话；② `--resume` 只看 `exists()` ⇒ 截断／空文件被当成已完成（现加 `file_is_complete`：空文件不算，jsonl 末字节须为换行）；③ 续跑沿用上一轮的文件名（编号按输入列表顺序算，列表一变就漂移出第二份产物）；④ 被跳过的会话不再进新清单（否则这次的 `index.json` 会把上一轮条目整个抹掉，全命中时变成空清单）；⑤ jsonl 收尾的 `flush().ok()` 吞错 ⇒ 磁盘满时留下截断产物却以成功收场（现 `flush()?`）。回归位置：`secret_check_covers_escaped_and_percent_encoded_forms` 所在的导出回归套件与 `tests/cli_e2e.rs`。
+- **秘密检查覆盖转义与编码形态**：此前只比原文，秘密以 JSON 转义形（`a\"b`）或百分号编码形落盘时会逃逸。现同时比原文、转义形、编码形。
+- **pathsafe：挡掉 Win32 保留设备名**。`safe_segment` 与 `slugify` 都不挡 `CON`／`NUL`／`COM1`…（大小写不敏感、**带扩展名也算**）。作末分量时 Win32 在触碰文件系统之前就把名字解析成设备：写 `NUL` **静默丢弃字节**、开 `COM1` 可能阻塞；而名字来自聊天库、由发送方可选。现 `safe_segment` 拒绝、`slugify` 加前导下划线（`CON` → `_CON`）。
+- **两个 SDK 的错误族与参数校验归一**：① Python 侧 httpx 异常族此前不被包装 ⇒ `except ClientError` 接得住服务端拒绝却**漏掉网络故障**，现新增 `TransportError(ClientError)`；② `_decode` 只把 `>= 400` 当错 ⇒ 3xx 落进 `resp.json()` 变成 `ShapeError`（Rust 是「非 2xx 即错」），现按 `not 200 <= status < 300`；③ 时间界校验用 `str.isdigit()` **会放行全角数字** ⇒ 漏到服务端吃 400（Rust 本地拒绝），现改 ASCII-only；④ `group_members` 不校验空 `chatroomId` ⇒ 空名册会被读成「这个群没有成员」，现 fail-fast；⑤ Rust 的 `MessageQuery::params()` 把错误 URL 写死为 `/api/v1/messages`，经 `chatlab_messages` 调用时报错**指向另一个端点**，现由调用方传端点；⑥ `pull_page` 与两处 media 路径直拼 id ⇒ 含 `#`／`?` 时打到别的路径（Python 侧同样如此，httpx 不编码已拼好的 path），两侧都加路径段百分号编码。回归位置：`encode_path_segment_escapes_delimiters_but_keeps_real_id_shapes`、`empty_talker_error_names_the_endpoint_that_was_actually_called`、`group_members_rejects_an_empty_chatroom_without_a_request`。
+- **SSE 重放历史改由生产者单点写入**：此前每个订阅端各自编号，会产生发布编号与投递倒序；并堵住订阅与基线发布留下的三个并发缺口（订阅/快照缝隙、基线发布越过归零基线）。增量读取改为**排空到不满页为止**，注销的副作用挪到账号校验之后。
+
+### 安全
+
+- **SNS 的 HTML 导出逐字段转义并给链接加协议白名单**：正文与昵称等此前直接插进 HTML 模板；`href` 也不校验协议（`javascript:` 一类可原样落进导出物）。同源判定补上反斜杠形态，`createTime` 的裸插值一并转义。
+
+### 变更（对门禁与工具链，不对接口）
+
+- **包装脚本不再把调用方首参注入第二遍**：`build.ps1` 此前在 `$args[0]` 恰为子命令时才补 `--features testing`，`build.ps1 --locked test` 这类写法会漏注入（报错是一堆「模块是私有的」），而 `--features=x`／`-F testing` 形式会被重复注入。
+- **`graceful_shutdown` 测试的等待谓词升级为三段式**（端口可连 → token 可读 → 用该 token 打通一次鉴权），并把「端口未起」与「端口起但读不到凭据」两种失败**分开报错**、各给 remedy。纯测试侧，不改产品行为。
+- **验收测试补强区分力**：改查值而非查键名、`--with-media` 断言句柄集合与 `media/` 文件集合相等、404 与 5xx 互为对照、缺 token 那条把 BASE_URL 指向保证无监听的端口。
+- **`docs/architecture.md` 新增「已登记的两类构建告警（预期内，处置＝维持现状）」**：默认 feature 组合下的 `dead_code`（只被 `testing` 夹具或单测调用的内部辅助；CI 的门禁带 `--features testing` 所以看不到），以及链接期 `LNK4099`（vendored OpenSSL 缺 `ossl_static.pdb`，只影响调试信息）。
+- **顶层 Python 包补 `py.typed`**：生成层内部有该标记、顶层手写包没有 ⇒ 消费方的类型注解全部静默失效（mypy 报 `import-untyped`）。
+
+
 ## [0.8.0] - 2026-10-04
 
 ### 变更
