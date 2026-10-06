@@ -51,9 +51,34 @@ jobs:
           fi
           echo "OK: tag ${TAG} matches Cargo.toml version ${VERSION}"
 
+  # 质量门：release 前在同 tag 上重跑 clippy ＋ 全量测试 ＋ 契约 nails，
+  # 防止「测试红着打 tag」——发布二进制里带进去的代码必须与主干同一质量线。
+  quality-gate:
+    name: Quality gate (clippy + test + conformance)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup show
+
+      - name: clippy (deny warnings)
+        run: bash scripts/build.sh clippy --all-targets --locked -- -D warnings
+
+      - name: test
+        run: bash scripts/build.sh test --locked
+
+      - name: conformance nails (contract data invariants)
+        shell: bash
+        run: |
+          set -euo pipefail
+          pin="$(tr -d '[:space:]' < conformance.pin)"
+          git clone --depth 1 --branch "$pin" https://github.com/ren-yc/flow-contract.git conformance-nails
+          FLOW_CONTRACT_DIR="$PWD/conformance-nails" FLOW_CONTRACT_CASE="nails" \
+            bash scripts/build.sh test --locked --test conformance_runner -- --ignored
   build:
     name: Build ${{ matrix.target }}
-    needs: guard
+    needs: [guard, quality-gate]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90 # bundled SQLCipher/OpenSSL compile is slow
     strategy:

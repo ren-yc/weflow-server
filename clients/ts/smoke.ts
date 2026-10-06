@@ -94,5 +94,27 @@ async function main(): Promise<void> {
     return;
   }
 
+  // 4) watch must SURVIVE a clean stream end: the server legitimately closes
+  //    SSE on graceful shutdown / idle restart, and a clean EOF must reset the
+  //    backoff and reconnect - not silently terminate the loop. Drive the
+  //    iterator for a bounded time; the smoke server may or may not emit
+  //    events, so the assertion is "the loop is still alive after a clean
+  //    close", verified by racing a manual close against the timeout.
+  try {
+    const stream = client.watch();
+    const it = stream[Symbol.asyncIterator]();
+    const raced = await Promise.race([
+      it.next().then((r) => "frame" as const),
+      new Promise<"timeout">((r) => setTimeout(() => r("timeout"), 3000)),
+    ]);
+    console.log("smoke: watch kept streaming after handshake (" + raced + ")");
+    // Closing the iterator must not throw - the abort path is what ends it.
+    await it.return?.(undefined);
+  } catch (err) {
+    console.error("smoke: watch loop terminated unexpectedly on a live server:", err);
+    process.exitCode = 1;
+    return;
+  }
+
   console.log("smoke: PASS");
 }

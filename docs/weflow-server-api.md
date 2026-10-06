@@ -971,7 +971,9 @@ feeds 条目字段（以源码 `sns.rs` 为准）：`tid/userName/content(明文
    `export::tests::failed_rerun_keeps_the_previous_complete_artifact`、
    `cli_e2e::export_writes_a_file_against_a_live_service`（含续跑第二次退 0）。
 
-内存：JSONL 逐页写盘、写完即丢，**峰值常驻集与条数无关**。大语料的实测口径与造库工具（隐藏的
+内存：JSONL 逐页写盘、写完即丢，**峰值常驻集与消息条数无关**；`--with-media` 的句柄集合是
+**O(不同媒体数)**、同秒组的消息会被服务端扩页带出（Pull 段的「同秒扩页」），这两项不在「与条数无关」
+的承诺内。大语料的实测口径与造库工具（隐藏的
 `--rows` 参数，仅 `testing` feature 下编译进二进制）见 `docs/architecture.md` 的「测试与夹具」。
 ## 启动示例
 
@@ -1020,8 +1022,8 @@ weflow-server.exe sessions --json        # 子命令面
   | `sync_now()` | `POST /api/v1/sync` | **写动作**（推进水位、可能导出媒体）：刻意不进入任何轮询路径，只有显式调用才触发（有测试钉住读路径零命中） |
 
   **两个容易读错的地方**：① `list_all_sessions` 与 `drain_session` 是取尽，而 `pull_page`/
-  `list_messages`/`contacts` 只取一页（后两者那个面没有 `hasMore`，翻页由调用方按 `offset` 推进）；② 时间界收
-  `YYYYMMDD` **或** unix 秒，`end` 作为上界时裸日期覆盖**整天**。
+  `list_messages` 只取一页；`contacts` 是一页语义但响应带 `total`/`hasMore`（CLI 的 `contacts` 子命令
+  也透传分页参数并回给这两个字段）；② 时间界收 `YYYYMMDD` **或** unix 秒，`end` 作为上界时裸日期覆盖**整天**。
 - **错误按性质分派变体**：HTTP 非 2xx → `Status`；连接/超时/重置 → `Transport`；响应是合法 JSON 但
   不合承诺形状 → `Shape`。解码是**先取字节再单独解析**的：`resp.json::<T>()` 会把解码失败也包成
   传输错误，于是「服务端答错了」与「网络断了」混成一类 —— 而调用方正是按变体分流的（重试传输故障
