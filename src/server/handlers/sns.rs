@@ -41,7 +41,12 @@ fn sns_feed_json(store: &crate::store::Store, f: &crate::store::SnsFeed) -> serd
             // "proxyThumbUrl" 提供。
             // "rawUrl" 刻意保留：它是协议白名单的**审计线索**——HTML 渲染器不读它
             // （恶意 scheme 因此进不了 href），而读者需要能在导出物里看见被拒的原始
-            // 地址到底是什么。回归位置：sns_json_export_drops_credential_media_keys。
+            // 地址到底是什么。"resolvedUrl" 是它在旧接口文档里的别名，值相同：审计
+            // 值本身要保留，别名就一并留着——删别名只是把同一个决定拆成两次破坏，
+            // 不换来任何安全或清晰度。thumb 侧不同：被裁的是 thumb 这个**审计对象
+            // 本身**（旧接口里缩略原址不参与白名单判定，渲染器也从不用它），所以
+            // rawThumb 与其别名 resolvedThumbUrl 一起出局，而不是留一个删一个。
+            // 回归位置：sns_json_export_drops_credential_media_keys。
             let mut e = json!({
                 "url": proxy(&m.url),
                 "thumb": proxy(m.thumb.as_deref().unwrap_or("")),

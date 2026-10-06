@@ -409,7 +409,12 @@ SSE 键集断言钉住，按「看着多余就顺手统一」改会直接让门�
 留下两份内容不同的同名产物，对使用者比一次响亮拒绝更糟。
 
 处置是会话级：记入 `skipped`（起手前就拒，不发请求、不留 `.part`），`skipped` 非空 ⇒ CLI 以 1 退出
-（沿用既有退出码口径）。回归位置：`subset_export_refuses_to_clobber_another_sessions_artifact`、
+（沿用既有退出码口径）。
+
+**拒绝轮必须把属主那一行带进本轮新清单**，否则这套机制自己会造出死锁：本轮收尾的 `write_index` 只写
+本轮交付的条目 ⇒ 属主的产物从清单上消失 ⇒ 属主下次重导时，同名文件算出的归属变成「无主」，被同一个
+拒绝逻辑挡住，唯一出路只剩手工删文件。回归位置：`refusing_a_collision_keeps_the_owner_exportable`
+（撤掉这一步实测变红）。其余回归：`subset_export_refuses_to_clobber_another_sessions_artifact`、
 `intentional_rerun_of_same_session_overwrites_itself`（钉住那半边豁免）、`unowned_leftover_file_is_not_clobbered`。
 
 ### 群名片的来源在另一个库，且两库的 id 空间互相独立

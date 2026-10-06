@@ -637,9 +637,14 @@ where
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            // 大小写折叠比对：去重集合与文件系统判定都是折叠口径（Windows 卷默认
+            // 大小写不敏感），归属比对若用原始串，`Team.jsonl` 登记、本轮算出
+            // `team.jsonl` 时会被判「无主」而误拒。
             let owner = recorded_index.iter().find_map(|(talker, row)| {
-                (row.get("file").and_then(Value::as_str) == Some(name_here.as_str()))
-                    .then(|| talker.clone())
+                row.get("file")
+                    .and_then(Value::as_str)
+                    .filter(|f| f.eq_ignore_ascii_case(&name_here))
+                    .map(|_| talker.clone())
             });
             let own_rerun = owner.as_deref() == Some(target.talker.as_str());
             // 同一 talker 在本轮出现两次（targets 是调用方给的，不去重）：第二次是在
@@ -655,14 +660,30 @@ where
                 };
                 // 会话级失败，不是整轮中止：其余会话的交付不该被一次撞名连坐。
                 // skipped 非空 ⇒ CLI 以 1 退出（既有口径），所以不新增退出码。
-                // 起手前就拒，因此本轮没有 .part 需要清理。有意覆盖自己的旧产物
-                // 走 --resume（它会核对清单、残留 .part、媒体承诺与内容完整性）。
+                // 起手前就拒，因此本轮没有 .part 需要清理。
+                //
+                // 被保护的属主必须继续留在清单里：把它那一行带进本轮清单。少了这步，
+                // 本轮收尾的 write_index 只写本轮交付的条目，属主的产物就从清单上消失
+                // —— 属主下次重导时，那个同名文件变成「无主」，被同一个拒绝机制挡住，
+                // 唯一出路只剩手工删文件：拒绝机制自己造出死锁。
+                if let Some(o) = &owner {
+                    let missing = !index_rows.iter().any(|r| {
+                        r.get("talker").and_then(Value::as_str) == Some(o.as_str())
+                    });
+                    let carried = missing.then(|| recorded_index.get(o)).flatten().cloned();
+                    if let Some(row) = carried {
+                        index_rows.push(row);
+                    }
+                }
                 tracing::warn!(
-                    "跳过会话 {}：拒绝覆盖既有产物 {}（{why}）——它不是这个会话的交付物",
+                    "跳过会话 {}：拒绝覆盖既有产物 {}（{why}）。出路：删除该文件后重跑、换一个输出目录，或用 --resume（它按清单核对后才复用／重写）",
                     target.talker,
                     path.display()
                 );
-                skipped.push(target.talker.clone());
+                // 同一 talker 在本轮出现两次且两次都撞名：skipped 只记一次。
+                if !skipped.contains(&target.talker) {
+                    skipped.push(target.talker.clone());
+                }
                 continue;
             }
         }
@@ -1268,6 +1289,11 @@ mod tests {
         assert_eq!(got.skipped, vec!["wxid_b".to_string()], "撞名会话要进 skipped");
         assert_eq!(fetched, 0, "拒绝发生在起手前：不该去取数");
         assert!(got.written.is_empty(), "被拒的会话不该记成交付: {:?}", got.written);
+        // 起手前就拒 ⇒ 连中转文件都不该留下（"不发请求"与"不留半成品"是两件事）。
+        assert!(
+            !dir.join("Team.jsonl.part").exists(),
+            "拒绝不得留下 .part 半成品"
+        );
         assert_eq!(
             std::fs::read_to_string(dir.join("Team.jsonl")).unwrap(),
             first,
@@ -1302,6 +1328,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 被拒绝的**属主**下一轮必须仍能正常重导——拒绝机制不得自造死锁。
+    ///
+    /// 这是上一轮修出来的洞：被拒时本轮的 write_index 只写本轮交付的条目，
+    /// 属主 Team.jsonl 就从清单上消失了；属主下次不带 --session 重导时，同名
+    /// 文件算出的归属是「无主」⇒ 被同一个拒绝逻辑挡住，唯一出路只剩手工删文件。
+    /// 修复是把属主那一行带进本轮清单；这条测试钉住它。
+    /// 回归位置：`refusing_a_collision_keeps_the_owner_exportable`。
+    #[test]
+    fn refusing_a_collision_keeps_the_owner_exportable() {
+        let dir = tmp("clobber-no-deadlock");
+        run(
+            &[mk("wxid_a", "Team")],
+            &opts(&dir, Format::Jsonl, false, ""),
+            |_t, on_page| on_page(&[row("1", 1, "u1", "")]),
+        )
+        .unwrap();
+        // 撞名轮：会话 b 被拒。
+        run(
+            &[mk("wxid_b", "Team")],
+            &opts(&dir, Format::Jsonl, false, ""),
+            |_t, on_page| on_page(&[row("8", 8, "u8", "")]),
+        )
+        .unwrap();
+        let idx: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("index.json")).unwrap()).unwrap();
+        assert!(
+            idx["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["talker"] == "wxid_a" && r["file"] == "Team.jsonl"),
+            "撞名轮必须把属主那一行留在清单里，否则下一轮它就是无主的: {idx}"
+        );
+        // 属主不带 --session 重导（非续跑轮）：自己的旧产物按归属放行。
+        let mut fetched = 0;
+        let got = run(
+            &[mk("wxid_a", "Team")],
+            &opts(&dir, Format::Jsonl, false, ""),
+            |_t, on_page| {
+                fetched += 1;
+                on_page(&[row("3", 3, "u3", "")])
+            },
+        )
+        .unwrap();
+        assert_eq!(fetched, 1, "属主重导必须真的取数（未被拒）");
+        assert!(got.skipped.is_empty(), "属主重导不该被拒: {:?}", got.skipped);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
     /// 既有产物**没有被任何一轮清单认领**（外力放的、或清单已丢失）时同样拒绝覆盖。
     ///
     /// 这是最安静的一类数据丢失：导出目录里躺着一个 `A.jsonl`，index 里却不提它，本轮
@@ -1324,6 +1400,7 @@ mod tests {
         .unwrap();
         assert_eq!(got.skipped, vec!["wxid_a".to_string()], "无人认领的同名文件须拒绝覆盖");
         assert_eq!(fetched, 0, "拒绝发生在起手前");
+        assert!(!dir.join("A.jsonl.part").exists(), "拒绝不得留下 .part 半成品");
         assert_eq!(
             std::fs::read_to_string(dir.join("A.jsonl")).unwrap(),
             "{ EXTERNAL, NOT OURS }\n",

@@ -809,6 +809,10 @@ mod tests {
         .unwrap();
         let rows = read_new(&conn, "msg_2021f50af0b435101c0219d73dd2d44b", &Watermark::default(), None)
             .expect("补上时间列后同一张表必须可读");
+        // 不只数条数：一个「无论有没有时间列都吐 1 行」的实现会骗过 len 断言。
+        // 内容断言把它钉死——上一测试要红，这条要绿，两个方向才都成立。
         assert_eq!(rows.len(), 1, "对照基线: {rows:?}");
+        assert_eq!(rows[0].local_id, 1, "读到的必须是那一行本体: {rows:?}");
+        assert_eq!(rows[0].create_time, 1700000000, "时间列必须被真正用于窗口读: {rows:?}");
     }
 }
