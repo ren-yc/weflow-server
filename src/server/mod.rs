@@ -648,13 +648,12 @@ pub async fn start_account(
                     n,
                     msg_total
                 );
-                let wms: Vec<(String, crate::store::Watermark)> = {
-                    let guard = handle2.store.read();
-                    guard.watermarks.clone().into_iter().collect()
-                };
                 // Global bus: clients already streaming (possibly since before
-                // this account existed) get the watermark baseline here.
-                state2.bus.publish(crate::sync::Event::Sync(wms));
+                // this account existed) get the watermark baseline here. The
+                // stopped re-check and the publish share one store write lock,
+                // so a deregistration landing in between cannot be overwritten
+                // by a stale (ghost) baseline.
+                publish_watermark_baseline(&handle2.store, &state2.bus, || handle2.is_stopped());
                 let acct = handle2.sync.clone();
                 let dir = handle2.info.db_storage.clone();
                 let h = tokio::spawn(async move {
@@ -913,24 +912,20 @@ pub fn deregister_account(state: &AppState, wxid: &str, purge_media: bool) -> De
     };
     let previous = handle.status();
 
-    // 2. 注销时**清掉重放条目并推进基线代号**。条目留着对下一个账号没有意义；而事件 id
-    //    计数器**保留** —— 见 `HistoryBuf::clear` 与 `GENERATION` 的说明。基线代号让带着旧
-    //    `Last-Event-ID` 重连的客户端能区分「注销后新账号刚开始」与「自己漏收了」。
-    //    位置在账号校验之后：mismatch 与 NotRegistered 都在上一步 return 掉了。
-    state.bus.history().lock().clear();
-    bump_generation();
-
-    // 3. Retire the sync side without touching `handle.sync`'s mutex.
+    // 2. Retire the sync side without touching `handle.sync`'s mutex。**先于清历史**：
+    //    基线发布与清历史的互斥依赖「stopped 先置、清历史后置」（见第 4 步）。
     handle.stopped.store(true, Ordering::SeqCst);
 
-    // 4. Stop future watch passes.
+    // 3. Stop future watch passes.
     if let Some(task) = handle.watcher.lock().take() {
         task.abort();
     }
 
-    // 5. Drop the index, collecting the talkers to purge while we still can.
+    // 4. Drop the index, collecting the talkers to purge while we still can.
     // The handle is already unreachable, so clearing its store is enough —
-    // nothing else can observe it, and it dies with the last Arc.
+    // nothing else can observe it, and it dies with the last Arc。
+    // 清索引用的这把 store 写锁，也是 init 完成路径发布基线时持的那把（见
+    // `publish_watermark_baseline`）—— 两侧在这把锁上串行。
     let (talkers, index_cleared) = {
         let mut guard = handle.store.write();
         let talkers: Vec<String> =
@@ -939,6 +934,18 @@ pub fn deregister_account(state: &AppState, wxid: &str, purge_media: bool) -> De
         *guard = Store::default();
         (talkers, had_index)
     };
+
+    // 5. 注销时**清掉重放条目并推进基线代号**。条目留着对下一个账号没有意义；而事件 id
+    //    计数器**保留** —— 见 `HistoryBuf::clear` 与 `GENERATION` 的说明。基线代号让带着旧
+    //    `Last-Event-ID` 重连的客户端能区分「注销后新账号刚开始」与「自己漏收了」。
+    //    位置在账号校验之后：mismatch 与 NotRegistered 都在上一步 return 掉了。
+    //    **必须晚于第 4 步的 store 清空**：init 完成路径发布基线时持这同一把 store 写锁、
+    //    并在锁内复查 `stopped` —— 若清历史发生在清 store 之前，init 的基线会落在注销的
+    //    归零基线**之后**（`HistoryBuf::clear` 保留 id 计数器，幽灵基线拿到更大的新 id、
+    //    盖上新代号，客户端无从识别）。回归：
+    //    install_baseline_is_not_published_after_a_deregistration_reset。
+    state.bus.history().lock().clear();
+    bump_generation();
     state.bus.publish(Event::Sync(current_watermarks(state)));
 
     let purged_dirs = if purge_media {
@@ -950,6 +957,41 @@ pub fn deregister_account(state: &AppState, wxid: &str, purge_media: bool) -> De
         "[deregister] 账号 {wxid} 已注销 (原状态 {previous:?}, 索引已清理 {index_cleared}, 清理媒体目录 {purged_dirs})"
     );
     DeregisterOutcome::Deregistered { previous, index_cleared, purged_dirs }
+}
+
+/// 索引完成后把水位基线发布到总线，发布前在**同一把 store 写锁的临界区内**复查
+/// 「这一轮是否已被注销」。
+///
+/// 为什么复查与发布必须一起被这把锁罩住：注销清索引用同一把锁（第 4 步），且它在拿到
+/// 这把锁**之前**就已置了 `stopped`（第 2 步）；清重放历史与广播归零基线排在清空索引
+/// **之后**（第 5 步）。于是两种交错都被挡住：
+///  - 注销先跑完 ⇒ 这里拿到锁、复查到 `stopped`、直接返回 false，不发布；
+///  - 这里先拿到锁 ⇒ 基线发布在锁内；注销随后清索引、清历史（连刚发布的基线一起清掉）
+///    再广播归零基线，终态以归零基线收尾。
+///
+/// 反过来，若复查在锁外、发布也在锁外（本仓曾经的形态）：交错「这里复查通过 → 放读锁 →
+/// 注销完整跑完（清历史、bump 代号、广播归零）→ 这里才发布」就会把**已注销账号的水位**
+/// 追加在归零基线之后。`HistoryBuf::clear` 刻意保留 id 计数器，所以这条幽灵基线拿到更大
+/// 的新 id；而代号是序列化时才取的，它会被盖上注销后的新代号 —— 两条判据都显示「最新」，
+/// 客户端无从识别，会把一个已不存在的账号的水位当成事实。
+///
+/// 锁序 store→history 单向（`publish` 内取历史锁；注销清历史时不持 store，订阅端读历史
+/// 也不持 store），不存在反向嵌套，不会死锁。
+///
+/// 回归：`install_baseline_is_not_published_after_a_deregistration_reset`。
+fn publish_watermark_baseline(
+    store: &Arc<RwLock<Store>>,
+    bus: &EventBus,
+    cancelled: impl Fn() -> bool,
+) -> bool {
+    let guard = store.write();
+    if cancelled() {
+        return false;
+    }
+    let wms: Vec<(String, crate::store::Watermark)> = guard.watermarks.clone().into_iter().collect();
+    // guard 仍被持有 ⇒ 发布确定落在写锁之内（本函数返回时才 drop）。
+    bus.publish(crate::sync::Event::Sync(wms));
+    true
 }
 
 /// Build the watch config from CLI.
@@ -970,6 +1012,54 @@ mod tests {
      /// 「代号不得被 mismatch 推进」的观察变成跨测试竞态（Linux CI 实测红：
      /// left 4 / right 3；Windows 只是没排上那个交错）。
     static DEREG_LOCK: Mutex<()> = Mutex::new(());
+
+    /// 基线发布与注销的互斥：`publish_watermark_baseline` 持 store 写锁复查 `stopped`，
+    /// 注销又在**清空索引之后**才清历史与广播归零基线（第 5 步），两种交错都以归零基线
+    /// 收尾。反序时（复查在锁外或清历史先于清索引），交错「install 放锁 → 注销完整跑完
+    /// → install 才发布」会把已注销账号的水位追加在归零基线之后 —— `HistoryBuf::clear`
+    /// 保留 id 计数器，幽灵基线拿到更大的新 id、盖上新代号，客户端无从识别。
+    #[test]
+    fn install_baseline_is_not_published_after_a_deregistration_reset() {
+        let _g = DEREG_LOCK.lock();
+        let state = test_state();
+        let h = bind(&state, "wxid_base");
+        h.store.write().watermarks.insert(
+            "message/message_0.db:Msg_1".into(),
+            crate::store::Watermark::default(),
+        );
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<bool>();
+        // 主线程占住 store 写锁（模拟 init 完成路径正要发布），发布线程排队。
+        let guard = h.store.write();
+        let store2 = h.store.clone();
+        let bus2 = state.bus.clone();
+        let stopped2 = h.stopped.clone();
+        let publisher = std::thread::spawn(move || {
+            let ok = publish_watermark_baseline(&store2, &bus2, || stopped2.load(Ordering::SeqCst));
+            let _ = done_tx.send(ok);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        // 注销在发布者排队期间跑完可观测部分：置 stopped（第 2 步）。
+        h.stopped.store(true, Ordering::SeqCst);
+        drop(guard);
+        let published = done_rx.recv_timeout(std::time::Duration::from_secs(5)).expect("publisher settles");
+        publisher.join().unwrap();
+        assert!(!published, "拿到锁时已被注销 ⇒ 不得发布");
+        assert!(
+            state.bus.history().lock().replay_since(0).is_empty(),
+            "被拒的发布不得留下幽灵基线",
+        );
+        // 正面分支：未被注销时发布落锁内，历史恰好一条。
+        h.stopped.store(false, Ordering::SeqCst);
+        assert!(
+            publish_watermark_baseline(&h.store, &state.bus, || h.is_stopped()),
+            "未被注销时基线正常发布",
+        );
+        assert_eq!(
+            state.bus.history().lock().replay_since(0).len(),
+            1,
+            "基线恰好一条",
+        );
+    }
 
     fn test_state() -> Arc<AppState> {
         let cfg = Config {

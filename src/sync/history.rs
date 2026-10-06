@@ -99,7 +99,13 @@ impl EventBus {
 
     /// 单点发布：写入历史并广播带 id 的载荷，返回分配的 id。
     pub fn publish(&self, event: Event) -> u64 {
-        let id = self.history.lock().append(event.clone());
+        // append 与 send 必须在**同一把历史锁的临界区**内：并发 publish 时若先释放历史锁
+        // 再 send，两条事件的投递顺序可能与编号顺序相反 —— 客户端带着后一条事件的
+        // Last-Event-ID 断线重连，先前那条「已分配编号却尚未投递」的事件会被重放窗口
+        // 永久滤掉（它的编号更小、落在客户端已见水位之前）。tokio 的 send 非阻塞
+        // （写进各接收槽即返回），跨它持锁无代价；订阅端不在持历史锁时取 store（无 ABBA）。
+        let mut hist = self.history.lock();
+        let id = hist.append(event.clone());
         let _ = self.tx.send(Stamped { id, event });
         id
     }
@@ -108,8 +114,53 @@ impl EventBus {
         self.tx.subscribe()
     }
 
+    /// 建立一条 SSE 订阅：在**同一把历史锁的临界区内**先订阅广播、再取重放快照。
+    ///
+    /// 为什么必须是一步：`publish` 也在同一把锁里 append＋send。若「取快照」与「订阅」
+    /// 分两步，落在两步之间的那条发布既不在快照（已拍完）也进不了新的接收端（还没订阅）
+    /// —— 该连接永久漏收且毫无信号，只有它主动带旧 `Last-Event-ID` 重连才补得回，而它
+    /// 不知道自己漏了。焊进一个临界区后按锁的先后只剩两种情形，且都不丢不重：
+    /// 发布先拿到锁 ⇒ 该条进了快照、而新的接收端还不存在（收不到重复）；我们先用快照
+    /// ⇒ 该条进不了快照、但 send 时接收端已建好（回归：`subscribe_with_replay_delivers_every_event_exactly_once`）。
+    pub fn subscribe_with_replay(&self, since: u64) -> (broadcast::Receiver<Stamped>, Vec<(u64, Event)>) {
+        let hist = self.history.lock();
+        let rx = self.tx.subscribe();
+        let replay = hist.replay_since(since);
+        (rx, replay)
+    }
+
     /// 服务层读重放窗口 / 注销清条目用：同一份历史的句柄。
     pub fn history(&self) -> &Arc<Mutex<HistoryBuf>> {
         &self.history
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 快照通道与广播通道的并集必须**不丢不重**。
+    ///
+    /// 订阅与取快照若分成两步，落在两步之间的那条发布既不在快照（已拍完）也进不了
+    /// 接收端（还没订阅）—— 该连接永久漏收且毫无信号，只有它主动带旧 Last-Event-ID
+    /// 重连才补得回，而它不知道自己漏了。焊进同一把历史锁后，按锁的先后只有两种情形。
+    #[test]
+    fn subscribe_with_replay_delivers_every_event_exactly_once() {
+        let bus = EventBus::new(16);
+        // 发布先拿到历史锁 ⇒ 进快照；此刻接收端还不存在，不会重复。
+        let before_id = bus.publish(Event::Sync(vec![]));
+        let (mut rx, replay) = bus.subscribe_with_replay(0);
+        assert!(
+            replay.iter().any(|(id, _)| *id == before_id),
+            "订阅之前发布的必须进快照",
+        );
+        // 订阅之后发布 ⇒ 只能从广播收到，快照里没有。
+        let after_id = bus.publish(Event::Sync(vec![]));
+        assert!(
+            !replay.iter().any(|(id, _)| *id == after_id),
+            "不得同时出现在两条通道上",
+        );
+        let stamped = rx.try_recv().expect("订阅之后的发布必须从广播收到");
+        assert_eq!(stamped.id, after_id);
     }
 }

@@ -63,8 +63,12 @@ pub(crate) fn sse_from(
     serialize: Serializer,
 ) -> Response {
     let export_dir = export_dir.to_path_buf();
-    let replay = state.bus.history().lock().replay_since(last_id);
-    let rx = state.bus.subscribe();
+    // 订阅与重放快照必须在同一把历史锁的临界区里取（`EventBus::subscribe_with_replay`）。
+    // 分开两步时，恰好落在两步之间落地的 publish 既进不了快照（已拍完）也进不了这条连接
+    // （还没订阅）—— 永久漏收且毫无信号，只有它主动带旧 Last-Event-ID 重连才补得回，而它
+    // 不知道自己漏了。原子取后按锁的先后只剩两种情形、都不丢不重（回归：
+    // sse_... 的 subscribe_with_replay_delivers_every_event_exactly_once）。
+    let (rx, replay) = state.bus.subscribe_with_replay(last_id);
     // An SSE stream never ends on its own, so it would hold graceful shutdown
     // open for the whole grace period. Watching the shutdown channel lets the
     // stream close itself and the drain finish promptly.
