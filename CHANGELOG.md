@@ -11,6 +11,12 @@
   私聊里它是对面昵称、群聊里是发信人昵称，与会话 id 只在「显示名恰好没被改过」时相同，真实数据几乎必然对不上。**迁移方式**：
   `media_bytes(&message)` 改为 `media_bytes(&message, talker)`（Rust）/ `media_bytes(message, talker)`（Python），
   `talker` 用发起导出时传给 ChatLab 面的同一个会话 id。`media_bytes_by_id(id)` 不受影响。
+  空 `talker` 现在两语言都**本地拒绝**（Rust 报 `UnexpectedBody`，Python 报 `ShapeError`）——
+  此前 Rust 会把空串发给导出端点，把「参数无效」伪装成「句柄不可导出」。回归位置：
+  `tests/behavior.rs::media_bytes_exports_then_retries_once_after_404`（夹具昵称 ≠ 会话 id，
+  mock 拒绝错误 talker）与 `tests/cli_e2e.rs::with_media_skips_an_unfetchable_handle_without_failing`。
+  消息无媒体句柄时的错误也从「合成 404 + 句子塞 url 字段」改为 `UnexpectedBody`/`ShapeError`——
+  依赖旧错误形态分类的调用方需要调整。
 
 - **MCP `get_messages` 响应新增 `sinceResolved`**：`since` 接受相对串（`7d`/`24h`），续拉发生在
   下一轮对话——重发相对串会把窗口悄悄前移。响应回给本轮解析出的**排他**绝对下界，续拉传

@@ -564,11 +564,22 @@ impl Client {
     /// own the value).
     pub async fn media_bytes(&self, message: &gen_types::ChatlabMessage, talker: &str) -> Result<bytes::Bytes> {
         let Some(m) = &message.media else {
+            // 本地前置条件失败：还没发请求，也谈不上响应体——归 UnexpectedBody
+            // 是权宜（它带着 url/detail 两个槽位）。url 填哨兵是为了日志可读，
+            // 调用方按 url 归因时请注意这不是真实端点。
             return Err(ClientError::UnexpectedBody {
                 url: "(no media on message)".into(),
                 detail: "message carries no media handle".to_string(),
             });
         };
+        // 与 Python 侧同规：空 talker 会问一个不同的问题（导出空会话），
+        // 服务端答空结果，重试 404 把「参数无效」伪装成「句柄不可导出」。
+        if talker.trim().is_empty() {
+            return Err(ClientError::UnexpectedBody {
+                url: "(empty talker)".into(),
+                detail: "talker must not be empty".to_string(),
+            });
+        }
         let name = &m.file_name;
         let url_path = format!("/api/v1/media/{}", encode_path_segment(name));
         let url = self.url(&url_path);
