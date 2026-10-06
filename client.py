@@ -528,9 +528,10 @@ class Client:
                 {"talker": message.account_name, "media": "1"},
             )
             resp = await self._http_get(url, headers=auth)
-        # 非 2xx（不只是 4xx/5xx）：3xx 若落进 return 会把重定向页当媒体字节
-        # 交出去，且调用方拿不到任何错误信号 —— 与 _decode、media_bytes_by_id
-        # 同口径（regression: test_media_bytes_rejects_redirect_like_statuses）。
+        # Not-2xx (not just 4xx/5xx): a 3xx falling through to `return` hands
+        # the caller an empty redirect body as media bytes with no error signal
+        # - same rule as _decode / media_bytes_by_id.
+        # (regression: test_media_bytes_rejects_redirect_like_statuses)
         if not 200 <= resp.status_code < 300:
             raise StatusError(resp.status_code, url)
         return resp.content
@@ -713,9 +714,10 @@ class Client:
                 async with self._http.stream(
                     "GET", self._url("/api/v1/push/messages"), headers=headers
                 ) as resp:
-                    # 3xx 也算失败（与 _decode / media_bytes 的 not-2xx 同口径）：
-                    # 一次 302 若被当可读流处理，空体 EOF 会触发 clean_exit 退避
-                    # 复位、0.5s 无限重连，调用方拿不到任何错误信号。
+                    # 3xx is also a failure (same not-2xx rule as _decode /
+                    # media_bytes): a 302 decoded as a readable stream ends in
+                    # an empty-body EOF, resetting the backoff and looping
+                    # forever at 0.5s with no error signal to the caller.
                     if not 200 <= resp.status_code < 300:
                         raise StatusError(resp.status_code, self._url("/api/v1/push/messages"))
                     # The old shape reset backoff right here, on every
