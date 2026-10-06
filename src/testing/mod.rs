@@ -534,3 +534,38 @@ pub fn build_account_with_rows(dir: &Path, key: &Key, rows: usize) -> PathBuf {
     }
     storage
 }
+
+/// 给 "/api/v1/sns/export?format=html" 的注入面按需造一份朋友圈数据：一位显示名带 HTML
+/// 标记的联系人 ＋ 一条 "sns.db:SnsTimeLine" 动态。
+///
+/// 为什么不塞进 "build_wechat_account"：绝大多数测试与朋友圈无关，公共路径多一张库会让所有
+/// SNS golden 意外变化。列形态取自 "store::index::load_sns" 的实际查询（tid/user_name/content），
+/// XML 形状取自 "parser::parse_sns_feed" 的解析口径；"classify_rel" 按 "sns" 前缀归类，而夹具
+/// 用单钥匙（"KeyMap::Single"），新库自动被同一把钥匙打开。备注里刻意不带单引号。
+pub fn add_sns_fixture(storage: &Path, key: &Key) {
+    {
+        let path = storage.join("contact/contact.db");
+        let conn = wx_conn(&path, key, false);
+        // display_name 的取值顺序是 备注 > 昵称 > 用户名，而 SNS 的 HTML 导出把会话显示名写进
+        // <b>，所以这行备注就是那条注入面的输入。
+        conn.execute_batch(
+            r#"INSERT INTO contact (userName, remark, nickName, alias, localType)
+                 VALUES ('wxid_sns_html01', '<img src=x onerror=alert(1)>', 'SNS 作者', '', 1);"#,
+        )
+        .unwrap();
+    }
+    {
+        fs::create_dir_all(storage.join("sns")).unwrap();
+        let path = storage.join("sns/sns.db");
+        let conn = wx_conn(&path, key, false);
+        conn
+            .execute_batch("CREATE TABLE SnsTimeLine (tid INTEGER PRIMARY KEY, user_name TEXT, content TEXT);")
+            .unwrap();
+        let xml = r#"<SnsDataItem><TimelineObject><id>sns-obj-1</id><createTime>1700000099</createTime><contentDesc>sns-body-marker</contentDesc><ContentObject><type>2</type><mediaList><media><url>javascript:alert(1)</url></media></mediaList></ContentObject></TimelineObject><LocalExtraInfo><tid>-9001</tid><nickname>SNS 作者</nickname></LocalExtraInfo></SnsDataItem>"#;
+        conn.execute(
+            "INSERT INTO SnsTimeLine (tid, user_name, content) VALUES (?1, ?2, ?3)",
+            rusqlite::params![-9001i64, "wxid_sns_html01", xml],
+        )
+        .unwrap();
+    }
+}

@@ -1955,3 +1955,58 @@ fn probe_uri(path: &str) -> String {
     // 这类问题下一次被误当成别的原因（多一项替换看着像在支持那条路由）。
     path.replace("{wxid}", common::FAKE_WXID).replace("{id}", common::FAKE_GROUP)
 }
+
+/// SNS 的 HTML 导出：显示名与正文都必须经转义后落盘，正文键必须取生产者给的 "contentDesc"。
+///
+/// 端到端（造库触发真实导出路径，不手工注入 store）钉三层：注入输入经 "article_html" 变成无害
+/// 文本；同一条动态在 JSON 里有正文、HTML 里也必须有（此前读 "content" 这个不存在的键，静默变空
+/// "<p></p>"）；媒体链接只走协议白名单，恶意 scheme 至多以转义文本出现，不进 "href" 执行位。
+#[tokio::test]
+async fn sns_html_export_escapes_display_names_and_links() {
+    let dir = common::tmp_dir("smoke-sns-html-escape");
+    let state = test_state_with(&dir, common::add_sns_fixture);
+    let app = server::build_router(state);
+
+    let uri = format!("/api/v1/sns/export?username=wxid_sns_html01&format=html&access_token={TOKEN}");
+    let (status, body) = json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "导出应成功: {body}");
+    assert_eq!(body["count"], 1, "夹具的那条动态要在场: {body}");
+    let path = std::path::PathBuf::from(body["path"].as_str().expect("path 字段"));
+    let html = std::fs::read_to_string(&path).unwrap();
+
+    // 显示名：脚本必须只是文本，不是可执行标签（受害者一打开导出文件就执行，就是这条缺陷）
+    assert!(
+        html.contains("&lt;img src=x onerror=alert(1)&gt;"),
+        "显示名应以转义形态出现: {html}"
+    );
+    assert!(!html.contains("<img "), "未转义的标签不得落盘: {html}");
+    // 正文：同一条动态的 contentDesc 必须出现在 HTML 里
+    assert!(html.contains("sns-body-marker"), "正文不得静默变空: {html}");
+    // 媒体：代理形态是同源相对路径（合法），恶意 scheme 不给链接
+    assert!(
+        !html.contains(r#"href="javascript:"#),
+        "javascript: 不得成为可执行链接: {html}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 同一条数据走 JSON 导出：证明 "contentDesc" 一直在生产 —— HTML 侧的空正文是读错键，不是数据缺失。
+#[tokio::test]
+async fn sns_json_export_carries_content_desc_the_html_export_must_read() {
+    let dir = common::tmp_dir("smoke-sns-json-desc");
+    let state = test_state_with(&dir, common::add_sns_fixture);
+    let app = server::build_router(state);
+    let uri = format!("/api/v1/sns/export?username=wxid_sns_html01&format=json&access_token={TOKEN}");
+    let (status, body) = json_body(app.oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    // 时间线写在落盘文件里（响应只回元数据），这里读的才是生产者的真实键集
+    let path = std::path::PathBuf::from(body["path"].as_str().expect("path 字段"));
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let entry = &doc["timeline"][0];
+    assert_eq!(entry["contentDesc"], "sns-body-marker");
+    assert!(
+        entry.get("content").is_none(),
+        "生产者从来不给 content 键：HTML 侧读它就是那条静默变空的缺陷: {entry}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

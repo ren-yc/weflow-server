@@ -345,31 +345,9 @@ pub async fn export(
     }
 
     let bytes: Vec<u8> = if format == "html" {
-        let mut body_html = String::new();
-        for e in &entries {
-            let media_html: String = e["media"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .map(|m| {
-                            let u = m["thumb"]
-                                .as_str()
-                                .filter(|s| !s.is_empty())
-                                .or_else(|| m["url"].as_str())
-                                .unwrap_or("");
-                            format!(r#"<div class="media"><a href="{u}">{u}</a></div>"#)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            body_html.push_str(&format!(
-                "<article><header><b>{}</b> <time>{}</time></header><p>{}</p>{}</article>\n",
-                e["displayName"].as_str().unwrap_or(""),
-                e["createTime"],
-                html_escape(e["content"].as_str().unwrap_or("")),
-                media_html,
-            ));
-        }
+        // 逐字段转义都在 article_html 里：本处不再手拼 —— 手拼正是 displayName 与媒体 URL
+        // 绕过 html_escape 的地方（源昵称里的 <img onerror=…> 会原样落进导出文件）。
+        let body_html: String = entries.iter().map(article_html).collect();
         let html = format!(
             "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">\
 <title>SNS export — {}</title><style>body{{font-family:system-ui;max-width:720px;margin:2rem auto}}\
@@ -409,9 +387,59 @@ article{{border-bottom:1px solid #ddd;padding:.8rem 0}}</style></head>\
 }
 
 fn html_escape(s: &str) -> String {
+    // 连引号一起转：本函数也会被放进属性位置，只挡 &<> 挡不住 breakout（" onmouseover=…）。
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// 一条媒体渲染成 HTML。
+///
+/// URL 要同时进 "href" 属性与文本，而**转义挡不住协议** —— "javascript:…" 全由合法字符组成，
+/// 放在属性位置浏览器照样会执行。所以先过协议白名单：同源相对路径（本服务的代理形态
+/// "/api/v1/sns/media/proxy?url=…"）与 http(s)；其余一律不给链接，只输出转义后的原文，
+/// 让读者看得见被拒的是什么，而不是凭空少一块内容。
+fn media_link_html(u: &str) -> String {
+    let lower = u.to_ascii_lowercase();
+    let same_origin = u.starts_with('/') && !u.starts_with("//");
+    let web = lower.starts_with("http://") || lower.starts_with("https://");
+    let esc = html_escape(u);
+    if same_origin || web {
+        format!(r#"<div class="media"><a href="{esc}">{esc}</a></div>"#)
+    } else {
+        format!(r#"<div class="media">{esc}</div>"#)
+    }
+}
+
+/// 一条朋友圈渲染成 "<article>" 片段（从 HTML 导出里抽出来，让注入面能被单元测试直接钉住）。
+///
+/// 正文取 "contentDesc"："sns_feed_json" 产出的就是这个键；此前这里读 "content"，不存在的键
+/// 静默退化成空 "<p></p>"，而同一条动态在 JSON 导出里是有文字的。
+fn article_html(e: &serde_json::Value) -> String {
+    let media_html: String = e["media"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|m| {
+                    let u = m["thumb"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| m["url"].as_str())
+                        .unwrap_or("");
+                    media_link_html(u)
+                })
+                .collect::<String>()
+        })
+        .unwrap_or_default();
+    format!(
+        "<article><header><b>{}</b> <time>{}</time></header><p>{}</p>{}</article>\n",
+        html_escape(e["displayName"].as_str().unwrap_or("")),
+        e["createTime"],
+        html_escape(e["contentDesc"].as_str().unwrap_or("")),
+        media_html,
+    )
 }
 
 /// GET /api/v1/sns/export/stats — aggregation + latest export artifact info.
@@ -780,5 +808,49 @@ mod tests {
         // suffix matching is on a label boundary, not a substring
         assert!(check_proxy_url("https://xqpic.cn/x").is_err());
         assert!(check_proxy_url("https://sub.mmsns.qpic.cn/x").is_ok());
+    }
+
+    #[test]
+    fn article_html_escapes_display_name_and_reads_content_desc() {
+        let e = serde_json::json!({
+            "displayName": "<img src=x onerror=alert(1)>",
+            "createTime": 1700000099,
+            "contentDesc": r#"正文 "引号" & <b>粗</b>"#,
+            "media": [],
+        });
+        let html = article_html(&e);
+        // 源昵称原样进 <b> 就是导出文件里的脚本执行面（受害者一打开就执行）。
+        assert!(
+            html.contains(r#"<b>&lt;img src=x onerror=alert(1)&gt;</b>"#),
+            "显示名必须转义: {html}"
+        );
+        // 正文键必须是生产者真正给出的 contentDesc：读 content 会让同一条动态在 HTML 里静默变空。
+        assert!(
+            html.contains(r#"<p>正文 &quot;引号&quot; &amp; &lt;b&gt;粗&lt;/b&gt;</p>"#),
+            "正文要取 contentDesc 并连引号一起转义: {html}"
+        );
+    }
+
+    #[test]
+    fn media_link_html_limits_the_href_to_a_protocol_allowlist() {
+        // 同源相对路径（本服务代理的形态）与 http(s) 保留链接
+        assert!(media_link_html("/api/v1/sns/media/proxy?url=x").contains(r#"<a href="#));
+        assert!(media_link_html("https://mmsns.qpic.cn/a.jpg").contains(r#"<a href="#));
+        // 其余一律不给链接：转义挡不住协议 —— javascript: 全由合法字符组成，放属性位照样执行。
+        for bad in [
+            "javascript:alert(1)",
+            "JaVaScRiPt:alert(1)",
+            "data:text/html;base64,PHNjcmlwdD4",
+            "vbscript:msgbox(1)",
+            "//evil.example/x.js",
+        ] {
+            let h = media_link_html(bad);
+            assert!(!h.contains(r#"<a href="#), "{bad} 不得成为链接: {h}");
+            // 被拒的仍要可见：读者知道少了什么，而不是凭空少一块内容。
+            assert!(h.starts_with(r#"<div class="media">"#), "{bad}: {h}");
+        }
+        // 属性位突破：URL 文本里的引号转义后不能提前闭合 href。
+        let q = media_link_html(r#"https://x.example/" onmouseover=alert(1) //"#);
+        assert!(!q.contains(r#"" onmouseover="#), "属性位不得被突破: {q}");
     }
 }
