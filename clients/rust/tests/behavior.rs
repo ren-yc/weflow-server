@@ -29,6 +29,9 @@ struct Mock {
     sse_reconnect_ids: Arc<StdMutex<Vec<Option<String>>>>,
     /// When set, the health route answers this body verbatim (wrong-shape 反例用)。
     health_page: Arc<StdMutex<Option<serde_json::Value>>>,
+    /// Frames served per connection, in order (popped at request time); when
+    /// exhausted the fixed sse_frames body is used.
+    sse_frames_seq: Arc<StdMutex<std::collections::VecDeque<Vec<String>>>>,
     messages_query: Arc<StdMutex<Option<String>>>,
     /// When set, the accounts route answers `indexing` forever (timeout test).
     always_indexing: bool,
@@ -288,7 +291,11 @@ async fn sse_route(
     assert_bearer(&headers);
     let last_id = headers.get("last-event-id").and_then(|v| v.to_str().ok()).map(String::from);
     mock.sse_reconnect_ids.lock().unwrap().push(last_id);
-    let frames = mock.sse_frames.lock().unwrap().join("\n");
+    let seq = mock.sse_frames_seq.lock().unwrap().pop_front();
+    let frames = match seq {
+        Some(per_connection) => per_connection.join("\n"),
+        None => mock.sse_frames.lock().unwrap().join("\n"),
+    };
     let body = format!("{frames}\n");
     (
         [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
@@ -532,11 +539,6 @@ async fn watch_decodes_frames_and_reconnects_with_last_event_id() {
 #[tokio::test]
 async fn watch_does_not_advance_the_cursor_past_an_undelivered_frame() {
     let mock = Mock::default();
-    *mock.sse_event.lock().unwrap() = Some(serde_json::json!({
-        "event": "message.new", "rawid": "9", "sessionId": "alice",
-        "sessionType": "chat", "sourceName": "alice", "timestamp": 1_700_000_001,
-        "content": "hi",
-    }));
     // data 行运行时序列化：源码里不出现带转义的字符串字面量，也不会与真实帧格式漂移。
     let payload = serde_json::json!({
         "event": "message.new", "rawid": "9", "sessionId": "alice",
@@ -590,6 +592,51 @@ async fn a_200_with_the_wrong_shape_is_a_shape_error_not_a_transport_one() {
         !matches!(err, ClientError::Transport(..)),
         "不得记成传输故障（连接没坏，是服务端答错了）: {err:?}",
     );
+}
+
+/// 跨连接泄漏在**真实流**上的钉法：连接 2 的首帧故意不带 `id:` —— 若上一连接遗留的
+/// 暂存 id 没有在连接开始时丢弃，它会在这一帧被提交进游标，第三条连接的重连头就变成
+/// 那条从未交付事件的 id（服务端据此把它划出重放窗口）。单元测试只钉状态机，本条钉接线。
+#[tokio::test]
+async fn watch_resets_the_pending_id_when_a_new_connection_starts() {
+    let mock = Mock::default();
+    let frame = |rawid: &str| {
+        format!(
+            "data: {}",
+            serde_json::to_string(&serde_json::json!({
+                "event": "message.new", "rawid": rawid, "sessionId": "alice",
+                "sessionType": "chat", "sourceName": "alice", "timestamp": 1_700_000_001,
+                "content": "hi",
+            }))
+            .unwrap()
+        )
+    };
+    *mock.sse_frames_seq.lock().unwrap() = vec![
+        // 连接 1：交付一条（游标 → 7），随后断在悬空的 id: 8 上（始终没有 data:）
+        vec![
+            "id: 7".to_string(),
+            "event: message.new".to_string(),
+            frame("9"),
+            "id: 8".to_string(),
+        ],
+        // 连接 2：首帧没有自己的 id
+        vec![frame("10")],
+        // 连接 3：只为读取它的重连头
+        vec![frame("11")],
+    ].into();
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+    use futures_util::StreamExt as _;
+    let mut stream = Box::pin(client.watch());
+    // 三次 yield ≈ 三条连接（EOF 后 500ms 重连由 next().await 等待，不靠裸 sleep）
+    for _ in 0..3 {
+        let _ = stream.as_mut().next().await;
+    }
+    let heads = mock.sse_reconnect_ids.lock().unwrap().clone();
+    assert_eq!(heads.len(), 3, "三条连接各记录一次重连头: {heads:?}");
+    assert_eq!(heads[0], None, "首连没有游标");
+    assert_eq!(heads[1].as_deref(), Some("7"), "悬空 id 不得推进：连接 2 仍带 7");
+    assert_eq!(heads[2].as_deref(), Some("7"), "遗留 pending 不得跨连接提交: {heads:?}");
 }
 // ---- health / accounts / register / wait_ready ---------------------------
 

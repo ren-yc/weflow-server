@@ -696,6 +696,9 @@ impl Client {
             let mut sse = SseFrameState::default();
             let mut backoff = Duration::from_millis(500);
             loop {
+                // 每条连接开始时丢弃上一连接遗留的暂存 id：它属于那条连接上一个
+                // 从未出现 data: 的帧，跨连接提交会把未交付事件的 id 写进重放游标。
+                sse.begin_connection();
                 let url = client.url("/api/v1/push/messages");
                 let mut req = client.http.get(&url).bearer_auth(&client.token).header("accept", "text/event-stream");
                 if let Some(id) = sse.last_event_id {
@@ -761,6 +764,12 @@ struct SseFrameState {
 }
 
 impl SseFrameState {
+    /// 一条新连接开始：丢弃上一连接遗留的暂存 id（`last_event_id` 是跨连接携带的
+    /// 重放游标，必须保留）。
+    fn begin_connection(&mut self) {
+        self.pending_id = None;
+    }
+
     /// 喂一行；解出一个完整帧时返回要交给调用方的那一项。
     fn feed(&mut self, line: &str) -> Option<Result<ServerEvent>> {
         if let Some(rest) = line.strip_prefix("id:") {
@@ -822,6 +831,37 @@ mod tests {
         assert_eq!(encode_path_segment("a?b"), "a%3Fb");
         assert_eq!(encode_path_segment("a b"), "a%20b");
         assert_eq!(encode_path_segment("中文"), "%E4%B8%AD%E6%96%87");
+    }
+
+    /// 悬空的 `id:` 不得跨连接泄漏：新连接的首帧若不带自己的 id（SSE 允许省略），提交来的
+    /// 会是上一连接遗留的暂存值 —— 那条事件从未交付，游标一推进它就会从重放窗口消失。
+    #[test]
+    fn pending_id_does_not_leak_across_connections() {
+        let mut sse = SseFrameState::default();
+        // 连接 1：只等到 id: 8，没等到 data: 就断了
+        sse.begin_connection();
+        assert!(sse.feed("id: 8").is_none());
+        sse.begin_connection();
+        // 连接 2 的首帧不带 id（省略）
+        let payload = serde_json::json!({
+            "event": "message.new", "rawid": "9", "sessionId": "alice",
+            "sessionType": "chat", "sourceName": "alice", "timestamp": 1,
+            "content": "hi",
+        });
+        let line = format!("data: {}", serde_json::to_string(&payload).unwrap());
+        assert!(sse.feed(&line).is_some(), "帧本身仍应交付");
+        assert_eq!(
+            sse.last_event_id, None,
+            "上一连接遗留的 pending id 不得提交进重放游标",
+        );
+        // 同一连接内的正常序列必须提交
+        assert!(sse.feed("id: 12").is_none());
+        // 提交点必须唯一地落在 data: —— 在 event: 行提交是同一类缺陷的另一种写法，
+        // 只有 id 与 event、永远等不到 data 的帧会让游标越过未交付事件。
+        assert!(sse.feed("event: message.new").is_none());
+        assert_eq!(sse.last_event_id, None, "event: 行不得提交游标");
+        assert!(sse.feed(&line).is_some());
+        assert_eq!(sse.last_event_id, Some(12), "同连接内 id 先于 data 必须推进游标");
     }
 
     #[test]
