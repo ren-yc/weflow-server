@@ -675,8 +675,13 @@ where
                         index_rows.push(row);
                     }
                 }
+                // 出路只列"删除该文件／换目录"这一条确定可行的：`--resume` 在这里不该
+                // 被推荐——清单丢失时它同样认不出归属，会走"无完成记录 ⇒ 重写"的自愈
+                // 分支把同名文件改写掉（边界钉在
+                // resume_with_intact_index_avoids_the_collision_entirely：清单完好时
+                // 续跑轮的名字已播种，根本撞不上，也就不需要这层拒绝）。
                 tracing::warn!(
-                    "跳过会话 {}：拒绝覆盖既有产物 {}（{why}）。出路：删除该文件后重跑、换一个输出目录，或用 --resume（它按清单核对后才复用／重写）",
+                    "跳过会话 {}：拒绝覆盖既有产物 {}（{why}）。出路：确认该文件确属本会话后删除它再重跑，或换一个输出目录",
                     target.talker,
                     path.display()
                 );
@@ -1377,6 +1382,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+
+    /// `--resume` 的覆盖防护来自「上一轮清单的名字先播种进去重集合」这一条既有机制：
+    /// 清单完好时，别的会话的产物名**算不出来**（会拿到 `-2` 后缀），所以根本撞不上。
+    /// 这条测试钉住「拒绝覆盖」防护的真实边界：归属判定只在**清单可读**时成立；清单被删/截断时
+    /// 「本轮无完成记录 ⇒ 重写」是既有且被需要的自愈语义（见
+    /// `resume_needs_the_completion_record_not_just_a_matching_file`），此时无法区分
+    /// 「自己的产物丢了记录」与「别人的产物」——归属校验方案早已被否决（需文件头），
+    /// 因此告警文案不得把 `--resume` 说成无条件的安全出路。
+    #[test]
+    fn resume_with_intact_index_avoids_the_collision_entirely() {
+        let dir = tmp("resume-taken-seed");
+        run(
+            &[mk("wxid_a", "Team")],
+            &opts(&dir, Format::Jsonl, false, ""),
+            |_t, on_page| on_page(&[row("1", 1, "u1", "")]),
+        )
+        .unwrap();
+        // 清单完好：续跑导会话 b，其显示名折叠后与 a 同名。
+        let got = run(
+            &[mk("wxid_b", "Team")],
+            &opts(&dir, Format::Jsonl, true, ""),
+            |_t, on_page| on_page(&[row("5", 5, "u5", "")]),
+        )
+        .unwrap();
+        assert!(got.skipped.is_empty(), "续跑轮不该撞名被拒: {:?}", got.skipped);
+        assert_eq!(
+            got.written[0].file_name().unwrap().to_str().unwrap(),
+            "Team-2.jsonl",
+            "上一轮的名字已播种 ⇒ b 只能拿到后缀名"
+        );
+        assert!(
+            std::fs::read_to_string(dir.join("Team.jsonl"))
+                .unwrap()
+                .contains("\"platformMessageId\":\"1\""),
+            "会话 a 的产物必须没被动过"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// 既有产物**没有被任何一轮清单认领**（外力放的、或清单已丢失）时同样拒绝覆盖。
     ///

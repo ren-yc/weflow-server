@@ -417,6 +417,13 @@ SSE 键集断言钉住，按「看着多余就顺手统一」改会直接让门�
 （撤掉这一步实测变红）。其余回归：`subset_export_refuses_to_clobber_another_sessions_artifact`、
 `intentional_rerun_of_same_session_overwrites_itself`（钉住那半边豁免）、`unowned_leftover_file_is_not_clobbered`。
 
+**它的成立条件是「清单可读」，不是「任何时刻都能认出归属」**：非续跑轮不去重播种，所以撞名算得出、也拒
+得了；续跑轮把上一轮的名字先播种进 `taken`，别的会话的产物名**压根算不出来**（只会拿到 `-2` 后缀），
+于是那条路径本就不需要拒绝（实测钉在 `resume_with_intact_index_avoids_the_collision_entirely`）。清单
+丢失／被截断时，「本轮无完成记录 ⇒ 重写」是既有且**被需要**的自愈语义，此时同名文件的「自己的／别人的」
+无法区分（要区分得往产物里加归属头，那方案早被否决）。结论：这套防护是**降低**覆盖事故的概率，不是
+消除；把它当万能保险会误判。
+
 ### 群名片的来源在另一个库，且两库的 id 空间互相独立
 
 群名片不在 `contact.db`，而在 **`contact/contact_fts.db`** 的全文索引表里；
