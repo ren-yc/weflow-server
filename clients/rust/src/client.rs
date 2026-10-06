@@ -269,9 +269,12 @@ impl ServerEvent {
 /// compare against it instead of guessing.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Read budget for ordinary JSON requests. Requests that are unbounded by
-/// construction (a full-roster message count, a media body, the SSE stream)
-/// deliberately do not use it.
+/// Read budget for ordinary JSON requests, charged **per read operation** and
+/// reset by each successful chunk (deliberately not a total deadline): a large but
+/// steadily streaming answer is not a stall. Same semantics as httpx's read
+/// timeout, so this constant means one thing in both SDKs.
+/// Requests unbounded by construction (a full-roster message count, a media body,
+/// the SSE stream) deliberately do not use it.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Client for one weflow-server instance. Cloneable; shares the connection
@@ -297,7 +300,12 @@ impl Client {
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Self {
         let json = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(READ_TIMEOUT)
+            // read_timeout, not timeout: the latter is a *total* deadline from "start
+            // connecting" to "response body finished", which would cut off a large
+            // answer that is streaming fine. httpx (and this crate's own stream loop)
+            // charge a read bound per read operation, resetting on each successful
+            // chunk - the two SDKs must mean the same thing by "30s read budget".
+            .read_timeout(READ_TIMEOUT)
             .build()
             // reqwest only fails here when a TLS backend cannot initialize.
             // Falling back to an unbudgeted client would silently drop the
