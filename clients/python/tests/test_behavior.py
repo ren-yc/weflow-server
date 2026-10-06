@@ -36,6 +36,10 @@ class Mock:
         self.media_status: int = 200
         self.chatlab_page: dict | None = None
         self.messages_query: dict | None = None
+        # When set, the chatlab export route rejects any query whose `talker`
+        # differs from it (the retry must ask for the session id, not the
+        # display name).
+        self.chatlab_query_talker: str | None = None
         # Raw bytes for the SSE response body; str fixtures are encoded.
         self.sse_frames: list[str] = []
         self.sse_body: bytes | None = None
@@ -123,6 +127,11 @@ class Mock:
                     await send({"type": "http.response.body", "body": b"fixture exhausted"})
                     return
             elif path == "/chatlab/messages":
+                expected = mock.chatlab_query_talker
+                if expected is not None and query.get("talker") != expected:
+                    await send({"type": "http.response.start", "status": 400, "headers": []})
+                    await send({"type": "http.response.body", "body": b"export asked with wrong talker"})
+                    return
                 mock.messages_query = query
                 body = mock.chatlab_page
             elif path.startswith("/api/v1/media/"):
@@ -353,6 +362,10 @@ async def test_pull_page_omits_defaulted_cursors_instead_of_sending_zero() -> No
 
 
 async def test_media_bytes_exports_then_retries() -> None:
+    # The display name and the session id must DIFFER: the old retry used
+    # `message.account_name` as the export `talker`, and the fixture let the
+    # two coincide so the mistake was invisible. The mock now rejects any
+    # export query whose talker is not the session id we pass.
     mock = Mock()
     mock.chatlab_page = {
         "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
@@ -362,16 +375,17 @@ async def test_media_bytes_exports_then_retries() -> None:
         "page": {"hasMore": False, "nextCursor": None},
         "talker": "alice",
     }
+    mock.chatlab_query_talker = "wxid_alice"
     client = make_client(mock)
     message = gen.ChatlabMessage.model_validate({
-        "accountName": "alice", "content": "x", "groupNickname": "",
+        "accountName": "Alice DISPLAY", "content": "x", "groupNickname": "",
         "media": {"type": "image", "fileName": "abc.png", "md5": "z"},
         "platformMessageId": "1", "sender": "alice", "timestamp": 1, "type": 1,
     })
-    data = await client.media_bytes(message)
+    data = await client.media_bytes(message, "wxid_alice")
     assert data == b"png-bytes"
     assert mock.media_calls == ["abc.png", "abc.png"]
-    assert mock.messages_query == {"talker": "alice", "media": "1"}
+    assert mock.messages_query == {"talker": "wxid_alice", "media": "1"}
     await client.aclose()
 
 
@@ -400,7 +414,7 @@ async def test_media_bytes_rejects_redirect_like_statuses() -> None:
             "platformMessageId": "1", "sender": "alice", "timestamp": 1, "type": 1,
         })
         with pytest.raises(sdkmod.StatusError) as exc_info:
-            await client.media_bytes(message)
+            await client.media_bytes(message, "wxid_alice")
         assert exc_info.value.status == status
         await client.aclose()
 

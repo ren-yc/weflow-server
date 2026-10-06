@@ -557,9 +557,17 @@ impl Client {
     /// handle before the export finished, and `media=1` re-export is what
     /// mints the file. If the retry also 404s, the handle was not
     /// exportable to begin with and the error is returned as-is.
-    pub async fn media_bytes(&self, message: &gen_types::ChatlabMessage) -> Result<bytes::Bytes> {
+    /// `talker` is the **session id** the export side door needs; it is NOT
+    /// `message.account_name` (that is the sender's display name, which only
+    /// coincides with the session id for 1:1 chats where the display name was
+    /// never customized - real data breaks the coincidence, so the caller must
+    /// own the value).
+    pub async fn media_bytes(&self, message: &gen_types::ChatlabMessage, talker: &str) -> Result<bytes::Bytes> {
         let Some(m) = &message.media else {
-            return Err(ClientError::Status { status: 404, url: "(no media on message)".into() });
+            return Err(ClientError::UnexpectedBody {
+                url: "(no media on message)".into(),
+                detail: "message carries no media handle".to_string(),
+            });
         };
         let name = &m.file_name;
         let url_path = format!("/api/v1/media/{}", encode_path_segment(name));
@@ -568,7 +576,7 @@ impl Client {
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             // Trigger export, then retry once.
             let mut q = BTreeMap::new();
-            q.insert("talker", message.account_name.clone());
+            q.insert("talker", talker.to_string());
             q.insert("media", "1".to_string());
             let _: gen_types::ChatlabMessages = self
                 .get_json("/chatlab/messages", &q)

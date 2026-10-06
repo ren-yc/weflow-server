@@ -24,6 +24,10 @@ struct Mock {
     media_calls: Arc<StdMutex<Vec<String>>>,
     media_bytes: Arc<StdMutex<Option<Vec<u8>>>>,
     chatlab_page: Arc<StdMutex<Option<serde_json::Value>>>,
+    // When set, the chatlab export route rejects any query whose `talker`
+    // differs - the retry must ask for the session id, not
+    // the display name.
+    chatlab_query_talker: Arc<StdMutex<Option<String>>>,
     sse_frames: Arc<StdMutex<Vec<String>>>,
     sse_event: Arc<StdMutex<Option<serde_json::Value>>>,
     sse_reconnect_ids: Arc<StdMutex<Vec<Option<String>>>>,
@@ -178,7 +182,16 @@ async fn chatlab_route(
     headers: HeaderMap,
 ) -> Response {
     assert_bearer(&headers);
-    *mock.messages_query.lock().unwrap() = query;
+    *mock.messages_query.lock().unwrap() = query.clone();
+    if let Some(expected) = mock.chatlab_query_talker.lock().unwrap().clone() {
+        let got = query.as_deref().unwrap_or("").split("&").find_map(|kv| {
+            let (k, v) = kv.split_once("=")?;
+            (k == "talker").then(|| v.to_string())
+        });
+        if got.as_deref() != Some(expected.as_str()) {
+            return (StatusCode::BAD_REQUEST, format!("export asked with wrong talker: {got:?} (expected {expected:?})")).into_response();
+        }
+    }
     let page = mock.chatlab_page.lock().unwrap().clone();
     match page {
         Some(p) => Json(p).into_response(),
@@ -468,8 +481,11 @@ async fn pull_page_omits_defaulted_cursors_instead_of_sending_zero() {
 async fn media_bytes_exports_then_retries_once_after_404() {
     let mock = Mock::default();
     let talker = "wxid_mock";
-    // First media GET misses (not exported yet); the export side door then
-    // registers the bytes so the retry hits.
+    // The display name and the session id must DIFFER here: the old retry
+    // used `message.account_name` as the export `talker`, and the fixture let
+    // the two coincide so the mistake was invisible. The mock now rejects any
+    // export query whose talker is not the session id we pass.
+    let display_name = "Alice DISPLAY";
     *mock.chatlab_page.lock().unwrap() = Some(serde_json::json!({
         "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
         "count": 0, "members": [], "messages": [],
@@ -477,15 +493,39 @@ async fn media_bytes_exports_then_retries_once_after_404() {
         "page": {"hasMore": false, "nextCursor": null},
         "talker": talker,
     }));
+    *mock.chatlab_query_talker.lock().unwrap() = Some(talker.to_string());
     let base = spawn_mock(mock.clone()).await;
     let client = Client::new(&base, TOKEN);
     let message: weflow_client::generated::r#gen::types::ChatlabMessage =
-        serde_json::from_value(mock_message_json(talker, "abc123.png"))
+        serde_json::from_value(mock_message_json(display_name, "abc123.png"))
             .unwrap();
-    let bytes = client.media_bytes(&message).await.expect("retry must succeed");
+    assert_eq!(message.account_name, display_name, "fixture: display name differs from session id");
+    let bytes = client.media_bytes(&message, talker).await.expect("retry must succeed");
     assert_eq!(bytes.as_ref(), b"png-bytes");
     let calls = mock.media_calls.lock().unwrap().clone();
     assert_eq!(calls, vec!["abc123.png", "abc123.png"], "two GETs: miss then retry");
+}
+
+#[tokio::test]
+async fn media_bytes_without_a_handle_is_unexpected_body_not_a_fake_404() {
+    // The old code reported a synthesized 404 with a sentence in the url
+    // field: a caller classifying by status saw a server answer that never
+    // happened, and one matching on url saw prose. The local precondition is
+    // its own kind of error.
+    let mock = Mock::default();
+    let base = spawn_mock(mock).await;
+    let client = Client::new(&base, TOKEN);
+    let message: weflow_client::generated::r#gen::types::ChatlabMessage =
+        serde_json::from_value(serde_json::json!({
+            "accountName": "alice", "content": "x", "groupNickname": "",
+            "platformMessageId": "1", "sender": "alice",
+            "timestamp": 1_700_000_000, "type": 1,
+        }))
+        .unwrap();
+    match client.media_bytes(&message, "wxid_alice").await {
+        Err(ClientError::UnexpectedBody { .. }) => {}
+        other => panic!("expected UnexpectedBody, got {other:?}"),
+    }
 }
 
 #[tokio::test]

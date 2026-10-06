@@ -508,8 +508,14 @@ class Client:
 
     # ---- media_bytes ----------------------------------------------------
 
-    async def media_bytes(self, message: gen.ChatlabMessage) -> bytes:
+    async def media_bytes(self, message: gen.ChatlabMessage, talker: str) -> bytes:
         """Fetch media bytes for a uniquely-named handle.
+
+        ``talker`` is the **session id** the export side door needs; it is NOT
+        ``message.account_name`` (that is the sender's display name, which only
+        coincides with the session id for 1:1 chats where the display name was
+        never customized - real data breaks the coincidence, so the caller owns
+        the value).
 
         One automatic retry after a 404: the caller may have serialized the
         handle before the export finished, and the ``media=1`` re-export is
@@ -517,7 +523,9 @@ class Client:
         exportable and the error propagates.
         """
         if message.media is None:
-            raise StatusError(404, "(no media on message)")
+            raise ShapeError("(no media on message): nothing to fetch")
+        if not talker:
+            raise ShapeError("talker must not be empty")
         name = message.media.file_name
         url = self._url(f"/api/v1/media/{_encode_path_segment(name)}")
         auth = {"Authorization": f"Bearer {self._token}"}
@@ -525,7 +533,7 @@ class Client:
         if resp.status_code == 404:
             await self._get_json(
                 "/chatlab/messages",
-                {"talker": message.account_name, "media": "1"},
+                {"talker": talker, "media": "1"},
             )
             resp = await self._http_get(url, headers=auth)
         # Not-2xx (not just 4xx/5xx): a 3xx falling through to `return` hands

@@ -1014,7 +1014,7 @@ weflow-server.exe sessions --json        # 子命令面
   | `contacts(query)` | `GET /api/v1/contacts` | **一页语义**；ChatLab 面完全不覆盖联系人 |
   | `group_members(chatroom, include_message_counts)` | `GET /api/v1/group-members` | 成员集合＝**名册 ∪ 发言人**（潜水成员出现、计数 0）；计数开关**关闭时不发参数**而非发 `0`；**空群号本地拒绝**（与 Python 侧同措辞：空名册会被读成「这个群没有成员」） |
   | `list_all_sessions(page_size, keyword)` | `GET /api/v1/sessions` | **取尽语义**（内部翻页到空页），跨页重复折叠并告警；`keyword` 是**服务端过滤**（翻的是过滤后的列表，不是取回来再剪）；`page_size` 上限 10000 |
-  | `media_bytes(message)` | `GET /api/v1/media/{id}` | 从 ChatLab 消息取；404 后按「先 `media=1` 导出再取」自动重试一次 |
+  | `media_bytes(message, talker)` | `GET /api/v1/media/{id}` | 从 ChatLab 消息取；`talker` 是**会话 id**（不是 `accountName` 显示名）；404 后按「先 `media=1` 导出再取」自动重试一次 |
   | `media_bytes_by_id(id)` | `GET /api/v1/media/{id}` | 按**单段句柄**取（原生面的 `mediaId`，或 `media.url` 末段）；不触发导出 |
   | `watch()` | SSE `/api/v1/push/messages` | `Last-Event-ID` 重连（游标**只在帧被消费时推进**：只有 `id:` 没有 `data:` 的悬空帧不推进，否则那条事件会从重放窗口消失）、心跳注释帧过滤、`generation` 变化上报给调用方决定是否回退 Pull 补拉 |
   | `sync_now()` | `POST /api/v1/sync` | **写动作**（推进水位、可能导出媒体）：刻意不进入任何轮询路径，只有显式调用才触发（有测试钉住读路径零命中） |
