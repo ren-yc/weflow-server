@@ -682,6 +682,17 @@ fn build_all_live_inner(
     Ok(store)
 }
 
+/// 增量读取的单页上限。与 SQL 的 LIMIT 同值：调用方（sync 的排空循环）按
+/// 「满页 ⇒ 可能还有 ⇒ 继续读、不满 ⇒ 读尽」判定，两处必须引用同一个数。
+///
+/// 测试下取 5：排空与触顶路径能在十几行数据上构造（回归见 sync 的
+/// `single_commit_larger_than_page_is_fully_drained`）。集成测试链接的是非 test
+/// 配置的库（仍是 5000），不受影响 —— 它们的夹具远小于一页，行为等价。
+#[cfg(not(test))]
+pub const READ_PAGE: usize = 5000;
+#[cfg(test)]
+pub const READ_PAGE: usize = 5;
+
 /// Incremental read: rows of one table after the watermark, in order.
 pub fn read_new(
     conn: &Connection,
@@ -697,12 +708,13 @@ pub fn read_new(
     let uid_map = load_uid_map(conn, name2id);
     let order = [time, cols.seq.as_deref().unwrap_or(&cols.local), &cols.local];
     let query = format!(
-        "SELECT {sel} FROM \"{table}\" WHERE ({ts}, {seq}, {lid}) > (?1, ?2, ?3) ORDER BY {ord} LIMIT 5000",
+        "SELECT {sel} FROM \"{table}\" WHERE ({ts}, {seq}, {lid}) > (?1, ?2, ?3) ORDER BY {ord} LIMIT {page}",
         sel = cols.selected.join(", "),
         ord = order.join(", "),
         ts = time,
         seq = cols.seq.as_deref().unwrap_or(&cols.local),
         lid = cols.local,
+        page = READ_PAGE,
     );
     let mut stmt = conn.prepare(&query)?;
     let mut rows = stmt.query(rusqlite::params![

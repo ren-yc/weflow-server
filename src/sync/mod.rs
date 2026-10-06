@@ -200,6 +200,16 @@ pub struct AccountSync {
     stopped: Arc<AtomicBool>,
 }
 
+/// 单轮排空的页数上限：防坏数据（水位推不动的表）把一轮 poll 拖死。
+/// 5000 × 64 = 单轮最多 32 万行；超出即下一轮继续（不丢行，只晚一轮）。
+///
+/// 测试下取 2：与 `index::READ_PAGE` 的测试值（5）配对（单轮上限 10 行），
+/// 构造（回归：commit_bigger_than_one_round_is_drained_across_rounds）。
+#[cfg(not(test))]
+const READ_MAX_PAGES: usize = 64;
+#[cfg(test)]
+const READ_MAX_PAGES: usize = 2;
+
 impl AccountSync {
     pub fn new(wxid: &str, storage: &Path, keys: KeyMap, store: Arc<RwLock<Store>>) -> Self {
         let (events, _) = broadcast::channel(1024);
@@ -415,41 +425,60 @@ impl AccountSync {
                         }
                     };
                     let name2id = index::name2id_table(conn);
+                    // 排空循环：单页读满 ⇒ 该表可能还有 ⇒ 继续读，直到不满页。只读一次就记
+                    // 「本轮读过」的话，同一提交里第 5001 行之后的内容留在表里、而 phase 4 已
+                    // 给该文件记了戳与 data_version 基线 —— 下一轮判「未变」，余量被永久吞掉。
+                    // （回归：single_commit_larger_than_page_is_fully_drained）
+                    let mut drained_all = true;
                     for (table, md5_suffix) in index::message_tables(conn) {
                         let wm_key = format!("{}:{table}", f.rel);
-                        let wm = {
+                        let mut wm = {
                             let guard = self.store.read();
                             guard.watermarks.get(&wm_key).copied().unwrap_or_default()
                         };
-                        let rows = read_new(conn, &table, &wm, name2id.as_deref())?;
-                        for row in rows {
-                            let session_username = {
-                                let guard = self.store.read();
-                                index::resolve_table_session(&guard, &md5_suffix)
-                            };
-                            let wm = Watermark {
-                                create_time: row.create_time,
-                                sort_seq: row.sort_seq,
-                                local_id: row.local_id,
-                            };
-                            // Mask before matching: `local_type` is packed
-                            // (`(subtype << 32) | base`). System codes carry a
-                            // zero high half in practice, so this is a no-op on
-                            // today's data, but the bare comparison is the same
-                            // latent bug that killed the parser's appmsg branch.
-                            let (base_type, _) =
-                                crate::parser::split_local_type(row.local_type);
-                            if matches!(base_type, 10000 | 10002)
-                                || row.parsed.revoke.is_some()
-                            {
-                                revoke_rows.push((session_username.clone(), row));
-                            } else {
-                                new_rows.push((session_username.clone(), row));
+                        let mut pages = 0usize;
+                        loop {
+                            pages += 1;
+                            let rows = read_new(conn, &table, &wm, name2id.as_deref())?;
+                            let full = rows.len() >= index::READ_PAGE;
+                            for row in rows {
+                                let session_username = {
+                                    let guard = self.store.read();
+                                    index::resolve_table_session(&guard, &md5_suffix)
+                                };
+                                // 外层游标随每一行推进：下一轮排空从这里续读。
+                                wm = Watermark {
+                                    create_time: row.create_time,
+                                    sort_seq: row.sort_seq,
+                                    local_id: row.local_id,
+                                };
+                                // Mask before matching: `local_type` is packed
+                                // (`(subtype << 32) | base`). System codes carry a
+                                // zero high half in practice, so this is a no-op on
+                                // today's data, but the bare comparison is the same
+                                // latent bug that killed the parser's appmsg branch.
+                                let (base_type, _) =
+                                    crate::parser::split_local_type(row.local_type);
+                                if matches!(base_type, 10000 | 10002)
+                                    || row.parsed.revoke.is_some()
+                                {
+                                    revoke_rows.push((session_username.clone(), row));
+                                } else {
+                                    new_rows.push((session_username.clone(), row));
+                                }
+                                new_watermarks.push((wm_key.clone(), wm));
                             }
-                            new_watermarks.push((wm_key.clone(), wm));
+                            if !full { break; }
+                            if pages >= READ_MAX_PAGES {
+                                // 本轮没排空：不记戳、不推进基线，下一轮 classify 会把它再当
+                                // 「已变更」重查，余量继续排空（不丢，只是晚一轮）。
+                                tracing::debug!("drain cap hit for {}:{}", f.rel, table);
+                                drained_all = false;
+                                break;
+                            }
                         }
                     }
-                    read_done.push(f.rel.clone());
+                    if drained_all { read_done.push(f.rel.clone()); }
                 }
             }
         }
@@ -837,6 +866,31 @@ mod tests {
         .unwrap();
     }
 
+    /// 批量追加：一次开库、一个事务插 count 行。`append_row` 每行一开库、单行一提交，
+    /// 造不出「单个提交 > 单页」的规模 —— 而排空要防的失败模式恰恰是这一形态（回归：
+    /// `single_commit_larger_than_page_is_fully_drained`）。
+    fn append_rows(storage: &Path, key: &[u8; 32], base_id: i64, count: i64) {
+        let conn = Connection::open(storage.join("message/message_0.db")).unwrap();
+        let key_hex = hex::encode(key);
+        conn.execute_batch(&format!(
+            "PRAGMA cipher_page_size = 4096;\n PRAGMA key = \"x'{key_hex}'\";\n PRAGMA journal_mode = DELETE;"
+        ))
+        .unwrap();
+        let group_md5 = md5_hex(GROUP);
+        conn.execute_batch("BEGIN").unwrap();
+        {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "INSERT INTO \"Msg_{group_md5}\" (server_id, local_type, create_time, sort_seq, real_sender_id, message_content) VALUES (?1, 1, ?2, 0, 2, '排空行')"
+                ))
+                .unwrap();
+            for k in 0..count {
+                stmt.execute(rusqlite::params![base_id + k, 1_700_000_300i64 + k]).unwrap();
+            }
+        }
+        conn.execute_batch("COMMIT").unwrap();
+    }
+
     fn unique_dir(tag: &str) -> PathBuf {
         let base = std::env::temp_dir().join(format!(
             "weflow-sync-race-{tag}-{}-{}",
@@ -853,6 +907,50 @@ mod tests {
     /// 候选 1 路：**mtime/size 戳与基线相同**（模拟 Windows 高负载下元数据回读滞后）
     /// 但数据已提交 ⇒ 廉价跳过不得吞掉这一行。修复前：戳相同 ⇒ classify 判「未变」⇒
     /// poll 返回 0 ⇒ 红；修复后：已打开的文件改查 data_version ⇒ 仍能捡到 ⇒ 绿。
+    /// 单个提交的行数**超过单页**：一次 poll 必须排空到不满页为止。
+    /// 修复前的失败模式：读到 5 行（满页）就认为「本轮读过」，phase 4 给该文件记了
+    /// 戳与 data_version 基线 ⇒ 下一轮 classify 判「未变」⇒ 第 6 行起被永久吞掉。
+    /// （测试下 READ_PAGE=5、READ_MAX_PAGES=2）
+    #[test]
+    fn single_commit_larger_than_page_is_fully_drained() {
+        let dir = unique_dir("drain-page");
+        let key = crate::keystore::parse_db_key(KEY_HEX).unwrap().0;
+        let storage = build_message_account(&dir, &key);
+        let store = Arc::new(RwLock::new(Store::default()));
+        let mut sync = AccountSync::new(WXID, &storage, crate::keystore::KeyMap::from(crate::keystore::DbKey(key)), store.clone());
+        sync.full_sync().unwrap();
+        let base = store.read().convs[GROUP].len();
+        // 12 行 > 5×2：本轮读满两页即触顶，余量必须靠下一轮继续排空而不是被吞。
+        append_rows(&storage, &key, 8_100_000_000_000_001_000, 12);
+        let mut total = 0usize;
+        for _ in 0..3 {
+            let (n, _) = sync.poll_once().unwrap();
+            total += n;
+        }
+        assert_eq!(base + 12, store.read().convs[GROUP].len(), "12 行必须全部进索引（晚几轮不算失败）");
+        assert_eq!(total, 12, "12 条增量事件一条都不能少");
+    }
+
+    /// 触顶不丢：本轮没排空 ⇒ **不记戳、不推进基线** ⇒ 下一轮必然重查该文件。
+    /// 反向变异（把 drained_all 门去掉、无条件记戳）⇒ 第 4 轮之后永远停在 12 以内。
+    #[test]
+    fn commit_bigger_than_one_round_is_drained_across_rounds() {
+        let dir = unique_dir("drain-cap");
+        let key = crate::keystore::parse_db_key(KEY_HEX).unwrap().0;
+        let storage = build_message_account(&dir, &key);
+        let store = Arc::new(RwLock::new(Store::default()));
+        let mut sync = AccountSync::new(WXID, &storage, crate::keystore::KeyMap::from(crate::keystore::DbKey(key)), store.clone());
+        sync.full_sync().unwrap();
+        // 25 行：5/页 × 2 页 = 单轮最多 10 行 ⇒ 至少三轮才能排空。
+        append_rows(&storage, &key, 8_100_000_000_000_020_000, 25);
+        let mut rounds = 0;
+        while store.read().convs[GROUP].len() < 25 + 1 && rounds < 8 {
+            sync.poll_once().unwrap();
+            rounds += 1;
+        }
+        assert_eq!(store.read().convs[GROUP].len(), 26, "25 行跨轮排空，一行不能丢（用了 {rounds} 轮）");
+    }
+
     #[test]
     fn stamp_unchanged_but_committed_row_is_still_polled() {
         let dir = unique_dir("stale-stamp");

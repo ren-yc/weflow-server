@@ -947,13 +947,14 @@ fn purge_exported_media(root: &std::path::Path, talkers: &[String]) -> usize {
 /// (An earlier revision of this comment said the history was left alone — that was
 /// true before the deregister semantics were unified, and it has been wrong since.)
 pub fn deregister_account(state: &AppState, wxid: &str, purge_media: bool) -> DeregisterOutcome {
-    // 1. Claim the removal under one lock.
-
-    // 注销时**清掉重放条目并推进基线代号**。条目留着对下一个账号没有意义；而事件 id
-    // 计数器**保留** —— 见 `HistoryBuf::clear` 与 `GENERATION` 的说明。基线代号让带着旧
-    // `Last-Event-ID` 重连的客户端能区分「注销后新账号刚开始」与「自己漏收了」。
-    state.history.lock().clear();
-    bump_generation();
+    // 1. Claim the removal under one lock. Everything with an externally
+    //    visible effect sits **after** this block: a wrong-wxid call is
+    //    answered `WxidMismatch` and must touch nothing at all — including
+    //    the replay history and the generation counter. Clearing them before
+    //    the check would let any client that guesses the bound wxid wrong
+    //    erase the live stream's replay window and force every connected
+    //    subscriber into a re-baseline (regression:
+    //    `deregistering_the_wrong_wxid_touches_nothing`).
     let handle = {
         let mut accounts = state.accounts.lock();
         match bound_account(&accounts) {
@@ -972,15 +973,22 @@ pub fn deregister_account(state: &AppState, wxid: &str, purge_media: bool) -> De
     };
     let previous = handle.status();
 
-    // 2. Retire the sync side without touching `handle.sync`'s mutex.
+    // 2. 注销时**清掉重放条目并推进基线代号**。条目留着对下一个账号没有意义；而事件 id
+    //    计数器**保留** —— 见 `HistoryBuf::clear` 与 `GENERATION` 的说明。基线代号让带着旧
+    //    `Last-Event-ID` 重连的客户端能区分「注销后新账号刚开始」与「自己漏收了」。
+    //    位置在账号校验之后：mismatch 与 NotRegistered 都在上一步 return 掉了。
+    state.history.lock().clear();
+    bump_generation();
+
+    // 3. Retire the sync side without touching `handle.sync`'s mutex.
     handle.stopped.store(true, Ordering::SeqCst);
 
-    // 3. Stop future watch passes.
+    // 4. Stop future watch passes.
     if let Some(task) = handle.watcher.lock().take() {
         task.abort();
     }
 
-    // 4. Drop the index, collecting the talkers to purge while we still can.
+    // 5. Drop the index, collecting the talkers to purge while we still can.
     // The handle is already unreachable, so clearing its store is enough —
     // nothing else can observe it, and it dies with the last Arc.
     let (talkers, index_cleared) = {
@@ -1274,6 +1282,19 @@ mod tests {
         assert!(!h.is_stopped());
         assert_eq!(h.status(), AccountStatus::Ready);
         assert_eq!(state.accounts.lock().len(), 1);
+        // 重放面同样不得被一次失败的注销触碰：清历史／推代号原先发生在 wxid
+        // 校验**之前**，任何猜错 wxid 的调用都能抹掉在线流的回看窗口，并把所有
+        // 已连订阅者推进重基线（对服务端口免鉴权面等于一次拒绝服务）。挪到校验
+        // 之后 ⇒ 这里塞一条历史再注销，条目与代号都必须原样。
+        state.history.lock().append(crate::sync::Event::Sync(vec![]));
+        let gen_before = current_generation();
+        deregister_account(&state, "wxid_b", false);
+        assert_eq!(
+            state.history.lock().replay_since(0).len(),
+            1,
+            "mismatch 的注销不得清掉重放条目",
+        );
+        assert_eq!(current_generation(), gen_before, "也不得推进基线代号");
     }
 
     /// Idempotent: retrying a completed deregistration is not an error.
