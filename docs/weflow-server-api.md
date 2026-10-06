@@ -51,6 +51,17 @@
 > ChatLab 形状一律走 `/chatlab/*`（见「ChatLab 适配面」）—— 调用方不必知道还有另一种形状，
 > 也不会因为漏传一个开关而拿到另一种。
 
+> **三个「上限」是三个不同的面，别互相换算**（文档里 200 与 10000 都出现过，混读会得出
+> 「两仓口径不一致」的错误结论——两仓的 HTTP 上限实际同为 10000）：
+>
+> | 数字 | 属于哪个面 | 含义 |
+> |---|---|---|
+> | **10000** | HTTP 的 `limit` / `page_size`（`sessions`／`contacts`／`group-members`／原生 `messages`）| 服务端对**单个请求返回条数**的硬上限，两仓相同；SDK 的 `list_all_sessions` 用它作页大小 |
+> | **200**（MCP）| MCP 工具参数 `limit`（`docs/mcp.md`）| **工具层**对一次取页的默认 50／上限 200，比 HTTP 更严；它与 HTTP 上限不构成矛盾，因为它是「模型经 MCP 取数据」这一层的自限 |
+> | **200**（导出）| `media=1` 的**每请求导出项上限**（见「媒体导出」小节）| 一次请求**最多触发 200 项媒体导出**，不是返回条数上限；超出的项保持未导出，`exported` 不为真 |
+>
+> 所以「联系人一次最多能拿多少」＝10000（HTTP），走 MCP 则被压到 200，而 `media=1` 的 200 与这两者**无关**。
+
 ## 端点
 
 ### GET `/openapi.json` — 接口描述（**免鉴权**）
@@ -841,7 +852,16 @@ Pull，避免同一批数据出现第二种形状。WeFlow（安装版）没有�
 | `/api/v1/sns/media/proxy` | `url`、`referer`、`user_agent` | 媒体字节流（CDN 鉴权墙时返回明确错误） |
 
 feeds 条目字段（以源码 `sns.rs` 为准）：`tid/userName/content(明文XML 解析后)/likes/comments/mediaList/location/rawXml` 的等效 JSON 键
-（`mediaList` 每项含 `url/thumb/md5/width/height`）。
+（`mediaList` 每项含 `url/thumb/md5/encIdx/rawUrl/resolvedUrl/proxyUrl/proxyThumbUrl/width/height`）。
+
+> **导出物不含取图凭据**：`token`／`key`（微信侧的访问与解密参数）与两个同值冗余键
+> `rawThumb`／`resolvedThumbUrl` 已从 JSON 导出移除。代理端点只读 `url`（＋可选
+> `referer`/`user_agent`），所以移除不影响任何取图路径；导出文件常被转发、存档或贴进
+> 别处，留着凭据等于每个导出包多带一份第三方能直接使用的材料。
+> **迁移方式**：需要凭据的调用方改走 `/api/v1/sns/media/proxy?url=…`（代理路径已在
+> `url`/`proxyUrl` 里给出），不要依赖导出物内的原始凭据。`rawUrl` 刻意保留：它是协议
+> 白名单的审计线索（HTML 渲染器不读它，恶意 scheme 因此进不了 `href`，而读者要能看见
+> 被拒的原始地址）。回归位置：`sns_json_export_drops_credential_media_keys`。
 
 ## 数据获取与安全模型
 

@@ -703,7 +703,13 @@ pub fn read_new(
     let cols =
         MsgCols::probe(conn, table).ok_or_else(|| anyhow::anyhow!("no local_id column"))?;
     let Some(time) = cols.time.as_deref() else {
-        return Ok(Vec::new()); // no time column: cannot do window reads
+        // 与「无 local_id 列」同口径报 Err，而不是返回空 Vec：空 Vec 与「真的没有新行」
+        // 在调用方完全不可区分，于是这张表的增量**永久静默为空**——水位照记、页面照答，
+        // 谁也不会再回头看它。真库里出现过这种列形态时，唯一能发现它的就是这个错误串。
+        // 回归位置：no_time_column_is_an_error_not_an_empty_increment。
+        return Err(anyhow::anyhow!(
+            "message table {table} has no time column: incremental read cannot be ordered"
+        ));
     };
     let uid_map = load_uid_map(conn, name2id);
     let order = [time, cols.seq.as_deref().unwrap_or(&cols.local), &cols.local];
@@ -733,4 +739,76 @@ pub fn read_new(
     }
     let _ = empty;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 无 time 列的消息表：增量读必须**报错**，不能返回空 Vec。
+    ///
+    /// 失败模式（修之前）：空 Vec 与「真的没有新行」在调用方完全不可区分，于是这张表
+    /// 的增量永久静默为空——水位照记、页面照答，谁也不会再回头看它。同口径的
+    /// 「无 local_id 列」本来就是 Err，两者行为不一致本身就是线索。
+    ///
+    /// 影响面如实登记：`read_new` 的错误在 `AccountSync::poll_once` 里经 `?` 上抛，
+    /// 会中止本轮增量（与无 local_id 列的既有行为相同）。真库里是否存在这种列形态
+    /// 属观察项，由真库窗口核对。
+    #[test]
+    fn no_time_column_is_an_error_not_an_empty_increment() {
+        let conn = Connection::open_in_memory().unwrap();
+        // 表名走 message_tables 的谓词（msg_ + 32 位十六进制），列里刻意不放时间列。
+        conn.execute_batch(
+            "CREATE TABLE msg_2021f50af0b435101c0219d73dd2d44b (
+                local_id INTEGER PRIMARY KEY,
+                server_id TEXT,
+                local_type INTEGER,
+                sender_username TEXT
+            );
+            INSERT INTO msg_2021f50af0b435101c0219d73dd2d44b
+                (local_id, server_id, local_type, sender_username)
+                VALUES (1, 's1', 1, 'u1');
+        "
+        )
+        .unwrap();
+        // 前置：这张表确实会被选中（否则下面的断言是在空转）
+        let tables = message_tables(&conn);
+        assert_eq!(
+            tables.len(),
+            1,
+            "夹具表必须落在 message_tables 的谓词里: {tables:?}"
+        );
+        let err = read_new(&conn, "msg_2021f50af0b435101c0219d73dd2d44b", &Watermark::default(), None)
+            .expect_err("无 time 列必须报错，不能静默返回空增量");
+        let text = format!("{err}");
+        assert!(
+            text.contains("no time column"),
+            "错误要点名成因（运维只能凭这串判断是哪类列形态）: {text}"
+        );
+        assert!(text.contains("msg_2021"), "错误要带表名: {text}");
+    }
+
+    /// 对照：同一条夹具把时间列补上，就应当正常读到行（证明上一条不是因为
+    /// 「表根本读不了」而报错——那样上一条就成了空转）。
+    #[test]
+    fn same_table_reads_once_the_time_column_exists() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE msg_2021f50af0b435101c0219d73dd2d44b (
+                local_id INTEGER PRIMARY KEY,
+                server_id TEXT,
+                local_type INTEGER,
+                create_time INTEGER,
+                sender_username TEXT
+            );
+            INSERT INTO msg_2021f50af0b435101c0219d73dd2d44b
+                (local_id, server_id, local_type, create_time, sender_username)
+                VALUES (1, 's1', 1, 1700000000, 'u1');
+        "
+        )
+        .unwrap();
+        let rows = read_new(&conn, "msg_2021f50af0b435101c0219d73dd2d44b", &Watermark::default(), None)
+            .expect("补上时间列后同一张表必须可读");
+        assert_eq!(rows.len(), 1, "对照基线: {rows:?}");
+    }
 }

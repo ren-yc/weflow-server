@@ -2021,3 +2021,57 @@ async fn sns_json_export_carries_content_desc_the_html_export_must_read() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 朋友圈 JSON 导出不带取图凭据（删 `token`/`key`，并把同值的 `rawThumb`/`resolvedThumbUrl`
+/// 一起去掉）。导出物会被转发、存档、贴进别处的文件，而代理端点只读 `url`——这些键留着
+/// 就是每个导出包多带一份第三方能直接使用的凭据；删掉它们不影响任何取图路径。
+///
+/// `rawUrl` 刻意保留：它是协议白名单的审计线索（渲染器不读它，所以恶意 scheme 进不了
+/// `href`，但读者要能看见被拒的原始地址是什么）。
+///
+/// 空转防护：夹具的 `<url>` 元素**确实带着** `md5`/`token`/`key`/`enc_idx` 四个属性，
+/// 所以「`md5` 与 `encIdx` 在导出里出现」这条断言同时钉住了「凭据属性确实被解析进来了」——
+/// 它们同源同元素。若夹具哪天丢了这些属性，前两条断言就会红，而不是让「删掉了凭据」
+/// 退化成恒真。
+#[tokio::test]
+async fn sns_json_export_drops_credential_media_keys() {
+    let dir = common::tmp_dir("smoke-sns-json-cred");
+    let state = test_state_with(&dir, common::add_sns_fixture);
+    let app = server::build_router(state);
+    let uri = format!("/api/v1/sns/export?username=wxid_sns_html01&format=json&access_token={TOKEN}");
+    let (status, body) = json_body(app.oneshot(request("GET", &uri, None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    let path = std::path::PathBuf::from(body["path"].as_str().expect("path 字段"));
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let media = doc["timeline"][0]["media"].as_array().expect("一条媒体");
+    assert_eq!(media.len(), 1, "夹具应产出一条媒体: {media:?}");
+    let m = &media[0];
+    // 同元素的兄弟属性在场 ⇒ 凭据属性也确实被解析进来了（否则下面的「缺席」是空转）
+    assert_eq!(
+        m["md5"].as_str(),
+        Some("2021f50af0b435101c0219d73dd2d44b"),
+        "md5 与凭据属性同元素，它必须在场（否则本测试在空夹具上空转）"
+    );
+    assert_eq!(m["encIdx"].as_str(), Some("7"), "encIdx 是定位序号，保留");
+    // 凭据类键全部缺席
+    for k in ["token", "key", "rawThumb", "resolvedThumbUrl"] {
+        assert!(m.get(k).is_none(), "导出物不该带 {k}（取图凭据／同值冗余键）: {m}");
+    }
+    // 代理形态仍在（删的是凭据，不是可取性）
+    assert!(
+        m["url"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("/api/v1/sns/media/proxy?url="),
+        "url 仍应是同源代理相对路径: {m}"
+    );
+    assert_eq!(m["proxyUrl"], m["url"], "proxyUrl 与 url 同值（代理形态）");
+    // 审计线索保留
+    assert_eq!(
+        m["rawUrl"].as_str(),
+        Some("javascript:alert(1)"),
+        "rawUrl 是白名单的审计线索，必须保留原样"
+    );
+    assert_eq!(m["resolvedUrl"].as_str(), Some("javascript:alert(1)"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -32,17 +32,23 @@ fn sns_feed_json(store: &crate::store::Store, f: &crate::store::SnsFeed) -> serd
         .media
         .iter()
         .map(|m| {
+            // 导出物会被转发、存档、贴进别处的文件，取图凭据不该在里面：
+            // "token"／"key" 是微信侧的访问与解密参数，而代理端点（media_proxy）
+            // 只读 url（＋可选 referer/user_agent）——删掉它们不影响任何取图路径；
+            // 留着则是每个导出包都多带一份第三方可以直接使用的凭据。
+            // "rawThumb" 与 "resolvedThumbUrl" 是**同一个值**（都是原始 thumb URL）：
+            // 只删其中一个等于没删，两个一起去掉；代理形态仍由 "thumb"／
+            // "proxyThumbUrl" 提供。
+            // "rawUrl" 刻意保留：它是协议白名单的**审计线索**——HTML 渲染器不读它
+            // （恶意 scheme 因此进不了 href），而读者需要能在导出物里看见被拒的原始
+            // 地址到底是什么。回归位置：sns_json_export_drops_credential_media_keys。
             let mut e = json!({
                 "url": proxy(&m.url),
                 "thumb": proxy(m.thumb.as_deref().unwrap_or("")),
                 "md5": m.md5,
-                "token": m.token,
-                "key": m.key,
                 "encIdx": m.enc_idx,
                 "rawUrl": m.url,
-                "rawThumb": m.thumb,
                 "resolvedUrl": m.url,
-                "resolvedThumbUrl": m.thumb,
             });
             if let Some(o) = e.as_object_mut() {
                 o.insert("proxyUrl".into(), o["url"].clone());

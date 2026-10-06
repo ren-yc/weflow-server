@@ -578,8 +578,21 @@ where
     let mut skipped = Vec::new();
     let mut total = 0u64;
     let mut index_rows: Vec<Value> = Vec::new();
+    // 本轮**已经交付**的（会话 → 文件名）。!opts.resume && path.exists() 不能直接拒绝：
+    // 全量重导同一个会话是合法用法（for t in targets 里同一个 talker 出现两次，第一次
+    // 交付的文件就在盘上），只有**不属于本轮**的既有文件才是覆盖事故。
+    let mut round_files: BTreeMap<String, BTreeSet<PathBuf>> = BTreeMap::new();
     // `--resume` 要真是「续跑」：文件名与清单都必须以上一轮为准（见 previous_index 的说明）。
     let previous = if opts.resume { previous_index(&opts.out_dir) } else { BTreeMap::new() };
+    // 非续跑轮也要**读**上一轮清单，只是不拿它做复用判据：盘上已有产物若不在本轮登记的
+    // 名字集合里，taken 根本不认识它，于是编号会撞出一个同名文件并被 rename 静默覆盖
+    // ——被覆盖的那个属于未在本轮的会话，而新一轮清单又没有它的条目，于是既看不见也
+    // 不能自愈（子集轮最容易踩到：--session 少给一个会话，那个会话的产物就在射程内）。
+    // 刻意**不**把清单登记的行播种进 taken：那会让撞名会话改拿 -2 留下第二份产物，
+    // 而两份内容不同的同名产物对使用者比一次响亮拒绝更糟。回归位置：
+    // subset_export_refuses_to_clobber_another_sessions_artifact。
+    let recorded_index: BTreeMap<String, Value> =
+        if opts.resume { previous.clone() } else { previous_index(&opts.out_dir) };
     // 上一轮的产物名先全部占位（按折叠键）：文件名编号按本轮输入列表的顺序算，新增会话
     // 排在旧会话前面时会抢走它的名字，旧会话随后沿用旧名就在大小写不敏感的卷上互相覆盖。
     for row in previous.values() {
@@ -615,6 +628,44 @@ where
         };
         // 文件名先算出来才能判断 --resume：确定性（同样的输入→同样的名字）是续跑的前提。
         let path = opts.out_dir.join(format!("{stem}.{ext}"));
+        if !opts.resume && path.exists() {
+            // 判据是**归属**，不是「本轮有没有写过」：既有产物属于别的会话、或谁都不
+            // 认领时，本轮写下去就是把别人的交付物静默换成这个会话的内容——而新清单里
+            // 没有那个会话的条目，于是它既看不见也不能自愈。同名重导（同一会话有意重跑）
+            // 不在此列：那是「重导自己」，本轮的取数会覆盖自己的旧产物，语义正确。
+            let name_here = path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let owner = recorded_index.iter().find_map(|(talker, row)| {
+                (row.get("file").and_then(Value::as_str) == Some(name_here.as_str()))
+                    .then(|| talker.clone())
+            });
+            let own_rerun = owner.as_deref() == Some(target.talker.as_str());
+            // 同一 talker 在本轮出现两次（targets 是调用方给的，不去重）：第二次是在
+            // 覆盖本轮自己刚交付的产物，属同一语义，放行。
+            let this_round = round_files
+                .get(&target.talker)
+                .map(|names| names.contains(&path))
+                .unwrap_or(false);
+            if !own_rerun && !this_round {
+                let why = match &owner {
+                    Some(o) => format!("它属于会话 {o}"),
+                    None => "它没有被任何一轮清单认领（外部文件，或清单已丢失）".to_string(),
+                };
+                // 会话级失败，不是整轮中止：其余会话的交付不该被一次撞名连坐。
+                // skipped 非空 ⇒ CLI 以 1 退出（既有口径），所以不新增退出码。
+                // 起手前就拒，因此本轮没有 .part 需要清理。有意覆盖自己的旧产物
+                // 走 --resume（它会核对清单、残留 .part、媒体承诺与内容完整性）。
+                tracing::warn!(
+                    "跳过会话 {}：拒绝覆盖既有产物 {}（{why}）——它不是这个会话的交付物",
+                    target.talker,
+                    path.display()
+                );
+                skipped.push(target.talker.clone());
+                continue;
+            }
+        }
         if opts.resume && path.exists() {
             // 复用必须同时满足三条，缺一条就重写：
             //   1. 上一轮的清单记着这个会话——「有个同名文件」不是完成记录。少了这条，
@@ -651,6 +702,10 @@ where
                 if let Some(row) = previous.get(&target.talker) {
                     index_rows.push(row.clone());
                 }
+                round_files
+                    .entry(target.talker.clone())
+                    .or_default()
+                    .insert(path.clone());
                 continue;
             }
             // 半成品**不能**当成已完成：否则 --resume 会永久跳过它。
@@ -707,7 +762,11 @@ where
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        written.push(path);
+        written.push(path.clone());
+        round_files
+            .entry(target.talker.clone())
+            .or_default()
+            .insert(path);
         index_rows.push(json!({
             "talker": target.talker,
             "file": file,
@@ -1177,6 +1236,110 @@ mod tests {
     // 复用判据不能只是"最终名存在且内容便宜判据通过"。清单被删或被截断时，本轮新算出的
     // 名字撞上别人的旧产物，就会把一个从没导出过的会话静默判成已完成——而它在新一轮清单
     // 里没有条目，于是既看不见也不能自愈。
+    /// 子集导出撞名时**拒绝覆盖**别的会话的既有产物（会话级 skipped ⇒ 退 1）。
+    ///
+    /// 失败模式（修之前）：`taken` 从空开始、编号按本轮输入重算，于是本轮新会话能算出与
+    /// 一个**未在本轮**的会话已交付产物同名的文件名，`.part` 收尾 rename 直接把它盖掉；
+    /// 而新一轮 `index.json` 又没有那个会话的条目 ⇒ 交付物被换掉、清单不再提它、下一轮
+    /// 也无从自愈。判据是**归属**（既有产物登记在另一个会话名下），不是「本轮写过没有」。
+    #[test]
+    fn subset_export_refuses_to_clobber_another_sessions_artifact() {
+        let dir = tmp("clobber-refuse");
+        // 第一轮：会话 a 交付成 "Team.jsonl"。
+        run(
+            &[mk("wxid_a", "Team")],
+            &opts(&dir, Format::Jsonl, false, ""),
+            |_t, on_page| on_page(&[row("1", 1, "u1", "")]),
+        )
+        .unwrap();
+        let first = std::fs::read_to_string(dir.join("Team.jsonl")).unwrap();
+        assert!(first.contains("\"platformMessageId\":\"1\""), "第一轮产物基线: {first}");
+        // 第二轮：只导会话 b，而它的显示名折叠后与 a 同名。
+        let mut fetched = 0;
+        let got = run(
+            &[mk("wxid_b", "Team")],
+            &opts(&dir, Format::Jsonl, false, ""),
+            |_t, on_page| {
+                fetched += 1;
+                on_page(&[row("9", 9, "u9", "")])
+            },
+        )
+        .unwrap();
+        assert_eq!(got.skipped, vec!["wxid_b".to_string()], "撞名会话要进 skipped");
+        assert_eq!(fetched, 0, "拒绝发生在起手前：不该去取数");
+        assert!(got.written.is_empty(), "被拒的会话不该记成交付: {:?}", got.written);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("Team.jsonl")).unwrap(),
+            first,
+            "会话 a 的既有产物必须原样保留，不能被会话 b 覆盖"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 但**同一会话有意重导**不算覆盖事故——它覆盖的是自己的旧产物。
+    ///
+    /// 若这里也拒，`export --session X` 重跑同一个会话就会永久失败（除非人先去删文件），
+    /// 那是把「保护交付物」做成「交付物一旦生成就改不了」。判据用归属区分这两种情形：
+    /// owner == 本会话 ⇒ 放行。回归位置：`intentional_rerun_of_same_session_overwrites_itself`。
+    #[test]
+    fn intentional_rerun_of_same_session_overwrites_itself() {
+        let dir = tmp("rerun-self");
+        let t = mk("wxid_a", "A");
+        run(std::slice::from_ref(&t), &opts(&dir, Format::Jsonl, false, ""), |_t, on_page| {
+            on_page(&[row("1", 1, "u1", "")])
+        })
+        .unwrap();
+        let got = run(
+            &[t],
+            &opts(&dir, Format::Jsonl, false, ""),
+            |_t, on_page| on_page(&[row("2", 2, "u2", "")]),
+        )
+        .unwrap();
+        assert!(got.skipped.is_empty(), "重导自己的会话不该被拒: {:?}", got.skipped);
+        let body = std::fs::read_to_string(dir.join("A.jsonl")).unwrap();
+        assert!(body.contains("\"platformMessageId\":\"2\""), "第二轮内容应生效: {body}");
+        assert!(!body.contains("\"platformMessageId\":\"1\""), "旧内容不该残留: {body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 既有产物**没有被任何一轮清单认领**（外力放的、或清单已丢失）时同样拒绝覆盖。
+    ///
+    /// 这是最安静的一类数据丢失：导出目录里躺着一个 `A.jsonl`，index 里却不提它，本轮
+    /// 算出的名字正好撞上——若放行，那份「没人认领但确实存在」的文件就被换了内容，而
+    /// 事后从清单里查不到它曾经存在过。
+    #[test]
+    fn unowned_leftover_file_is_not_clobbered() {
+        let dir = tmp("clobber-unowned");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("A.jsonl"), "{ EXTERNAL, NOT OURS }\n").unwrap();
+        let mut fetched = 0;
+        let got = run(
+            &[mk("wxid_a", "A")],
+            &opts(&dir, Format::Jsonl, false, ""),
+            |_t, on_page| {
+                fetched += 1;
+                on_page(&[row("1", 1, "u1", "")])
+            },
+        )
+        .unwrap();
+        assert_eq!(got.skipped, vec!["wxid_a".to_string()], "无人认领的同名文件须拒绝覆盖");
+        assert_eq!(fetched, 0, "拒绝发生在起手前");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("A.jsonl")).unwrap(),
+            "{ EXTERNAL, NOT OURS }\n",
+            "外部文件内容必须原样保留"
+        );
+        // 先删掉它，重导就正常成功：拒绝只针对「不明来源的既有产物」。
+        std::fs::remove_file(dir.join("A.jsonl")).unwrap();
+        let got2 = run(
+            &[mk("wxid_a", "A")],
+            &opts(&dir, Format::Jsonl, false, ""),
+            |_t, on_page| on_page(&[row("2", 2, "u2", "")]),
+        )
+        .unwrap();
+        assert!(got2.skipped.is_empty(), "删除后重导应成功: {:?}", got2.skipped);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn resume_needs_the_completion_record_not_just_a_matching_file() {
         let dir = tmp("orphan-artifact");

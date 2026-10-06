@@ -561,7 +561,7 @@ pub fn add_sns_fixture(storage: &Path, key: &Key) {
         conn
             .execute_batch("CREATE TABLE SnsTimeLine (tid INTEGER PRIMARY KEY, user_name TEXT, content TEXT);")
             .unwrap();
-        let xml = r#"<SnsDataItem><TimelineObject><id>sns-obj-1</id><createTime>1700000099</createTime><contentDesc>sns-body-marker & "q" <i>粗</i></contentDesc><ContentObject><type>2</type><mediaList><media><url>javascript:alert(1)</url></media></mediaList></ContentObject></TimelineObject><LocalExtraInfo><tid>-9001</tid><nickname>SNS 作者</nickname></LocalExtraInfo></SnsDataItem>"#;
+        let xml = r#"<SnsDataItem><TimelineObject><id>sns-obj-1</id><createTime>1700000099</createTime><contentDesc>sns-body-marker & "q" <i>粗</i></contentDesc><ContentObject><type>2</type><mediaList><media><url type="1" md5="2021f50af0b435101c0219d73dd2d44b" token="SNS-URL-TOKEN" key="SNS-URL-KEY" enc_idx="7">javascript:alert(1)</url></media></mediaList></ContentObject></TimelineObject><LocalExtraInfo><tid>-9001</tid><nickname>SNS 作者</nickname></LocalExtraInfo></SnsDataItem>"#;
         conn.execute(
             "INSERT INTO SnsTimeLine (tid, user_name, content) VALUES (?1, ?2, ?3)",
             rusqlite::params![-9001i64, "wxid_sns_html01", xml],

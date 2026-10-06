@@ -221,11 +221,15 @@ pub struct SnsMedia {
     pub width: i64,
     /// 像素高；未知时为 `0`。
     pub height: i64,
-    /// CDN access material (passthrough for proxy clients)
+    /// CDN access material, parsed from the source XML.
+    ///
+    /// **刻意不进 JSON 导出**：导出物会被转发与存档，而代理端点
+    /// （`media_proxy`）只读 url——留个字段是为了「解析层忠实于源」，
+    /// 不是「可以往外写」。回归位置：`sns_json_export_drops_credential_media_keys`。
     pub token: Option<String>,
-    /// 解码密钥材料（原样透传给代理客户端，本 crate 不解读它）。
+    /// 解码密钥材料（同上：解析保留、导出不含，本 crate 不解读它）。
     pub key: Option<String>,
-    /// 加密索引（同上，原样透传）。
+    /// 加密索引（随导出保留：它是定位用的序号，不是凭据）。
     pub enc_idx: Option<String>,
 }
 
