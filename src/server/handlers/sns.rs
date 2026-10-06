@@ -403,7 +403,9 @@ fn html_escape(s: &str) -> String {
 /// 让读者看得见被拒的是什么，而不是凭空少一块内容。
 fn media_link_html(u: &str) -> String {
     let lower = u.to_ascii_lowercase();
-    let same_origin = u.starts_with('/') && !u.starts_with("//");
+    // 同源相对路径要连反斜杠一起挡：浏览器对特殊协议把 "\\" 归一为 "/"，于是 "/\\evil.example" 会
+    // 解析成协议相对的跨源地址——看着像同源，跳出去是别人家的。
+    let same_origin = u.starts_with('/') && !u.starts_with("//") && !u.contains('\\');
     let web = lower.starts_with("http://") || lower.starts_with("https://");
     let esc = html_escape(u);
     if same_origin || web {
@@ -433,10 +435,16 @@ fn article_html(e: &serde_json::Value) -> String {
                 .collect::<String>()
         })
         .unwrap_or_default();
+    // createTime 走数字分支：serde_json::Value 的 Display **不做 HTML 转义**。生产者今天恒给 i64，
+    // 但这个渲染器收的是任意 JSON —— 上游一旦换成字符串，</time><script>… 就直接进文档。
+    let when = match e["createTime"].as_i64() {
+        Some(n) => n.to_string(),
+        None => html_escape(e["createTime"].as_str().unwrap_or("")),
+    };
     format!(
         "<article><header><b>{}</b> <time>{}</time></header><p>{}</p>{}</article>\n",
         html_escape(e["displayName"].as_str().unwrap_or("")),
-        e["createTime"],
+        when,
         html_escape(e["contentDesc"].as_str().unwrap_or("")),
         media_html,
     )
@@ -831,6 +839,23 @@ mod tests {
         );
     }
 
+    /// 渲染器收的是任意 JSON："createTime" 换成字符串时也不得把标签原样写出去。
+    #[test]
+    fn article_html_never_emits_raw_markup_from_create_time() {
+        let e = serde_json::json!({
+            "displayName": "张三",
+            "createTime": "</time><script>alert(1)</script>",
+            "contentDesc": "",
+            "media": [],
+        });
+        let html = article_html(&e);
+        assert!(!html.contains("<script>"), "字符串时间戳不得注入标签: {html}");
+        assert!(html.contains("&lt;/time&gt;"), "应以转义形态出现: {html}");
+        // 数字时间戳原样可读（别把正常形态也转义没了）
+        let ok = article_html(&serde_json::json!({"displayName": "n", "createTime": 1700000099, "contentDesc": "", "media": []}));
+        assert!(ok.contains("<time>1700000099</time>"), "数字时间戳要保持可读: {ok}");
+    }
+
     #[test]
     fn media_link_html_limits_the_href_to_a_protocol_allowlist() {
         // 同源相对路径（本服务代理的形态）与 http(s) 保留链接
@@ -852,5 +877,14 @@ mod tests {
         // 属性位突破：URL 文本里的引号转义后不能提前闭合 href。
         let q = media_link_html(r#"https://x.example/" onmouseover=alert(1) //"#);
         assert!(!q.contains(r#"" onmouseover="#), "属性位不得被突破: {q}");
+        // 反斜杠形态：浏览器把 "@"BS"@" 归一为 "/"，"@"BS@@BS"@" 看着同源实则协议相对跨源，必须拒。
+        for slash in [r"/\evil.example/x.js", r"/\#", r"/a\b"] {
+            let h = media_link_html(slash);
+            assert!(!h.contains(r#"<a href="#), "{slash} 看似同源实则跨源: {h}");
+        }
+        // 正向回归：生产的代理形态把反斜杠百分号编码成 %5C，绝不能被我新加的反斜杠规则误伤
+        // —— 误伤会让所有朋友圈媒体从链接退化成纯文本。
+        let proxied = media_link_html("/api/v1/sns/media/proxy?url=a%5Cb%5C");
+        assert!(proxied.contains(r#"<a href="#), "代理形态必须仍是链接: {proxied}");
     }
 }

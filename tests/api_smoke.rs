@@ -1975,18 +1975,29 @@ async fn sns_html_export_escapes_display_names_and_links() {
     let html = std::fs::read_to_string(&path).unwrap();
 
     // 显示名：脚本必须只是文本，不是可执行标签（受害者一打开导出文件就执行，就是这条缺陷）
+    // 外层 <title> 也带同一份转义文本，所以只断言"含转义形态"没有区分力 —— 钉的是
+    // **"<b>" 里**的形态（article 的显示名位），外加"整份文档不含未转义标签"。
     assert!(
-        html.contains("&lt;img src=x onerror=alert(1)&gt;"),
-        "显示名应以转义形态出现: {html}"
+        html.contains(r#"<b>&lt;img src=x onerror=alert(1)&gt;</b>"#),
+        "显示名应以转义形态落在 <b> 里: {html}"
     );
     assert!(!html.contains("<img "), "未转义的标签不得落盘: {html}");
-    // 正文：同一条动态的 contentDesc 必须出现在 HTML 里
+    // 正文：① 必须出现在 HTML 里（读错键就是那条静默变空的缺陷）；② 其中的特殊字符必须是
+    // **转义后的形态** —— 夹具正文刻意带 & 引号与标签，删掉正文转义这条就红。
     assert!(html.contains("sns-body-marker"), "正文不得静默变空: {html}");
-    // 媒体：代理形态是同源相对路径（合法），恶意 scheme 不给链接
     assert!(
-        !html.contains(r#"href="javascript:"#),
-        "javascript: 不得成为可执行链接: {html}"
+        html.contains(r#"<p>sns-body-marker &amp; &quot;q&quot; &lt;i&gt;粗&lt;/i&gt;</p>"#),
+        "正文必须按 HTML 转义落盘: {html}"
     );
+    assert!(!html.contains("<i>"), "正文里的标签不得原样落盘: {html}");
+    // 媒体：生产路径的 URL 恒为**同源代理相对路径**（恶意 scheme 在 "rawUrl" 里，渲染器不读它）。
+    // 白名单的拒绝分支在端到端不可达，由 media_link_html 的单元测试直接钉；这里钉的是
+    // "代理形态确实成为链接、且没有原始 scheme 漏进 href"。
+    assert!(
+        html.contains(r#"href="/api/v1/sns/media/proxy?url=javascript%3Aalert%281%29""#),
+        "代理相对路径应保留为链接: {html}"
+    );
+    assert!(!html.contains(r#"href="javascript"#), "原始 scheme 不得进 href: {html}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2003,7 +2014,7 @@ async fn sns_json_export_carries_content_desc_the_html_export_must_read() {
     let path = std::path::PathBuf::from(body["path"].as_str().expect("path 字段"));
     let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     let entry = &doc["timeline"][0];
-    assert_eq!(entry["contentDesc"], "sns-body-marker");
+    assert_eq!(entry["contentDesc"], r#"sns-body-marker & "q" <i>粗</i>"#);
     assert!(
         entry.get("content").is_none(),
         "生产者从来不给 content 键：HTML 侧读它就是那条静默变空的缺陷: {entry}"
