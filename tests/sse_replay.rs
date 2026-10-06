@@ -74,7 +74,7 @@ async fn start(dir: &std::path::Path) -> TestServer {
         &storage,
         keystore::KeyMap::from(key),
         store.clone(),
-        state.events.clone(),
+        state.bus.clone(),
     )));
     sync.lock().full_sync().unwrap();
 
@@ -211,9 +211,9 @@ async fn sse_replay_after_reconnect() {
     let reader = sse_frames(&server, None, Duration::from_secs(8), 2);
     let sender = async {
         tokio::time::sleep(Duration::from_millis(300)).await;
-        server.state.events.send(event1).ok();
+        server.state.bus.publish(event1);
         tokio::time::sleep(Duration::from_millis(300)).await;
-        server.state.events.send(event2).ok();
+        server.state.bus.publish(event2);
     };
     let f2 = tokio::join!(reader, sender).0;
     let new_events: Vec<_> = f2.iter().filter(|(_, e, _)| e == "message.new").collect();
@@ -234,6 +234,57 @@ async fn sse_replay_after_reconnect() {
     assert!(
         !f4.iter().any(|(_, e, _)| e == "message.new"),
         "no replay past id2: {f4:?}"
+    );
+}
+
+/// 历史由**生产者**单点写入，两半失败模式都要钉住：
+/// ① 没有任何 SSE 连接在线时广播没有接收者 —— 修复前由订阅端各自 append，零订阅者
+///    意味着**没有人在写历史**，这段时间的事件从此不在重放窗口里，之后带
+///    `Last-Event-ID` 重连的客户端漏收却无从得知；
+/// ② N 个订阅者在线时同一条被写 N 次，id 随连接数跳号，1000 条的窗口被重复条目稀释。
+#[tokio::test]
+async fn sse_history_is_recorded_once_without_subscribers() {
+    let dir = common::tmp_dir("ssehist-single-writer");
+    let server = start(&dir).await;
+    let ev = |rawid: &str, ts: i64| {
+        weflow_server::sync::Event::New(weflow_server::sync::NewMessageEvent {
+            session_id: common::FAKE_GROUP.to_string(),
+            session_type: "group",
+            rawid: rawid.into(),
+            source_name: "a".into(),
+            group_name: Some("g".into()),
+            content: "hello".into(),
+            timestamp: ts,
+            media: None,
+        })
+    };
+
+    // ① 此刻没有任何 SSE 连接（start() 只起了服务）：publish 仍必须写历史。
+    let before = server.state.bus.history().lock().replay_since(0).len();
+    let id1 = server.state.bus.publish(ev("7001", 1_700_000_010));
+    let id2 = server.state.bus.publish(ev("7002", 1_700_000_011));
+    let after = server.state.bus.history().lock().replay_since(0);
+    assert_eq!(
+        after.len(),
+        before + 2,
+        "零订阅者时 publish 也必须写历史：漏一条 = 重连后那条永久消失",
+    );
+    assert_eq!(id2, id1 + 1, "每条事件只分配一个 id（订阅端各自写时会随连接数跳号）");
+
+    // ② 新连接的重放必须用**生产者分配的那对 id**；带着 id2 重连不得再收到这两条。
+    // 采到两条 message.new 为止（expected_new=0 会在第一帧 ready 就收摊，测不到重放）。
+    let f = sse_frames(&server, None, Duration::from_secs(3), 2).await;
+    let news: Vec<u64> = f.iter().filter(|(_, e, _)| e == "message.new").map(|(id, _, _)| *id).collect();
+    assert!(
+        news.contains(&id1) && news.contains(&id2),
+        "重放帧的 id 必须是生产者的编号（订阅端自己编号时历史里已有同号条目，两边会分叉）: {f:?}",
+    );
+    // 反向：永不满足 expected_new ⇒ 整窗读满，断言才是真「这段时间没有任何重放」。
+    let f2 = sse_frames(&server, Some(id2), Duration::from_secs(2), 5).await;
+    let news2: Vec<u64> = f2.iter().filter(|(_, e, _)| e == "message.new").map(|(id, _, _)| *id).collect();
+    assert!(
+        !news2.contains(&id1) && !news2.contains(&id2),
+        "带 Last-Event-ID={id2} 重连不得重复收到这两条: {f2:?}",
     );
 }
 
@@ -303,7 +354,7 @@ async fn subscriber_survives_account_registration() {
         );
         tokio::time::sleep(Duration::from_millis(300)).await;
         // Published on the global bus — the pre-registration subscriber must see it.
-        state.events.send(event).ok();
+        state.bus.publish(event);
     };
     let frames = tokio::join!(reader, writer).0;
     assert!(
@@ -345,7 +396,7 @@ async fn sse_payload_keys_are_pinned() {
     let reader = sse_frames(&server, None, Duration::from_secs(8), 1);
     let sender = async {
         tokio::time::sleep(Duration::from_millis(300)).await;
-        server.state.events.send(ev).ok();
+        server.state.bus.publish(ev);
     };
     let frames = tokio::join!(reader, sender).0;
     let (_, _, data) = frames
@@ -444,7 +495,7 @@ async fn sse_media_id_is_advertised_and_fetchable() {
     let reader = sse_frames(&server, None, Duration::from_secs(8), 1);
     let sender = async {
         tokio::time::sleep(Duration::from_millis(300)).await;
-        server.state.events.send(ev).ok();
+        server.state.bus.publish(ev);
     };
     let frames = tokio::join!(reader, sender).0;
     let (_, _, data) = frames
@@ -525,8 +576,8 @@ async fn chatlab_revoke_frame_carries_platform_message_id() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     server
         .state
-        .events
-        .send(weflow_server::sync::Event::Revoke(weflow_server::sync::RevokeEvent {
+        .bus
+        .publish(weflow_server::sync::Event::Revoke(weflow_server::sync::RevokeEvent {
             session_id: common::FAKE_GROUP.to_string(),
             session_type: "group",
             rawid: "9001".into(),
@@ -534,8 +585,7 @@ async fn chatlab_revoke_frame_carries_platform_message_id() {
             group_name: Some("项目群".into()),
             content: "对方撤回了一条消息".into(),
             timestamp: 1_700_000_005,
-        }))
-        .ok();
+        }));
 
     // 第一帧是基线 `sync`，所以一直读到 `message.revoke` 为止。
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);

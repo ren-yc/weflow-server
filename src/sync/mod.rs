@@ -19,6 +19,7 @@
 //! we never hold transactions across polls (so checkpoints are never blocked
 //! by us).
 
+pub mod history;
 pub mod watch;
 
 use std::path::{Path, PathBuf};
@@ -34,6 +35,7 @@ use crate::db::scan::{self, DbFile, DbKind};
 use crate::keystore::KeyMap;
 use crate::store::index::{self, read_new};
 use crate::store::{MessageRecord, Store, Watermark};
+use crate::sync::history::{EventBus, Stamped};
 
 /// Events broadcast to SSE subscribers (and consumed by tests).
 #[derive(Debug, Clone)]
@@ -178,11 +180,17 @@ impl Work {
 pub struct AccountSync {
     pub wxid: String,
     pub store: Arc<RwLock<Store>>,
-    /// 内部事件总线。服务层的 SSE 直接订阅它 —— **这不是承诺面**：它要求调用方用 tokio 的
-    /// `broadcast` 并处理 `RecvError::Lagged`，而嵌入者不该被绑到这两件事上。
-    pub(crate) events: broadcast::Sender<Event>,
+    /// 内部事件总线（重放历史 ＋ 广播通道）。服务层的 SSE 直接订阅它 —— **这不是承诺面**：
+    /// 它要求调用方用 tokio 的 `broadcast` 并处理 `RecvError::Lagged`，而嵌入者不该被绑到
+    /// 这两件事上（见 [`crate::api::Sync::drain_events`]）。
+    ///
+    /// 发布只走 `publish`：**历史由生产者在广播前单点写入**。订阅端各自 append 会让事件 id
+    /// 随在线连接数跳号、把同一条塞进缓冲多次，而零订阅者时广播根本没人接 —— 那段事件就永远
+    /// 不在重放窗口里（断线重连的客户端因此漏收，且无从得知自己漏了）。回归：
+    /// `sse_history_is_recorded_once_without_subscribers`。
+    pub(crate) bus: EventBus,
     /// 给嵌入者的事件队列，见 [`AccountSync::drain_events`]。
-    events_rx: broadcast::Receiver<Event>,
+    events_rx: broadcast::Receiver<Stamped>,
     pool: LivePool,
     keys: KeyMap,
     /// Live source databases root (`<account>/db_storage`).
@@ -212,12 +220,12 @@ const READ_MAX_PAGES: usize = 2;
 
 impl AccountSync {
     pub fn new(wxid: &str, storage: &Path, keys: KeyMap, store: Arc<RwLock<Store>>) -> Self {
-        let (events, _) = broadcast::channel(1024);
-        let events_rx = events.subscribe();
+        let bus = EventBus::new(1024);
+        let events_rx = bus.subscribe();
         AccountSync {
             wxid: wxid.to_string(),
             store,
-            events,
+            bus,
             events_rx,
             pool: LivePool::new(),
             keys,
@@ -233,13 +241,13 @@ impl AccountSync {
         storage: &Path,
         keys: KeyMap,
         store: Arc<RwLock<Store>>,
-        events: broadcast::Sender<Event>,
+        bus: EventBus,
     ) -> Self {
-        let events_rx = events.subscribe();
+        let events_rx = bus.subscribe();
         AccountSync {
             wxid: wxid.to_string(),
             store,
-            events,
+            bus,
             events_rx,
             pool: LivePool::new(),
             keys,
@@ -265,7 +273,7 @@ impl AccountSync {
         let mut out = Vec::new();
         loop {
             match self.events_rx.try_recv() {
-                Ok(ev) => out.push(ev),
+                Ok(stamped) => out.push(stamped.event),
                 // `Lagged` 说明调用方太慢，中间的事件已被丢弃 —— 剩下的仍然取走。
                 Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
                 Err(_) => break,
@@ -558,7 +566,7 @@ impl AccountSync {
                             .and_then(|r| r.parsed.media.as_ref())
                             .map(PushMedia::from),
                     };
-                    let _ = self.events.send(Event::New(ev));
+                    self.bus.publish(Event::New(ev));
                 }
             }
             for (session, row) in revoke_rows {
@@ -604,7 +612,7 @@ impl AccountSync {
                     content,
                     timestamp: row.create_time,
                 };
-                let _ = self.events.send(Event::Revoke(ev));
+                self.bus.publish(Event::Revoke(ev));
             }
         }
 

@@ -20,13 +20,13 @@ use std::sync::Arc;
 use anyhow::Result;
 use axum::Router;
 use parking_lot::{Mutex, RwLock};
-use tokio::sync::broadcast;
 
 use crate::config::Config;
 use crate::db::scan::AccountInfo;
 use crate::server::error::ApiError;
 use crate::store::Store;
 use crate::sync::{watch::WatchConfig, AccountSync, Event};
+use crate::sync::history::EventBus;
 
 /// One account's state-machine value, exposed via the token-protected
 /// `GET /api/v1/accounts` and echoed by the registration endpoint.
@@ -141,6 +141,8 @@ pub struct AccountHandle {
     pub stopped: Arc<std::sync::atomic::AtomicBool>,
 }
 
+pub use crate::sync::history::{HistoryBuf, HistoryItem};
+
 /// **事件基线代号**：注销账号时递增。
 ///
 /// 为什么需要它：注销会清掉重放缓冲里的条目，而**事件 id 计数器保留**（否则新账号的事件 id 会
@@ -161,62 +163,6 @@ pub fn bump_generation() -> u64 {
     GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
 }
 
-/// One buffered SSE event (WeFlow contract: replay cap 1000, TTL 10 min).
-///
-/// **存的是原始事件，不是序列化后的载荷。** 载荷形状是**视图**的事：两个面对同一个事件有不同的
-/// 形状要求（WeFlow 兼容面发完整消息，ChatLab 面只发元信息）。存序列化结果的话，后加的那个面
-/// 重放时会吐出**另一个面的形状** —— 而且这种错在只连新面时看不出来。
-pub struct HistoryItem {
-    pub id: u64,
-    pub at: std::time::Instant,
-    pub event: crate::sync::Event,
-}
-
-#[derive(Default)]
-pub struct HistoryBuf {
-    items: std::collections::VecDeque<HistoryItem>,
-    last_id: u64,
-}
-
-impl HistoryBuf {
-    pub const MAX: usize = 1000;
-    pub const TTL: std::time::Duration = std::time::Duration::from_secs(600);
-
-    /// Append an event and return its id (monotonic).
-    pub fn append(&mut self, event: crate::sync::Event) -> u64 {
-        self.last_id += 1;
-        self.items.push_back(HistoryItem {
-            id: self.last_id,
-            at: std::time::Instant::now(),
-            event,
-        });
-        while self.items.len() > Self::MAX {
-            self.items.pop_front();
-        }
-        self.last_id
-    }
-
-    /// 清空缓冲，但**不动 id 计数器**。
-    ///
-    /// 注销时用它：旧账号的事件对下一个账号没有意义，而计数器若一起归零，带着旧
-    /// `Last-Event-ID` 重连的客户端会把新事件当成「已经收过」而丢掉 —— 那比跳号更难查。
-    /// 跳号是看得见的，丢事件是看不见的。
-    pub fn clear(&mut self) {
-        self.items.clear();
-    }
-
-    /// Events with id > `since`, still within the TTL window.
-    ///
-    /// 返回**事件本身** —— 由调用它的那个面决定怎么序列化（见 [`HistoryItem`] 的说明）。
-    pub fn replay_since(&self, since: u64) -> Vec<(u64, crate::sync::Event)> {
-        let now = std::time::Instant::now();
-        self.items
-            .iter()
-            .filter(|i| i.id > since && now.duration_since(i.at) < Self::TTL)
-            .map(|i| (i.id, i.event.clone()))
-            .collect()
-    }
-}
 
 impl AccountHandle {
     pub fn status(&self) -> AccountStatus {
@@ -284,17 +230,12 @@ pub struct AppState {
     /// [`AppState::set_discovered`].
     pub discovered: Mutex<Vec<AccountInfo>>,
     pub shutdown: tokio::sync::watch::Sender<bool>,
-    /// Process-wide SSE event bus (qqflow-server parity). Global rather than
-    /// per-account so that `/api/v1/push/messages` needs no ready account to
-    /// subscribe (clients connect at startup and receive events once an
-    /// account finishes indexing), and so replacing an `error` account keeps
-    /// existing subscribers attached to the same sender.
-    pub events: broadcast::Sender<Event>,
-    /// SSE replay history for Last-Event-ID (1000 items / 10 min TTL).
-    /// Global for the same reason as `events` — and necessarily so: the frame
-    /// `id` is a bus-level monotonic sequence, which a per-account buffer
-    /// could not keep consistent across registrations.
-    pub history: Arc<Mutex<HistoryBuf>>,
+    /// 进程级事件总线（qqflow-server 同构）：重放历史 ＋ 广播通道，**绑成一件**。
+    /// 全局而非每账号：`/api/v1/push/messages` 无需 ready 账号即可订阅（客户端在启动时
+    /// 连接、账号建好索引后开始收事件），替换 `error` 账号也不会让在线订阅者失联。
+    /// 历史与通道必须成对：把裸 `Sender` 交出去，生产者就会忘记写历史 —— 而忘记的后果
+    /// （重放窗口里没有断线期间的事件）要等第一次重连才显形，见 `sync::history`。
+    pub bus: EventBus,
 }
 
 impl AppState {
@@ -316,8 +257,7 @@ impl AppState {
             accounts: Mutex::new(HashMap::new()),
             discovered: Mutex::new(Vec::new()),
             shutdown,
-            events: broadcast::channel(Self::EVENT_BUS_CAPACITY).0,
-            history: Arc::new(Mutex::new(HistoryBuf::default())),
+            bus: EventBus::new(Self::EVENT_BUS_CAPACITY),
         }
     }
 
@@ -714,7 +654,7 @@ pub async fn start_account(
                 };
                 // Global bus: clients already streaming (possibly since before
                 // this account existed) get the watermark baseline here.
-                let _ = state2.events.send(crate::sync::Event::Sync(wms));
+                state2.bus.publish(crate::sync::Event::Sync(wms));
                 let acct = handle2.sync.clone();
                 let dir = handle2.info.db_storage.clone();
                 let h = tokio::spawn(async move {
@@ -789,7 +729,7 @@ pub fn register_account(
         &info.db_storage,
         keys,
         store.clone(),
-        state.events.clone(),
+        state.bus.clone(),
     )));
     // No second owner of `sync` yet, so this lock cannot contend.
     let stopped = sync.lock().stop_flag();
@@ -977,7 +917,7 @@ pub fn deregister_account(state: &AppState, wxid: &str, purge_media: bool) -> De
     //    计数器**保留** —— 见 `HistoryBuf::clear` 与 `GENERATION` 的说明。基线代号让带着旧
     //    `Last-Event-ID` 重连的客户端能区分「注销后新账号刚开始」与「自己漏收了」。
     //    位置在账号校验之后：mismatch 与 NotRegistered 都在上一步 return 掉了。
-    state.history.lock().clear();
+    state.bus.history().lock().clear();
     bump_generation();
 
     // 3. Retire the sync side without touching `handle.sync`'s mutex.
@@ -999,7 +939,7 @@ pub fn deregister_account(state: &AppState, wxid: &str, purge_media: bool) -> De
         *guard = Store::default();
         (talkers, had_index)
     };
-    let _ = state.events.send(Event::Sync(current_watermarks(state)));
+    state.bus.publish(Event::Sync(current_watermarks(state)));
 
     let purged_dirs = if purge_media {
         purge_exported_media(&state.cfg.media_export_dir, &talkers)
@@ -1297,12 +1237,12 @@ mod tests {
         // 校验**之前**，任何猜错 wxid 的调用都能抹掉在线流的回看窗口，并把所有
         // 已连订阅者推进重基线（对服务端口免鉴权面等于一次拒绝服务）。挪到校验
         // 之后 ⇒ 这里塞一条历史再注销，条目与代号都必须原样。
-        state.history.lock().append(crate::sync::Event::Sync(vec![]));
+        state.bus.history().lock().append(crate::sync::Event::Sync(vec![]));
         // 本用例在 DEREG_LOCK 里：否则并发注销会推进进程级代号，这条断言变成竞态。
         let gen_before = current_generation();
         deregister_account(&state, "wxid_b", false);
         assert_eq!(
-            state.history.lock().replay_since(0).len(),
+            state.bus.history().lock().replay_since(0).len(),
             1,
             "mismatch 的注销不得清掉重放条目",
         );

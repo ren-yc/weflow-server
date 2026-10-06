@@ -63,7 +63,7 @@ fn test_state_with(
         &storage,
         weflow_server::keystore::KeyMap::from(key),
         store.clone(),
-        state.events.clone(),
+        state.bus.clone(),
     )));
     sync.lock().full_sync().unwrap();
 

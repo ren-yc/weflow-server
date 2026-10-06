@@ -237,10 +237,16 @@ tag，再驱动上面的执行入口。另有一步只跑 `nails-*`（四条数�
 
 ### SSE 总线
 
-`GET /api/v1/push/messages` 是长连接：订阅 `AppState.events` 这条 broadcast 总线，迟到者靠
-重放缓冲补齐。`/chatlab/push/messages` 挂在**同一条总线**上，只换了序列化器：它发的是通知帧
-（只带标识与时间，不带正文），连接机制（鉴权、重放、保活、基线）与老面完全一致。三点必须知道：
+`GET /api/v1/push/messages` 是长连接：订阅 `AppState.bus`（`sync::history::EventBus`，把重放
+历史与 broadcast 通道绑成一件），迟到者靠重放缓冲补齐。`/chatlab/push/messages` 挂在**同一条
+总线**上，只换了序列化器：它发的是通知帧（只带标识与时间，不带正文），连接机制（鉴权、重放、
+保活、基线）与老面完全一致。四点必须知道：
 
+- **历史由生产者单点写入**：`AccountSync` 与服务层都经 `EventBus::publish` 先写重放历史、再广播
+  带 id 的载荷，订阅端只读快照、不再各自 append。否则坏在两处：零订阅者时广播没人接、那段事件
+  根本不进历史，之后带旧 `Last-Event-ID` 重连的客户端漏收却无从得知；而 N 个在线订阅者各写一份
+  会让事件 id 随连接数跳号、1000 条窗口被重复条目稀释。回归：
+  `sse_history_is_recorded_once_without_subscribers`。
 - **载体是类型不是 `json!`**：`sync::events::Event` 是带 `skip_serializing_if` 的 struct，
   `PushMedia` 在**类型层面就没有** `aes_key` —— 密钥不会因为某次改动「忘了过滤」而泄露。
 - **推送载荷没有快照护栏**（快照的模型是一次请求一次响应），所以它的键集由

@@ -63,9 +63,8 @@ pub(crate) fn sse_from(
     serialize: Serializer,
 ) -> Response {
     let export_dir = export_dir.to_path_buf();
-    let replay = state.history.lock().replay_since(last_id);
-    let rx = state.events.subscribe();
-    let history = state.history.clone();
+    let replay = state.bus.history().lock().replay_since(last_id);
+    let rx = state.bus.subscribe();
     // An SSE stream never ends on its own, so it would hold graceful shutdown
     // open for the whole grace period. Watching the shutdown channel lets the
     // stream close itself and the drain finish promptly.
@@ -107,8 +106,9 @@ pub(crate) fn sse_from(
                     None => break,
                 },
             };
-            let ev = match item {
-                Ok(ev) => ev,
+            // 生产者已单点写入历史并分配 id；这里只消费，不再 append、不再编号。
+            let (id, ev) = match item {
+                Ok(stamped) => (stamped.id, stamped.event),
                 Err(_lagged) => {
                     // Subscriber fell behind. Re-baseline with the CURRENT
                     // watermarks: a bare `{"rebased":true}` tells the client
@@ -125,7 +125,6 @@ pub(crate) fn sse_from(
                     continue;
                 }
             };
-            let id = history.lock().append(ev.clone());
             let (name, payload) = serialize(ev, &export_dir);
             yield Ok(Event::default()
                 .id(id.to_string())
