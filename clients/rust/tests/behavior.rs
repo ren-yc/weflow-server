@@ -39,6 +39,9 @@ struct Mock {
     messages_query: Arc<StdMutex<Option<String>>>,
     /// When set, the accounts route answers `indexing` forever (timeout test).
     always_indexing: bool,
+    /// Statuses the accounts route answers, in order (FIFO), before the normal page.
+    /// A transient 5xx must be waited out; a 4xx must not be.
+    accounts_status_seq: Arc<StdMutex<Vec<u16>>>,
     /// When set, `GET /api/v1/accounts` answers this page verbatim.
     accounts_page: Arc<StdMutex<Option<serde_json::Value>>>,
     /// How many times the accounts route was hit (asserts "no polling").
@@ -139,6 +142,13 @@ fn assert_bearer(headers: &HeaderMap) {
 async fn accounts_get(State(mock): State<Mock>, headers: HeaderMap) -> Response {
     assert_bearer(&headers);
     *mock.accounts_calls.lock().unwrap() += 1;
+    let injected = {
+        let mut seq = mock.accounts_status_seq.lock().unwrap();
+        if seq.is_empty() { None } else { Some(seq.remove(0)) }
+    };
+    if let Some(status) = injected {
+        return (StatusCode::from_u16(status).unwrap(), "not yet").into_response();
+    }
     if let Some(page) = mock.accounts_page.lock().unwrap().clone() {
         return Json(page).into_response();
     }
@@ -529,6 +539,51 @@ async fn media_bytes_without_a_handle_is_unexpected_body_not_a_fake_404() {
 }
 
 #[tokio::test]
+async fn media_precondition_errors_name_the_real_endpoint_not_prose() {
+    // Three local preconditions (no handle, empty talker, empty file name, empty id)
+    // used to put a sentence into the `url` field: a caller classifying by url prefix
+    // saw prose where a path belongs, and the cases were indistinguishable in logs.
+    // `detail` carries the reason; `url` stays the endpoint this call targets.
+    let mock = Mock::default();
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+    let no_media: weflow_client::generated::r#gen::types::ChatlabMessage =
+        serde_json::from_value(serde_json::json!({
+            "accountName": "alice", "content": "x", "groupNickname": "",
+            "platformMessageId": "1", "sender": "alice",
+            "timestamp": 1_700_000_000, "type": 1,
+        }))
+        .unwrap();
+    let blank_name: weflow_client::generated::r#gen::types::ChatlabMessage =
+        serde_json::from_value(serde_json::json!({
+            "accountName": "alice", "content": "x", "groupNickname": "",
+            "media": {"type": "image", "fileName": "", "md5": "z"},
+            "platformMessageId": "2", "sender": "alice",
+            "timestamp": 1_700_000_000, "type": 1,
+        }))
+        .unwrap();
+    let cases = vec![
+        client.media_bytes(&no_media, "wxid_alice").await.unwrap_err(),
+        client.media_bytes(&blank_name, "").await.unwrap_err(),
+        client.media_bytes(&blank_name, "wxid_alice").await.unwrap_err(),
+        client.media_bytes_by_id("").await.unwrap_err(),
+    ];
+    for err in cases {
+        match err {
+            ClientError::UnexpectedBody { url, detail } => {
+                assert!(url.ends_with("/api/v1/media"), "url must be the endpoint: {url}");
+                assert!(!detail.is_empty(), "the reason belongs in detail");
+            }
+            other => panic!("expected UnexpectedBody, got {other:?}"),
+        }
+    }
+    assert!(
+        mock.media_calls.lock().unwrap().is_empty(),
+        "a local precondition failure must not reach the server"
+    );
+}
+
+#[tokio::test]
 async fn watch_decodes_frames_and_reconnects_with_last_event_id() {
     let mock = Mock::default();
     let event = serde_json::json!({
@@ -765,6 +820,37 @@ async fn wait_ready_polls_without_registering() {
     assert_eq!(*mock.post_calls.lock().unwrap(), 0, "wait_ready is wait-only");
 }
 
+#[tokio::test]
+async fn wait_ready_rides_out_a_transient_5xx_but_not_a_4xx() {
+    // The account listing is polled while the server builds its index. A momentary
+    // 5xx is a dropped round, not a verdict: aborting here would turn "still
+    // warming up" into a client-side failure and contradict the promise on this
+    // method that only the deadline and the account error state fail. A 4xx is the
+    // opposite - a misconfiguration (bad token, wrong route) that must surface at
+    // once instead of spinning out the whole budget.
+    let mock = Mock::default();
+    *mock.accounts_status_seq.lock().unwrap() = vec![503, 403];
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+    let err = client
+        .wait_ready("wxid_mock", Duration::from_secs(30))
+        .await
+        .expect_err("the 403 round must end the wait");
+    assert!(
+        *mock.accounts_calls.lock().unwrap() >= 2,
+        "the 5xx round must be followed by another poll"
+    );
+    assert_eq!(
+        *mock.accounts_status_seq.lock().unwrap(),
+        Vec::<u16>::new(),
+        "both injected statuses were consumed: 5xx tolerated, 4xx fatal"
+    );
+    match err {
+        ClientError::Status { status, .. } => assert_eq!(status, 403, "4xx propagates verbatim"),
+        other => panic!("expected a 403 Status, got {other:?}"),
+    }
+    assert_eq!(*mock.post_calls.lock().unwrap(), 0, "wait_ready stays wait-only");
+}
 // ---- list_messages / contacts / media_bytes_by_id ------------------------
 
 #[tokio::test]

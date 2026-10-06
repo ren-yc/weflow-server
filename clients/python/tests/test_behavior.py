@@ -12,7 +12,15 @@ from typing import Any
 import httpx
 import pytest
 
-from weflow_sdk import Client, ClientError, NotReady
+from weflow_sdk import (
+    CONNECT_TIMEOUT,
+    READ_TIMEOUT,
+    Client,
+    ClientError,
+    NotReady,
+    ShapeError,
+    StatusError,
+)
 from weflow_sdk import client as sdkmod
 from weflow_sdk.generated.weflow_sdk import models as gen
 
@@ -61,6 +69,9 @@ class Mock:
         self.register_body: dict | None = None
         # When set, GET /api/v1/accounts answers this page verbatim.
         self.accounts_page: dict | None = None
+        # Statuses the accounts route answers, in order (FIFO), before the normal
+        # page. A transient 5xx must be waited out by wait_ready; a 4xx must not.
+        self.accounts_status_seq: list[int] = []
         # When set, GET /api/v1/messages answers this page verbatim.
         self.native_page: dict | None = None
         # When set, GET /api/v1/contacts answers this page verbatim.
@@ -107,6 +118,14 @@ class Mock:
                 body = {"success": True, "newMessages": 7, "revokeMessages": 2}
             elif path == "/api/v1/accounts":
                 mock.get_accounts_calls += 1
+                if mock.accounts_status_seq:
+                    await send({
+                        "type": "http.response.start",
+                        "status": mock.accounts_status_seq.pop(0),
+                        "headers": [],
+                    })
+                    await send({"type": "http.response.body", "body": b"not yet"})
+                    return
                 if mock.accounts_page is not None:
                     body = mock.accounts_page
                 else:
@@ -296,6 +315,22 @@ async def test_ensure_ready_rejects_conflict_200_without_waiting() -> None:
     assert mock.get_accounts_calls == 0
     await client.aclose()
 
+
+async def test_wait_ready_rides_out_a_transient_5xx_but_not_a_4xx() -> None:
+    # The account listing is polled while the server builds its index. A momentary
+    # 5xx is a dropped round, not a verdict - aborting here would turn "still
+    # warming up" into a client-side failure. A 4xx is a misconfiguration and must
+    # surface at once instead of spinning out the whole budget.
+    mock = Mock()
+    mock.accounts_status_seq = [503, 403]
+    client = make_client(mock)
+    with pytest.raises(StatusError) as exc:
+        await client.wait_ready("wxid_mock", timeout=30)
+    assert exc.value.status == 403, "4xx propagates verbatim"
+    assert mock.get_accounts_calls == 2, "the 5xx round must be followed by another poll"
+    assert mock.accounts_status_seq == [], "both injected statuses were consumed"
+    assert mock.post_calls == 0, "wait_ready stays wait-only"
+    await client.aclose()
 
 async def test_wait_ready_is_wait_only() -> None:
     # wait_ready must not register: only the listing endpoint is polled.
@@ -1132,3 +1167,164 @@ async def test_transport_failures_are_client_errors() -> None:
             await entry()
         with pytest.raises(sdkmod.ClientError):
             await entry()
+
+
+
+class _BudgetRecorder(httpx.AsyncBaseTransport):
+    """Wraps the mock transport and records the timeout httpx actually applied.
+
+    The published budgets are only worth something if a request that must be
+    unbounded actually *travels* unbounded - this is the one place both budgets
+    are observable, so the assertions below are about the wire, not about a
+    constant someone could change without anything failing.
+    """
+
+    def __init__(self, inner: httpx.AsyncBaseTransport) -> None:
+        self._inner = inner
+        self.seen: list[tuple[str, dict]] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.seen.append((request.url.path, dict(request.extensions.get("timeout") or {})))
+        return await self._inner.handle_async_request(request)
+
+
+def make_budget_client(mock: Mock) -> tuple[Client, _BudgetRecorder]:
+    client = Client("http://mock", TOKEN)
+    recorder = _BudgetRecorder(httpx.ASGITransport(app=mock.asgi_app()))
+    # Same budget config the real client builds, only the transport is mocked.
+    client._http = httpx.AsyncClient(transport=recorder, timeout=client._timeout)
+    return client, recorder
+
+async def test_published_timeout_budgets_travel_per_request() -> None:
+    """Connect 5s everywhere; read 30s for JSON, **none** for size-bounded work.
+
+    A whole-roster message count, a media body and a sync pass are bounded only by
+    the library or the upload - applying the JSON read budget to them turns "this
+    group is big" into a client-side failure. The uncounted roster listing must
+    stay on the ordinary budget, otherwise the switch is just "no timeouts at all".
+    """
+    mock = Mock()
+    mock.group_members_page = {
+        "success": True, "chatroomId": "10001", "count": 0,
+        "fromCache": False, "updatedAt": 1700000000123, "members": [],
+    }
+    client, rec = make_budget_client(mock)
+    await client.accounts()
+    await client.group_members("10001", include_message_counts=False)
+    await client.group_members("10001", include_message_counts=True)
+    await client.sync_now()
+    # The media route mints the file on its first miss by default; this test
+    # only needs the fetch itself, so start from a hit.
+    mock.media_hit_first = False
+    await client.media_bytes_by_id("deadbeef.png")
+
+    for path, to in rec.seen:
+        assert to["connect"] == CONNECT_TIMEOUT, f"{path} lost the connect bound: {to}"
+    by_path = [to for _, to in rec.seen]
+    assert by_path[0]["read"] == READ_TIMEOUT, f"accounts: {by_path[0]}"
+    assert by_path[1]["read"] == READ_TIMEOUT, f"uncounted roster: {by_path[1]}"
+    assert by_path[2]["read"] is None, f"counted roster: {by_path[2]}"
+    assert by_path[3]["read"] is None, f"sync: {by_path[3]}"
+    assert by_path[4]["read"] is None, f"media: {by_path[4]}"
+    await client.aclose()
+
+
+async def test_watch_stream_is_not_bounded_by_the_json_read_timeout() -> None:
+    """The SSE connection is long-lived by contract: it must carry no read bound.
+
+    A read bound is charged per read operation and the server pings every 25s, so the
+    30s JSON budget leaves a 5s margin - one proxy stall drops a healthy idle
+    stream, and the client reconnects so quickly the loss looks like a normal end.
+    """
+    mock = Mock()
+    mock.sse_body = ("\n".join(sse_frame("message.new", new_payload("9", "hi"), 7)) + "\n\n").encode()
+    client, rec = make_budget_client(mock)
+    agen = client.watch()
+    await collect(agen, 1, timeout=5)
+    await agen.aclose()
+    stream = [to for path, to in rec.seen if path.endswith("/api/v1/push/messages")]
+    assert stream, f"the stream request was never observed: {rec.seen}"
+    assert all(to["read"] is None for to in stream), stream
+    assert all(to["connect"] == CONNECT_TIMEOUT for to in stream), stream
+    await client.aclose()
+
+
+
+async def test_status_error_url_stays_the_request_url() -> None:
+    """`StatusError.url` is the request URL - nothing else.
+
+    The 200-refusal used to fold the state name into that field, so a caller
+    matching on url (prefix, exact, per-endpoint metrics) silently misclassified
+    the refusal while the human-readable message still looked right. The state
+    now rides on its own field.
+    """
+    mock = Mock()
+    mock.register_body = {
+        "success": True, "state": "account_conflict",
+        "wxid": "wxid_other", "occupied_by": "wxid_other",
+    }
+    client = make_client(mock)
+    with pytest.raises(StatusError) as exc:
+        await client.ensure_ready("wxid_other", {"wxid": "wxid_other", "db_path": "X:/db"}, timeout=5)
+    assert exc.value.url == "http://mock/api/v1/accounts", exc.value.url
+    assert exc.value.detail == "state=account_conflict", exc.value.detail
+    assert "account_conflict" in str(exc.value), str(exc.value)
+    await client.aclose()
+
+
+async def test_malformed_base_url_stays_inside_the_client_error_tree() -> None:
+    """httpx raises InvalidURL for an unparsable URL, and it is NOT an HTTPError.
+
+    Wrapping only the HTTPError family let a bad base_url (bad port, control
+    character in the host, malformed IPv6 literal) escape every documented
+    `except ClientError` - the caller caught server refusals but not its own
+    typo. The URL is built per request, so all three entry points share the fix.
+    """
+    client = Client("http://h:99999x", TOKEN, timeout=2.0)
+    for entry in (client.health, client.accounts, client.sync_now):
+        with pytest.raises(ClientError):
+            await entry()
+    await client.aclose()
+
+
+async def test_media_bytes_reject_an_empty_handle_without_a_request() -> None:
+    """Same fail-fast as talker/chatroom: an empty handle is a different path.
+
+    The server answers "no such file", so without the local check a missing
+    file_name reads as an unexportable handle rather than a caller mistake.
+    """
+    mock = Mock()
+    client = make_client(mock)
+    message = gen.ChatlabMessage.model_validate({
+        "accountName": "alice", "content": "x", "groupNickname": "",
+        "media": {"type": "image", "fileName": "", "md5": "z"},
+        "platformMessageId": "1", "sender": "alice", "timestamp": 1, "type": 1,
+    })
+    with pytest.raises(ShapeError):
+        await client.media_bytes(message, "wxid_alice")
+    with pytest.raises(ShapeError):
+        await client.media_bytes_by_id("")
+    assert mock.media_calls == [], "no request may go out for an empty handle"
+    await client.aclose()
+
+
+async def test_media_bytes_rejects_a_redirect_on_the_first_hit() -> None:
+    """The existing test covers 3xx on the *retry*; this covers the first hit.
+
+    The bytes check is "not 2xx" for both fetches. Only the retry being
+    checked would let a first-hop 302 hand back an empty redirect body.
+    """
+    mock = Mock()
+    mock.media_hit_first = False  # first GET already answers
+    mock.media_status = 302
+    client = make_client(mock)
+    message = gen.ChatlabMessage.model_validate({
+        "accountName": "alice", "content": "x", "groupNickname": "",
+        "media": {"type": "image", "fileName": "abc.png", "md5": "z"},
+        "platformMessageId": "1", "sender": "alice", "timestamp": 1, "type": 1,
+    })
+    with pytest.raises(StatusError) as exc:
+        await client.media_bytes(message, "wxid_alice")
+    assert exc.value.status == 302, exc.value.status
+    assert exc.value.url == "http://mock/api/v1/media/abc.png", exc.value.url
+    await client.aclose()

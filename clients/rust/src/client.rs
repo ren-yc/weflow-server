@@ -265,11 +265,28 @@ impl ServerEvent {
     }
 }
 
+/// Connect budget for every request the SDK makes. Published so a caller can
+/// compare against it instead of guessing.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Read budget for ordinary JSON requests. Requests that are unbounded by
+/// construction (a full-roster message count, a media body, the SSE stream)
+/// deliberately do not use it.
+pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Client for one weflow-server instance. Cloneable; shares the connection
-/// pool.
+/// pools.
 #[derive(Clone)]
 pub struct Client {
+    /// Ordinary JSON requests: [`CONNECT_TIMEOUT`] plus [`READ_TIMEOUT`].
     http: reqwest::Client,
+    /// No read bound: a whole-roster message count, a media body of arbitrary
+    /// size, a sync pass, and the SSE stream. Connect stays bounded (a server
+    /// that is not there must fail fast) but a slow answer is not an error.
+    /// The stream needs this too: a read bound is charged per read operation
+    /// while the server pings every 25s, so the JSON budget leaves only a 5s
+    /// margin that one proxy stall burns through on a healthy idle stream.
+    http_long: reqwest::Client,
     base_url: String,
     token: String,
 }
@@ -278,8 +295,21 @@ impl Client {
     /// Point a client at a server. `token` is the API token the server
     /// printed on first start (or `--show-token`).
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Self {
+        let json = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(READ_TIMEOUT)
+            .build()
+            // reqwest only fails here when a TLS backend cannot initialize.
+            // Falling back to an unbudgeted client would silently drop the
+            // published default rather than tell anyone about it.
+            .unwrap_or_else(|_| reqwest::Client::new());
+        let long = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            http: reqwest::Client::new(),
+            http: json,
+            http_long: long,
             base_url: base_url.into().trim_end_matches('/').to_string(),
             token: token.into(),
         }
@@ -295,9 +325,19 @@ impl Client {
     }
 
     async fn get_json<T: DeserializeOwned>(&self, path: &str, query: &BTreeMap<&str, String>) -> Result<T> {
+        self.get_json_on(&self.http, path, query).await
+    }
+
+    /// Same request on an explicitly chosen client: the two budgets are the
+    /// whole difference between a JSON page and a full-roster count.
+    async fn get_json_on<T: DeserializeOwned>(
+        &self,
+        http: &reqwest::Client,
+        path: &str,
+        query: &BTreeMap<&str, String>,
+    ) -> Result<T> {
         let url = self.url(path);
-        let resp = self
-            .http
+        let resp = http
             .get(&url)
             .bearer_auth(&self.token)
             .query(query)
@@ -397,7 +437,8 @@ impl Client {
     /// caller that asked for it triggers it.
     pub async fn sync_now(&self) -> Result<gen_types::SyncResult> {
         let url = self.url("/api/v1/sync");
-        let resp = self.http.post(&url).bearer_auth(&self.token).send().await?;
+        // A sync pass indexes and may export media: bounded only by the library size.
+        let resp = self.http_long.post(&url).bearer_auth(&self.token).send().await?;
         Self::decode(resp, &url).await
     }
 
@@ -409,19 +450,32 @@ impl Client {
     /// compared against.
     pub async fn wait_ready(&self, wxid: &str, timeout: Duration) -> Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut last_state = "not-registered".to_string();
         loop {
-            let accounts = self.accounts().await?;
-            let last_state = match accounts.iter().find(|a| a.wxid == wxid) {
-                Some(a) if a.state == gen_types::AccountStatus::Ready => return Ok(()),
-                Some(a) if a.state == gen_types::AccountStatus::Error => {
-                    return Err(ClientError::NotReady {
-                        timeout,
-                        last_state: format!("error: {}", a.error.clone().unwrap_or_default()),
-                    });
-                }
-                Some(a) => a.state.to_string(),
-                None => "not-registered".to_string(),
-            };
+            match self.accounts().await {
+                Ok(accounts) => match accounts.iter().find(|a| a.wxid == wxid) {
+                    Some(a) if a.state == gen_types::AccountStatus::Ready => return Ok(()),
+                    Some(a) if a.state == gen_types::AccountStatus::Error => {
+                        return Err(ClientError::NotReady {
+                            timeout,
+                            last_state: format!("error: {}", a.error.clone().unwrap_or_default()),
+                        });
+                    }
+                    Some(a) => last_state = a.state.to_string(),
+                    None => last_state = "not-registered".to_string(),
+                },
+                // A dropped round is **waiting**, not failure. The whole point of a
+                // deadline-based poll is to ride out a transient connect blip or a
+                // momentary 5xx while the index is still coming up - aborting the
+                // wait on one such round would contradict this method's own promise
+                // that only the deadline and the account's `error` state fail. A 4xx
+                // (bad token, wrong route) is a real misconfiguration, and a
+                // `Shape` means the listing stopped matching the contract: both
+                // propagate rather than silently waiting.
+                Err(ClientError::Transport(_)) => {}
+                Err(ClientError::Status { status, .. }) if (500..=599).contains(&status) => {}
+                Err(e) => return Err(e),
+            }
             if tokio::time::Instant::now() >= deadline {
                 return Err(ClientError::NotReady { timeout, last_state });
             }
@@ -565,10 +619,10 @@ impl Client {
     pub async fn media_bytes(&self, message: &gen_types::ChatlabMessage, talker: &str) -> Result<bytes::Bytes> {
         let Some(m) = &message.media else {
             // 本地前置条件失败：还没发请求，也谈不上响应体——归 UnexpectedBody
-            // 是权宜（它带着 url/detail 两个槽位）。url 填哨兵是为了日志可读，
-            // 调用方按 url 归因时请注意这不是真实端点。
+            // 是权宜（它带着 url/detail 两个槽位）。url 必须是这条调用真正面向的
+            // 端点而不是散文：调用方按 url 归因时，散文会让分类静默失配。
             return Err(ClientError::UnexpectedBody {
-                url: "(no media on message)".into(),
+                url: self.url("/api/v1/media"),
                 detail: "message carries no media handle".to_string(),
             });
         };
@@ -576,14 +630,22 @@ impl Client {
         // 服务端答空结果，重试 404 把「参数无效」伪装成「句柄不可导出」。
         if talker.trim().is_empty() {
             return Err(ClientError::UnexpectedBody {
-                url: "(empty talker)".into(),
+                url: self.url("/api/v1/media"),
                 detail: "talker must not be empty".to_string(),
             });
         }
         let name = &m.file_name;
+        if name.trim().is_empty() {
+            // 与 talker／chatroom 同规的空值前置拒绝：空句柄打到另一个路径上，
+            // 服务端答「查无此文件」，于是「你没给名字」被伪装成「句柄不可导出」。
+            return Err(ClientError::UnexpectedBody {
+                url: self.url("/api/v1/media"),
+                detail: "media file_name must not be empty".to_string(),
+            });
+        }
         let url_path = format!("/api/v1/media/{}", encode_path_segment(name));
         let url = self.url(&url_path);
-        let resp = self.http.get(&url).bearer_auth(&self.token).send().await?;
+        let resp = self.http_long.get(&url).bearer_auth(&self.token).send().await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             // Trigger export, then retry once.
             let mut q = BTreeMap::new();
@@ -592,7 +654,7 @@ impl Client {
             let _: gen_types::ChatlabMessages = self
                 .get_json("/chatlab/messages", &q)
                 .await?;
-            let retry = self.http.get(&url).bearer_auth(&self.token).send().await?;
+            let retry = self.http_long.get(&url).bearer_auth(&self.token).send().await?;
             return Self::decode_bytes(retry, &url).await;
         }
         Self::decode_bytes(resp, &url).await
@@ -683,7 +745,13 @@ impl Client {
         if include_message_counts {
             params.insert("includeMessageCounts", "1".to_string());
         }
-        self.get_json("/api/v1/group-members", &params).await
+        // Counting messages scans every session behind each roster entry: that is
+        // exactly the case the published read budget must not apply to.
+        if include_message_counts {
+            self.get_json_on(&self.http_long, "/api/v1/group-members", &params).await
+        } else {
+            self.get_json("/api/v1/group-members", &params).await
+        }
     }
 
     /// `GET /api/v1/media/{id}` — bytes for a handle the server advertised.
@@ -693,8 +761,14 @@ impl Client {
     /// [`Client::media_bytes`] when a ChatLab message is at hand — that one
     /// also triggers an export and retries once on a 404.
     pub async fn media_bytes_by_id(&self, id: &str) -> Result<bytes::Bytes> {
+        if id.trim().is_empty() {
+            return Err(ClientError::UnexpectedBody {
+                url: self.url("/api/v1/media"),
+                detail: "media id must not be empty".to_string(),
+            });
+        }
         let url = self.url(&format!("/api/v1/media/{}", encode_path_segment(id)));
-        let resp = self.http.get(&url).bearer_auth(&self.token).send().await?;
+        let resp = self.http_long.get(&url).bearer_auth(&self.token).send().await?;
         Self::decode_bytes(resp, &url).await
     }
 
@@ -719,7 +793,11 @@ impl Client {
                 // 从未出现 data: 的帧，跨连接提交会把未交付事件的 id 写进重放游标。
                 sse.begin_connection();
                 let url = client.url("/api/v1/push/messages");
-                let mut req = client.http.get(&url).bearer_auth(&client.token).header("accept", "text/event-stream");
+                let mut req = client
+                    .http_long
+                    .get(&url)
+                    .bearer_auth(&client.token)
+                    .header("accept", "text/event-stream");
                 if let Some(id) = sse.last_event_id {
                     req = req.header("last-event-id", id.to_string());
                 }
@@ -883,6 +961,18 @@ mod tests {
         assert_eq!(sse.last_event_id, Some(12), "同连接内 id 先于 data 必须推进游标");
     }
 
+    #[test]
+    fn published_timeouts_match_the_documented_budgets() {
+        // reqwest exposes no accessor for a built Client's configuration, so the
+        // wire behaviour of the two budgets cannot be asserted from Rust the way
+        // Python can (its transport sees the per-request timeout). What this can
+        // pin is the published numbers themselves: they are the contract a caller
+        // compares against, and a silent edit here would make the docs a lie.
+        // The routing (which request gets which client) is covered on the Python
+        // side by test_published_timeout_budgets_travel_per_request.
+        assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(READ_TIMEOUT, Duration::from_secs(30));
+    }
     #[test]
     fn empty_talker_error_names_the_endpoint_that_was_actually_called() {
         let q = MessageQuery::new("");

@@ -97,13 +97,53 @@ Set-Location $PSScriptRoot\..
 #
 # 在这里补而不是写进文档：忘记它得到的是一堆看不懂的隐私错误，而不是一个明确的提示。
 # 已显式给过 feature 相关参数时不插手（尊重调用方的选择）。
-$needsTesting = $args.Count -gt 0 -and ($args[0] -eq 'test' -or ($args[0] -eq 'clippy' -and $args -contains '--all-targets'))
-$alreadyHas = $args -contains '--features' -or $args -contains '--all-features' -or $args -contains '--no-default-features'
-if ($needsTesting -and -not $alreadyHas) {
-    # Select-Object 而非下标区间：单参数调用会算出区间 1..0，PowerShell 把端点
+# 判定只看 `--` **之前**的那段：`--` 之后是转发给测试二进制／rustc 的参数，那里出现同名词
+# 不代表调用方给 cargo 指定过 feature（当成指定过就会漏注入，报错是一堆「模块是私有的」）。
+$dash = [Array]::IndexOf($args, '--')
+# 外层 @() 不可省：PowerShell 把 if 赋值的单元素数组摊平成标量，于是 `test`（恰好
+# 一个参数，也就是最常用的门禁调用形态）会让 $cargoSide 变成字符串、$cargoSide[0] 取到
+# 首字符 't'，判定为「不是 test」，testing 从此不再注入 —— 报的是一堆「模块是私有的」。
+$cargoSide = @(if ($dash -lt 0) { $args } elseif ($dash -eq 0) { @() } else { $args[0..($dash - 1)] })
+$restSide = @(if ($dash -lt 0) { @() } else { $args[$dash..($args.Count - 1)] })
+# 子命令不假定在 $args[0]：--locked／--config 是 cargo 的全局选项，
+# `build.ps1 --locked test` 合法且同样需要注入。这些全局选项的值紧跟其后，跳过值才轮得到子命令。
+$valueOptions = @('-p', '--package', '--config', '-Z', '--target', '--target-dir', '--manifest-path', '--color', '--message-format', '--profile')
+$subIndex = -1
+for ($i = 0; $i -lt $cargoSide.Count; $i++) {
+    $tok = [string]$cargoSide[$i]
+    if ($tok.Length -eq 0) { continue }
+    if ($tok[0] -eq '-') {
+        if ($valueOptions -contains $tok) { $i += 1 }
+        continue
+    }
+    $subIndex = $i
+    break
+}
+$sub = if ($subIndex -ge 0) { [string]$cargoSide[$subIndex] } else { '' }
+# 调用方自己指定过 feature 就不插手（尊重选择）；`--features=x` 与 `-Fxyz` 的合并形态
+# 也算指定过——早先只比 `-contains '--features'`，这两种写法会被当成没指定，于是重复注入。
+$alreadyHas = $false
+foreach ($tok in $cargoSide) {
+    $t = [string]$tok
+    if ($t -eq '--all-features' -or $t -eq '--no-default-features' -or $t -eq '--features' -or $t -eq '-F') { $alreadyHas = $true; break }
+    if ($t.StartsWith('--features=') -or ($t.Length -gt 2 -and $t.StartsWith('-F'))) { $alreadyHas = $true; break }
+}
+# `-p <crate>` 选中的是另一个 package：`testing` 只存在于根 package，注入了会让 cargo 直接报
+# 「the package does not contain this feature」，而这不是调用方的本意（SDK 的测试用公开 API，不需要它）。
+$selectsPackage = $false
+foreach ($tok in $cargoSide) {
+    $t = [string]$tok
+    if ($t -eq '-p' -or $t -eq '--package' -or ($t.Length -gt 2 -and $t.StartsWith('-p'))) { $selectsPackage = $true; break }
+}
+$needsTesting = ($sub -eq 'test') -or ($sub -eq 'clippy' -and $cargoSide -contains '--all-targets')
+if ($needsTesting -and -not $alreadyHas -and -not $selectsPackage -and $subIndex -ge 0) {
+    # Select-Object / 切片而非下标区间：单参数调用会算出区间 1..0，PowerShell 把端点
     # 取整回绕成「再取一次首元素」，调用方的首参被注入第二遍——build.ps1 test
     # 变成 cargo test test，第二个 test 沦为过滤词，全量测试被静默换成零匹配。
-    $args = @($args[0]) + @('--features', 'testing') + @($args | Select-Object -Skip 1)
+    # 注入点紧跟子命令，而不是硬插在数组最前面：`--locked test` 要保持 --locked 在前。
+    $head = @(if ($subIndex -eq 0) { @() } else { $cargoSide[0..($subIndex - 1)] })
+    $tail = @(if ($subIndex + 1 -lt $cargoSide.Count) { $cargoSide[($subIndex + 1)..($cargoSide.Count - 1)] } else { @() })
+    $args = $head + @($sub) + @('--features', 'testing') + $tail + $restSide
     Write-Host 'build.ps1: 已补 --features testing（集成测试需要它才看得见实现面）'
 }
 & cargo @args

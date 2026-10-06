@@ -68,6 +68,41 @@
 - **顶层 Python 包补 `py.typed`**：生成层内部有该标记、顶层手写包没有 ⇒ 消费方的类型注解全部静默失效（mypy 报 `import-untyped`）。
 
 
+- **两个 SDK 的请求超时改为分层默认（行为变化，公开常量）**：连接 **5s**（`CONNECT_TIMEOUT`）、普通 JSON 请求读
+  **30s**（`READ_TIMEOUT`）；`group_members(..., include_message_counts=True)`（整名册计数＝全会话扫描）、
+  `media_bytes`／`media_bytes_by_id`（体积由发送方决定）、`sync_now()`（索引＋可能导出媒体）、`watch()`（长连接；读上界按每次读操作计时，而服务端
+  每 25s 才发一次 keep-alive ping，30s 只剩 5s 余量）改用**无读上界**的连接池。此前 Python 是「所有请求一律 30s」、Rust 是「所有请求
+  一律无限制」——两边都不对：前者会把「这个群很大」变成客户端错误，后者让「服务端根本不在」挂到调用方的耐心耗尽。
+  **迁移方式**：需要自定义的调用方仍可传 `Client(..., timeout=)`（Python 的该参数现在只作用于普通 JSON 请求）；
+  Rust 侧无需改动，两个常量已导出。回归位置：`test_published_timeout_budgets_travel_per_request`
+  （断言 transport 实际收到的 per-request timeout，而不是读常量）、
+  `test_watch_stream_is_not_bounded_by_the_json_read_timeout`、`published_timeouts_match_the_documented_budgets`。
+- **`wait_ready`／`ensure_ready` 把瞬时故障算作「还在等」**（行为变化）：轮询账号列表时遇到连接失败或 5xx 不再
+  中止整个等待。此前一次抖动就把「索引仍在建」变成客户端错误，与该函数自己的文档（只有 deadline 与账号 `error`
+  态失败）矛盾。**4xx 仍然立即失败**——那是配置错误（token 不对、路径写错），把它等满预算只会把可当场定位的问题
+  拖成一次超时。回归位置：`wait_ready_rides_out_a_transient_5xx_but_not_a_4xx`（两语言两仓）。
+- **httpx 解析不出 URL 的错误进入 `ClientError` 树**：`httpx.InvalidURL` 不属于 `httpx.HTTPError` 家族，
+  此前畸形 `base_url`（端口非法、主机含控制字符、残缺 IPv6 字面量）会裸逃过 `except ClientError`——调用方接住了
+  服务端拒绝，却接不住自己写错的地址。三个请求入口（GET／POST／SSE 流）统一补上。回归位置：
+  `test_malformed_base_url_stays_inside_the_client_error_tree`。
+- **`StatusError.url` 恒等于请求 URL**（破坏性，仅影响按 url 归因的调用方）：200 拒绝态此前把
+  `state=…` 拼进 url 字段，于是按前缀/精确匹配分类的调用方会静默错分。拒绝态的 `state` 改由新增的 `detail`
+  字段承载，`str(exc)` 仍然包含它。**迁移方式**：读 `exc.state` 语义的调用方改读 `exc.detail`；只读
+  `exc.status` 与 `exc.url` 的不受影响。Rust 侧同类修正：媒体前置条件错误此前把散文塞进 `url`
+  （`"(no media on message)"`、`"(empty talker)"`），现改为该调用真正面向的端点，原因写在 `detail`。
+  回归位置：`test_status_error_url_stays_the_request_url`、`media_precondition_errors_name_the_real_endpoint_not_prose`。
+- **媒体句柄的空值本地拒绝**（与 `talker`／`chatroomId` 同口径）：`media_bytes` 对空 `file_name`、
+  `media_bytes_by_id` 对空 `media_id` 现在不发请求直接报错。空句柄打到的是另一个路径，服务端答「查无此文件」，
+  于是「调用方没给名字」被伪装成「这个句柄不可导出」。回归位置：`media_precondition_errors_name_the_real_endpoint_not_prose`
+  （含「本地拒绝不得发出任何请求」的计数断言）与 Python 侧 `test_media_bytes_reject_an_empty_handle_without_a_request`。
+- **包装脚本的 feature 注入判定三处收口**：① 只看 `--` **之前**的参数（`--` 之后是转发给测试二进制／rustc 的，
+  那里的 `--features` 不是给 cargo 的，此前会让整轮测试漏注入并报一堆「模块是私有的」）；② 子命令不再假定是第一个
+  参数（`--locked test` 这类全局选项先行的写法此前不注入）；③ `-p <crate>` 选中别的 package 时**不注入**——
+  `testing` 只存在于根 package，注入会让 SDK 的测试直接报「does not contain this feature」。回归位置：
+  `scripts/tests/test_build_wrapper.py` 的 `test_global_option_before_subcommand_still_gets_testing`、
+  `test_features_after_double_dash_does_not_suppress_injection`、`test_merged_features_form_is_not_reinjected`、
+  `test_package_selection_does_not_inject_root_only_feature`。
+
 ## [0.8.0] - 2026-10-04
 
 ### 变更

@@ -125,3 +125,51 @@ def test_build_subcommand_is_not_touched():
 def test_no_arguments_at_all():
     final = _run_wrapper([])
     assert final == [], final
+
+
+def test_global_option_before_subcommand_still_gets_testing():
+    """`--locked test` is valid cargo: global options precede the subcommand.
+
+    The subcommand used to be read off the first token only, so this shape
+    skipped the injection entirely and the run died as a wall of "module is
+    private" errors - readable as a code problem, not as a missing feature flag.
+    """
+    final = _run_wrapper(["--locked", "test"])
+    assert final == ["--locked", "test", "--features", "testing"], final
+
+
+def test_features_after_double_dash_does_not_suppress_injection():
+    """`--` starts the arguments forwarded to the test binary / rustc.
+
+    A `--features` living there was never a request to cargo, so treating it as
+    one silenced the injection for the whole run.
+    """
+    final = _run_wrapper(["test", "--", "--features"])
+    assert final == ["test", "--features", "testing", "--", "--features"], final
+
+
+def test_merged_features_form_is_not_reinjected():
+    """`--features=x` and `-Fxyz` are the same request as `--features x`.
+
+    Comparing tokens for exact equality missed both forms, so the wrapper added
+    a second `--features`: cargo unions them, so nothing fails loudly - the
+    argv the caller wrote is silently not the argv cargo received.
+    """
+    assert _run_wrapper(["test", "--features=testing"]) == ["test", "--features=testing"]
+    assert _run_wrapper(["test", "-Ftesting"]) == ["test", "-Ftesting"]
+
+
+def test_package_selection_does_not_inject_root_only_feature():
+    """`testing` lives on the root package only.
+
+    `test -p weflow-client` selects the SDK crate, whose suite runs against the
+    public API and needs no feature. Injecting `testing` there made cargo refuse
+    with "does not contain this feature: testing" - the same unreadable wall of
+    errors the wrapper exists to prevent.
+    """
+    assert _run_wrapper(["test", "--locked", "-p", "weflow-client"]) == [
+        "test",
+        "--locked",
+        "-p",
+        "weflow-client",
+    ]

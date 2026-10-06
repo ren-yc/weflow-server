@@ -1024,10 +1024,19 @@ weflow-server.exe sessions --json        # 子命令面
   **两个容易读错的地方**：① `list_all_sessions` 与 `drain_session` 是取尽，而 `pull_page`/
   `list_messages` 只取一页；`contacts` 是一页语义但响应带 `total`/`hasMore`（CLI 的 `contacts` 子命令
   也透传分页参数并回给这两个字段）；② 时间界收 `YYYYMMDD` **或** unix 秒，`end` 作为上界时裸日期覆盖**整天**。
-- **错误按性质分派变体**：HTTP 非 2xx → `Status`；连接/超时/重置 → `Transport`；响应是合法 JSON 但
-  不合承诺形状 → `Shape`。解码是**先取字节再单独解析**的：`resp.json::<T>()` 会把解码失败也包成
+- **错误按性质分派变体**：HTTP 非 2xx → `Status`；连接/超时/重置/**URL 解析不出来** → `Transport`；
+  响应是合法 JSON 但不合承诺形状 → `Shape`。解码是**先取字节再单独解析**的：`resp.json::<T>()` 会把解码失败也包成
   传输错误，于是「服务端答错了」与「网络断了」混成一类 —— 而调用方正是按变体分流的（重试传输故障
-  合理，重试形状错误不合理）。
+  合理，重试形状错误不合理）。`Status.url` **恒等于请求 URL**，不掺描述文字（按 url 归因的调用方会静默错分类），
+  拒绝态的 `state` 另走 `detail` 字段。
+- **超时默认（Rust 与 Python 一致；TS 仅示例，不在承诺面内）**：连接 **5s**（`CONNECT_TIMEOUT`）——服务端不在时要立刻失败；普通 JSON 请求读 **30s**
+  （`READ_TIMEOUT`）；**按构造无上界**的请求不带读上界：`group_members(..., include_message_counts=True)`
+  （整名册计数＝全会话扫描）、`media_bytes`／`media_bytes_by_id`（体积由发送方决定）、`sync_now()`（索引＋可能导出媒体）、
+  `watch()`（长连接；服务端每 25s 发一次 keep-alive ping，读上界是按每次读操作计时的，30s 只剩 5s 余量，代理缓冲或一次事件循环卡顿就会掐断健康的空闲流）。
+  判据是「慢不等于坏」：把 30s 套到这些面上会把「这个群很大」变成客户端错误。
+  回归位置：`test_published_timeout_budgets_travel_per_request`（钉到 transport 收到的 per-request timeout 上，
+  不是只读常量）、`test_watch_stream_is_not_bounded_by_the_json_read_timeout`；Rust 侧因 reqwest 不暴露已建
+  Client 的配置，`published_timeouts_match_the_documented_budgets` 只钉公开常量数值。
 - 鉴权走 `Authorization: Bearer`；客户端从不把 token 放进 URL（`/health` 是唯一免鉴权端点）。
 - 本轮**不发布** crates.io：本地 `cargo build -p weflow-client` 即可使用。
 
