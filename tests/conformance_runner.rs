@@ -201,7 +201,7 @@ async fn wait_ready(app: &axum::Router) -> bool {
 
 /// 夹具声明的契约版本。**必须与 `conformance.pin` 同改** —— 见下面的
 /// `pinned_contract_version_matches_the_fixture`。
-const CONTRACT_VERSION: &str = "0.4.0";
+const CONTRACT_VERSION: &str = "0.5.0";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "由 CI 的一致性步骤显式运行：需要 FLOW_CONTRACT_DIR"]
