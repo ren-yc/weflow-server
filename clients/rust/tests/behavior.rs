@@ -27,6 +27,8 @@ struct Mock {
     sse_frames: Arc<StdMutex<Vec<String>>>,
     sse_event: Arc<StdMutex<Option<serde_json::Value>>>,
     sse_reconnect_ids: Arc<StdMutex<Vec<Option<String>>>>,
+    /// When set, the health route answers this body verbatim (wrong-shape 反例用)。
+    health_page: Arc<StdMutex<Option<serde_json::Value>>>,
     messages_query: Arc<StdMutex<Option<String>>>,
     /// When set, the accounts route answers `indexing` forever (timeout test).
     always_indexing: bool,
@@ -231,6 +233,9 @@ async fn messages_route(
 async fn health_route(State(mock): State<Mock>, headers: HeaderMap) -> Response {
     let carried = headers.contains_key("authorization");
     mock.health_calls.lock().unwrap().push(carried);
+    if let Some(page) = mock.health_page.lock().unwrap().clone() {
+        return Json(page).into_response();
+    }
     Json(serde_json::json!({"account": "ready", "status": "ok", "version": "9.9.9"}))
         .into_response()
 }
@@ -518,6 +523,74 @@ async fn watch_decodes_frames_and_reconnects_with_last_event_id() {
     );
 }
 
+
+/// 断线恰好落在 `id:` 与 `data:` 之间时，那个 id 指向一个**从未交付给调用方**的事件。
+///
+/// 游标若在见到 `id:` 时就推进，重连会让服务端把这条从重放窗口里划掉 —— 事件静默丢失，
+/// 而调用方永远不知道它存在过。这里先正常交付一帧（游标应推进到 7），再给一个只有 `id: 8`
+/// 的悬空帧：重连必须仍带 7、绝不带 8。
+#[tokio::test]
+async fn watch_does_not_advance_the_cursor_past_an_undelivered_frame() {
+    let mock = Mock::default();
+    *mock.sse_event.lock().unwrap() = Some(serde_json::json!({
+        "event": "message.new", "rawid": "9", "sessionId": "alice",
+        "sessionType": "chat", "sourceName": "alice", "timestamp": 1_700_000_001,
+        "content": "hi",
+    }));
+    // data 行运行时序列化：源码里不出现带转义的字符串字面量，也不会与真实帧格式漂移。
+    let payload = serde_json::json!({
+        "event": "message.new", "rawid": "9", "sessionId": "alice",
+        "sessionType": "chat", "sourceName": "alice", "timestamp": 1_700_000_001,
+        "content": "hi",
+    });
+    let data_line = format!("data: {}", serde_json::to_string(&payload).unwrap());
+    *mock.sse_frames.lock().unwrap() = vec![
+        "id: 7".to_string(),
+        "event: message.new".to_string(),
+        data_line,
+        // 悬空的第二帧：只有 id，没有 data
+        "id: 8".to_string(),
+    ];
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+    use futures_util::StreamExt as _;
+    let mut stream = Box::pin(client.watch());
+    stream.as_mut().next().await.expect("stream must yield").expect("decode");
+    let _ = stream.as_mut().next().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let reconnects = mock.sse_reconnect_ids.lock().unwrap().clone();
+    assert!(
+        reconnects.iter().any(|id| id.as_deref() == Some("7")),
+        "已交付的帧必须推进游标: {reconnects:?}",
+    );
+    assert!(
+        !reconnects.iter().any(|id| id.as_deref() == Some("8")),
+        "悬空的 id: 8 不得推进游标（否则那条事件从重放窗口消失）: {reconnects:?}",
+    );
+}
+
+/// 形状损坏不能冒充传输故障。
+///
+/// `resp.json::<T>()` 把**解码失败也包成 reqwest::Error**，于是「服务端答了个不合承诺形状的
+/// 东西」被记成「网络断了」—— 调用方按变体分流时两边同时失去区分力（重试传输故障合理，
+/// 重试形状错误不合理）。
+#[tokio::test]
+async fn a_200_with_the_wrong_shape_is_a_shape_error_not_a_transport_one() {
+    let mock = Mock::default();
+    // 合法的 JSON、错误的形状：数组而非对象
+    *mock.health_page.lock().unwrap() = Some(serde_json::json!([]));
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+    let err = client.health().await.expect_err("200 但形状不符必须报错");
+    assert!(
+        matches!(err, ClientError::Shape(..)),
+        "形状损坏必须是 Shape，实际 {err:?}",
+    );
+    assert!(
+        !matches!(err, ClientError::Transport(..)),
+        "不得记成传输故障（连接没坏，是服务端答错了）: {err:?}",
+    );
+}
 // ---- health / accounts / register / wait_ready ---------------------------
 
 #[tokio::test]
@@ -747,6 +820,24 @@ async fn group_members_decodes_roster_page_and_sends_chatroom_param() {
     assert!(queries[0].contains("includeMessageCounts=1"), "counts asked for: {}", queries[0]);
 }
 
+/// 空群号问的是另一个问题：服务端会答成一个空名册，于是「这个群没有成员」与「你没告诉我是
+/// 哪个群」在调用方看来一模一样。必须本地拒绝，并且**不发请求**。
+#[tokio::test]
+async fn group_members_rejects_an_empty_chatroom_without_a_request() {
+    let mock = Mock::default();
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+    let err = client
+        .group_members("", true)
+        .await
+        .expect_err("空群号必须本地拒绝");
+    let msg = format!("{err}");
+    assert!(msg.contains("chatroom must not be empty"), "报错要指出问题: {msg}");
+    assert!(
+        mock.group_members_queries.lock().unwrap().is_empty(),
+        "本地校验失败时不该发出任何请求",
+    );
+}
 /// The off switch: `include_message_counts = false` must **omit the parameter**
 /// rather than send `0` — the server reads it through a flexible bool parser,
 /// and the wire shape for "don't scan the conversation" is absence.

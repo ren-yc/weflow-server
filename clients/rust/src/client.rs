@@ -311,7 +311,11 @@ impl Client {
         if !status.is_success() {
             return Err(ClientError::Status { status: status.as_u16(), url: url.to_string() });
         }
-        Ok(resp.json::<T>().await?)
+        // 先拿字节、再单独解码：`resp.json::<T>()` 把**解码失败**也包成 reqwest::Error，
+        // 于是"服务端给了不符合承诺形状的东西"会被记成 Transport（连接故障），而调用方正是按
+        // ClientError 的变体分支处理的 —— 形状损坏与网络断了混成一类，两边都失去了区分力。
+        let body = resp.bytes().await?;
+        serde_json::from_slice(&body).map_err(ClientError::Shape)
     }
 
     // ---- ensure_ready ---------------------------------------------------
@@ -647,6 +651,14 @@ impl Client {
         chatroom: &str,
         include_message_counts: bool,
     ) -> Result<gen_types::GroupMembers> {
+        if chatroom.is_empty() {
+            // 空群号问的是另一个问题：服务端会答成一个空名册，于是"这个群没有成员"与
+            // "你没告诉我是哪个群"在调用方看来一模一样。与 talker 同规本地拒绝、不发请求。
+            return Err(ClientError::UnexpectedBody {
+                url: "/api/v1/group-members".to_string(),
+                detail: "chatroom must not be empty".to_string(),
+            });
+        }
         let mut params = BTreeMap::new();
         params.insert("chatroomId", chatroom.to_string());
         if include_message_counts {
@@ -681,12 +693,12 @@ impl Client {
     ) -> impl futures_util::Stream<Item = Result<ServerEvent>> + Send {
         let client = self.clone();
         async_stream::stream! {
-            let mut last_event_id: Option<u64> = None;
+            let mut sse = SseFrameState::default();
             let mut backoff = Duration::from_millis(500);
             loop {
                 let url = client.url("/api/v1/push/messages");
                 let mut req = client.http.get(&url).bearer_auth(&client.token).header("accept", "text/event-stream");
-                if let Some(id) = last_event_id {
+                if let Some(id) = sse.last_event_id {
                     req = req.header("last-event-id", id.to_string());
                 }
                 let resp = match req.send().await {
@@ -714,7 +726,7 @@ impl Client {
                             while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                                 let line = String::from_utf8_lossy(&buf[..pos]).to_string();
                                 buf.drain(..=pos);
-                                if let Some(event) = parse_sse_line(&line, &mut last_event_id) {
+                                if let Some(event) = sse.feed(&line) {
                                     yield event;
                                 }
                             }
@@ -734,32 +746,50 @@ impl Client {
     }
 }
 
-/// Parse one SSE line; returns a decoded event when a complete frame landed.
-/// The server's frames are `id:` / `event:` / `data:` with the JSON payload on
-/// the `data:` line; `:`-prefixed comment lines are heartbeats.
-fn parse_sse_line(line: &str, last_event_id: &mut Option<u64>) -> Option<Result<ServerEvent>> {
-    if let Some(rest) = line.strip_prefix("id:") {
-        if let Ok(id) = rest.trim().parse::<u64>() {
-            *last_event_id = Some(id);
-        }
-        return None;
-    }
-    if let Some(rest) = line.strip_prefix("data:") {
-        let payload = rest.strip_prefix(' ').unwrap_or(rest);
-        // The notification face's frames are meta-only; decode by `event` key
-        // inside the payload (the SSE `event:` line is set to the same value,
-        // but decoding from the payload keeps one source of truth).
-        let v: serde_json::Value = match serde_json::from_str(payload) {
-            Ok(v) => v,
-            Err(e) => return Some(Err(e.into())),
-        };
-        let kind = v.get("event").and_then(|e| e.as_str()).unwrap_or("");
-        return Some(decode_event(kind, &v));
-    }
-    None
+/// SSE 的行级解析状态：`id:` 与它所属事件的游标。
+///
+/// 服务器的帧是 `id:` / `event:` / `data:`（JSON 载荷在 `data:` 行），`:` 开头是心跳注释。
+/// `id:` 只**暂存**、不立刻推进重放游标 —— 它属于"接下来那一个事件"。断线恰好落在
+/// `id:` 与 `data:` 之间时，那个 id 指向一个**从未交付给调用方**的事件：若已经推进游标，
+/// 重连就会让服务端把那一条从重放窗口里划掉，事件静默丢失。
+#[derive(Default)]
+struct SseFrameState {
+    /// `id:` 行的暂存值；见到 `data:`（帧已被消费）时提交给 `last_event_id`
+    pending_id: Option<u64>,
+    /// 重连用的游标
+    last_event_id: Option<u64>,
 }
 
-fn decode_event(kind: &str, v: &serde_json::Value) -> Result<ServerEvent> {
+impl SseFrameState {
+    /// 喂一行；解出一个完整帧时返回要交给调用方的那一项。
+    fn feed(&mut self, line: &str) -> Option<Result<ServerEvent>> {
+        if let Some(rest) = line.strip_prefix("id:") {
+            if let Ok(id) = rest.trim().parse::<u64>() {
+                self.pending_id = Some(id);
+            }
+            return None;
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
+            // 提交点在这里：出现 data: 就说明这一帧已被消费（无论解出事件还是解码错误）。
+            // 若只在成功交付时提交，一个永久解不开的帧会让游标停在它前一步，每次重连都重放
+            // 同一帧 —— 整条流被毒住。
+            if let Some(id) = self.pending_id.take() {
+                self.last_event_id = Some(id);
+            }
+            let payload = rest.strip_prefix(' ').unwrap_or(rest);
+            // The notification face's frames are meta-only; decode by `event` key
+            // inside the payload (the SSE `event:` line is set to the same value, but
+            // decoding from the payload keeps one source of truth).
+            let v: serde_json::Value = match serde_json::from_str(payload) {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e.into())),
+            };
+            let kind = v.get("event").and_then(|e| e.as_str()).unwrap_or("");
+            return Some(decode_event(kind, &v));
+        }
+        None
+    }
+}fn decode_event(kind: &str, v: &serde_json::Value) -> Result<ServerEvent> {
     match kind {
         "message.new" => Ok(ServerEvent::New(serde_json::from_value(v.clone())?)),
         "message.revoke" => Ok(ServerEvent::Revoke(serde_json::from_value(v.clone())?)),
