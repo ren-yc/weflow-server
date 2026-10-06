@@ -40,7 +40,7 @@ WEFLOW_BASE_URL=http://127.0.0.1:6002 weflow-server mcp
 | `list_sessions` | 会话发现面 | 可选 `keyword`（服务端过滤）；返回 username / displayName / sessionType / messageCount 等 |
 | `get_messages` | Pull 面 | ChatLab 形状、时间升序；游标 `nextSince` 与 `nextOffset` |
 | `get_messages_raw` | 原生消息面 | 带 `rawContent` / `isSend` / `localType` 与媒体元数据；按 `offset` 翻页 |
-| `search_messages` | ChatLab 消息面 | 会话内关键词检索；游标 `nextCursor` |
+| `search_messages` | ChatLab 消息面 | 会话内关键词检索；按 `offset` 翻页（游标 `nextOffset`） |
 | `get_contacts` | 联系人面 | 备注 / 昵称 / 别名只在这个面出现 |
 | `get_media` | —— | 只给句柄与访问地址，**不下发字节** |
 | `group_members` | 群成员面 | 名册与发言人的并集（潜水成员也会出现，计数为 0） |
@@ -51,10 +51,13 @@ WEFLOW_BASE_URL=http://127.0.0.1:6002 weflow-server mcp
 - 「取一页」类工具的 `limit` 默认 50、上限 200（超出按 200 计）。
 - 单次输出的字符预算约 32 KB：超出时**少给若干条**并置 `truncated: true`。第一条永远保留 ——
   否则一条长消息会得到「既无内容又无截断标记」的结果，那是 agent 场景里最坏的一种失败。
-- Pull 面与 ChatLab 消息面在**预算截断时不返回整页游标**：它们的游标指向整页的最后一条，
-  用它续拉会跳过我们没给出去的那些条。此时请用更小的 `limit` 重取本页。
-- `get_messages_raw` 例外：原生面按 offset 翻页、本页是连续切片，砍掉尾部后 `nextOffset` 正好
-  指向被砍掉的第一条，所以它照常返回（并把 `hasMore` 置真）。
+- `get_messages` 在预算截断时**不返回整页游标** `nextSince`（它指向整页最后一条，用它续拉会
+  跳过没给出去的那些条），但**返回 `nextOffset`**（这一面从 `offset` 起是连续切片，`start + 给出
+  条数` 恰指向被砍掉的第一条）与 `sinceResolved`（本轮 `since` 解析出的**排他**绝对下界）。
+  续拉请传 `nextOffset` 且 `since` 传 `sinceResolved`——不要重发相对串（如 `7d`）：续拉发生在
+  下一轮对话，「现在」已经前移，相对串会把窗口悄悄前移、跳过中间的消息。
+- `search_messages` 同样按 `offset` 翻页、本页是连续切片，截断时 `nextOffset` 正好指向被砍掉的
+  第一条（并把 `hasMore` 置真）。
 
 ## 失败通道
 

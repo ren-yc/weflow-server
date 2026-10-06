@@ -301,6 +301,10 @@ impl WeflowMcp {
         // 续拉会跳过我们没给出去的那些条。
         let cut = proj.truncated;
         let start = a.offset.unwrap_or(0);
+        // since 是调用方的相对串（"7d"/"24h"），解析出的**绝对下界**必须原样回给：
+        // 续拉发生在下一轮对话，「现在」已经前移，重发相对串会把窗口悄悄向前挪，
+        // 中间那段时间的消息就被跳过了。
+        let since_resolved = since;
         Ok(CallToolResult::structured(json!({
             "talker": a.talker,
             "count": proj.items.len(),
@@ -318,7 +322,9 @@ impl WeflowMcp {
             } else {
                 json!(page.sync.next_offset)
             },
-            "hint": if cut { json!("本页超过字符预算，已少给若干条：保持同一 since、用 nextOffset 续拉即可（不要用整页的 nextSince，那会跳过未给出的条）；也可用更小的 limit 重取本页，此时按 platformMessageId 去重") } else { Value::Null },
+            // 绝对下界：续拉时传它而不是原始 since 串（下一轮 now 已前移，相对串会挪窗）。
+            "sinceResolved": since_resolved,
+            "hint": if cut { json!("本页超过字符预算，已少给若干条：用 nextOffset 且 since 传响应里的 sinceResolved（绝对下界，不要重发相对串——下一轮 now 已前移会挪窗）续拉；也可用更小的 limit 重取本页，此时按 platformMessageId 去重") } else { Value::Null },
             "messages": proj.items,
         })))
     }
@@ -530,6 +536,14 @@ mod tests {
         assert_eq!(parse_since("20231114", now).unwrap(), ymd);
         assert!(parse_since("2025-01-01", now).is_err());
         assert!(parse_since("7x", now).is_err());
+        // sinceResolved 冻结的就是这个值：同一相对串随 now 前移会得到不同的
+        // 绝对下界 —— 响应必须回给「本轮的」下界，续拉才不挪窗。
+        let later = now + 86_400;
+        assert_ne!(
+            parse_since("7d", now).unwrap(),
+            parse_since("7d", later).unwrap(),
+            "同一相对串在不同 now 下必须解析出不同下界（这正是要回传 sinceResolved 的原因）",
+        );
     }
 
     #[test]

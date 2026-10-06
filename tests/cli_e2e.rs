@@ -560,6 +560,19 @@ async fn mcp_three_step_demo_lists_searches_and_fetches() {
     assert_ne!(searched["result"]["isError"], json!(true), "search 不该是工具级错误: {searched}");
     assert!(searched["result"]["content"][0]["text"].as_str().unwrap_or_default().contains("hi"),
         "搜索结果应含命中消息: {searched}");
+    // 文档曾把这里的游标写成 `nextCursor`；用响应本身钉住真实字段名，防止文档再漂。
+    let searched_json: Value = serde_json::from_str(
+        searched["result"]["content"][0]["text"].as_str().unwrap_or_default(),
+    )
+    .expect("工具输出应是 JSON");
+    assert!(
+        searched_json.get("nextCursor").is_none(),
+        "search 不得返回 nextCursor（无法回传）: {searched_json}",
+    );
+    assert!(
+        searched_json.get("nextOffset").is_some(),
+        "search 必须返回 nextOffset: {searched_json}",
+    );
 
     // 三步：取消息。
     send(&mut stdin, json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call",
@@ -575,6 +588,11 @@ async fn mcp_three_step_demo_lists_searches_and_fetches() {
     .expect("工具输出应是 JSON");
     assert_eq!(fetched_json["truncated"], json!(false), "单条消息不该被截断: {fetched_json}");
     assert_eq!(fetched_json["hasMore"], json!(false), "单条消息不该报还有更多: {fetched_json}");
+    // `sinceResolved` 是本轮 since 解析出的绝对下界（相对串在下一轮会挪窗）。
+    assert!(
+        fetched_json.get("sinceResolved").is_some(),
+        "get_messages 必须回给 sinceResolved: {fetched_json}",
+    );
 
     child.kill().ok();
     let _ = child.wait();
