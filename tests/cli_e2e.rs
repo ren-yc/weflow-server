@@ -87,7 +87,16 @@ async fn sessions(axum::extract::RawQuery(q): axum::extract::RawQuery) -> Json<V
 async fn pull(axum::extract::Path(id): axum::extract::Path<String>) -> Json<Value> {
     // map-talker：拉取面给**原始名**（photo.png），而消息面给回填名（digest.png，见 chatlab 分支），
     // 同一条消息 id——CLI 必须按消息 id 把导出物的句柄对回实际落盘的名字。
-    let messages = if id == "map-talker" {
+    let messages = if id == "gone-talker" {
+        // 对账收口：同一个不可取句柄在**两个面**都出现。此前只有 ChatLab 面带它，
+        // Pull 面给的是默认消息 —— 于是「删掉 retain_downloaded_media」的回归
+        // （未取到的句柄不再被从导出物里清除）根本不会红：gone.png 从不出现在
+        // Pull 输入里，对账逻辑无从触发。现在两面都给 gone.png，删掉对账调用
+        // 必红。
+        let mut m = pull_message();
+        m["media"] = json!({"fileName": "gone.png", "type": "image"});
+        vec![m]
+    } else if id == "map-talker" {
         let mut m = pull_message();
         m["media"] = json!({"fileName": "photo.png", "type": "image"});
         vec![m]
@@ -397,6 +406,9 @@ async fn with_media_skips_an_unfetchable_handle_without_failing() {
         .expect("应有 jsonl");
     let body = std::fs::read_to_string(&jsonl).unwrap();
     assert!(!body.contains("gone.png"), "没有字节的句柄不该写进导出物: {body}");
+    // 对账是承重的：两面都带这个句柄，若「取到 404 后不把句柄从导出物里清掉」，
+    // 上面那条 !contains 就会红 —— 这里点名对账调用本身被删的情形（回归位置：
+    // retain_downloaded_media 调用点）。删掉它 ⇒ 本用例必须红。
     let _ = std::fs::remove_dir_all(&dir);
 }
 

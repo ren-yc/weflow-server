@@ -12,6 +12,18 @@
   `media_bytes(&message)` 改为 `media_bytes(&message, talker)`（Rust）/ `media_bytes(message, talker)`（Python），
   `talker` 用发起导出时传给 ChatLab 面的同一个会话 id。`media_bytes_by_id(id)` 不受影响。
 
+- **MCP `get_messages` 响应新增 `sinceResolved`**：`since` 接受相对串（`7d`/`24h`），续拉发生在
+  下一轮对话——重发相对串会把窗口悄悄前移。响应回给本轮解析出的**排他**绝对下界，续拉传
+  `nextOffset` + `sinceResolved`；`since` 未提供时为 `null`。
+- **CLI `contacts` 子命令分页化**：带 `--limit`/`--offset`，输出从裸数组改为
+  `{total, hasMore, contacts}`（此前固定取第一页且不报总数）。
+- **CLI 用法错误口径统一**：显式空 `--talker`、带空白的 `--since`、嵌入分支的同类输入，
+  一律以用法错误退出（此前部分形态静默返回空结果退出 0）；`--since` 解析返回 trim 后的值。
+- **TS 客户端 `watch` 的干净 EOF 改为重连**：服务端优雅关停/空闲重启不再静默终止跟随
+  （与 qqflow 同构）。
+- **发布流水线新增质量门**：release 前在同 tag 重跑 clippy、全量测试与契约 nails，
+  构建依赖该门——测试红着打 tag 会被拒绝。
+
 ## [0.8.0] - 2026-10-04
 
 ### 变更
