@@ -202,7 +202,7 @@ export class WeflowClient {
           // clean stream end: reconnect at the floor. The server closes the
           // SSE stream on graceful shutdown *and* on idle restarts; treating
           // a clean EOF as terminal would silently stop following a live
-          // server (the qqflow sibling behaves this way).
+          // server (both siblings share this behavior).
           backoff = 500;
         } else {
           backoff = Math.min(backoff * 2, 30000); // malformed: keep escalating

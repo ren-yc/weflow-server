@@ -257,7 +257,9 @@ pub(crate) fn dispatch() -> Result<Entry> {
         }
         Command::Contacts(q) => {
             let (rows, total, has_more) = if q.embedded {
-                let rows = embedded_contacts()?;
+                // 与 HTTP 分支同契约：limit/offset 真实生效（声明了参数却不透传，
+                // 按页翻的调用方会拿到 N 份全量）。
+                let rows = embedded_contacts(q.limit, q.offset)?;
                 let total = rows.len() as u64;
                 (rows, total, false)
             } else {
@@ -368,6 +370,11 @@ fn usage_error(msg: &str) -> ! {
 /// 进程内形态可以省略（索引里所有会话都能翻）。
 fn run_messages(m: &MessageArgs) -> Result<Vec<Value>> {
     if m.embedded {
+        // None 是「跨全部会话」的合法语义；显式空串/纯空白不是 —— 它会变成一个
+        // 永远匹配不到的会话键，静默给出空结果退 0，与 HTTP 形态的用法错误不一致。
+        if m.talker.as_deref().is_some_and(|t| t.trim().is_empty()) {
+            usage_error("--talker 不能是空串（要跨全部会话请省略 --talker）")
+        }
         return embedded_messages(m.talker.as_deref(), m.since.as_deref(), m.keyword.as_deref(), m.limit);
     }
     let Some(talker) = m.talker.clone().filter(|t| !t.trim().is_empty()) else {
@@ -469,13 +476,19 @@ fn embedded_sessions() -> Result<Vec<Value>> {
         .collect())
 }
 
-fn embedded_contacts() -> Result<Vec<Value>> {
+fn embedded_contacts(limit: Option<u32>, offset: Option<u64>) -> Result<Vec<Value>> {
     let index = embedded_index()?;
     // 承诺面的 Contact 里备注与昵称是 Option：这里保留「没有就是 null」而不是压成空串——
     // 「有键但值为空」与「没有这个键」的区分在本服务的其它面是契约的一部分，这里不自创例外。
+    // limit/offset 与 HTTP 分支同语义：offset 跳过前 N 条，limit 截断本页（声明了参数就
+    // 必须真实生效，否则按页翻的调用方会拿到 N 份全量）。
+    let skip = offset.unwrap_or(0) as usize;
+    let take = limit.unwrap_or(200) as usize;
     Ok(index
         .contacts()
         .iter()
+        .skip(skip)
+        .take(take)
         .map(|c| json!({
             "username": c.username,
             "displayName": c.display_name(),
