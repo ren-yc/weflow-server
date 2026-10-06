@@ -32,6 +32,8 @@ class Mock:
         self.pull_queries: list[dict] = []
         self.media_calls: list[str] = []
         self.media_hit_first = True
+        # Status the media route answers with once the first miss is done.
+        self.media_status: int = 200
         self.chatlab_page: dict | None = None
         self.messages_query: dict | None = None
         # Raw bytes for the SSE response body; str fixtures are encoded.
@@ -42,6 +44,8 @@ class Mock:
         # Split delivery: when set, sent as separate body messages.
         self.sse_chunks: list[bytes] | None = None
         self.sse_connections: int = 0
+        # Status the SSE route answers with (default 200).
+        self.sse_status: int = 200
         self.sse_last_ids: list[str | None] = []
         # Request counters: which endpoints a call actually touched.
         self.post_calls: int = 0
@@ -130,7 +134,7 @@ class Mock:
                     return
                 await send({
                     "type": "http.response.start",
-                    "status": 200,
+                    "status": mock.media_status,
                     "headers": [(b"content-type", b"application/octet-stream")],
                 })
                 await send({"type": "http.response.body", "body": b"png-bytes"})
@@ -168,7 +172,7 @@ class Mock:
                     payload = mock.sse_body
                 await send({
                     "type": "http.response.start",
-                    "status": 200,
+                    "status": mock.sse_status,
                     "headers": [(b"content-type", b"text/event-stream")],
                 })
                 if mock.sse_chunks is not None:
@@ -369,6 +373,36 @@ async def test_media_bytes_exports_then_retries() -> None:
     assert mock.media_calls == ["abc.png", "abc.png"]
     assert mock.messages_query == {"talker": "alice", "media": "1"}
     await client.aclose()
+
+
+async def test_media_bytes_rejects_redirect_like_statuses() -> None:
+    """The bytes check must be "not 2xx", not "4xx/5xx".
+
+    A 302 without `Location` (or a 304) must surface as StatusError: falling
+    through the old ">= 400" check would hand the caller an empty redirect
+    body as if it were the media bytes, with no signal at all.
+    """
+    for status in (302, 304):
+        mock = Mock()
+        mock.chatlab_page = {
+            "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
+            "count": 0, "members": [], "messages": [],
+            "meta": {"groupId": "", "name": "", "ownerId": "",
+                     "platform": "weflow", "type": "chat"},
+            "page": {"hasMore": False, "nextCursor": None},
+            "talker": "alice",
+        }
+        mock.media_status = status
+        client = make_client(mock)
+        message = gen.ChatlabMessage.model_validate({
+            "accountName": "alice", "content": "x", "groupNickname": "",
+            "media": {"type": "image", "fileName": "abc.png", "md5": "z"},
+            "platformMessageId": "1", "sender": "alice", "timestamp": 1, "type": 1,
+        })
+        with pytest.raises(sdkmod.StatusError) as exc_info:
+            await client.media_bytes(message)
+        assert exc_info.value.status == status
+        await client.aclose()
 
 
 # ---- watch --------------------------------------------------------------
@@ -754,6 +788,53 @@ async def test_health_reports_version_and_account_phase() -> None:
     assert mock.health_auth == [False], "/health is unauthenticated: no credentials"
 
 
+async def test_watch_treats_a_3xx_as_an_error_not_a_reconnectable_stream() -> None:
+    """A 3xx on the SSE endpoint must surface as StatusError.
+
+    The status check was `>= 400` while every other entry uses `not 2xx`:
+    a gateway 302 with an empty body decoded as a clean EOF, the backoff
+    reset, and the client looped forever at 0.5s with no error signal.
+    """
+    mock = Mock()
+    mock.sse_status = 302
+    client = make_client(mock)
+    agen = client.watch()
+    try:
+        # The timeout is load-bearing: the pre-fix code never raises here
+        # (a 3xx decoded as a clean stream and the watch looped forever),
+        # so without it a regression turns into a hung test instead of a
+        # red one.
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(anext(agen), timeout=5)
+            print("UNREACHABLE: no error within 5s - reconnect storm?")
+        raise AssertionError("3xx did not surface as StatusError")
+    except sdkmod.StatusError as exc_info:
+        assert exc_info.status == 302
+        assert exc_info.url.endswith("/api/v1/push/messages")
+    finally:
+        await agen.aclose()
+        await client.aclose()
+
+
+async def test_health_shape_corruption_is_a_shape_error() -> None:
+    """A 200 with a body of the wrong type lands in ShapeError.
+
+    pydantic's own ValidationError used to escape the ClientError tree for
+    every route that decodes through model_validate; callers that classify
+    "except ClientError" saw an unplanned exception class. One pin here is
+    enough: every route shares the same wrapper.
+    """
+    mock = Mock()
+    # Truthy body, wrong field *type*: `account` must be an enum string, so a
+    # number fails model_validate — and the mock's `or`-fallback must not kick
+    # in the way an empty list would.
+    mock.health_body = {"account": 123, "status": "ok", "version": "9.9.9"}
+    client = make_client(mock)
+    with pytest.raises(sdkmod.ShapeError):
+        await client.health()
+    await client.aclose()
+
+
 async def test_accounts_expose_state_error_and_message_count() -> None:
     mock = Mock()
     mock.accounts_page = {
@@ -1016,11 +1097,24 @@ async def test_group_members_rejects_an_empty_chatroom() -> None:
 async def test_transport_failures_are_client_errors() -> None:
     """A refused connection must land inside the ClientError tree.
 
-    httpx raises its own family, so `except ClientError` used to catch every
-    server refusal while missing every network failure.
+    httpx raises its own family, so "except ClientError" used to catch every
+    server refusal while missing every network failure. Every public request
+    entry goes through _http_get/_http_post; walk one representative per
+    transport method (an entry that called self._http directly let a raw
+    httpx error escape for that route alone).
     """
     client = Client("http://127.0.0.1:1", TOKEN, timeout=2.0)
-    with pytest.raises(sdkmod.TransportError):
-        await client.group_members("10001")
-    with pytest.raises(sdkmod.ClientError):
-        await client.group_members("10001")
+    get_entries = [
+        lambda: client.health(),
+        lambda: client.accounts(),
+        lambda: client.group_members("10001"),
+    ]
+    post_entries = [
+        lambda: client.register({"qq": "10001", "key": "k", "db_path": "X:/a"}),
+        lambda: client.sync_now(),
+    ]
+    for entry in get_entries + post_entries:
+        with pytest.raises(sdkmod.TransportError):
+            await entry()
+        with pytest.raises(sdkmod.ClientError):
+            await entry()
