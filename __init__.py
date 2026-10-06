@@ -10,9 +10,20 @@ Two layers with different ownership:
   most downstreams should use.
 """
 
-from .client import BadDate, Client, ClientError, NotReady, ShapeError, StatusError
+from .client import (
+    CONNECT_TIMEOUT,
+    READ_TIMEOUT,
+    BadDate,
+    Client,
+    ClientError,
+    NotReady,
+    ShapeError,
+    StatusError,
+)
 
 __all__ = [
+    "CONNECT_TIMEOUT",
+    "READ_TIMEOUT",
     "BadDate",
     "Client",
     "ClientError",

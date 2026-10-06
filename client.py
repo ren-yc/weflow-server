@@ -30,6 +30,15 @@ from .generated.weflow_sdk import models as gen
 
 log = logging.getLogger(__name__)
 
+# Published connect budget (seconds) for every request the SDK makes: a server
+# that is not there must fail fast rather than hang a caller.
+CONNECT_TIMEOUT = 5.0
+
+# Published read budget for ordinary JSON requests. Requests that are unbounded
+# by construction (a full-roster message count, a media body, a sync pass, the
+# SSE stream) do not use it - see ``_long_timeout``.
+READ_TIMEOUT = 30.0
+
 # 200-with-refusal vocabulary across the two servers: the weflow server
 # currently emits only account_conflict, the qqflow sibling adds
 # invalid_key / invalid_db_path / unknown_qq. One shared set keeps the two
@@ -58,7 +67,8 @@ class ClientError(Exception):
 
 
 class TransportError(ClientError):
-    """The request never produced an HTTP response (connect, timeout, reset).
+    """The request never produced an HTTP response (connect, timeout, reset),
+    or was never sent at all because httpx could not parse the URL.
 
     Why this exists: ``httpx`` raises its own exception family, so a caller doing
     ``except ClientError`` used to miss **every** network failure while catching
@@ -69,10 +79,13 @@ class TransportError(ClientError):
 class StatusError(ClientError):
     """The server answered, but not with a usable body."""
 
-    def __init__(self, status: int, url: str) -> None:
-        super().__init__(f"HTTP {status} on {url}")
+    def __init__(self, status: int, url: str, detail: str | None = None) -> None:
+        note = f" ({detail})" if detail else ""
+        super().__init__(f"HTTP {status} on {url}{note}")
         self.status = status
         self.url = url
+        #: Why this status matters (e.g. the refusal state a 200 carried).
+        self.detail = detail
 
 
 class ShapeError(ClientError):
@@ -210,8 +223,18 @@ class Client:
     never in the URL.
     """
 
-    def __init__(self, base_url: str, token: str, timeout: float = 30.0) -> None:
-        self._http = httpx.AsyncClient(timeout=timeout)
+    def __init__(self, base_url: str, token: str, timeout: float = READ_TIMEOUT) -> None:
+        self._timeout = httpx.Timeout(timeout, connect=CONNECT_TIMEOUT)
+        # No read bound for the requests whose cost is not a function of
+        # anything the caller can see: counting a roster, transferring a
+        # media body, running a sync pass. The SSE stream belongs here too -
+        # a read bound is charged per read operation while the server pings only
+        # every 25s, so the JSON budget would leave a 5s margin that one proxy
+        # stall burns through on a healthy idle connection.
+        self._long_timeout = httpx.Timeout(
+            None, connect=CONNECT_TIMEOUT, write=None, pool=None
+        )
+        self._http = httpx.AsyncClient(timeout=self._timeout)
         self._base = base_url.rstrip("/")
         self._token = token
 
@@ -233,7 +256,7 @@ class Client:
         """GET that maps `httpx` transport failures into :class:`TransportError`."""
         try:
             return await self._http.get(url, **kwargs)
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
             raise TransportError(f"{type(exc).__name__} on {url}: {exc}") from exc
 
     async def _http_post(self, url: str, **kwargs: Any) -> httpx.Response:
@@ -247,15 +270,18 @@ class Client:
         representative per transport method)."""
         try:
             return await self._http.post(url, **kwargs)
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
             raise TransportError(f"{type(exc).__name__} on {url}: {exc}") from exc
 
-    async def _get_json(self, path: str, query: dict[str, str]):
+    async def _get_json(
+        self, path: str, query: dict[str, str], *, long: bool = False
+    ):
         url = self._url(path)
         resp = await self._http_get(
             url,
             headers={"Authorization": f"Bearer {self._token}"},
             params=query,
+            timeout=self._long_timeout if long else self._timeout,
         )
         return await self._decode(resp, url)
 
@@ -301,10 +327,27 @@ class Client:
         deadline = asyncio.get_running_loop().time() + timeout
         last_state = "not-registered"
         while True:
-            listing = self._validate(gen.AccountsList, 
-                await self._get_json("/api/v1/accounts", {})
+            # A dropped round is waiting, not failure: this poll exists to ride out
+            # a transient connect blip or a momentary 5xx while the index is still
+            # coming up. A 4xx is a misconfiguration, and a listing that no longer
+            # matches the declared shape is a broken contract - both propagate
+            # instead of being waited out.
+            try:
+                listing = self._validate(
+                    gen.AccountsList, await self._get_json("/api/v1/accounts", {})
+                )
+            except TransportError:
+                listing = None
+            except StatusError as exc:
+                if 500 <= exc.status < 600:
+                    listing = None
+                else:
+                    raise
+            mine = (
+                next((a for a in listing.accounts if a.wxid == account), None)
+                if listing is not None
+                else None
             )
-            mine = next((a for a in listing.accounts if a.wxid == account), None)
             if mine is not None:
                 if mine.state is gen.AccountStatus.READY:
                     return
@@ -331,7 +374,7 @@ class Client:
         outcome = await self.register(body)
         if outcome.state in _REFUSAL_STATES:
             url = self._url("/api/v1/accounts")
-            raise StatusError(200, f"{url} (state={outcome.state})")
+            raise StatusError(200, url, f"state={outcome.state}")
         await self.wait_ready(account, timeout)
 
     # ---- health / accounts / register -----------------------------------
@@ -395,8 +438,12 @@ class Client:
         caller that asked for it triggers it.
         """
         url = self._url("/api/v1/sync")
+        # A sync pass indexes and may export media: bounded only by the size of
+        # the library, never by a fixed budget.
         resp = await self._http_post(
-            url, headers={"Authorization": f"Bearer {self._token}"}
+            url,
+            headers={"Authorization": f"Bearer {self._token}"},
+            timeout=self._long_timeout,
         )
         return self._validate(gen.SyncResult, await self._decode(resp, url))
 
@@ -527,15 +574,23 @@ class Client:
         if not talker:
             raise ShapeError("talker must not be empty")
         name = message.media.file_name
+        if not name:
+            # Same fail-fast as the other keys: an empty handle addresses a
+            # different path than the caller means, and the server cannot tell
+            # "no file name" from "some file I never heard of".
+            raise ShapeError("media file_name must not be empty")
         url = self._url(f"/api/v1/media/{_encode_path_segment(name)}")
         auth = {"Authorization": f"Bearer {self._token}"}
-        resp = await self._http_get(url, headers=auth)
+        # Media size is whatever the sender uploaded; the export trigger behind a
+        # 404 copies whole files. Neither has a meaningful read budget.
+        resp = await self._http_get(url, headers=auth, timeout=self._long_timeout)
         if resp.status_code == 404:
             await self._get_json(
                 "/chatlab/messages",
                 {"talker": talker, "media": "1"},
+                long=True,
             )
-            resp = await self._http_get(url, headers=auth)
+            resp = await self._http_get(url, headers=auth, timeout=self._long_timeout)
         # Not-2xx (not just 4xx/5xx): a 3xx falling through to `return` hands
         # the caller an empty redirect body as media bytes with no error signal
         # - same rule as _decode / media_bytes_by_id.
@@ -654,11 +709,17 @@ class Client:
         query: dict[str, str] = {"chatroomId": chatroom}
         if include_message_counts:
             query["includeMessageCounts"] = "1"
+        # Counting messages scans every session behind each roster entry: that is
+        # exactly the request the published read budget must not apply to.
         return self._validate(gen.GroupMembers, 
-            await self._get_json("/api/v1/group-members", query)
+            await self._get_json(
+                "/api/v1/group-members", query, long=include_message_counts
+            )
         )
 
     async def media_bytes_by_id(self, media_id: str) -> bytes:
+        if not media_id:
+            raise ShapeError("media_id must not be empty")
         """``GET /api/v1/media/{id}`` - bytes for a handle the server advertised.
 
         ``media_id`` is a **single path segment**: the native face's
@@ -668,7 +729,9 @@ class Client:
         """
         url = self._url(f"/api/v1/media/{_encode_path_segment(media_id)}")
         resp = await self._http_get(
-            url, headers={"Authorization": f"Bearer {self._token}"}
+            url,
+            headers={"Authorization": f"Bearer {self._token}"},
+            timeout=self._long_timeout,
         )
         if not 200 <= resp.status_code < 300:
             raise StatusError(resp.status_code, url)
@@ -720,7 +783,10 @@ class Client:
                     headers["Last-Event-ID"] = last_event_id
                 overflow = False
                 async with self._http.stream(
-                    "GET", self._url("/api/v1/push/messages"), headers=headers
+                    "GET",
+                    self._url("/api/v1/push/messages"),
+                    headers=headers,
+                    timeout=self._long_timeout,
                 ) as resp:
                     # 3xx is also a failure (same not-2xx rule as _decode /
                     # media_bytes): a 302 decoded as a readable stream ends in
@@ -813,7 +879,7 @@ class Client:
                             clean_exit = True
                     # Overflow: skip the EOF flush entirely (an un-trusted
                     # stream must not deliver its tail) and keep escalating.
-            except httpx.HTTPError as exc:
+            except (httpx.HTTPError, httpx.InvalidURL) as exc:
                 log.warning("SSE stream error, reconnecting: %s", exc)
             if clean_exit:
                 backoff = 0.5
