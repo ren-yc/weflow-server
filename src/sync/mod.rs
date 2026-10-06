@@ -203,8 +203,8 @@ pub struct AccountSync {
 /// 单轮排空的页数上限：防坏数据（水位推不动的表）把一轮 poll 拖死。
 /// 5000 × 64 = 单轮最多 32 万行；超出即下一轮继续（不丢行，只晚一轮）。
 ///
-/// 测试下取 2：与 `index::READ_PAGE` 的测试值（5）配对（单轮上限 10 行），
-/// 构造（回归：commit_bigger_than_one_round_is_drained_across_rounds）。
+/// 测试下取 2：与 `index::READ_PAGE` 的测试值（5）配对（单轮上限 10 行），让触顶
+/// 路径能在十几行上构造（回归：commit_bigger_than_one_round_is_drained_across_rounds）。
 #[cfg(not(test))]
 const READ_MAX_PAGES: usize = 64;
 #[cfg(test)]

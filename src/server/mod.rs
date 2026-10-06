@@ -1024,6 +1024,13 @@ pub fn watch_config(cfg: &Config) -> WatchConfig {
 mod tests {
     use super::*;
 
+    /// 进程级 `GENERATION` 的串行化：会走**有效**注销的用例都先拿这把锁。
+     /// 不加锁时 `--lib` 套件的并行执行里，任何一条并发注销都会
+     /// `bump_generation()`，让 `deregistering_the_wrong_wxid_touches_nothing` 对
+     /// 「代号不得被 mismatch 推进」的观察变成跨测试竞态（Linux CI 实测红：
+     /// left 4 / right 3；Windows 只是没排上那个交错）。
+    static DEREG_LOCK: Mutex<()> = Mutex::new(());
+
     fn test_state() -> Arc<AppState> {
         let cfg = Config {
             host: "127.0.0.1".into(),
@@ -1187,6 +1194,7 @@ mod tests {
     /// After a deregistration the binding is free for a different account.
     #[test]
     fn deregistration_frees_the_binding_for_another_wxid() {
+        let _dereg_serial = DEREG_LOCK.lock();
         let state = test_state();
         bind(&state, "wxid_a").set_status(AccountStatus::Ready);
         assert!(matches!(
@@ -1222,6 +1230,7 @@ mod tests {
     /// retired, and `/health` reads `unregistered` again.
     #[test]
     fn deregistering_clears_the_index_and_retires_the_handle() {
+        let _dereg_serial = DEREG_LOCK.lock();
         let state = test_state();
         let h = bind(&state, "wxid_a");
         h.set_status(AccountStatus::Ready);
@@ -1250,6 +1259,7 @@ mod tests {
     /// a client needs to be able to clear — and reports no index to clear.
     #[test]
     fn deregistering_mid_indexing_is_allowed() {
+        let _dereg_serial = DEREG_LOCK.lock();
         let state = test_state();
         let h = bind(&state, "wxid_a"); // indexing
         assert_eq!(
@@ -1269,6 +1279,7 @@ mod tests {
     /// The `wxid` in the path is an interlock: a mismatch changes nothing.
     #[test]
     fn deregistering_the_wrong_wxid_touches_nothing() {
+        let _dereg_serial = DEREG_LOCK.lock();
         let state = test_state();
         let h = bind(&state, "wxid_a");
         h.set_status(AccountStatus::Ready);
@@ -1287,6 +1298,7 @@ mod tests {
         // 已连订阅者推进重基线（对服务端口免鉴权面等于一次拒绝服务）。挪到校验
         // 之后 ⇒ 这里塞一条历史再注销，条目与代号都必须原样。
         state.history.lock().append(crate::sync::Event::Sync(vec![]));
+        // 本用例在 DEREG_LOCK 里：否则并发注销会推进进程级代号，这条断言变成竞态。
         let gen_before = current_generation();
         deregister_account(&state, "wxid_b", false);
         assert_eq!(
@@ -1300,6 +1312,7 @@ mod tests {
     /// Idempotent: retrying a completed deregistration is not an error.
     #[test]
     fn deregistering_nothing_is_idempotent() {
+        let _dereg_serial = DEREG_LOCK.lock();
         let state = test_state();
         assert_eq!(deregister_account(&state, "wxid_a", false), DeregisterOutcome::NotRegistered);
         bind(&state, "wxid_a");
@@ -1315,6 +1328,7 @@ mod tests {
     /// `discovered` alone — the two lists are independent.
     #[test]
     fn deregistration_reverts_scanned_accounts_and_drops_client_only_ones() {
+        let _dereg_serial = DEREG_LOCK.lock();
         let state = test_state();
         state.set_discovered(vec![info("wxid_scanned")]);
         bind(&state, "wxid_scanned").set_status(AccountStatus::Ready);
