@@ -94,7 +94,8 @@ struct ListSessionsArgs {
 struct GetMessagesArgs {
     /// 会话 ID（…@chatroom 为群）
     talker: String,
-    /// 起始时间：unix 秒 / YYYYMMDD / 7d / 24h（含边界）
+    /// 起始时间下界（**排他**，只返回严格晚于它的消息）：unix 秒 / YYYYMMDD /
+    /// 7d / 24h
     since: Option<String>,
     /// 单页条数（默认 50，上限 200）
     limit: Option<usize>,
@@ -303,8 +304,10 @@ impl WeflowMcp {
         let start = a.offset.unwrap_or(0);
         // since 是调用方的相对串（"7d"/"24h"），解析出的**绝对下界**必须原样回给：
         // 续拉发生在下一轮对话，「现在」已经前移，重发相对串会把窗口悄悄向前挪，
-        // 中间那段时间的消息就被跳过了。
-        let since_resolved = since;
+        // 中间那段时间的消息就被跳过了。序列化成**字符串**：续拉的入参 since 是
+        // Option<String>，回填数字会被反序列化拒绝，而 MCP 协议错误只渲染成一句
+        // 笼统的内部错误 —— 指引本身不能制造不可读失败。
+        let since_resolved = since.map(|v| v.to_string());
         Ok(CallToolResult::structured(json!({
             "talker": a.talker,
             "count": proj.items.len(),
@@ -324,7 +327,17 @@ impl WeflowMcp {
             },
             // 绝对下界：续拉时传它而不是原始 since 串（下一轮 now 已前移，相对串会挪窗）。
             "sinceResolved": since_resolved,
-            "hint": if cut { json!("本页超过字符预算，已少给若干条：用 nextOffset 且 since 传响应里的 sinceResolved（绝对下界，不要重发相对串——下一轮 now 已前移会挪窗）续拉；也可用更小的 limit 重取本页，此时按 platformMessageId 去重") } else { Value::Null },
+            // hint 只在确实有下界可回填时指路：since 未提供时 sinceResolved 为 null，
+            // 教调用方「传响应里的 sinceResolved」会得到 null/反序列化失败。
+            "hint": if cut {
+                if since_resolved.is_some() {
+                    json!("本页超过字符预算，已少给若干条：用 nextOffset 且 since 传响应里的 sinceResolved（绝对下界，不要重发相对串——下一轮 now 已前移会挪窗）续拉；也可用更小的 limit 重取本页，此时按 platformMessageId 去重")
+                } else {
+                    json!("本页超过字符预算，已少给若干条：用 nextOffset 续拉（本次调用未提供 since，无绝对下界可回填）；也可用更小的 limit 重取本页，此时按 platformMessageId 去重")
+                }
+            } else {
+                Value::Null
+            },
             "messages": proj.items,
         })))
     }

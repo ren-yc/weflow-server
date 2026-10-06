@@ -574,9 +574,10 @@ async fn mcp_three_step_demo_lists_searches_and_fetches() {
         "search 必须返回 nextOffset: {searched_json}",
     );
 
-    // 三步：取消息。
+    // 三步：取消息。带一个相对 since：同时钉「相对串 → 绝对下界」这条链路
+    // （不传 since 时 sinceResolved 是 null，那种断言拦不住「值恒为 null」）。
     send(&mut stdin, json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call",
-        "params": {"name": "get_messages", "arguments": {"talker": TALKER}}}));
+        "params": {"name": "get_messages", "arguments": {"talker": TALKER, "since": "24h"}}}));
     let fetched = read_until(&mut out, 5);
     assert_ne!(fetched["result"]["isError"], json!(true), "get_messages 不该是工具级错误: {fetched}");
     assert!(fetched["result"]["content"][0]["text"].as_str().unwrap_or_default().contains("42"),
@@ -589,9 +590,16 @@ async fn mcp_three_step_demo_lists_searches_and_fetches() {
     assert_eq!(fetched_json["truncated"], json!(false), "单条消息不该被截断: {fetched_json}");
     assert_eq!(fetched_json["hasMore"], json!(false), "单条消息不该报还有更多: {fetched_json}");
     // `sinceResolved` 是本轮 since 解析出的绝对下界（相对串在下一轮会挪窗）。
+    // 必须是**数值语义**（序列化为字符串，与入参 since 的 String 同型）且等于 24h
+    // 前的绝对秒——只钉键名不钉值，拦不住「值恒为 null」。
+    let resolved: i64 = fetched_json["sinceResolved"]
+        .as_str()
+        .unwrap_or_else(|| panic!("sinceResolved 必须是字符串形式的秒数: {fetched_json}"))
+        .parse()
+        .unwrap_or_else(|e| panic!("sinceResolved 必须可解析为 i64: {e}"));
     assert!(
-        fetched_json.get("sinceResolved").is_some(),
-        "get_messages 必须回给 sinceResolved: {fetched_json}",
+        resolved <= chrono::Utc::now().timestamp() && resolved > chrono::Utc::now().timestamp() - 25 * 3_600,
+        "sinceResolved 应为 24h 前的绝对秒: {resolved}",
     );
 
     child.kill().ok();

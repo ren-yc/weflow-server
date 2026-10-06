@@ -38,7 +38,7 @@ WEFLOW_BASE_URL=http://127.0.0.1:6002 weflow-server mcp
 | 工具 | 取数面 | 说明 |
 | --- | --- | --- |
 | `list_sessions` | 会话发现面 | 可选 `keyword`（服务端过滤）；返回 username / displayName / sessionType / messageCount 等 |
-| `get_messages` | Pull 面 | ChatLab 形状、时间升序；游标 `nextSince` 与 `nextOffset` |
+| `get_messages` | Pull 面 | ChatLab 形状、时间升序；游标 `nextSince`/`nextOffset`，另回 `sinceResolved`（本轮 `since` 的绝对下界） |
 | `get_messages_raw` | 原生消息面 | 带 `rawContent` / `isSend` / `localType` 与媒体元数据；按 `offset` 翻页 |
 | `search_messages` | ChatLab 消息面 | 会话内关键词检索；按 `offset` 翻页（游标 `nextOffset`） |
 | `get_contacts` | 联系人面 | 备注 / 昵称 / 别名只在这个面出现 |
@@ -54,10 +54,14 @@ WEFLOW_BASE_URL=http://127.0.0.1:6002 weflow-server mcp
 - `get_messages` 在预算截断时**不返回整页游标** `nextSince`（它指向整页最后一条，用它续拉会
   跳过没给出去的那些条），但**返回 `nextOffset`**（这一面从 `offset` 起是连续切片，`start + 给出
   条数` 恰指向被砍掉的第一条）与 `sinceResolved`（本轮 `since` 解析出的**排他**绝对下界）。
+  此组合只在**截断场景**使用；未截断时响应给出整页游标 `nextSince`，按原语义续拉即可。
   续拉请传 `nextOffset` 且 `since` 传 `sinceResolved`——不要重发相对串（如 `7d`）：续拉发生在
-  下一轮对话，「现在」已经前移，相对串会把窗口悄悄前移、跳过中间的消息。
+  下一轮对话，「现在」已经前移，相对串会把窗口悄悄前移、跳过中间的消息。未提供 `since` 时
+  `sinceResolved` 为 null（等价于不传）。
 - `search_messages` 同样按 `offset` 翻页、本页是连续切片，截断时 `nextOffset` 正好指向被砍掉的
   第一条（并把 `hasMore` 置真）。
+- `get_messages_raw` 例外：原生面按 offset 翻页、本页是连续切片，砍掉尾部后 `nextOffset` 正好
+  指向被砍掉的第一条，所以它照常返回（并把 `hasMore` 置真）。
 
 ## 失败通道
 
