@@ -935,6 +935,8 @@ feeds 条目字段（以源码 `sns.rs` 为准）：`tid/userName/content(明文
 - **响应里的媒体名要过本地路径校验**：服务端回传的 `media.fileName` 要拿去拼 `<目录>/media/` 下的路径，
   `../`、盘符、ADS、Win32 设备名这类值配合 `join` 能写到导出目录之外（URL 段编码只防 HTTP 层）。
   因此落盘前先过 `pathsafe::safe_segment`，非法名按 404 同级跳过**并计数可见**（汇总行给出个数）。
+  同名（含仅大小写不同，折叠口径与会话名一致）的媒体只下载一份字节，引用它的每条消息都映射到**实际落盘的
+  那个名字**。
   回归位置：`export::tests::with_media_keeps_only_handles_whose_bytes_are_on_disk`、
   `export::tests::message_line_omits_media_without_a_handle`、
   `cli_e2e::with_media_rejects_unsafe_response_file_names` 与
@@ -952,7 +954,18 @@ feeds 条目字段（以源码 `sns.rs` 为准）：`tid/userName/content(明文
    （幂等完成），同参数续跑以退出码 0 收场。
 3. **最终名是唯一的完成标记**：会话先写 `<slug>.<格式>.part`，整个会话成功收尾后才 `rename` 成最终名。
    因此 `.part` 残留意味着「没写完」，续跑一律重写；失败的那一轮只删 `.part`，**不会**碰上一轮已经
-   交付的完整产物。
+   交付的完整产物。清单 `index.json` 同样先 `index.json.part` 再改名 —— 它是续跑唯一的「完成记录」来源，
+   半路被杀的截断清单会让下一轮误判「没有上一轮」。
+4. **`--resume` 复用要同时满足四条**（缺一条就重写，并在日志点名原因）：上一轮清单记着该会话、
+   且它登记的**就是本轮这个文件名**（换格式 `jsonl`／`json` 后盘上的另一扩展名文件是孤儿，
+   不算本轮产物）、没有 `.part` 残留、本轮带 `--with-media` 时上一轮也带过媒体。
+   「有个同名文件」单独不构成完成记录：清单被删或被截断时，那会让从没导出过的会话被静默判成已完成，
+   而它在新清单里没有条目，既看不见也不能自愈。
+5. **媒体承诺按轮成立**：`--with-media --resume` 复用上一轮产物时，CLI 会逐个核对复用会话里的
+   `fileName` 在 `media/` 下确有字节；有悬空就点名该会话并以退出码 1 结束（媒体目录被清理或
+   搬走过的交付包不该静默通过）。处理办法：对点名的会话去掉 `--resume` 重跑，或恢复 `media/`。
+6. **单个会话的起手／收尾失败只跳过该会话**（记入 `skipped`），不中止整轮 —— 整轮中止会让本轮已写出
+   的会话留在盘上却不进清单，比留一个 `.part` 更难恢复。令牌泄漏仍是整轮中止。
 
    回归位置：`export::tests::resume_rewrites_an_incomplete_artifact`、
    `export::tests::failed_rerun_keeps_the_previous_complete_artifact`、

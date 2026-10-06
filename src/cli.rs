@@ -624,7 +624,10 @@ async fn download_session_media(
     // 键是消息 id（映射），另留一份落盘名集合做去重：同一条媒体可能被多条消息引用。
     let mut by_message: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
-    let mut on_disk: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // 折叠键 → 实际落盘的名字：与会话名同一口径（Windows 卷大小写不敏感），
+    // 否则 Img.png 与 img.png 会被当成两份媒体，后一份把前一份的字节覆盖掉。
+    let mut on_disk: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     let mut rejected = 0usize;
     let mut offset = 0u64;
     loop {
@@ -646,9 +649,10 @@ async fn download_session_media(
                 tracing::warn!("媒体文件名不是安全的单路径分量，跳过: {name}");
                 continue;
             }
-            if on_disk.contains(&name) {
-                // 同一份媒体被多条消息引用：字节只下一份，映射逐条补。
-                by_message.insert(m.platform_message_id.clone(), name);
+            if let Some(already) = on_disk.get(&name.to_lowercase()) {
+                // 同一份媒体被多条消息引用（或仅大小写不同的同名）：字节只下一份，
+                // 映射一律指向**实际落盘的那个名字**，不重下、也不另开一个物理文件。
+                by_message.insert(m.platform_message_id.clone(), already.clone());
                 continue;
             }
             match client.media_bytes_by_id(&name).await {
@@ -658,7 +662,7 @@ async fn download_session_media(
                     let path = media_dir.join(&name);
                     std::fs::write(&path, &bytes)
                         .with_context(|| format!("写媒体失败: {}", path.display()))?;
-                    on_disk.insert(name.clone());
+                    on_disk.insert(name.to_lowercase(), name.clone());
                     by_message.insert(m.platform_message_id.clone(), name);
                 }
                 // **只有 404 才算「不是可取句柄」**（外链、或服务端没写出副本）。
@@ -679,6 +683,41 @@ async fn download_session_media(
     }
 }
 
+
+/// 逐个核对**复用会话**产物里的媒体句柄是否在同目录 `media/` 下有字节。
+///
+/// 返回悬空的会话名。清单只含本轮 target 与复用命中的条目，所以复用会话都能在清单里找到
+/// 自己的 `file`。句柄用子串扫描取（不解析整份 JSON）：两种形态都按 `{"fileName":"<name>"}` 无空格
+/// 序列化，而整份解析会把 jsonl 的「内存与条数无关」这条承诺在这里破掉。
+fn reused_dangling_handles(
+    index: &std::path::Path,
+    reused: &[String],
+    media_dir: &std::path::Path,
+) -> Result<Vec<String>> {
+    let text = std::fs::read_to_string(index)
+        .with_context(|| format!("读清单失败: {}", index.display()))?;
+    let v: Value = serde_json::from_str(&text).context("清单不是合法 JSON")?;
+    let mut dangling = Vec::new();
+    for row in v.get("sessions").and_then(Value::as_array).into_iter().flatten() {
+        let Some(talker) = row.get("talker").and_then(Value::as_str) else { continue };
+        if !reused.iter().any(|t| t.as_str() == talker) {
+            continue;
+        }
+        let Some(file) = row.get("file").and_then(Value::as_str) else { continue };
+        let body = std::fs::read_to_string(index.with_file_name(file))
+            .with_context(|| format!("读复用产物失败: {file}"))?;
+        for handle in body.split("\"fileName\":\"").skip(1).filter_map(|s| s.split('"').next()) {
+            if handle.is_empty() {
+                continue;
+            }
+            if !media_dir.join(handle).exists() {
+                dangling.push(talker.to_string());
+                break;
+            }
+        }
+    }
+    Ok(dangling)
+}
 
 /// clap 层的 `--since` 校验：非法取值必须是**用法错误（退出码 2）**。
 ///
@@ -746,6 +785,8 @@ fn run_export(a: &ExportArgs) -> Result<()> {
         format,
         resume: a.resume,
         secret,
+        // 续跑的复用判据要知这一轮在乎不在乎媒体字节（承诺按轮成立，见 export::run 的复用条件）。
+        with_media: a.with_media,
     };
     let since = a.since.as_deref().map(to_unix).transpose()?;
     let start = std::time::Instant::now();
@@ -807,6 +848,22 @@ fn run_export(a: &ExportArgs) -> Result<()> {
         // 计数要可见：静默拒绝与静默少下载一样糟——交付物少了东西却不能被发现。
         println!("[export] 拒绝 {media_rejected} 个非法媒体文件名（不落盘、不写进导出物）");
     }
+    if a.with_media && !outcome.reused.is_empty() {
+        // 复用的会话本轮一个字节都没下载，而 `--with-media` 的承诺是「导出物里出现的每个
+        // fileName，字节都在 media/ 下」。上一轮之后媒体目录被清理或搬走时，句柄会悬空在交付
+        // 包里而退出码仍是 0——这里按最终名逐个核对，把静默成功变成响亮失败。
+        let dangling = reused_dangling_handles(&outcome.index, &outcome.reused, &media_dir)
+            .unwrap_or_default();
+        if !dangling.is_empty() {
+            for t in &dangling {
+                println!("[export] 媒体句柄悬空（复用产物缺字节）: {t}");
+            }
+            anyhow::bail!(
+                "{} 个复用会话的媒体句柄在 media/ 下没有字节：请对这些会话去掉 --resume 重跑，或恢复媒体目录",
+                dangling.len()
+            );
+        }
+    }
     if !outcome.skipped.is_empty() {
         for s in &outcome.skipped {
             println!("[export] 跳过: {}", s);
@@ -856,6 +913,7 @@ fn export_corpus(out: &std::path::Path, rows: usize) -> Result<()> {
         out_dir: out.to_path_buf(),
         format: export::Format::Jsonl,
         resume: false,
+        with_media: false,
         // 夹具里没有真令牌；留空表示「不检查」，而检查逻辑本身由 tests/cli.rs 直接测。
         secret: String::new(),
     };
@@ -944,5 +1002,58 @@ fn peak_rss_kb() -> Option<u64> {
     #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
     {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_index_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("{}-reverify-{tag}-{}", env!("CARGO_CRATE_NAME"), std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("media")).unwrap();
+        d
+    }
+
+    /// 复用的会话产物里有句柄，而 `media/` 下没有字节 —— 必须点名报出。
+    ///
+    /// 这条路径是"上一轮带 --with-media 导出、之后媒体目录被清理或搬走"：本轮 --resume
+    /// 复用产物（句柄还在导出物里），而本轮一个字节都没下载。承诺「出现即可取」被破坏
+    /// 却静默退 0，是交付包里最难被发现的一类缺件。
+    #[test]
+    fn reused_dangling_handles_are_detected_and_clean_rounds_pass() {
+        let d = tmp_index_dir("dangling");
+        let artifact = "Reused.jsonl";
+        std::fs::write(
+            d.join(artifact),
+            "{\"_type\":\"header\"}\n{\"_type\":\"message\",\"media\":{\"type\":\"image\",\"fileName\":\"gone.png\"}}\n",
+        )
+        .unwrap();
+        let index = d.join("index.json");
+        std::fs::write(
+            &index,
+            serde_json::to_string(&json!({"sessions": [{"talker": "wxid_reused", "file": artifact, "messages": 1, "withMedia": true}]}))
+                .unwrap(),
+        )
+        .unwrap();
+        let reused = vec!["wxid_reused".to_string()];
+
+        // 字节缺失 → 点名
+        let found = reused_dangling_handles(&index, &reused, &d.join("media")).unwrap();
+        assert_eq!(found, vec!["wxid_reused".to_string()], "句柄没有字节时必须报出该会话");
+
+        // 字节在 → 不报（同名的句柄确实落盘）
+        std::fs::write(d.join("media").join("gone.png"), b"PNG-BYTES").unwrap();
+        let ok = reused_dangling_handles(&index, &reused, &d.join("media")).unwrap();
+        assert!(ok.is_empty(), "字节齐备时不该误报: {ok:?}");
+
+        // 没有句柄的复用产物 → 不报（承诺空真成立）
+        std::fs::remove_file(d.join("media").join("gone.png")).unwrap();
+        std::fs::write(d.join(artifact), "{\"_type\":\"header\"}\n").unwrap();
+        let none = reused_dangling_handles(&index, &reused, &d.join("media")).unwrap();
+        assert!(none.is_empty(), "无句柄的产物不该被报为悬空: {none:?}");
+
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

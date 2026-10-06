@@ -77,6 +77,9 @@ pub struct Options {
     pub resume: bool,
     /// 绝不允许出现在导出物里的串（通常是访问令牌）。
     pub secret: String,
+    /// 本轮交付包是否要自带媒体字节（CLI 的 `--with-media`）。本模块自己不下载，但
+    /// 「句柄出现即可取」这条承诺**按轮次成立**，续跑判完成时需要知道这一轮在乎媒体。
+    pub with_media: bool,
 }
 
 #[derive(Debug, Default)]
@@ -471,7 +474,13 @@ pub fn write_index(
     })
     .to_string();
     assert_no_secret(&body, &opts.secret, &index)?;
-    std::fs::write(&index, body).with_context(|| format!("写索引失败: {}", index.display()))?;
+    // 清单同样先写 .part 再改名：它是续跑唯一的完成记录来源，一次半路被杀留下截断 JSON
+    // 就会让 previous_index 当"没有上一轮"，把复用判据整条废掉。
+    let index_part = opts.out_dir.join("index.json.part");
+    std::fs::write(&index_part, body)
+        .with_context(|| format!("写索引失败: {}", index_part.display()))?;
+    std::fs::rename(&index_part, &index)
+        .with_context(|| format!("改名索引失败: {} -> {}", index_part.display(), index.display()))?;
     Ok(index)
 }
 
@@ -549,8 +558,10 @@ fn file_is_complete(path: &Path, format: Format) -> bool {
 ///
 /// **调用方契约（本模块无法自己强制）**：若这次导出会留下媒体句柄（例如 CLI 的 `--with-media`），
 /// 调用方必须在把每一行交给 `on_page` 之前调用 `retain_downloaded_media`，并把「消息 id →
-/// 实际落盘名」的映射传进去。本模块不持有那个映射（下载发生在调用方），所以它写不出「有句柄必有
-/// 字节」这条不变量；漏调的结果是**外链媒体也会原样落成 `media.fileName`** —— 导入器随后找不到那个文件。
+/// 实际落盘名」的映射传进去，同时把 `Options::with_media` 设成本轮真实意图。本模块不持有那个映射
+/// （下载发生在调用方），所以它写不出「有句柄必有字节」这条不变量：漏调映射的结果是**外链媒体也会
+/// 原样落成 `media.fileName`**；漏设 `with_media` 的结果是**带媒体的续跑会复用上一轮的消息面
+/// 产物**，而那一轮可能根本没下过媒体字节。两条都是导入器事后才会发现的缺件。
 pub fn run<F>(targets: &[SessionTarget], opts: &Options, mut fetch: F) -> Result<Outcome>
 where
     F: FnMut(&SessionTarget, &mut dyn FnMut(&[Row]) -> Result<()>) -> Result<()>,
@@ -605,24 +616,63 @@ where
         // 文件名先算出来才能判断 --resume：确定性（同样的输入→同样的名字）是续跑的前提。
         let path = opts.out_dir.join(format!("{stem}.{ext}"));
         if opts.resume && path.exists() {
-            if !file_is_complete(&path, opts.format) {
-                // 半成品**不能**当成已完成：否则 --resume 会永久跳过它。
-                tracing::warn!("{} 的既有产物不完整（空文件或被截断），本轮重写它", target.talker);
-            } else {
+            // 复用必须同时满足三条，缺一条就重写：
+            //   1. 上一轮的清单记着这个会话——「有个同名文件」不是完成记录。少了这条，
+            //      从没导出过的会话只要算出同名就被静默判完成，而它在新一轮清单里又没有
+            //      条目，于是既看不见也不能自愈（清单被删/被子集轮重写后特别容易踩到）。
+            //   2. 没有 `.part` 残留——留着它说明有一轮起笔后没收住。
+            //   3. 本轮承诺媒体时 `media/` 非空——「出现即可取」是按轮成立的：上一轮没带
+            //      --with-media（或媒体目录被清理）就复用，导出物里每个 fileName 都会悬空。
+            // 内容便宜判据（非空/末字节）仍然保留，防旧版本或外力留下的残缺文件。
+            let name_here = path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            // 不仅要看清单记没记这个会话，还要看它记的是不是**本轮这个文件名**：清单登记过
+            // A.jsonl 而本轮 --format json 时，盘上的 A.json 若是上一轮换格式留下的孤儿，
+            // 它再"完整"也不是本轮要的产物；切回 jsonl 时同理（旧孤儿会冒充新产物）。
+            let recorded = previous
+                .get(&target.talker)
+                .is_some_and(|row| row.get("file").and_then(Value::as_str) == Some(name_here.as_str()));
+            let part_left = opts.out_dir.join(format!("{stem}.{ext}.part")).exists();
+            // 上一轮登记时带没带媒体，记在清单行里（`withMedia`）——数目录不行：一个根本没有
+            // 媒体的语料永远不会建 `media/`，按目录判会让 `--with-media --resume` 每次全量重导，
+            // 而它本来是无害的（导出物里没有句柄，承诺空真成立）。清单没有这个键的旧条目按"没带"处理。
+            let media_kept = !opts.with_media
+                || previous
+                    .get(&target.talker)
+                    .and_then(|r| r.get("withMedia"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+            if recorded && !part_left && media_kept && file_is_complete(&path, opts.format) {
                 // 命中既有完整产物是幂等完成，不是失败：退出码只看 skipped。
                 reused.push(target.talker.clone());
                 // 跳过的会话也要进新清单，否则这次写出的 index.json 会把上一轮的条目抹掉。
-                match previous.get(&target.talker) {
-                    Some(row) => index_rows.push(row.clone()),
-                    None => tracing::warn!(
-                        "{} 有既有产物但上一轮清单里没有它，本次 index 不收录（无法得知条数）",
-                        target.talker
-                    ),
+                if let Some(row) = previous.get(&target.talker) {
+                    index_rows.push(row.clone());
                 }
                 continue;
             }
+            // 半成品**不能**当成已完成：否则 --resume 会永久跳过它。
+            tracing::warn!(
+                "{} 的既有产物不可信（清单没有完成记录、残留 .part、缺媒体或内容不完整），本轮重写",
+                target.talker
+            );
         }
-        let mut w = SessionWriter::begin(target.clone(), opts, stem)?;
+        // 起手失败（建目录或建 .part 失败）同样是**会话级**失败：跳过这一个、继续其余。
+        // 整轮中止会把本轮已交付的会话留在盘上却不进清单——那比留一个 .part 更难收拾。
+        // 令牌泄漏例外：凭据已经写出去了，必须立刻中止整轮。
+        let mut w = match SessionWriter::begin(target.clone(), opts, stem) {
+            Ok(w) => w,
+            Err(e) => {
+                if e.downcast_ref::<SecretLeak>().is_some() {
+                    return Err(e);
+                }
+                tracing::warn!("跳过会话 {}（起手失败）：{e:#}", target.talker);
+                skipped.push(target.talker.clone());
+                continue;
+            }
+        };
         let failed = fetch(target, &mut |rows| w.page(rows)).err();
         if let Some(e) = failed {
             // 只清本轮的 .part：最终名从头到尾没被本轮碰过，上一轮的完整产物必须原样保留
@@ -638,7 +688,19 @@ where
             skipped.push(target.talker.clone());
             continue;
         }
-        let (n, path) = w.finish()?;
+        // 收尾失败（改名不回来等）与取数失败同级：跳过这一个会话。整轮中止会把本轮已经
+        // 写出的会话留在盘上却不进清单，比留一个 .part 更难恢复。令牌泄漏例外——它整轮中止。
+        let (n, path) = match w.finish() {
+            Ok(v) => v,
+            Err(e) => {
+                if e.downcast_ref::<SecretLeak>().is_some() {
+                    return Err(e);
+                }
+                tracing::warn!("跳过会话 {} 的收尾：{e:#}", target.talker);
+                skipped.push(target.talker.clone());
+                continue;
+            }
+        };
         // （finish 内部已经删掉半成品；能走到这里说明没有泄漏，因为泄漏是 Err。）
         total += n;
         let file = path
@@ -651,6 +713,8 @@ where
             "file": file,
             "messages": n,
             "displayName": target.display_name,
+            // 本轮交付包是否自带媒体字节：续跑时这是"能不能复用"的判据之一（见 run 的复用条件）。
+            "withMedia": opts.with_media,
         }));
     }
 
@@ -684,7 +748,18 @@ mod tests {
     }
 
     fn opts(dir: &Path, format: Format, resume: bool, secret: &str) -> Options {
-        Options { out_dir: dir.to_path_buf(), format, resume, secret: secret.into() }
+        Options { out_dir: dir.to_path_buf(), format, resume, secret: secret.into(), with_media: false }
+    }
+
+    /// 带媒体意图的参数（`--with-media --resume` 的组合在测试里要能构造）。
+    fn opts_media(dir: &Path, format: Format, resume: bool) -> Options {
+        Options {
+            out_dir: dir.to_path_buf(),
+            format,
+            resume,
+            secret: String::new(),
+            with_media: true,
+        }
     }
 
     fn tmp(tag: &str) -> PathBuf {
@@ -1090,6 +1165,202 @@ mod tests {
             first,
             "失败轮不得破坏上一轮的完整产物"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+        fn mk(talker: &str, name: &str) -> SessionTarget {
+        SessionTarget { talker: talker.into(), display_name: name.into() }
+    }
+
+    // 复核修复一：孤儿文件不能冒充完成记录。
+    //
+    // 复用判据不能只是"最终名存在且内容便宜判据通过"。清单被删或被截断时，本轮新算出的
+    // 名字撞上别人的旧产物，就会把一个从没导出过的会话静默判成已完成——而它在新一轮清单
+    // 里没有条目，于是既看不见也不能自愈。
+    #[test]
+    fn resume_needs_the_completion_record_not_just_a_matching_file() {
+        let dir = tmp("orphan-artifact");
+        let o = opts(&dir, Format::Jsonl, false, "");
+        run(&[mk("wxid_a", "A")], &o, |_t, on_page| on_page(&[row("1", 1, "u1", "")])).unwrap();
+        let _ = std::fs::remove_file(dir.join("index.json"));
+        let mut fetched = 0;
+        let got = run(
+            &[mk("wxid_a", "A")],
+            &opts(&dir, Format::Jsonl, true, ""),
+            |_t, on_page| {
+                fetched += 1;
+                on_page(&[row("2", 2, "u2", "")])
+            },
+        )
+        .unwrap();
+        assert_eq!(fetched, 1, "没有完成记录的既有产物必须重导，而不是静默判完成");
+        assert!(got.reused.is_empty(), "重导的会话不该记成复用: {:?}", got.reused);
+        // 重导之后清单重新记着它，下一轮才允许复用
+        let mut fetched2 = 0;
+        let got2 = run(
+            &[mk("wxid_a", "A")],
+            &opts(&dir, Format::Jsonl, true, ""),
+            |_t, on_page| {
+                fetched2 += 1;
+                on_page(&[row("3", 3, "u3", "")])
+            },
+        )
+        .unwrap();
+        assert_eq!(fetched2, 0, "已有完成记录且产物完整时应当复用");
+        assert_eq!(got2.reused, vec!["wxid_a".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 复核修复二：「出现即可取」是按轮成立的承诺。
+    //
+    // 上一轮不带 --with-media 时，导出行的 fileName 只是元数据、字节从未下载。本轮带媒体
+    // 意图续跑若复用它，交付包里每个 fileName 都会悬空，而退出码仍然是 0。
+    #[test]
+    fn with_media_resume_redoes_sessions_whose_previous_round_had_no_media() {
+        let dir = tmp("media-per-round");
+        run(&[mk("wxid_a", "A")], &opts(&dir, Format::Jsonl, false, ""), |_t, on_page| {
+            on_page(&[row("1", 1, "u1", "")])
+        })
+        .unwrap();
+        let mut fetched = 0;
+        let got = run(
+            &[mk("wxid_a", "A")],
+            &opts_media(&dir, Format::Jsonl, true),
+            |_t, on_page| {
+                fetched += 1;
+                on_page(&[row("2", 2, "u1", "")])
+            },
+        )
+        .unwrap();
+        assert_eq!(fetched, 1, "上一轮没下媒体时，带媒体续跑不得复用");
+        assert!(got.reused.is_empty(), "{:?}", got.reused);
+        // 本轮登记了 withMedia，第三次才可以复用
+        let mut fetched2 = 0;
+        let got2 = run(
+            &[mk("wxid_a", "A")],
+            &opts_media(&dir, Format::Jsonl, true),
+            |_t, on_page| {
+                fetched2 += 1;
+                on_page(&[row("3", 3, "u1", "")])
+            },
+        )
+        .unwrap();
+        assert_eq!(fetched2, 0, "上一轮自带媒体且产物完整时应当复用");
+        assert_eq!(got2.reused, vec!["wxid_a".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 复核修复三：换格式留下的孤儿不是本轮的产物。
+    #[test]
+    fn format_switch_does_not_reuse_the_other_formats_orphan() {
+        let dir = tmp("format-switch");
+        run(&[mk("wxid_a", "A")], &opts(&dir, Format::Jsonl, false, ""), |_t, on_page| {
+            on_page(&[row("1", 1, "u1", "")])
+        })
+        .unwrap();
+        // 清单登记的是 A.jsonl；本轮要 A.json。盘上那个 json 是外力/旧轮留下的孤儿。
+        std::fs::write(dir.join("A.json"), "{\"a\":1}").unwrap();
+        let mut fetched = 0;
+        let got = run(
+            &[mk("wxid_a", "A")],
+            &opts(&dir, Format::Json, true, ""),
+            |_t, on_page| {
+                fetched += 1;
+                on_page(&[row("2", 2, "u2", "")])
+            },
+        )
+        .unwrap();
+        assert_eq!(fetched, 1, "清单登记的文件名与本轮不同，孤儿不算本轮产物");
+        assert!(got.reused.is_empty());
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("A.json")).unwrap()).unwrap();
+        assert_eq!(doc["messages"][0]["platformMessageId"], "2", "孤儿必须被重写");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 复核修复四：残留的 .part 说明上一轮起笔后没收住。
+    #[test]
+    fn leftover_part_file_blocks_reuse() {
+        let dir = tmp("part-blocks-reuse");
+        run(&[mk("wxid_a", "A")], &opts(&dir, Format::Jsonl, false, ""), |_t, on_page| {
+            on_page(&[row("1", 1, "u1", "")])
+        })
+        .unwrap();
+        std::fs::write(dir.join("A.jsonl.part"), b"half-written").unwrap();
+        let mut fetched = 0;
+        let got = run(
+            &[mk("wxid_a", "A")],
+            &opts(&dir, Format::Jsonl, true, ""),
+            |_t, on_page| {
+                fetched += 1;
+                on_page(&[row("3", 3, "u3", "")])
+            },
+        )
+        .unwrap();
+        assert_eq!(fetched, 1, "残留 .part 时不得复用");
+        assert!(got.reused.is_empty());
+        assert!(!dir.join("A.jsonl.part").exists(), "重导的收尾必须把 .part 改名掉");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 复核修复五：单个会话收尾失败不得牵连整轮。
+    //
+    // 整轮中止会让本轮已经写出的会话留在盘上却不进清单——那比留一个 .part 更难收拾，
+    // 也和"会话级失败只跳过"的既有口径自相矛盾。
+    #[test]
+    fn one_sessions_finish_failure_does_not_abort_the_round() {
+        let dir = tmp("finish-skip");
+        // 把最终名占成一个非空目录：收尾改名必然失败，模拟"目标被别的东西占着"
+        let blocked = dir.join("B.jsonl");
+        std::fs::create_dir_all(&blocked).unwrap();
+        std::fs::write(blocked.join("keep"), b"x").unwrap();
+        let o = opts(&dir, Format::Jsonl, false, "");
+        let got = run(&[mk("wxid_a", "A"), mk("wxid_b", "B")], &o, |_t, on_page| {
+            on_page(&[row("1", 1, "u1", "")])
+        })
+        .unwrap();
+        assert_eq!(got.skipped, vec!["wxid_b".to_string()], "收尾失败应只跳过该会话");
+        assert_eq!(got.written.len(), 1, "另一个会话仍应交付");
+        let idx: Value =
+            serde_json::from_str(&std::fs::read_to_string(&got.index).unwrap()).unwrap();
+        let rows = idx["sessions"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "本轮已交付的会话必须进清单: {idx}");
+        assert_eq!(rows[0]["talker"], "wxid_a");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 复核修复六：清单自己也要原子写。
+    //
+    // 它是续跑唯一的完成记录来源。一次半路被杀留下截断 JSON，previous_index 就当"没有
+    // 上一轮"，于是复用判据整条被废——正是修复一/三/四要防的那条覆盖链。
+    #[test]
+    fn index_is_written_atomically_and_a_truncated_one_does_not_silently_reuse() {
+        let dir = tmp("index-atomic");
+        let o = opts(&dir, Format::Jsonl, false, "");
+        let got = run(&[mk("wxid_a", "A")], &o, |_t, on_page| on_page(&[row("1", 1, "u1", "")])).unwrap();
+        assert_eq!(got.written.len(), 1);
+        assert!(!dir.join("index.json.part").exists(), "清单收尾应改名，不留中转文件");
+        // 清单出现在最终名上就必须是一份可读的清单——原子性的全部意义
+        let idx: Value =
+            serde_json::from_str(&std::fs::read_to_string(&got.index).unwrap()).unwrap();
+        assert_eq!(idx["sessions"].as_array().unwrap().len(), 1, "清单登记本轮交付: {idx}");
+
+        // 把清单截断成半份 JSON：下一轮不得因为"产物完整"就复用
+        std::fs::write(dir.join("index.json"), "{\"sessions\":[").unwrap();
+        let mut fetched = 0;
+        let got2 = run(
+            &[mk("wxid_a", "A")],
+            &opts(&dir, Format::Jsonl, true, ""),
+            |_t, on_page| {
+                fetched += 1;
+                on_page(&[row("5", 5, "u5", "")])
+            },
+        )
+        .unwrap();
+        assert_eq!(fetched, 1, "清单坏了就当没有完成记录，必须重导");
+        assert!(got2.reused.is_empty());
+        let idx: Value =
+            serde_json::from_str(&std::fs::read_to_string(&got2.index).unwrap()).unwrap();
+        assert_eq!(idx["sessions"].as_array().unwrap().len(), 1, "重导后清单恢复: {idx}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
