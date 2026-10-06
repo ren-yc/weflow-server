@@ -236,6 +236,20 @@ class Client:
         except httpx.HTTPError as exc:
             raise TransportError(f"{type(exc).__name__} on {url}: {exc}") from exc
 
+    async def _http_post(self, url: str, **kwargs: Any) -> httpx.Response:
+        """POST with the same transport-failure mapping as :meth:`_http_get`.
+
+        Every public request entry must go through one of these two: an entry
+        that calls ``self._http`` directly lets a raw `httpx.ConnectError`
+        escape the ClientError tree, and callers that classify
+        ``except ClientError`` then miss transport failures for that route
+        alone (regression: test_transport_failures_are_client_errors walks one
+        representative per transport method)."""
+        try:
+            return await self._http.post(url, **kwargs)
+        except httpx.HTTPError as exc:
+            raise TransportError(f"{type(exc).__name__} on {url}: {exc}") from exc
+
     async def _get_json(self, path: str, query: dict[str, str]):
         url = self._url(path)
         resp = await self._http_get(
@@ -257,6 +271,22 @@ class Client:
         except _json.JSONDecodeError as exc:  # pragma: no cover - defensive
             raise ShapeError(str(exc)) from exc
 
+
+    @staticmethod
+    def _validate(model: Any, payload: Any) -> Any:
+        """`model_validate` with shape corruption kept inside ShapeError.
+
+        A 200 with a body of the wrong *type* (a list where the route
+        returns an object, a string where a number lives) raises pydantic's
+        own ValidationError, which is not a ClientError. Callers that
+        classify ``except ClientError`` would see it escape for that route
+        alone (regression: test_health_shape_corruption_is_a_shape_error
+        feeds a 200 whose `account` field is a number)."""
+        try:
+            return model.model_validate(payload)
+        except ValidationError as exc:
+            raise ShapeError(str(exc)) from exc
+
     # ---- readiness ------------------------------------------------------
 
     async def wait_ready(self, account: str, timeout: float = 120.0) -> None:
@@ -271,7 +301,7 @@ class Client:
         deadline = asyncio.get_running_loop().time() + timeout
         last_state = "not-registered"
         while True:
-            listing = gen.AccountsList.model_validate(
+            listing = self._validate(gen.AccountsList, 
                 await self._get_json("/api/v1/accounts", {})
             )
             mine = next((a for a in listing.accounts if a.wxid == account), None)
@@ -314,8 +344,8 @@ class Client:
         here, and a test pins that.
         """
         url = self._url("/health")
-        resp = await self._http.get(url)
-        return gen.Health.model_validate(await self._decode(resp, url))
+        resp = await self._http_get(url)
+        return self._validate(gen.Health, await self._decode(resp, url))
 
     async def accounts(self) -> list[gen.AccountStateView]:
         """``GET /api/v1/accounts`` - one entry per bound account.
@@ -323,7 +353,7 @@ class Client:
         The failure reason (``error``) and the message count live only here;
         ``/health`` collapses everything to a scalar phase.
         """
-        listing = gen.AccountsList.model_validate(
+        listing = self._validate(gen.AccountsList, 
             await self._get_json("/api/v1/accounts", {})
         )
         return listing.accounts
@@ -338,7 +368,7 @@ class Client:
         HTTP error) use this pair instead.
         """
         url = self._url("/api/v1/accounts")
-        resp = await self._http.post(
+        resp = await self._http_post(
             url,
             headers={"Authorization": f"Bearer {self._token}"},
             json=body,
@@ -365,10 +395,10 @@ class Client:
         caller that asked for it triggers it.
         """
         url = self._url("/api/v1/sync")
-        resp = await self._http.post(
+        resp = await self._http_post(
             url, headers={"Authorization": f"Bearer {self._token}"}
         )
-        return gen.SyncResult.model_validate(await self._decode(resp, url))
+        return self._validate(gen.SyncResult, await self._decode(resp, url))
 
     # ---- pull_page / drain_session --------------------------------------
 
@@ -398,7 +428,7 @@ class Client:
             query["offset"] = str(offset)
         if limit is not None:
             query["limit"] = str(limit)
-        return gen.PullEnvelope.model_validate(
+        return self._validate(gen.PullEnvelope, 
             await self._get_json(
             f"/api/v1/sessions/{_encode_path_segment(talker)}/messages", query
         )
@@ -459,7 +489,7 @@ class Client:
                 query["limit"] = str(page_size)
             if keyword is not None:
                 query["keyword"] = keyword
-            page = gen.SessionsNative.model_validate(
+            page = self._validate(gen.SessionsNative, 
                 await self._get_json("/api/v1/sessions", query)
             )
             count = len(page.sessions)
@@ -490,14 +520,18 @@ class Client:
             raise StatusError(404, "(no media on message)")
         name = message.media.file_name
         url = self._url(f"/api/v1/media/{_encode_path_segment(name)}")
-        resp = await self._http.get(url, headers={"Authorization": f"Bearer {self._token}"})
+        auth = {"Authorization": f"Bearer {self._token}"}
+        resp = await self._http_get(url, headers=auth)
         if resp.status_code == 404:
             await self._get_json(
                 "/chatlab/messages",
                 {"talker": message.account_name, "media": "1"},
             )
-            resp = await self._http.get(url, headers={"Authorization": f"Bearer {self._token}"})
-        if resp.status_code >= 400:
+            resp = await self._http_get(url, headers=auth)
+        # 非 2xx（不只是 4xx/5xx）：3xx 若落进 return 会把重定向页当媒体字节
+        # 交出去，且调用方拿不到任何错误信号 —— 与 _decode、media_bytes_by_id
+        # 同口径（regression: test_media_bytes_rejects_redirect_like_statuses）。
+        if not 200 <= resp.status_code < 300:
             raise StatusError(resp.status_code, url)
         return resp.content
 
@@ -528,7 +562,7 @@ class Client:
         query = _message_query_params(
             talker, keyword, start, end, limit, offset, media
         )
-        return gen.MessagesNative.model_validate(
+        return self._validate(gen.MessagesNative, 
             await self._get_json("/api/v1/messages", query)
         )
 
@@ -559,7 +593,7 @@ class Client:
         query = _message_query_params(
             talker, keyword, start, end, limit, offset, media
         )
-        return gen.ChatlabMessages.model_validate(
+        return self._validate(gen.ChatlabMessages, 
             await self._get_json("/chatlab/messages", query)
         )
 
@@ -582,7 +616,7 @@ class Client:
             query["offset"] = str(offset)
         if keyword is not None:
             query["keyword"] = keyword
-        return gen.Contacts.model_validate(
+        return self._validate(gen.Contacts, 
             await self._get_json("/api/v1/contacts", query)
         )
 
@@ -611,7 +645,7 @@ class Client:
         query: dict[str, str] = {"chatroomId": chatroom}
         if include_message_counts:
             query["includeMessageCounts"] = "1"
-        return gen.GroupMembers.model_validate(
+        return self._validate(gen.GroupMembers, 
             await self._get_json("/api/v1/group-members", query)
         )
 
@@ -679,7 +713,10 @@ class Client:
                 async with self._http.stream(
                     "GET", self._url("/api/v1/push/messages"), headers=headers
                 ) as resp:
-                    if resp.status_code >= 400:
+                    # 3xx 也算失败（与 _decode / media_bytes 的 not-2xx 同口径）：
+                    # 一次 302 若被当可读流处理，空体 EOF 会触发 clean_exit 退避
+                    # 复位、0.5s 无限重连，调用方拿不到任何错误信号。
+                    if not 200 <= resp.status_code < 300:
                         raise StatusError(resp.status_code, self._url("/api/v1/push/messages"))
                     # The old shape reset backoff right here, on every
                     # 200: a server that connects fine and then emits
@@ -782,11 +819,11 @@ class Client:
             raise ShapeError(str(exc)) from exc
         kind = payload.get("event", frame.event or "")
         if kind == "message.new":
-            return gen.EventNew.model_validate(payload)
+            return Client._validate(gen.EventNew, payload)
         if kind == "message.revoke":
-            return gen.EventRevoke.model_validate(payload)
+            return Client._validate(gen.EventRevoke, payload)
         if kind == "sync":
-            return gen.EventSync.model_validate(payload)
+            return Client._validate(gen.EventSync, payload)
         # Notification face / unknown kinds: meta-only pass-through so a new
         # server event kind degrades instead of killing the stream.
         log.debug("ignoring unknown SSE event kind: %s", kind)
