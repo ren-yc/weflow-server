@@ -133,7 +133,11 @@ foreach ($tok in $cargoSide) {
 $selectsPackage = $false
 foreach ($tok in $cargoSide) {
     $t = [string]$tok
-    if ($t -eq '-p' -or $t -eq '--package' -or ($t.Length -gt 2 -and $t.StartsWith('-p'))) { $selectsPackage = $true; break }
+    if ($t -eq '-p' -or $t -eq '--package') { $selectsPackage = $true; break }
+    # Merged forms too: `--package=x` asks the same thing as `--package x`, and
+    # `-px` the same as `-p x`. Missing them re-injects a feature the selected
+    # package does not have - the exact failure this guard exists to prevent.
+    if ($t.StartsWith('--package=') -or ($t.Length -gt 2 -and $t.StartsWith('-p'))) { $selectsPackage = $true; break }
 }
 $needsTesting = ($sub -eq 'test') -or ($sub -eq 'clippy' -and $cargoSide -contains '--all-targets')
 if ($needsTesting -and -not $alreadyHas -and -not $selectsPackage -and $subIndex -ge 0) {

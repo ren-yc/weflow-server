@@ -173,3 +173,15 @@ def test_package_selection_does_not_inject_root_only_feature():
         "-p",
         "weflow-client",
     ]
+
+
+def test_merged_package_form_does_not_inject_either():
+    """`--package=x` asks for the same thing as `--package x`.
+
+    The guard compared tokens with `-eq`, so only the separate form was
+    recognised and the merged one re-injected `testing` - the exact refusal the
+    guard exists to prevent, and the same submission that already handles the
+    merged `--features=x` form.
+    """
+    assert _run_wrapper(["test", "--package=weflow-client"]) == ["test", "--package=weflow-client"]
+    assert _run_wrapper(["test", "-pweflow-client"]) == ["test", "-pweflow-client"]

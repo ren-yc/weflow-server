@@ -1029,14 +1029,20 @@ weflow-server.exe sessions --json        # 子命令面
   传输错误，于是「服务端答错了」与「网络断了」混成一类 —— 而调用方正是按变体分流的（重试传输故障
   合理，重试形状错误不合理）。`Status.url` **恒等于请求 URL**，不掺描述文字（按 url 归因的调用方会静默错分类），
   拒绝态的 `state` 另走 `detail` 字段。
-- **超时默认（Rust 与 Python 一致；TS 仅示例，不在承诺面内）**：连接 **5s**（`CONNECT_TIMEOUT`）——服务端不在时要立刻失败；普通 JSON 请求读 **30s**
-  （`READ_TIMEOUT`）；**按构造无上界**的请求不带读上界：`group_members(..., include_message_counts=True)`
-  （整名册计数＝全会话扫描）、`media_bytes`／`media_bytes_by_id`（体积由发送方决定）、`sync_now()`（索引＋可能导出媒体）、
-  `watch()`（长连接；服务端每 25s 发一次 keep-alive ping，读上界是按每次读操作计时的，30s 只剩 5s 余量，代理缓冲或一次事件循环卡顿就会掐断健康的空闲流）。
-  判据是「慢不等于坏」：把 30s 套到这些面上会把「这个群很大」变成客户端错误。
-  回归位置：`test_published_timeout_budgets_travel_per_request`（钉到 transport 收到的 per-request timeout 上，
-  不是只读常量）、`test_watch_stream_is_not_bounded_by_the_json_read_timeout`；Rust 侧因 reqwest 不暴露已建
-  Client 的配置，`published_timeouts_match_the_documented_budgets` 只钉公开常量数值。
+- **超时默认（Rust 与 Python 一致；TS 仅示例，不在承诺面内）**：三个公开常量，且**每一个都按单次操作计时、
+  有进展即复位——没有一个是总时限**（reqwest 的 `timeout()` 是总时限，所以这里刻意用 `read_timeout`，与 httpx 同语义）：
+  连接 `CONNECT_TIMEOUT` **5s**（服务端不在时要立刻失败）；普通 JSON 请求 `READ_TIMEOUT` **30s**；成本由数据量或
+  后台工作决定的一族——`group_members(..., include_message_counts=True)`（整名册计数＝全会话扫描）、
+  `media_bytes`／`media_bytes_by_id`（体积由发送方决定）、`sync_now()`（索引＋可能导出媒体）、`watch()`（长连接）——
+  用 `STALL_TIMEOUT` **90s**。判据两面：把 30s 套到这些面上会把「这个群很大」变成客户端错误（慢不等于坏）；
+  而**完全不设上界**又会让黑洞连接（对端被 kill 且没有 FIN、NAT 映射过期、笔记本唤醒后）永不被发现——对 SSE 尤其
+  致命：重连分支根本不可达，表现为一条既不产出也不报错的流。90s ≈ 服务端 25s keep-alive 间隔的四倍，丢一次心跳
+  加一次调度抖动仍算健康，黑洞则会被抓到。自定义走 Python 的 `timeout=`／`stall_timeout=`，或 Rust 的
+  `Client::with_timeouts(base_url, token, connect, read, stall)`。回归位置：
+  `each_request_family_uses_its_own_time_budget`（Rust：驱动一个 600ms 才回响应头的真实服务端，两个上界各自生效，
+  退回任一路由即变红）、`test_published_timeout_budgets_travel_per_request` 与
+  `test_watch_stream_is_not_bounded_by_the_json_read_timeout`（Python：断言 transport 实际收到的 per-request 值，
+  不是只读常量）、`published_timeouts_match_the_documented_budgets`（三个常量的数值与大小关系）。
 - 鉴权走 `Authorization: Bearer`；客户端从不把 token 放进 URL（`/health` 是唯一免鉴权端点）。
 - 本轮**不发布** crates.io：本地 `cargo build -p weflow-client` 即可使用。
 

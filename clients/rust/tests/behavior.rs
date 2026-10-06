@@ -42,6 +42,11 @@ struct Mock {
     /// Statuses the accounts route answers, in order (FIFO), before the normal page.
     /// A transient 5xx must be waited out; a 4xx must not be.
     accounts_status_seq: Arc<StdMutex<Vec<u16>>>,
+    /// Slept **before the response head** by the health and sync routes. This is
+    /// where a per-read bound bites: both reqwest and httpx charge the read timeout
+    /// while waiting for the response and reset it per body chunk, so a delay inside
+    /// the body would prove nothing about the budgets.
+    delay: Arc<StdMutex<Duration>>,
     /// When set, `GET /api/v1/accounts` answers this page verbatim.
     accounts_page: Arc<StdMutex<Option<serde_json::Value>>>,
     /// How many times the accounts route was hit (asserts "no polling").
@@ -125,6 +130,12 @@ async fn accounts_post(
 /// caller asked for one, never from a polling path.
 async fn sync_post(State(mock): State<Mock>, headers: HeaderMap) -> Response {
     assert_bearer(&headers);
+    // Copy the duration out before awaiting: a MutexGuard held across `.await`
+    // makes the handler future non-Send, and axum rejects a non-Send handler.
+    let delay = *mock.delay.lock().unwrap();
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
     *mock.sync_calls.lock().unwrap() += 1;
     Json(serde_json::json!({
         "success": true,
@@ -257,6 +268,12 @@ async fn messages_route(
 /// `/health` is unauthenticated: the mock records whether a bearer arrived,
 /// so the test can pin "the SDK does not send credentials to it".
 async fn health_route(State(mock): State<Mock>, headers: HeaderMap) -> Response {
+    // Copy the duration out before awaiting: a MutexGuard held across `.await`
+    // makes the handler future non-Send, and axum rejects a non-Send handler.
+    let delay = *mock.delay.lock().unwrap();
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
     let carried = headers.contains_key("authorization");
     mock.health_calls.lock().unwrap().push(carried);
     if let Some(page) = mock.health_page.lock().unwrap().clone() {
@@ -1117,6 +1134,39 @@ async fn ensure_ready_fails_fast_on_a_refusal_state() {
 /// `sync_now` is a **write** (it advances watermarks and may export media), so
 /// the contract has two halves: it POSTs with the bearer token and decodes the
 /// counters, and nothing else in the client ever triggers it.
+/// The budgets are chosen per call site, so a test that only reads the constants
+/// stays green even when every request is routed through the wrong client. This drives
+/// the difference through two real call sites on one client against one server: the
+/// JSON page that answers slower than the read bound must fail, while the exempt
+/// request - same server, same one-second delay, wider bound - must answer. Pointing
+/// either call site back at the other client reddens it.
+#[tokio::test]
+async fn each_request_family_uses_its_own_time_budget() {
+    let mock = Mock::default();
+    *mock.delay.lock().unwrap() = Duration::from_millis(600);
+    let base = spawn_mock(mock.clone()).await;
+    let tight = Client::with_timeouts(
+        &base,
+        TOKEN,
+        Duration::from_secs(5),
+        Duration::from_millis(200),
+        Duration::from_secs(5),
+    );
+    let err = tight
+        .health()
+        .await
+        .expect_err("a JSON read bound must cut off a page that stalls before the head");
+    assert!(
+        matches!(err, ClientError::Transport(_)),
+        "a timeout is transport-level, not a shape or status failure: {err:?}"
+    );
+    let ok = tight
+        .sync_now()
+        .await
+        .expect("the stall bound is a different budget and must not trip here");
+    assert!(ok.success, "the exempt path answered normally");
+}
+
 #[tokio::test]
 async fn sync_now_posts_with_the_bearer_token_and_decodes_counters() {
     let mock = Mock::default();

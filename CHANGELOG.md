@@ -30,6 +30,54 @@
 - **发布流水线新增质量门**：release 前在同 tag 重跑 clippy、全量测试与契约 nails，
   构建依赖该门——测试红着打 tag 会被拒绝。
 
+- **两个 SDK 的请求超时改为分层默认（破坏性；公开常量 `CONNECT_TIMEOUT`／`READ_TIMEOUT`／`STALL_TIMEOUT`）**：
+  连接一律 **5s**；普通 JSON 请求**每次读**最多等 **30s**；`group_members(..., include_message_counts=True)`
+  （整名册计数＝全会话扫描）、`media_bytes`／`media_bytes_by_id`（体积由发送方决定）、`sync_now()`
+  （索引＋可能导出媒体）与 `watch()`（长连接）走**停滞上界 90s**。两个上界都按每次读操作计时、有进展即复位，
+  **不是总时限**——「慢但在动」的大响应不会被判失败，而彻底静默的连接（对端被 kill 且没有 FIN、NAT 映射过期、
+  笔记本睡眠唤醒）会报错而不是永久挂住。服务端每 25s 发一次 keep-alive ping，90s ≈ 四倍余量：丢一次心跳加一次
+  调度抖动仍算健康，黑洞则会被发现。此前 Python 是「所有请求一律 30s」、Rust 是「所有请求一律无限制」，两边都
+  不对：前者把「这个群很大」变成客户端错误、并把空闲 SSE 在 30s 掐断（心跳间隔 25s，只剩 5s 余量），后者让黑洞
+  连接永不被发现。**迁移方式**：Python 的 `Client(..., timeout=)` 数值语义不变，但作用域从「所有请求」收窄为
+  普通 JSON 请求（这是破坏性的一半），豁免族改由新增的 `stall_timeout=` 设界；Rust 用
+  `Client::with_timeouts(base_url, token, connect, read, stall)`，`Client::new` 走公开默认；要彻底关掉停滞
+  检测就传一个足够大的 `stall`。回归位置：`each_request_family_uses_its_own_time_budget`（Rust：驱动一个
+  600ms 才回响应头的服务端，证明两个上界各自生效，退回任一路由即变红）、
+  `test_published_timeout_budgets_travel_per_request` 与
+  `test_watch_stream_is_not_bounded_by_the_json_read_timeout`（Python：断言 transport 实际收到的
+  per-request 值）、`published_timeouts_match_the_documented_budgets`（三个常量的数值与大小关系）。
+
+- **`wait_ready`／`ensure_ready` 把瞬时故障算作「还在等」，并把丢掉的轮次记进最终报错**（行为变化）：
+  轮询账号列表时遇到连接失败或 5xx 不再中止整个等待。此前一次抖动就把「索引仍在建」变成客户端错误，与该函数自己的
+  文档（只有 deadline 与账号 `error` 态失败）矛盾。**4xx 仍然立即失败**——那是配置错误（token 不对、路径写错），
+  把它等满预算只会把可当场定位的问题拖成一次超时。但「等待」不等于「失忆」：一直连不上或一直 5xx 时，超时若仍报
+  `not-registered`，就把矛头错误指向注册那一步，而真正的现象是服务端从头到尾没答过。现最终消息带上最后一次观察
+  与丢掉的轮数（`…; N poll(s) never got through`）。回归位置：
+  `wait_ready_rides_out_a_transient_5xx_but_not_a_4xx`（两语言两仓）。
+
+- **httpx 解析不出 URL 的错误进入 `ClientError` 树**：`httpx.InvalidURL` 不属于 `httpx.HTTPError`
+  家族，此前畸形 `base_url`（端口非法、主机含控制字符、残缺 IPv6 字面量）会裸逃过 `except ClientError`——
+  调用方接住了服务端拒绝，却接不住自己写错的地址。GET／POST 两个入口包成 `TransportError`；SSE 入口**单独
+  raise 后仍然上抛**（那里吞掉它等于把配置错误变成一条永不产出、也永不报错的流，退避还会封顶 30s 无限重试）。
+  回归位置：`test_malformed_base_url_stays_inside_the_client_error_tree`。
+
+- **`StatusError.url` 恒等于请求 URL**（破坏性，仅影响按 url 归因的调用方）：200 拒绝态此前把
+  `state=…` 拼进 url 字段，于是按前缀/精确匹配分类的调用方会静默错分。拒绝态的 `state` 改由新增的 `detail`
+  字段承载，`str(exc)` 仍然包含它。**迁移方式**：`StatusError` 此前从来没有 `state` 属性，拒绝态信息只藏在
+  url 里，因此只有「从 url 字符串里解析 `state=`」的调用方需要改读 `exc.detail`；只读 `exc.status`／
+  `exc.url` 的不受影响（url 现在更干净）。Rust 侧同类修正：媒体前置条件错误此前把散文塞进 `url`
+  （`"(no media on message)"`、`"(empty talker)"`），现改为这条调用所属的媒体端点族（缺的正是句柄本身，
+  此刻没有 id 段可填），原因写在 `detail`。回归位置：`test_status_error_url_stays_the_request_url`、
+  `media_precondition_errors_name_the_real_endpoint_not_prose`。
+
+- **媒体句柄的空值本地拒绝**：`media_bytes` 对空 `file_name`、`media_bytes_by_id` 对空
+  `media_id` 现在不发请求直接报错（两侧都算上纯空白，与 Rust 的 `.trim().is_empty()` 同口径）。空句柄打到的
+  是另一个路径，服务端答「查无此文件」，于是「调用方没给名字」被伪装成「这个句柄不可导出」。两侧的空白口径
+  也在此统一（Rust 用 `.trim().is_empty()`、Python 用 `.strip()`）；`chatroomId` 一族的既有校验保持
+  「只挡空串」不变——那是 Pull 面的既有承诺，不属本条。回归位置：
+  `media_precondition_errors_name_the_real_endpoint_not_prose`（含「本地拒绝不得发出任何请求」的计数断言）与
+  `test_media_bytes_reject_an_empty_handle_without_a_request`（含纯空白句柄）。
+
 ### 新增
 
 - **两个 SDK 各补五项公共面（Rust 与 Python 同名同义）**：`sync_now()`（手动触发一次增量同步）、`pull_page(talker, since, offset, limit)`（**单页** Pull 入口，`drain_session` 改为复用它 ⇒ 游标装配从两处回到一处）、`chatlab_messages(...)`（ChatLab 形状的消息面，此前该面只被内部当触发导出用、没有公共入口）、`group_members(chatroom_id, include_message_counts)`、`list_all_sessions` 的关键词与页大小。
@@ -67,39 +115,14 @@
 - **`docs/architecture.md` 新增「已登记的两类构建告警（预期内，处置＝维持现状）」**：默认 feature 组合下的 `dead_code`（只被 `testing` 夹具或单测调用的内部辅助；CI 的门禁带 `--features testing` 所以看不到），以及链接期 `LNK4099`（vendored OpenSSL 缺 `ossl_static.pdb`，只影响调试信息）。
 - **顶层 Python 包补 `py.typed`**：生成层内部有该标记、顶层手写包没有 ⇒ 消费方的类型注解全部静默失效（mypy 报 `import-untyped`）。
 
-
-- **两个 SDK 的请求超时改为分层默认（行为变化，公开常量）**：连接 **5s**（`CONNECT_TIMEOUT`）、普通 JSON 请求读
-  **30s**（`READ_TIMEOUT`）；`group_members(..., include_message_counts=True)`（整名册计数＝全会话扫描）、
-  `media_bytes`／`media_bytes_by_id`（体积由发送方决定）、`sync_now()`（索引＋可能导出媒体）、`watch()`（长连接；读上界按每次读操作计时，而服务端
-  每 25s 才发一次 keep-alive ping，30s 只剩 5s 余量）改用**无读上界**的连接池。此前 Python 是「所有请求一律 30s」、Rust 是「所有请求
-  一律无限制」——两边都不对：前者会把「这个群很大」变成客户端错误，后者让「服务端根本不在」挂到调用方的耐心耗尽。
-  **迁移方式**：需要自定义的调用方仍可传 `Client(..., timeout=)`（Python 的该参数现在只作用于普通 JSON 请求）；
-  Rust 侧无需改动，两个常量已导出。回归位置：`test_published_timeout_budgets_travel_per_request`
-  （断言 transport 实际收到的 per-request timeout，而不是读常量）、
-  `test_watch_stream_is_not_bounded_by_the_json_read_timeout`、`published_timeouts_match_the_documented_budgets`。
-- **`wait_ready`／`ensure_ready` 把瞬时故障算作「还在等」**（行为变化）：轮询账号列表时遇到连接失败或 5xx 不再
-  中止整个等待。此前一次抖动就把「索引仍在建」变成客户端错误，与该函数自己的文档（只有 deadline 与账号 `error`
-  态失败）矛盾。**4xx 仍然立即失败**——那是配置错误（token 不对、路径写错），把它等满预算只会把可当场定位的问题
-  拖成一次超时。回归位置：`wait_ready_rides_out_a_transient_5xx_but_not_a_4xx`（两语言两仓）。
-- **httpx 解析不出 URL 的错误进入 `ClientError` 树**：`httpx.InvalidURL` 不属于 `httpx.HTTPError` 家族，
-  此前畸形 `base_url`（端口非法、主机含控制字符、残缺 IPv6 字面量）会裸逃过 `except ClientError`——调用方接住了
-  服务端拒绝，却接不住自己写错的地址。三个请求入口（GET／POST／SSE 流）统一补上。回归位置：
-  `test_malformed_base_url_stays_inside_the_client_error_tree`。
-- **`StatusError.url` 恒等于请求 URL**（破坏性，仅影响按 url 归因的调用方）：200 拒绝态此前把
-  `state=…` 拼进 url 字段，于是按前缀/精确匹配分类的调用方会静默错分。拒绝态的 `state` 改由新增的 `detail`
-  字段承载，`str(exc)` 仍然包含它。**迁移方式**：读 `exc.state` 语义的调用方改读 `exc.detail`；只读
-  `exc.status` 与 `exc.url` 的不受影响。Rust 侧同类修正：媒体前置条件错误此前把散文塞进 `url`
-  （`"(no media on message)"`、`"(empty talker)"`），现改为该调用真正面向的端点，原因写在 `detail`。
-  回归位置：`test_status_error_url_stays_the_request_url`、`media_precondition_errors_name_the_real_endpoint_not_prose`。
-- **媒体句柄的空值本地拒绝**（与 `talker`／`chatroomId` 同口径）：`media_bytes` 对空 `file_name`、
-  `media_bytes_by_id` 对空 `media_id` 现在不发请求直接报错。空句柄打到的是另一个路径，服务端答「查无此文件」，
-  于是「调用方没给名字」被伪装成「这个句柄不可导出」。回归位置：`media_precondition_errors_name_the_real_endpoint_not_prose`
-  （含「本地拒绝不得发出任何请求」的计数断言）与 Python 侧 `test_media_bytes_reject_an_empty_handle_without_a_request`。
-- **包装脚本的 feature 注入判定三处收口**：① 只看 `--` **之前**的参数（`--` 之后是转发给测试二进制／rustc 的，
-  那里的 `--features` 不是给 cargo 的，此前会让整轮测试漏注入并报一堆「模块是私有的」）；② 子命令不再假定是第一个
-  参数（`--locked test` 这类全局选项先行的写法此前不注入）；③ `-p <crate>` 选中别的 package 时**不注入**——
-  `testing` 只存在于根 package，注入会让 SDK 的测试直接报「does not contain this feature」。回归位置：
-  `scripts/tests/test_build_wrapper.py` 的 `test_global_option_before_subcommand_still_gets_testing`、
+- **包装脚本的 feature 注入判定四处收口**：① 只看 `--` **之前**的参数（`--` 之后是转发给测试
+  二进制／rustc 的，那里的 `--features` 不是给 cargo 的，此前会让整轮测试漏注入并报一堆「模块是私有的」）；
+  ② 子命令不再假定是第一个参数（`--locked test` 这类全局选项先行的写法此前不注入）；③ `-p <crate>`／
+  `--package <crate>`／`--package=<crate>`／`-p<crate>` 选中别的 package 时**不注入**——`testing` 只存在于
+  根 package，注入会让 SDK 的测试直接报「does not contain this feature」（合并形态此前只认 `.StartsWith('-p')`
+  与 `-p?*)`，漏了 `--package=`）；④ bash 侧切片改带引号展开，否则含空格或 glob 字符的选项值会在注入这一步
+  被重新分词。回归位置：`scripts/tests/test_build_wrapper.py` 的
+  `test_global_option_before_subcommand_still_gets_testing`、
   `test_features_after_double_dash_does_not_suppress_injection`、`test_merged_features_form_is_not_reinjected`、
   `test_package_selection_does_not_inject_root_only_feature`。
 

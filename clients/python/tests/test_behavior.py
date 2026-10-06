@@ -15,11 +15,13 @@ import pytest
 from weflow_sdk import (
     CONNECT_TIMEOUT,
     READ_TIMEOUT,
+    STALL_TIMEOUT,
     Client,
     ClientError,
     NotReady,
     ShapeError,
     StatusError,
+    TransportError,
 )
 from weflow_sdk import client as sdkmod
 from weflow_sdk.generated.weflow_sdk import models as gen
@@ -1196,12 +1198,16 @@ def make_budget_client(mock: Mock) -> tuple[Client, _BudgetRecorder]:
     return client, recorder
 
 async def test_published_timeout_budgets_travel_per_request() -> None:
-    """Connect 5s everywhere; read 30s for JSON, **none** for size-bounded work.
+    """Connect 5s everywhere; a 30s read bound on JSON, a larger stall bound elsewhere.
 
     A whole-roster message count, a media body and a sync pass are bounded only by
-    the library or the upload - applying the JSON read budget to them turns "this
-    group is big" into a client-side failure. The uncounted roster listing must
-    stay on the ordinary budget, otherwise the switch is just "no timeouts at all".
+    the library or the upload - applying the JSON read bound to them turns "this
+    group is big" into a client-side failure. Dropping the bound entirely is the
+    opposite failure: a connection that goes silent with no FIN (peer killed, NAT
+    mapping expired) then never reports at all. So these requests get a bound that
+    is charged per read operation and is generous enough not to punish slow progress.
+    The uncounted roster listing stays on the ordinary bound, otherwise the switch
+    is just "no bounds anywhere".
     """
     mock = Mock()
     mock.group_members_page = {
@@ -1223,18 +1229,20 @@ async def test_published_timeout_budgets_travel_per_request() -> None:
     by_path = [to for _, to in rec.seen]
     assert by_path[0]["read"] == READ_TIMEOUT, f"accounts: {by_path[0]}"
     assert by_path[1]["read"] == READ_TIMEOUT, f"uncounted roster: {by_path[1]}"
-    assert by_path[2]["read"] is None, f"counted roster: {by_path[2]}"
-    assert by_path[3]["read"] is None, f"sync: {by_path[3]}"
-    assert by_path[4]["read"] is None, f"media: {by_path[4]}"
+    assert by_path[2]["read"] == STALL_TIMEOUT, f"counted roster: {by_path[2]}"
+    assert by_path[3]["read"] == STALL_TIMEOUT, f"sync: {by_path[3]}"
+    assert by_path[4]["read"] == STALL_TIMEOUT, f"media: {by_path[4]}"
     await client.aclose()
 
 
 async def test_watch_stream_is_not_bounded_by_the_json_read_timeout() -> None:
-    """The SSE connection is long-lived by contract: it must carry no read bound.
+    """The SSE stream is bounded by the stall budget, not by the JSON read bound.
 
-    A read bound is charged per read operation and the server pings every 25s, so the
-    30s JSON budget leaves a 5s margin - one proxy stall drops a healthy idle
-    stream, and the client reconnects so quickly the loss looks like a normal end.
+    Charged per read operation and reset by each chunk, the 30s JSON bound leaves only a
+    5s margin over the server's 25s keep-alive: one proxy hiccup drops a healthy idle
+    stream and the client reconnects so fast the loss looks like a normal end. The stall
+    bound is wide enough to survive that, yet still finite - a connection that goes
+    silent without ever closing must fail rather than hang the caller forever.
     """
     mock = Mock()
     mock.sse_body = ("\n".join(sse_frame("message.new", new_payload("9", "hi"), 7)) + "\n\n").encode()
@@ -1244,7 +1252,7 @@ async def test_watch_stream_is_not_bounded_by_the_json_read_timeout() -> None:
     await agen.aclose()
     stream = [to for path, to in rec.seen if path.endswith("/api/v1/push/messages")]
     assert stream, f"the stream request was never observed: {rec.seen}"
-    assert all(to["read"] is None for to in stream), stream
+    assert all(to["read"] == STALL_TIMEOUT for to in stream), stream
     assert all(to["connect"] == CONNECT_TIMEOUT for to in stream), stream
     await client.aclose()
 
@@ -1328,3 +1336,78 @@ async def test_media_bytes_rejects_a_redirect_on_the_first_hit() -> None:
     assert exc.value.status == 302, exc.value.status
     assert exc.value.url == "http://mock/api/v1/media/abc.png", exc.value.url
     await client.aclose()
+
+class _DroppingTransport(httpx.AsyncBaseTransport):
+    """Refuse the first `blips` connections, then delegate to `inner`.
+
+    The Transport branch of wait_ready changed in this batch and had no test:
+    HTTP-status injection cannot reach it, because the request never produces a
+    response. Two properties, both from review: a dropped round must be waited
+    out, and a server that never answers once must not be reported as
+    `not-registered` - that sends the caller to the registration step when the
+    symptom is "nothing ever replied".
+    """
+
+    def __init__(self, inner: httpx.AsyncBaseTransport, blips: int) -> None:
+        self._inner = inner
+        self.blips = blips
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if self.blips > 0:
+            self.blips -= 1
+            raise httpx.ConnectError("connection refused", request=request)
+        return await self._inner.handle_async_request(request)
+
+
+def make_flaky_client(mock: Mock, blips: int) -> tuple[Client, _DroppingTransport]:
+    client = Client("http://mock", TOKEN)
+    drop = _DroppingTransport(httpx.ASGITransport(app=mock.asgi_app()), blips)
+    client._http = httpx.AsyncClient(transport=drop, base_url="http://mock")
+    return client, drop
+
+
+async def test_wait_ready_rides_out_a_dropped_connection() -> None:
+    """One refused connection is still "warming up", not a verdict."""
+    mock = Mock()
+    mock.states = ["ready"]
+    client, drop = make_flaky_client(mock, 1)
+    await client.wait_ready("wxid_mock", timeout=10)
+    assert drop.blips == 0, "the injected failure was actually hit"
+    await client.aclose()
+
+
+async def test_wait_ready_reports_a_server_that_never_answered() -> None:
+    """The deadline must name the dropped rounds instead of inventing a story."""
+    mock = Mock()
+    # No `drop` binding: this test never asserts on the counter - every poll is
+    # meant to fail, which is the point.
+    client, _ = make_flaky_client(mock, 10**6)
+    with pytest.raises(NotReady) as exc:
+        await client.wait_ready("wxid_mock", timeout=1.0)
+    assert "unreachable" in exc.value.last_state, exc.value.last_state
+    assert "never got through" in exc.value.last_state, exc.value.last_state
+    assert "not-registered" not in exc.value.last_state, exc.value.last_state
+    await client.aclose()
+
+
+async def test_watch_raises_on_an_unusable_base_url_instead_of_looping_forever() -> None:
+    """A URL this client cannot parse is configuration, not a stream hiccup.
+
+    Reconnect-with-backoff is right for a dropped stream and wrong here: every
+    retry fails identically (backoff caps at 30s), so the caller gets a stream
+    that neither yields nor errors, forever. The two JSON entry points raise, so
+    this one has to as well.
+    """
+    client = Client("http://h:99999x", TOKEN, timeout=2.0)
+    with pytest.raises(ClientError) as exc:
+        # wait_for, not a bare `async for`: the bug this test exists to catch is
+        # the stream swallowing the error and reconnecting forever, and an
+        # unguarded consumption would hang the suite instead of failing it.
+        async def _first() -> None:
+            async for _ in client.watch():
+                return
+        await asyncio.wait_for(_first(), timeout=5.0)
+    assert isinstance(exc.value, TransportError), repr(exc.value)
+    assert "base_url" in str(exc.value).lower(), str(exc.value)
+    await client.aclose()
+

@@ -34,10 +34,19 @@ log = logging.getLogger(__name__)
 # that is not there must fail fast rather than hang a caller.
 CONNECT_TIMEOUT = 5.0
 
-# Published read budget for ordinary JSON requests. Requests that are unbounded
-# by construction (a full-roster message count, a media body, a sync pass, the
-# SSE stream) do not use it - see ``_long_timeout``.
+# Published read budget for ordinary JSON requests, charged per read operation.
 READ_TIMEOUT = 30.0
+
+# Stall budget for the requests whose cost is set by the data or by server-side
+# work (a full-roster message count, a media body, an export trigger, a sync
+# pass, the SSE stream). httpx charges it per read operation and resets it on
+# progress, so a 500 MB download or a minutes-long first pull never trips it *while
+# advancing* - but a connection that goes silent (peer killed without a FIN, a NAT
+# that dropped the mapping, a laptop resuming from sleep) surfaces instead of
+# hanging the caller forever. 90s is about four times the server keep-alive
+# interval (25s): one missed ping plus a scheduling hiccup stays healthy, a black
+# hole does not.
+STALL_TIMEOUT = 90.0
 
 # 200-with-refusal vocabulary across the two servers: the weflow server
 # currently emits only account_conflict, the qqflow sibling adds
@@ -223,17 +232,24 @@ class Client:
     never in the URL.
     """
 
-    def __init__(self, base_url: str, token: str, timeout: float = READ_TIMEOUT) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        timeout: float = READ_TIMEOUT,
+        stall_timeout: float = STALL_TIMEOUT,
+    ) -> None:
+        """Point a client at a server.
+
+        ``timeout`` bounds one read of an ordinary JSON response; ``stall_timeout``
+        bounds one read of a request whose size or server-side work is unbounded
+        (roster counts, media bytes, ``sync_now``, the SSE stream). Both are charged
+        per read operation rather than as a total deadline, so a slow answer that
+        keeps arriving is never cut off while one that goes silent still fails.
+        Pass a large ``stall_timeout`` to opt a stream out of stall detection.
+        """
         self._timeout = httpx.Timeout(timeout, connect=CONNECT_TIMEOUT)
-        # No read bound for the requests whose cost is not a function of
-        # anything the caller can see: counting a roster, transferring a
-        # media body, running a sync pass. The SSE stream belongs here too -
-        # a read bound is charged per read operation while the server pings only
-        # every 25s, so the JSON budget would leave a 5s margin that one proxy
-        # stall burns through on a healthy idle connection.
-        self._long_timeout = httpx.Timeout(
-            None, connect=CONNECT_TIMEOUT, write=None, pool=None
-        )
+        self._long_timeout = httpx.Timeout(stall_timeout, connect=CONNECT_TIMEOUT)
         self._http = httpx.AsyncClient(timeout=self._timeout)
         self._base = base_url.rstrip("/")
         self._token = token
@@ -326,6 +342,7 @@ class Client:
         """
         deadline = asyncio.get_running_loop().time() + timeout
         last_state = "not-registered"
+        dropped = 0
         while True:
             # A dropped round is waiting, not failure: this poll exists to ride out
             # a transient connect blip or a momentary 5xx while the index is still
@@ -336,11 +353,15 @@ class Client:
                 listing = self._validate(
                     gen.AccountsList, await self._get_json("/api/v1/accounts", {})
                 )
-            except TransportError:
+            except TransportError as exc:
                 listing = None
+                dropped += 1
+                last_state = f"unreachable ({exc})"
             except StatusError as exc:
                 if 500 <= exc.status < 600:
                     listing = None
+                    dropped += 1
+                    last_state = f"server error {exc.status} on the listing"
                 else:
                     raise
             mine = (
@@ -354,10 +375,18 @@ class Client:
                 if mine.state is gen.AccountStatus.ERROR:
                     raise NotReady(timeout, f"error: {mine.error or ''}")
                 last_state = str(mine.state.value)
-            else:
+            elif listing is not None:
                 last_state = "not-registered"
             if asyncio.get_running_loop().time() >= deadline:
-                raise NotReady(timeout, last_state)
+                # Naming the dropped rounds is the difference between "indexing, keep
+                # waiting" and "this server never answered once" - both end at the
+                # same deadline, and only one of them is a caller-side problem.
+                raise NotReady(
+                    timeout,
+                    last_state
+                    if not dropped
+                    else f"{last_state}; {dropped} poll(s) never got through",
+                )
             await asyncio.sleep(0.25)
 
     async def ensure_ready(self, account: str, body: dict, timeout: float = 120.0) -> None:
@@ -571,13 +600,15 @@ class Client:
         """
         if message.media is None:
             raise ShapeError("(no media on message): nothing to fetch")
-        if not talker:
+        if not talker.strip():
+            # Whitespace included, matching the Rust client: this is the media family,
+            # where an empty handle addresses a different path than the caller means.
             raise ShapeError("talker must not be empty")
         name = message.media.file_name
-        if not name:
-            # Same fail-fast as the other keys: an empty handle addresses a
-            # different path than the caller means, and the server cannot tell
-            # "no file name" from "some file I never heard of".
+        if not name.strip():
+            # Fail-fast, whitespace included (the Rust client trims too): an empty
+            # handle addresses a different path than the caller means, and the
+            # server cannot tell "no file name" from "some file I never heard of".
             raise ShapeError("media file_name must not be empty")
         url = self._url(f"/api/v1/media/{_encode_path_segment(name)}")
         auth = {"Authorization": f"Bearer {self._token}"}
@@ -718,8 +749,6 @@ class Client:
         )
 
     async def media_bytes_by_id(self, media_id: str) -> bytes:
-        if not media_id:
-            raise ShapeError("media_id must not be empty")
         """``GET /api/v1/media/{id}`` - bytes for a handle the server advertised.
 
         ``media_id`` is a **single path segment**: the native face's
@@ -727,6 +756,14 @@ class Client:
         :meth:`media_bytes` when a ChatLab message is at hand - that one also
         triggers an export and retries once on a 404.
         """
+        if not media_id.strip():
+            # Whitespace counts as empty, matching the Rust client: an empty handle
+            # addresses a *different* path, and the
+            # server answering "no such file" would dress up a caller mistake as an
+            # unexportable handle. (The check sits after the docstring: a statement
+            # before it turns the docstring into a discarded expression, so help()
+            # and API docs generators would lose this method entirely.)
+            raise ShapeError("media_id must not be empty")
         url = self._url(f"/api/v1/media/{_encode_path_segment(media_id)}")
         resp = await self._http_get(
             url,
@@ -879,7 +916,13 @@ class Client:
                             clean_exit = True
                     # Overflow: skip the EOF flush entirely (an un-trusted
                     # stream must not deliver its tail) and keep escalating.
-            except (httpx.HTTPError, httpx.InvalidURL) as exc:
+            except httpx.InvalidURL as exc:
+                # Not a stream hiccup: this client cannot parse its own URL, so every
+                # reconnect fails identically. Swallowing it would turn a
+                # configuration mistake into a stream that never yields and never
+                # errors - the two other entry points raise, so raise here too.
+                raise TransportError(f"unusable base_url for SSE: {exc}") from exc
+            except httpx.HTTPError as exc:
                 log.warning("SSE stream error, reconnecting: %s", exc)
             if clean_exit:
                 backoff = 0.5

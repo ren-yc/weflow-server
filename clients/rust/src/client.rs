@@ -273,9 +273,20 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// reset by each successful chunk (deliberately not a total deadline): a large but
 /// steadily streaming answer is not a stall. Same semantics as httpx's read
 /// timeout, so this constant means one thing in both SDKs.
-/// Requests unbounded by construction (a full-roster message count, a media body,
-/// the SSE stream) deliberately do not use it.
+/// Requests whose cost is set by the data (a full-roster message count, a media
+/// body, an export trigger, a sync pass, the SSE stream) do not use it - they use
+/// [`STALL_TIMEOUT`] instead.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Stall budget for [`READ_TIMEOUT`]-exempt requests: the longest gap **between two
+/// chunks** that still counts as "working" rather than "hung". Charged per read
+/// operation like a read timeout, so a 500 MB media body or a multi-minute
+/// first-pull never trips it while it is advancing - but a connection that goes
+/// silent (peer killed without a FIN, a NAT that dropped the mapping, a laptop
+/// resuming from sleep) is reported instead of hanging the caller forever.
+/// 90s is four times the server's 25s keep-alive interval: one missed ping plus a
+/// scheduling hiccup stays healthy, a black hole does not.
+pub const STALL_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Client for one weflow-server instance. Cloneable; shares the connection
 /// pools.
@@ -283,12 +294,10 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Client {
     /// Ordinary JSON requests: [`CONNECT_TIMEOUT`] plus [`READ_TIMEOUT`].
     http: reqwest::Client,
-    /// No read bound: a whole-roster message count, a media body of arbitrary
-    /// size, a sync pass, and the SSE stream. Connect stays bounded (a server
-    /// that is not there must fail fast) but a slow answer is not an error.
-    /// The stream needs this too: a read bound is charged per read operation
-    /// while the server pings every 25s, so the JSON budget leaves only a 5s
-    /// margin that one proxy stall burns through on a healthy idle stream.
+    /// The [`READ_TIMEOUT`]-exempt family (see [`STALL_TIMEOUT`]): a whole-roster
+    /// message count, a media body of arbitrary size, an export trigger, a sync
+    /// pass, and the SSE stream. Connect stays bounded (a server that is not
+    /// there must fail fast); a slow-but-advancing answer is never an error.
     http_long: reqwest::Client,
     base_url: String,
     token: String,
@@ -298,26 +307,46 @@ impl Client {
     /// Point a client at a server. `token` is the API token the server
     /// printed on first start (or `--show-token`).
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Self {
-        let json = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            // read_timeout, not timeout: the latter is a *total* deadline from "start
-            // connecting" to "response body finished", which would cut off a large
-            // answer that is streaming fine. httpx (and this crate's own stream loop)
-            // charge a read bound per read operation, resetting on each successful
-            // chunk - the two SDKs must mean the same thing by "30s read budget".
-            .read_timeout(READ_TIMEOUT)
-            .build()
-            // reqwest only fails here when a TLS backend cannot initialize.
-            // Falling back to an unbudgeted client would silently drop the
-            // published default rather than tell anyone about it.
-            .unwrap_or_else(|_| reqwest::Client::new());
-        let long = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        Self::with_timeouts(
+            base_url,
+            token,
+            CONNECT_TIMEOUT,
+            READ_TIMEOUT,
+            STALL_TIMEOUT,
+        )
+    }
+
+    /// The same client with explicit budgets.
+    ///
+    /// Every budget is charged **per operation and reset by progress**, never as a
+    /// total deadline: `read` bounds one read on a JSON page, `stall` bounds one
+    /// read on a request whose size or server-side work is unbounded. That is why
+    /// a large answer that keeps arriving cannot fail while a connection that goes
+    /// silent still does. Callers that need no stall detection at all (a deliberately
+    /// idle stream) pass a duration large enough to serve as "never".
+    pub fn with_timeouts(
+        base_url: impl Into<String>,
+        token: impl Into<String>,
+        connect: Duration,
+        read: Duration,
+        stall: Duration,
+    ) -> Self {
+        let build = |body: Option<Duration>| {
+            let mut b = reqwest::Client::builder().connect_timeout(connect);
+            if let Some(d) = body {
+                b = b.read_timeout(d);
+            }
+            // The only way build() fails is a missing TLS backend - a link-time
+            // property of this binary, not a runtime condition. Reaching here means
+            // the crate cannot make authenticated requests at all, so panic rather
+            // than hand back an unbudgeted client and let every budget above vanish
+            // silently. (This matches reqwest::Client::new(), which expects too.)
+            b.build()
+                .expect("no TLS backend available in this build (check reqwest features)")
+        };
         Self {
-            http: json,
-            http_long: long,
+            http: build(Some(read)),
+            http_long: build(Some(stall)),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             token: token.into(),
         }
@@ -458,7 +487,11 @@ impl Client {
     /// compared against.
     pub async fn wait_ready(&self, wxid: &str, timeout: Duration) -> Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
-        let mut last_state = "not-registered".to_string();
+        // Declared without a value: every round of the loop assigns this before
+        // the deadline is looked at, so a seed would be a store nobody ever reads.
+        // Leaving it uninitialised says so at the type level.
+        let mut last_state: String;
+        let mut dropped = 0u32;
         loop {
             match self.accounts().await {
                 Ok(accounts) => match accounts.iter().find(|a| a.wxid == wxid) {
@@ -480,11 +513,35 @@ impl Client {
                 // (bad token, wrong route) is a real misconfiguration, and a
                 // `Shape` means the listing stopped matching the contract: both
                 // propagate rather than silently waiting.
-                Err(ClientError::Transport(_)) => {}
-                Err(ClientError::Status { status, .. }) if (500..=599).contains(&status) => {}
+                //
+                // The dropped round still goes into `last_state`: a server that is
+                // wedged (5xx on every poll) or simply absent (connection refused
+                // on every poll) has to be distinguishable at the deadline, or the
+                // caller is told "not-registered" - a wrong diagnosis that points at
+                // the registration step instead of the server. The round counter
+                // separates "one blip among many good polls" from "never got through".
+                Err(ClientError::Transport(e)) => {
+                    dropped += 1;
+                    last_state = format!("unreachable ({e})");
+                }
+                Err(ClientError::Status { status, .. }) if (500..=599).contains(&status) => {
+                    dropped += 1;
+                    last_state = format!("server error {status} on the listing");
+                }
                 Err(e) => return Err(e),
             }
             if tokio::time::Instant::now() >= deadline {
+                // Naming the dropped rounds is the difference between "indexing,
+                // keep waiting" and "this server never answered once" - both end at
+                // the same deadline, and only one of them is a client-side bug.
+                // Naming the dropped rounds is the difference between "indexing,
+                // keep waiting" and "this server never answered once" - both end at the
+                // same deadline, and only one of them is the caller's problem.
+                let last_state = if dropped == 0 {
+                    last_state
+                } else {
+                    format!("{last_state}; {dropped} poll(s) never got through")
+                };
                 return Err(ClientError::NotReady { timeout, last_state });
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -627,8 +684,9 @@ impl Client {
     pub async fn media_bytes(&self, message: &gen_types::ChatlabMessage, talker: &str) -> Result<bytes::Bytes> {
         let Some(m) = &message.media else {
             // 本地前置条件失败：还没发请求，也谈不上响应体——归 UnexpectedBody
-            // 是权宜（它带着 url/detail 两个槽位）。url 必须是这条调用真正面向的
-            // 端点而不是散文：调用方按 url 归因时，散文会让分类静默失配。
+            // 是权宜（它带着 url/detail 两个槽位）。url 给的是这条调用所属的**媒体端点族**
+            // （此刻还没有 id 段可填：缺的正是句柄本身），而不是散文——调用方按 url
+            // 前缀归因时，散文会让分类静默失配。
             return Err(ClientError::UnexpectedBody {
                 url: self.url("/api/v1/media"),
                 detail: "message carries no media handle".to_string(),
@@ -980,6 +1038,12 @@ mod tests {
         // side by test_published_timeout_budgets_travel_per_request.
         assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(5));
         assert_eq!(READ_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(STALL_TIMEOUT, Duration::from_secs(90));
+        assert!(
+            STALL_TIMEOUT > READ_TIMEOUT,
+            "the exempt family must be bounded looser, not tighter: slow but
+             progressing work is not a failure",
+        );
     }
     #[test]
     fn empty_talker_error_names_the_endpoint_that_was_actually_called() {

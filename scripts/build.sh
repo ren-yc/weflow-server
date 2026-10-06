@@ -51,7 +51,7 @@ for t in ${cargo_side[@]+"${cargo_side[@]}"}; do
   case "$t" in
     --all-features|--no-default-features|--features|-F) already_has=1 ;;
     --features=*|-F?*) already_has=1 ;;
-    -p|--package) selects_package=1 ;;
+    -p|--package|--package=*) selects_package=1 ;;
     -p?*) selects_package=1 ;;
   esac
 done
@@ -61,8 +61,10 @@ if [[ "$sub" == "test" || ( "$sub" == "clippy" && " ${cargo_side[*]-} " == *" --
   needs_testing=1
 fi
 if [[ $needs_testing -eq 1 && $already_has -eq 0 && $selects_package -eq 0 && $sub_idx -ge 0 ]]; then
-  head=(${cargo_side[@]:0:$sub_idx})   # 全局选项在前，注入点紧跟子命令
-  tail=(${cargo_side[@]:$((sub_idx + 1))})
+  # 引号不可省：无引号的数组展开会把含空格的元素重新分词、把带 glob 字符的
+  # 路径就地展开（`--config "a b"`、`--target-dir t*`），参数在注入这一步就被改坏。
+  head=("${cargo_side[@]:0:$sub_idx}")   # 全局选项在前，注入点紧跟子命令
+  tail=("${cargo_side[@]:$((sub_idx + 1))}")
   set -- ${head[@]+"${head[@]}"} "$sub" --features testing ${tail[@]+"${tail[@]}"} ${rest_side[@]+"${rest_side[@]}"}
   echo "build.sh: 已补 --features testing（集成测试需要它才看得见实现面）" >&2
 fi
