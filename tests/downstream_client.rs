@@ -37,11 +37,6 @@ const TEST_TOKEN: &str = "downstream-client-test-token";
 /// Bind port for the fixture app; media URLs are minted against it.
 const TEST_PORT: u16 = 5033;
 
-/// The base URL the handlers derive for media links, given the fixture config.
-fn derive_base() -> String {
-    server::derive_base_url("127.0.0.1", TEST_PORT, None)
-}
-
 /// Resolved registration inputs, shaped like the `POST /api/v1/accounts` body.
 struct Inputs {
     wxid: String,
@@ -57,9 +52,12 @@ struct Inputs {
 impl Inputs {
     /// The registration body a downstream client would POST. Built here so the
     /// key material is assembled in exactly one place and never printed.
-    fn body(&self, token: &str) -> Value {
+    /// The token travels in the query string, not in this body: the handler
+    /// refuses credential-named keys from the JSON body (a body token would be
+    /// indistinguishable from the payload being registered), so a body token
+    /// now answers 401 instead of authenticating.
+    fn body(&self) -> Value {
         let mut body = json!({
-            "access_token": token,
             "wxid": self.wxid,
             "db_path": self.db_path,
         });
@@ -269,7 +267,7 @@ async fn downstream_client_real_db() {
     assert_eq!(v["accounts"].as_array().unwrap().len(), 0);
 
     // ---- 0.1 register the account (client-driven startup) ---------------
-    let (s, v) = client_post(app.clone(), "/api/v1/accounts", &[], inputs.body(token)).await;
+    let (s, v) = client_post(app.clone(), &format!("/api/v1/accounts?access_token={TEST_TOKEN}"), &[], inputs.body()).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["success"], true, "registration accepted: {v}");
     assert_eq!(v["state"], "accepted", "registration accepted: {v}");
@@ -288,7 +286,7 @@ async fn downstream_client_real_db() {
     assert!(std::path::Path::new(resolved).is_dir(), "resolved storage dir exists");
 
     // ---- 0.2 registration is idempotent while indexing ------------------
-    let (s, v) = client_post(app.clone(), "/api/v1/accounts", &[], inputs.body(token)).await;
+    let (s, v) = client_post(app.clone(), &format!("/api/v1/accounts?access_token={TEST_TOKEN}"), &[], inputs.body()).await;
     assert_eq!(s, StatusCode::OK);
     assert!(
         v["state"] == "in_progress" || v["state"] == "already_ready",
@@ -302,12 +300,11 @@ async fn downstream_client_real_db() {
     // oracle. The real account must be completely unaffected.
     let (s, v) = client_post(
         app.clone(),
-        "/api/v1/accounts",
+        &format!("/api/v1/accounts?access_token={token}"),
         &[],
         serde_json::json!({
             "wxid": "wxid_downstream_intruder",
             "db_path": "Z:/nonexistent",
-            "access_token": token,
         }),
     )
     .await;
@@ -624,7 +621,7 @@ async fn downstream_client_real_db() {
         // is served by this process. For the local route the URL's last
         // segment is the EXPORTED file name — which is not necessarily
         // `fileName`, that one carries the name from the message XML.
-        if url.starts_with(&format!("{}/api/v1/media/", derive_base())) {
+        if url.starts_with("/api/v1/media/") {
             local_route += 1;
             let exported_name = std::path::Path::new(local_path)
                 .file_name()
@@ -648,7 +645,9 @@ async fn downstream_client_real_db() {
     if let Some(m) = exported.first() {
         let url = m["media"]["url"].as_str().unwrap();
         // 返回值本身就是 oneshot 需要的路径（根相对、无查询串）。
-        let uri = url.to_string();
+        // The served URL is root-relative and carries no credential (checked
+        // above); fetching it is the caller's job — base and token included.
+        let uri = format!("{url}?access_token={token}");
         let resp = app
             .clone()
             .oneshot(Request::builder().method("GET").uri(&uri).body(Body::empty()).unwrap())
@@ -872,9 +871,9 @@ async fn downstream_client_real_db() {
     // ---- 10. manual sync: real incremental pass over the real db --------
     let (s, v) = client_post(
         app.clone(),
-        "/api/v1/sync",
+        &format!("/api/v1/sync?access_token={token}"),
         &[],
-        json!({ "access_token": token }),
+        json!({}),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
@@ -1024,12 +1023,11 @@ async fn downstream_client_real_db() {
     // spawn a second full index and the runtime blocks on it at teardown.
     let (s, v) = client_post(
         app.clone(),
-        "/api/v1/accounts",
+        &format!("/api/v1/accounts?access_token={token}"),
         &[],
         serde_json::json!({
             "wxid": "wxid_downstream_intruder",
             "db_path": "Z:/nonexistent",
-            "access_token": token,
         }),
     )
     .await;
