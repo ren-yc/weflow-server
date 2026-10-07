@@ -94,6 +94,8 @@ jobs:
           git clone --depth 1 --branch "$pin" https://github.com/ren-yc/flow-contract.git conformance-nails
           FLOW_CONTRACT_DIR="$PWD/conformance-nails" FLOW_CONTRACT_CASE="nails" \
             bash scripts/build.sh test --locked --test conformance_runner -- --ignored
+
+  build:
     name: Build ${{ matrix.target }}
     needs: [guard, quality-gate]
     runs-on: ${{ matrix.os }}
