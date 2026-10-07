@@ -910,7 +910,7 @@ feeds 条目字段（以源码 `sns.rs` 为准）：`tid/userName/content(明文
 | `contacts` | SDK `contacts` | 单页；要全量请自己带 `--limit`/`--offset` 翻页 |
 | `accounts` | SDK `accounts` | **只有 HTTP 形态**（没有 `--embedded`）：这一面问的是「服务端此刻实际绑定了什么」，进程内索引给的是另一个答案 |
 | `sync` | SDK `sync_now` | **写动作**：让服务端立刻跑一次增量同步；同样没有 `--embedded` |
-| `export` | SDK `list_all_sessions` ＋ `drain_session` ＋ `chatlab_messages` | **只走 HTTP**（不提供 `--embedded`）：批量导出到 ChatLab Format 文件；`--with-media` 时另用 `chatlab_messages(media=1)` 触发导出并下载字节，见下一节 |
+| `export` | SDK `list_all_sessions` ＋ `pull_page` ＋ `chatlab_messages` | **只走 HTTP**（不提供 `--embedded`）：批量导出到 ChatLab Format 文件；`--with-media` 时用同一页的时间窗调 `chatlab_messages(media=1)` 触发导出并下载字节，见下一节 |
 
 环境变量：`WEFLOW_BASE_URL`（默认 `http://127.0.0.1:5033`）、`WEFLOW_TOKEN`（API token）。
 **token 一律不经命令行传递**——命令行会落进 shell history 与进程列表，而这个值能读出整份聊天记录。
@@ -951,9 +951,16 @@ feeds 条目字段（以源码 `sns.rs` 为准）：`tid/userName/content(明文
 - **`index.json`**：本服务自造的编排清单（会话 → 文件 → 条数）。**它不属于 ChatLab 规范，导入
   请用单个 `<slug>.jsonl`／`.json`；整个目录不可导入。**
 - **`--with-media`**：把本会话用到的媒体字节下载到 `<目录>/media/`，并把导出物里的
-  `media.fileName` **限定为确实落盘的那些句柄**。实现上先走 `/chatlab/messages?media=1` 触发导出
-  （该面**每请求最多导出 200 项**，超出部分靠翻页续传），再取字节；顺序不能反 —— 服务端只有在真的
-  写出了本地副本之后，才把 `fileName` 回填成可取句柄。注意**两个面给的名字不必相同**：消息面回填的是
+  `media.fileName` **限定为确实落盘的那些句柄**。实现是**单遍**的：每取到一页 Pull 行，就用这一页的时间窗
+  （`(since, nextSince]` 正好对应消息面认的 `start`/`end`，两端都是闭区间的秒级戳；同秒的行必然落在同一页里，
+  所以窗口两端不漏行）调一次 `/chatlab/messages?media=1` 触发导出（该面**每请求最多导出 200 项**，超出部分
+  靠翻页续传）并取字节，然后才写这一页的行；顺序不能反 —— 服务端只有在真的写出了本地副本之后，才把
+  `fileName` 回填成可取句柄。**`--since` 因此同时下推到导出面**：过去它是两趟独立的全历史遍历，`--since`
+  只管住写出来的行、媒体照样把整个会话导出并重下一遍；而两趟之间若有并发同步推进水位，第一趟没覆盖到的
+  消息会「有行、无句柄」地静默缺件。磁盘上已有的摘要文件**不重下**（内容摘要名同名即同内容，按存在性复用
+  是安全的）——这也是 `--resume` 能「只补下缺件」的依据。回归位置：`cli_e2e::media_window_follows_the_pull_page`
+  （每个导出请求都带 `start`/`end`、请求条数等于 Pull 页数、两页窗口互不重叠，且 250 条句柄与 `media/`
+  文件集合大小相等）与 `cli_e2e::with_media_reuses_bytes_already_on_disk`（第二次跑不得重下覆盖）。注意**两个面给的名字不必相同**：消息面回填的是
   导出后的内容摘要名，拉取面携带的仍是索引里的原始名，所以句柄**按消息 id 对账**（不是按名字比对），
   导出物里写的是实际落盘的那个名字。外链媒体与未能导出的媒体**不会**留下句柄：宁可少一个 `media`
   字段，也不给一个指向不存在文件的句柄。单个媒体取不到只跳过，不升级成会话级失败。
@@ -996,9 +1003,9 @@ feeds 条目字段（以源码 `sns.rs` 为准）：`tid/userName/content(明文
    `export::tests::failed_rerun_keeps_the_previous_complete_artifact`、
    `cli_e2e::export_writes_a_file_against_a_live_service`（含续跑第二次退 0）。
 
-内存：JSONL 逐页写盘、写完即丢，**峰值常驻集与消息条数无关**；`--with-media` 的句柄集合是
-**O(不同媒体数)**、同秒组的消息会被服务端扩页带出（Pull 段的「同秒扩页」），这两项不在「与条数无关」
-的承诺内。大语料的实测口径与造库工具（隐藏的
+内存：JSONL 逐页写盘、写完即丢，**峰值常驻集与消息条数无关**；`--with-media` 的句柄映射现在**只活在
+这一页**（O(本页不同媒体数)，不随会话长度增长），因此媒体侧不再破坏这条承诺。同秒组的消息会被服务端
+扩页带出（Pull 段的「同秒扩页」），那一项仍在承诺之外。大语料的实测口径与造库工具（隐藏的
 `--rows` 参数，仅 `testing` feature 下编译进二进制）见 `docs/architecture.md` 的「测试与夹具」。
 ## 启动示例
 

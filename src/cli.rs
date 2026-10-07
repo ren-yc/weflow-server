@@ -404,16 +404,6 @@ fn env_token() -> Result<String> {
     })
 }
 
-/// 与 [`block`] 同形，但面向返回 `anyhow::Result` 的 future：`anyhow::Error` 不实现
-/// `std::error::Error`，塞不进 `block` 的约束里（那条约束是为了把 SDK 的错误类型接过来）。
-fn block_anyhow<T>(f: impl std::future::Future<Output = Result<T>>) -> Result<T> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("建 tokio 运行时失败")?;
-    rt.block_on(f)
-}
-
 /// SDK 的方法都是 async；子命令是「跑一次就退出」，所以用一个当前线程运行时把 future 拉完。
 /// 刻意不建多线程运行时：这里没有并发需求，多花的线程只会拖慢冷启动。
 fn block<T, E: std::error::Error + Send + Sync + 'static>(
@@ -641,89 +631,106 @@ fn row_from_pull(m: &weflow_client::generated::r#gen::types::PullMessage) -> exp
     }
 }
 
-/// 把一个会话的媒体导出并下载到 `<out>/media/`，返回「消息 id → 确实落盘的文件名」映射与被
-/// 拒的非法名字个数。
+/// 给**一页 Pull 行**配齐媒体：把这一页的时间窗交给消息面触发导出（每请求上限
+/// 200 项），取回回填好的可取句柄、下载字节，返回「消息 id → 落盘名」映射与
+/// 被拒的非法名字数。
 ///
-/// 为什么先走 `/chatlab/messages?media=1`：服务端**只有在真的写出了本地副本之后**才把
-/// `fileName` 回填成可取句柄（外链与平台名给不出跨会话唯一的句柄），所以「触发导出」与
-/// 「拿到句柄」是同一次请求的两面。该面每请求最多导出 200 项，超出部分靠翻页续传。
+/// **为什么按页配窗，而不是先独立遍历一遍全会话**：`--with-media` 此前是两趟全
+/// 历史遍历（消息面翻页收集句柄 ＋ 拉取面翻页写行）。消息面那个面不认 `since`，
+/// 于是 `--since` 只约束了写出来的行、媒体照旧把整个历史导出并重下一遍（成本是
+/// 取数承诺的数倍）；更要紧的是两趟之间并发同步会让窗口滑动 —— 第一趟没覆盖到的
+/// 消息照样有行、句柄却永远缺失，且没有任何计数说得出少了件。按页配窗让两件事
+/// 发生在**同一页**上：滑动窗口这一类问题被消除，而 Pull 页的 `(since, nextSince]`
+/// 区间正好就是消息面认的 `start`/`end`（两端闭区间的秒级戳；同秒的行必然落在同一
+/// 页里，所以窗口两端不会漏行）。回归位置：`media_window_follows_the_pull_page`。
 ///
-/// 返回**映射**而不是名字集合：消息面回填的 fileName 是导出后的内容摘要名，拉取面携带的是
-/// 索引里的原始名，两者不必相同——只有消息 id 能把两边对上（`retain_downloaded_media` 按 id 改写句柄）。
+/// 映射仍按**消息 id**：消息面回填的是内容摘要名、Pull 面给的是索引里的原始名，
+/// 两者不必相同，只有 id 能把两边对上（`retain_downloaded_media` 按 id 改写句柄）。
 ///
-/// 名字来自 HTTP 响应，却要拿去拼本地路径：`../`、盘符、设备名这类值配合 `join` 能写到导出目录之外。
-/// `media_bytes_by_id` 会做 URL 段编码，那防的是 HTTP 层，替代不了本地写盘前的 `safe_segment`。
-/// 非法名按 404 同级跳过并计数：静默少下载而整体退 0，是不可发现的失败。
+/// 磁盘存在性即去重：摘要派生的名字在导出目录里内容唯一（同名即同内容），所以复用
+/// 磁盘上已有的字节是安全的 —— 这正是 `--resume` 要「只补下缺件」、以及 `--since`
+/// 重跑时不该把窗口内媒体全部重下一遍所需要的性质。折叠口径与会话名去重同一
+/// （Windows 卷大小写不敏感）：`Img.png` 与 `img.png` 是同一份。
+/// 回归位置：`with_media_reuses_bytes_already_on_disk`。
 ///
-/// 单个媒体拿不到（404）只跳过，不升级成会话级失败：外链媒体本来就没有可取句柄，把它
-/// 升格会让「这个群里有一个表情包不是本地文件」变成「这个群一条都没导出」。
-async fn download_session_media(
+/// 单个媒体拿不到（404）只跳过，不升级成会话级失败：外链媒体本来就没有可取句柄，
+/// 把它升格会让「这个群里有一个表情包不是本地文件」变成「这个群一条都没导出」。
+async fn media_window_for_page(
     client: &Client,
     talker: &str,
     media_dir: &std::path::Path,
+    page: &[weflow_client::generated::r#gen::types::PullMessage],
 ) -> Result<(std::collections::BTreeMap<String, String>, usize)> {
-    // 键是消息 id（映射），另留一份落盘名集合做去重：同一条媒体可能被多条消息引用。
     let mut by_message: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
-    // 折叠键 → 实际落盘的名字：与会话名同一口径（Windows 卷大小写不敏感），
-    // 否则 Img.png 与 img.png 会被当成两份媒体，后一份把前一份的字节覆盖掉。
-    let mut on_disk: std::collections::BTreeMap<String, String> =
-        std::collections::BTreeMap::new();
-    let mut rejected = 0usize;
+    let mut rejected_names: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    let lo = page.iter().map(|m| m.timestamp).min().unwrap_or(0);
+    let hi = page.iter().map(|m| m.timestamp).max().unwrap_or(0);
+    let mut q = MessageQuery::new(talker.to_string());
+    q.media = true;
+    q.start = Some(lo.to_string());
+    q.end = Some(hi.to_string());
+    q.limit = Some(200);
     let mut offset = 0u64;
     loop {
-        let mut q = MessageQuery::new(talker.to_string());
-        q.media = true;
-        q.limit = Some(200);
-        q.offset = Some(offset);
-        let page = client.chatlab_messages(&q).await?;
-        let count = page.messages.len();
-        for m in &page.messages {
+        let resp = client.chatlab_messages(&q).await?;
+        let count = resp.messages.len();
+        for m in &resp.messages {
             let Some(media) = &m.media else { continue };
             let name = media.file_name.clone();
             if name.is_empty() {
                 continue;
             }
-            // 本地路径校验先于取字节与写盘：非法名根本不进下载，也就不可能被 `join` 带出目录。
+            // 名字来自 HTTP 响应、却要拿去拼本地路径：`../`、盘符、设备名配合 `join`
+            // 能写到导出目录之外。`media_bytes_by_id` 做 URL 段编码，那防的是 HTTP 层，
+            // 替代不了写盘前的这一道。非法名根本不进下载，也就不可能被带出目录。
             if !crate::pathsafe::safe_segment(&name) {
-                rejected += 1;
+                // 计数按去重后的名字：同一个非法名在两个面上各出现一次时只该报一次。
+                rejected_names.insert(name.to_lowercase());
                 tracing::warn!("媒体文件名不是安全的单路径分量，跳过: {name}");
                 continue;
             }
-            if let Some(already) = on_disk.get(&name.to_lowercase()) {
-                // 同一份媒体被多条消息引用（或仅大小写不同的同名）：字节只下一份，
-                // 映射一律指向**实际落盘的那个名字**，不重下、也不另开一个物理文件。
-                by_message.insert(m.platform_message_id.clone(), already.clone());
-                continue;
-            }
-            match client.media_bytes_by_id(&name).await {
-                Ok(bytes) => {
-                    std::fs::create_dir_all(media_dir)
-                        .with_context(|| format!("创建媒体目录失败: {}", media_dir.display()))?;
-                    let path = media_dir.join(&name);
-                    std::fs::write(&path, &bytes)
-                        .with_context(|| format!("写媒体失败: {}", path.display()))?;
-                    on_disk.insert(name.to_lowercase(), name.clone());
-                    by_message.insert(m.platform_message_id.clone(), name);
-                }
-                // **只有 404 才算「不是可取句柄」**（外链、或服务端没写出副本）。
-                //
-                // 其余错误（瞬时 5xx、传输层、鉴权）必须上抛：把它们一并当成「不可取」会静默
-                // 少下载若干媒体、而整体仍退 0 —— 交付物少了东西却没有任何信号，比直接失败更坏。
-                Err(ClientError::Status { status: 404, .. }) => {
-                    tracing::debug!("跳过不可取句柄 {name}: 404（外链或未落盘）");
-                }
-                // 其余错误（瞬时 5xx、传输层、鉴权）**上抛**：让该会话进 skipped，CLI 以非零码说话。
-                Err(e) => return Err(e.into()),
-            }
+            let folded = name.to_lowercase();
+            let in_page = by_message
+                .values()
+                .find(|v| v.to_lowercase() == folded)
+                .cloned();
+            let handle = match in_page {
+                // 本页已下过：一律引用**实际落盘的那个名字**，不重下、也不另开物理文件。
+                Some(known) => known,
+                None if media_dir.join(&name).exists() => name,
+                None => match client.media_bytes_by_id(&name).await {
+                    Ok(bytes) => {
+                        std::fs::create_dir_all(media_dir).with_context(|| {
+                            format!("创建媒体目录失败: {}", media_dir.display())
+                        })?;
+                        let path = media_dir.join(&name);
+                        std::fs::write(&path, &bytes).with_context(|| {
+                            format!("写媒体失败: {}", path.display())
+                        })?;
+                        name
+                    }
+                    // **只有 404 才算「不是可取句柄」**（外链、或服务端没写出副本）。
+                    // 其余错误（瞬时 5xx、传输层、鉴权）必须上抛：一并当成「不可取」会
+                    // 静默少下载若干媒体、而整体仍退 0 —— 交付物少了东西却没有信号。
+                    Err(ClientError::Status { status: 404, .. }) => {
+                        tracing::debug!("跳过不可取句柄 {name}: 404（外链或未落盘）");
+                        continue;
+                    }
+                    Err(e) => return Err(e.into()),
+                },
+            };
+            by_message.insert(m.platform_message_id.clone(), handle);
         }
-        if !page.page.has_more || count == 0 {
-            return Ok((by_message, rejected));
+        if !resp.page.has_more || count == 0 {
+            break;
         }
         offset += count as u64;
+        q.offset = Some(offset);
     }
+    Ok((by_message, rejected_names.len()))
 }
-
 
 /// 逐个核对**复用会话**产物里的媒体句柄是否在同目录 `media/` 下有字节。
 ///
@@ -841,36 +848,66 @@ fn run_export(a: &ExportArgs) -> Result<()> {
         // 「起点那一条」凭空消失，故这里减一。
         let talker = target.talker.clone();
         let since_pull = since.map(|s| s - 1);
-        // --with-media：**先**触发导出并把字节落盘，**再**拉行。顺序不能反 —— 消息面只有在
-        // 真的写出了本地副本之后才给得出可取句柄；拉取面给行的仍是原始名，句柄靠消息 id 对回。
-        let downloaded = if a.with_media {
-            let (got, rejected) =
-                block_anyhow(download_session_media(&client, &talker, &media_dir))?;
-            media_total += got.len();
-            media_rejected += rejected;
-            got
-        } else {
-            std::collections::BTreeMap::new()
-        };
-        // SDK 的回调要求它自己的错误类型，而这里真正会失败的是**写盘**。
-        // 把写失败硬塞成 ClientError 会丢信息，所以错误先存起来、循环后立即上抛，
-        // 后续页只跳过不再写（半途而废的会话由 run 删掉，交给 --resume 重来）。
+        // 单遍化：取数与媒体配窗都在**同一趟翻页**里发生。运行时仍是一个会话建一次
+        // （不是每页建一个），与改造前的量级相同。
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("建 tokio 运行时失败")?;
+        let mut next_since = since_pull;
+        let mut next_offset = 0u64;
+        // SDK 的回调要求它自己的错误类型，而这里真正会失败的是**写盘**：把写失败硬塞成
+        // ClientError 会丢信息，所以错误先存起来、循环后立即上抛，后续页只跳过不再写
+        // （半途而废的会话由 run 删掉，交给 --resume 重来）。
         let mut write_err: Option<anyhow::Error> = None;
-        block(client.drain_session(&talker, since_pull, |msgs| {
+        loop {
+            let page = rt
+                .block_on(client.pull_page(&talker, next_since, next_offset, None))
+                .map_err(anyhow::Error::new)?;
+            if page.messages.is_empty() {
+                break;
+            }
             if write_err.is_none() {
-                let mut rows: Vec<export::Row> = msgs.iter().map(row_from_pull).collect();
-                if a.with_media {
-                    for r in rows.iter_mut() {
-                        export::retain_downloaded_media(r, &downloaded);
-                    }
-                }
+                // --with-media：**先**按本页时间窗触发导出并落盘，**再**写行 —— 消息面
+                // 只有在真的写出本地副本之后才给得出可取句柄；行仍来自拉取面，句柄靠
+                // 消息 id 对回。映射只活在这一页：上一批句柄不需要为整会话驻留内存
+                // （jsonl 的「内存与条数无关」承诺因此不被媒体侧破坏）。
+                let downloaded = if a.with_media {
+                    let (got, rejected) = rt
+                        .block_on(media_window_for_page(
+                            &client,
+                            &talker,
+                            &media_dir,
+                            &page.messages,
+                        ))
+                        .context("取本页媒体失败")?;
+                    media_total += got.len();
+                    media_rejected += rejected;
+                    got
+                } else {
+                    std::collections::BTreeMap::new()
+                };
+                let rows: Vec<export::Row> = page
+                    .messages
+                    .iter()
+                    .map(|m| {
+                        let mut r = row_from_pull(m);
+                        if a.with_media {
+                            export::retain_downloaded_media(&mut r, &downloaded);
+                        }
+                        r
+                    })
+                    .collect();
                 if let Err(e) = on_page(&rows) {
                     write_err = Some(e);
                 }
             }
-            Ok(())
-        }))?;
-
+            if !page.sync.has_more {
+                break;
+            }
+            next_since = Some(page.sync.next_since);
+            next_offset = page.sync.next_offset;
+        }
         match write_err {
             Some(e) => Err(e),
             None => Ok(()),

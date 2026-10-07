@@ -129,6 +129,21 @@
 
 ### 修复
 
+- **`export --with-media` 改为单遍：媒体导出窗口跟着 Pull 页走（性能与正确性）**：过去一个会话要走**两趟全历史遍历**——
+  一趟用消息面（`/chatlab/messages?media=1`）翻页收集句柄并下载字节，另一趟用拉取面翻页写行。三处代价：
+  ① `--since` 只管住了写出来的行，媒体那趟**根本不带这个时间窗**（消息面那个面收 `start`/`end`，CLI 此前没传），
+  于是「只导最近一个月」仍会把整个会话的媒体导出并重下一遍；② 两趟之间一旦有并发同步推进水位，第一趟没覆盖到
+  的消息会「有行、无句柄」地静默缺件，且没有任何计数说得出少了件；③ 句柄映射按整会话驻留内存，与 JSONL 那条
+  「峰值常驻集与消息条数无关」的承诺相对抗。现在每取到一页 Pull 行，就用**这一页的时间窗**（`(since, nextSince]`
+  正是消息面认的 `start`/`end`；同秒的行必然落在同一页，故窗口两端不漏行）导出一页、取字节、再写这一页的行：
+  两趟并成一趟，`--since` 同时下推到导出面，映射只活在一页内。另加**磁盘存在性即去重**：已有摘要派生名的文件
+  不重下（同名即同内容），这也是 `--resume` 能「只补下缺件」的依据。**迁移方式**：命令行与产物形状都不变，
+  变的是成本与完整性：带 `--since` 时导出被限制在窗口内（导出量与相应请求数随之下降）；不带 `--since` 时消息面
+  请求数与过去相当（仍是每请求 200 项分页），但**跨轮次不再重下**已在盘上的摘要文件、句柄映射从「整会话驻留」
+  改为逐页释放，且两趟遍历之间窗口滑动导致的静默丢件整类消失。
+  回归位置：`media_window_follows_the_pull_page`（每个导出请求都带 `start`/`end`、请求条数等于 Pull 页数、两页窗口
+  互不重叠、250 条句柄与 `media/` 文件集合大小相等）与 `with_media_reuses_bytes_already_on_disk`（mtime 不变＝没重下）。
+
 - **MCP：预算截断时 `hasMore` 必须为真**。`get_messages`／`search_messages`／`get_contacts` 此前透出**页面自身的** `hasMore`，于是 `truncated: true` 与 `hasMore: false` 会同时出现——按 `hasMore` 判停的调用方会**静默停在不完整结果上**。现改为 `has_more || truncated`。回归位置：`mcp_truncation_reports_has_more_so_the_caller_does_not_stop`。
 - **MCP：`search_messages` 的续拉游标此前无处回传**。响应给出 ChatLab 的 `nextCursor`，但该工具的参数里既无 cursor 也无 offset ⇒ **第 2 页永远取不到**。现改为 `offset` 入参 ＋ 响应给 `nextOffset`（本页是连续切片，该值恰指向被砍掉的第一条），并**移除**那个回传不了的 `nextCursor`；`get_contacts`／`get_messages` 在预算截断时同步补 `nextOffset`（此前两个游标都置 null，纯按字段续拉的调用方会永远重取同一页）。回归位置：`mcp_search_pagination_actually_advances`。
 - **CLI：非法 `--since` 现在以用法错误退 2**。此前 clap 放行、手工解析再 anyhow 上抛退 1，而 `--limit abc` 走 value_parser 退 2——同一种「用法写错」两种退出码。回归位置：`invalid_since_is_a_usage_error_exit_2`。

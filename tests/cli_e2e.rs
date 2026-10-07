@@ -19,6 +19,12 @@ use serde_json::{json, Value};
 const TOKEN: &str = "e2e-token-0123456789abcdef";
 const TALKER: &str = "wxid_demo";
 
+/// 媒体导出请求的**观测探针**：桩服务端记下每一次 `/chatlab/messages` 的完整查询串，
+/// 只记 `talker=win-talker` 那一个会话（其余测试共用这个进程，全局计数会被别人打到）。
+/// 窗口断言靠它钉「导出请求的 `start`/`end` 跟着 Pull 页走」与「次数与窗口大小成
+/// 比例而不是与全历史成比例」——没有这个观测面，成本类的断言就只能靠推断。
+static WINDOW_QUERIES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 fn session_json() -> Value {
     json!({
         "displayName": "演示会话", "lastTimestamp": 1_700_000_000, "messageCount": 1,
@@ -84,9 +90,41 @@ async fn sessions(axum::extract::RawQuery(q): axum::extract::RawQuery) -> Json<V
     }
 }
 
-async fn pull(axum::extract::Path(id): axum::extract::Path<String>) -> Json<Value> {
+async fn pull(
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::RawQuery(q): axum::extract::RawQuery,
+) -> Json<Value> {
     // map-talker：拉取面给**原始名**（photo.png），而消息面给回填名（digest.png，见 chatlab 分支），
     // 同一条消息 id——CLI 必须按消息 id 把导出物的句柄对回实际落盘的名字。
+    // `win-talker`：250 条带媒体的消息，分两页给（150＋100），时间戳刻意跨两个秒段，
+    // 用来验单遍化后「一次 Pull 页 ⇒ 一次窗口导出请求」。
+    if id == "win-talker" {
+        let raw = q.unwrap_or_default();
+        let offset: usize = raw
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("offset="))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let second = offset > 0;
+        let n = if second { 100 } else { 150 };
+        let base = if second { 1_700_001_000 } else { 1_700_000_000 };
+        let messages: Vec<Value> = (0..n)
+            .map(|k| {
+                let mut m = pull_message();
+                m["platformMessageId"] = json!(format!("w{offset}-{k}"));
+                m["timestamp"] = json!(base + (k as i64 / 50));
+                m["media"] = json!({"fileName": format!("{:032x}.png", k), "type": "image"});
+                m
+            })
+            .collect();
+        let next_ts = base + ((n as i64 - 1) / 50);
+        return Json(json!({
+            "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
+            "members": [], "messages": messages,
+            "meta": {"groupId": "", "name": "演示会话", "ownerId": "", "platform": "wechat", "type": "private"},
+            "sync": {"hasMore": !second, "nextSince": next_ts, "nextOffset": if second { 0 } else { 150 }, "watermark": next_ts},
+        }));
+    }
     let messages = if id == "gone-talker" {
         // 对账收口：同一个不可取句柄在**两个面**都出现。此前只有 ChatLab 面带它，
         // Pull 面给的是默认消息 —— 于是「删掉 retain_downloaded_media」的回归
@@ -156,6 +194,34 @@ async fn media(
 
 async fn chatlab(axum::extract::RawQuery(q): axum::extract::RawQuery) -> Json<Value> {
     let raw = q.unwrap_or_default();
+    // `talker=win-talker`：按请求里的 `start`/`end` 给出**该窗口内**的消息（消息面回填名），
+    // 并把每一次查询原样记下来 —— 窗口断言要看的正是这些查询长什么样。只记这个会话，
+    // 否则同一进程里其它用例的 ChatLab 请求会污染计数。
+    if raw.contains("talker=win-talker") {
+        WINDOW_QUERIES.lock().unwrap().push(raw.clone());
+        let grab = |key: &str| -> Option<i64> {
+            raw
+                .split('&')
+                .find_map(|kv| kv.strip_prefix(key))
+                .and_then(|v| v.parse::<i64>().ok())
+        };
+        let first_window = grab("start=").is_none_or(|s| s < 1_700_001_000);
+        let (prefix, n) = if first_window { ("w0-", 150usize) } else { ("w150-", 100usize) };
+        let messages: Vec<Value> = (0..n)
+            .map(|k| {
+                let mut m = pull_message();
+                m["platformMessageId"] = json!(format!("{prefix}{k}"));
+                m["media"] = json!({"fileName": format!("{:032x}.png", if first_window { k } else { 150 + k }), "type": "image"});
+                m
+            })
+            .collect();
+        return Json(json!({
+            "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
+            "count": messages.len(), "members": [], "messages": messages,
+            "meta": {"groupId": "win-talker", "name": "演示会话", "ownerId": "", "platform": "wechat", "type": "private"},
+            "page": {"hasMore": false, "nextCursor": null}, "talker": "win-talker",
+        }));
+    }
     // `keyword=big` 时给一页**远超字符预算**的消息，用来钉「截断时 hasMore 必须为真」与
     // 「按 nextOffset 续拉确实前进」。所以这里**尊重 `offset`**：从 offset 起给出剩下的消息。
     if raw.contains("keyword=big") {
@@ -740,5 +806,105 @@ fn export_rows_keeps_peak_rss_flat() {
         peak < first + first / 10,
         "峰值 RSS 应平坦：首个大群 {first} KB → 全局峰值 {peak} KB（增量超过一成）"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+
+/// 单遍化：媒体导出请求的**窗口跟着 Pull 页走**，而不是各扫一遍全历史。
+///
+/// 改造前是两趟独立的全历史遍历：消息面那一趟**不带 `start`/`end`**（那个面此前根本没被
+/// 下推过 `--since`），于是 `--since` 只管写出来的行、媒体照样把整个会话导出并重下一遍；
+/// 而两趟之间一旦有并发同步推进水位，第一趟没覆盖到的消息会「有行、无句柄」地静默缺件，
+/// 且没有任何计数说得出少了件。现在一条 Pull 页 ⇒ 一次窗口导出请求，两条断言一起钉住：
+/// ① 每个导出请求都带 `start`/`end`（下推成立）；② 请求条数等于 Pull 页数（窗口随分页
+/// 移动，而不是「整会话一次搞定」或「与页数无关的全历史」）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn media_window_follows_the_pull_page() {
+    let base = spawn_stub().await;
+    WINDOW_QUERIES.lock().unwrap().clear();
+    let dir = std::env::temp_dir().join(format!("weflow-e2e-window-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (code, stdout, stderr) = run(
+        &base,
+        &[
+            "export", "--out", dir.to_str().unwrap(), "--format", "jsonl", "--with-media",
+            "--session", "win-talker",
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {stdout} stderr: {stderr}");
+    let queries = WINDOW_QUERIES.lock().unwrap().clone();
+    assert_eq!(queries.len(), 2, "一页 Pull 配一次窗口导出（桩给 150＋100 两页）: {queries:?}");
+    for q in &queries {
+        assert!(q.contains("start="), "导出请求必须带下推的 start: {q}");
+        assert!(q.contains("end="), "导出请求必须带下推的 end: {q}");
+    }
+    // 两页的窗口互不重叠 ⇒ 窗口是从 Pull 游标推出来的，不是同一个全历史区间被发了两遍。
+    let grab = |s: &str, key: &str| -> Option<i64> {
+        s.split('&').find_map(|kv| kv.strip_prefix(key))?.parse::<i64>().ok()
+    };
+    let w0 = (grab(&queries[0], "start="), grab(&queries[0], "end="));
+    let w1 = (grab(&queries[1], "start="), grab(&queries[1], "end="));
+    assert!(w0.0.is_some() && w0.1.is_some() && w1.0.is_some() && w1.1.is_some(), "窗口两端都可解析: {w0:?} {w1:?}");
+    assert!(w0.1.unwrap() < w1.0.unwrap(), "两页窗口应各自落在自己的时间段内（不重叠、不共用全历史）: {w0:?} vs {w1:?}");
+    // 地板：导出物里的句柄数与落盘文件数一致（单遍化没把任何一页的媒体漏掉）。
+    let jsonl = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .expect("应有 jsonl");
+    let body = std::fs::read_to_string(&jsonl).unwrap();
+    let handles: std::collections::BTreeSet<String> = body
+        .split("\"fileName\":\"")
+        .skip(1)
+        .filter_map(|s| s.split('"').next().map(String::from))
+        .collect();
+    let on_disk: Vec<String> = std::fs::read_dir(dir.join("media"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| !n.starts_with('.'))
+        .collect();
+    assert_eq!(handles.len(), 250, "250 条带媒体的消息都要有可取句柄: {handles:?}");
+    assert_eq!(
+        on_disk.len(),
+        handles.len(),
+        "句柄集合与 media/ 文件集合大小相等（缺件与多件都算失败）"
+    );
+    for h in &handles {
+        assert!(dir.join("media").join(h).is_file(), "句柄 {h} 没有落盘字节");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 磁盘复用：窗口内**已经落盘**的字节不得重下。
+///
+/// 摘要派生的名字在导出目录里内容唯一（同名即同内容），所以按存在性复用是安全的；这既
+/// 是 `--resume` 要「只补下缺件」的性质，也是 `--since` 重跑不该把窗口内媒体全部重下一遍
+/// 的依据。改造前那句 `media_dir.join(&name).exists()` 判断根本没有——跨轮次每次全量重下。
+/// 断言取的是「第二次跑几乎没有新增文件、也没重下」：用 `media/` 里文件的 mtime 不变来钉。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_media_reuses_bytes_already_on_disk() {
+    let base = spawn_stub().await;
+    let dir = std::env::temp_dir().join(format!("weflow-e2e-reuse-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let first = run(
+        &base,
+        &["export", "--out", dir.to_str().unwrap(), "--format", "jsonl", "--with-media",
+         "--session", "map-talker"],
+    );
+    assert_eq!(first.0, 0, "首轮应成功: {}", first.2);
+    let landed = dir.join("media").join("digest.png");
+    assert!(landed.is_file(), "首轮应落盘 digest.png");
+    let before = std::fs::metadata(&landed).unwrap().modified().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    let again = run(
+        &base,
+        &["export", "--out", dir.to_str().unwrap(), "--format", "jsonl", "--with-media",
+         "--session", "map-talker"],
+    );
+    assert_eq!(again.0, 0, "重跑应成功: {}", again.2);
+    let after = std::fs::metadata(&landed).unwrap().modified().unwrap();
+    assert_eq!(before, after, "磁盘上已有的摘要文件不得被重下覆盖（复用已落盘字节）");
     let _ = std::fs::remove_dir_all(&dir);
 }
