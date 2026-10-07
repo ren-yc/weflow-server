@@ -1,9 +1,10 @@
 [package]
 name = "weflow-server"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 description = "Headless HTTP API + SSE service for reading local WeChat 4.x chat records (WCDB/SQLCipher-4 decryption, real-time monitoring)"
 license = "MIT"
+repository = "https://github.com/ren-yc/weflow-server"
 
 [dependencies]
 anyhow = "1"
@@ -44,7 +45,7 @@ clap = { version = "4", optional = true, default-features = false, features = ["
 # CLI 与 MCP 都通过 HTTP 访问服务，因此**复用同工作区的 Rust SDK**，而不是在服务端 crate
 # 里再手写一份 HTTP。两份实现的失败模式是漂移：字段名、错误语义、分页规则各改各的，
 # 而 SDK 的公共面才是被测试钉住的那一份。
-weflow-client = { path = "clients/rust", optional = true }
+weflow-client = { path = "clients/rust", version = "0.9.0", optional = true }
 # MCP 工具面。default-features = false 加自选 feature：rmcp 的默认 feature 会带进 HTTP
 # 传输层与 reqwest/tower，而本面只在 stdio 上跑 server/macros。
 rmcp = { version = "3.5", optional = true, default-features = false, features = ["server", "macros", "transport-io"] }

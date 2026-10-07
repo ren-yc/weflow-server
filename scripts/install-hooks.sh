@@ -40,10 +40,13 @@ else
     status=1
 fi
 
-# 解释器解析：$PYTHON -> python3 -> python，且**实际执行** --version 校验。
+# 解释器解析：$PYTHON -> python -> python3，且**实际执行** --version 校验。
 # 不能只靠 command -v：Windows 上 python3 常被应用执行别名占据，命令存在但不能用。
+# python 优先于 python3 是刻意的：那个别名 stub 在环境变量缺失的进程里运行时，
+# 会在当前目录下创建字面命名的垃圾目录树（把注册表里未展开的 %SystemDrive% 路径
+# 当成相对路径写盘）；排在循环末尾可以让常规机器永远不触到它。
 py=""
-for candidate in "$PYTHON" python3 python; do
+for candidate in "$PYTHON" python python3; do
     [ -n "$candidate" ] || continue
     command -v "$candidate" >/dev/null 2>&1 || continue
     if "$candidate" --version 2>&1 | grep -q "Python 3"; then
@@ -80,7 +83,7 @@ cat > "$hook_dir/commit-msg" <<'HOOK'
 # Python 缺失时同样阻止提交（与 pre-commit 同规）。
 
 py=""
-for candidate in "$PYTHON" python3 python; do
+for candidate in "$PYTHON" python python3; do
     [ -n "$candidate" ] || continue
     command -v "$candidate" >/dev/null 2>&1 || continue
     if "$candidate" --version 2>&1 | grep -q "Python 3"; then

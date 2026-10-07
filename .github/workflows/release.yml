@@ -207,3 +207,49 @@ jobs:
             artifacts/SHA256SUMS
           generate_release_notes: true
           fail_on_unmatched_files: true
+  # crates.io / PyPI 首发通道（v0.9.0 起）。依赖完整质量门＋三平台构建，任何一步红
+  # 都不发布。凭据来自 Repo secrets（CARGO_REGISTRY_TOKEN / PYPI_TOKEN_WEFLOW，
+  # 配置步骤见本仓 docs/release-runbook.md）；密钥缺失时本作业会立即失败——
+  # 那是部署配置问题，不是代码问题。
+  publish:
+    name: Publish to crates.io and PyPI
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup show
+
+      # 顺序＝先 SDK、后根包：根包的依赖声明带 version，必须等 registry 上
+      # 存在该版本才发布得出去。
+      - name: Publish Rust SDK to crates.io
+        working-directory: clients/rust
+        run: cargo publish --locked --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+
+      - name: Wait for crates.io index to settle
+        run: sleep 30
+
+      - name: Publish server root to crates.io
+        run: cargo publish --locked --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+
+      - name: Set up Python for PyPI build
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build Python SDK distributions
+        working-directory: clients/python
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+          twine check dist/*
+
+      - name: Upload Python SDK to PyPI
+        working-directory: clients/python
+        run: >
+          twine upload --non-interactive --disable-progress-bar dist/*
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN_WEFLOW }}
+

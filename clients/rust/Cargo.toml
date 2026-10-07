@@ -4,7 +4,9 @@ version = "0.9.0"
 edition = "2024"
 description = "Typed Rust client for weflow-server's HTTP API (generated types + handwritten behavior layer)"
 license = "MIT"
-publish = false
+repository = "https://github.com/ren-yc/weflow-server"
+homepage = "https://github.com/ren-yc/weflow-server"
+readme = "README.md"
 
 [dependencies]
 progenitor-client = "0.15.0"

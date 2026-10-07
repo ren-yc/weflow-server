@@ -7,6 +7,9 @@ name = "weflow-sdk"
 version = "0.9.0"
 description = "Typed Python client for weflow-server's HTTP API (generated models + handwritten behavior layer)"
 license = "MIT"
+license-files = ["LICENSE"]
+readme = "README.md"
+authors = [{ name = "ren-yc" }]
 requires-python = ">=3.10"
 dependencies = [
   "httpx>=0.27",
@@ -20,6 +23,11 @@ dependencies = [
 # but rule *behavior* still drifts with the ruff version - an unpinned
 # CI step could go red (or silently green) on a day nobody changed code.
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "openapi-generator-cli>=7", "ruff==0.16.1"]
+
+[project.urls]
+Homepage = "https://github.com/ren-yc/weflow-server"
+Repository = "https://github.com/ren-yc/weflow-server"
+Issues = "https://github.com/ren-yc/weflow-server/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/weflow_sdk"]
