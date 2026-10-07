@@ -17,9 +17,12 @@ use crate::server::error::{ApiError, ApiResult};
 use crate::server::handlers::require_auth;
 use crate::server::AppState;
 
-/// 参与导出的四个类型目录。它同时是**按名取字节的白名单**：别的目录里就算躺着同名文件也不服务
+/// 参与导出的四个类型目录 ＝ **按名取字节的白名单**：别的目录里就算躺着同名文件也不服务
 /// —— 那些位置不是导出管线写出来的，服务它们等于把「导出根」变成「任意文件根」。
-const ALLOWED_TYPES: [&str; 4] = ["images", "voices", "videos", "emojis"];
+///
+/// 值来自 `media::export::EXPORT_TYPE_DIRS`（唯一一份）：这里再字面写一遍，就会与「导出实际
+/// 写到哪些目录」「拉取面按名查哪些目录」分成三份各自漂移。
+const ALLOWED_TYPES: [&str; 4] = crate::media::export::EXPORT_TYPE_DIRS;
 
 pub async fn handler_by_id(
     State(state): State<Arc<AppState>>,

@@ -631,31 +631,59 @@ fn row_from_pull(m: &weflow_client::generated::r#gen::types::PullMessage) -> exp
     }
 }
 
-/// 给**一页 Pull 行**配齐媒体：把这一页的时间窗交给消息面触发导出（每请求上限
-/// 200 项），取回回填好的可取句柄、下载字节，返回「消息 id → 落盘名」映射与
-/// 被拒的非法名字数。
+/// 取一个媒体句柄并保证它在 `<out>/media/` 下有字节，返回**实际落盘的名字**；`Ok(None)`
+/// 表示这个名字本来就取不到（404：外链、或服务端没写出副本），应当跳过而不是让整轮失败。
 ///
-/// **为什么按页配窗，而不是先独立遍历一遍全会话**：`--with-media` 此前是两趟全
-/// 历史遍历（消息面翻页收集句柄 ＋ 拉取面翻页写行）。消息面那个面不认 `since`，
-/// 于是 `--since` 只约束了写出来的行、媒体照旧把整个历史导出并重下一遍（成本是
-/// 取数承诺的数倍）；更要紧的是两趟之间并发同步会让窗口滑动 —— 第一趟没覆盖到的
-/// 消息照样有行、句柄却永远缺失，且没有任何计数说得出少了件。按页配窗让两件事
-/// 发生在**同一页**上：滑动窗口这一类问题被消除，而 Pull 页的 `(since, nextSince]`
-/// 区间正好就是消息面认的 `start`/`end`（两端闭区间的秒级戳；同秒的行必然落在同一
-/// 页里，所以窗口两端不会漏行）。回归位置：`media_window_follows_the_pull_page`。
+/// 磁盘存在性即去重：摘要派生的名字在导出目录里内容唯一（同名即同内容），复用是安全的 ——
+/// 这正是 `--resume` 要「只补下缺件」、以及 `--since` 重跑时不该把窗口内媒体重下一遍所需要的
+/// 性质。回归位置：`with_media_reuses_bytes_already_on_disk`。
 ///
-/// 映射仍按**消息 id**：消息面回填的是内容摘要名、Pull 面给的是索引里的原始名，
+/// **只有 404 才算「不是可取句柄」**。其余错误（瞬时 5xx、传输层、鉴权）上抛：一并当成「不可取」
+/// 会静默少下载若干媒体、而整体仍退 0 —— 交付物少了东西却没有任何信号，比直接失败更坏。
+async fn fetch_one_handle(
+    client: &Client,
+    media_dir: &std::path::Path,
+    name: &str,
+) -> Result<Option<String>> {
+    if media_dir.join(name).exists() {
+        return Ok(Some(name.to_string()));
+    }
+    let bytes = match client.media_bytes_by_id(name).await {
+        Ok(bytes) => bytes,
+        Err(ClientError::Status { status: 404, .. }) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    std::fs::create_dir_all(media_dir)
+        .with_context(|| format!("创建媒体目录失败: {}", media_dir.display()))?;
+    let path = media_dir.join(name);
+    std::fs::write(&path, &bytes).with_context(|| format!("写媒体失败: {}", path.display()))?;
+    Ok(Some(name.to_string()))
+}
+
+/// 给**一页 Pull 行**配齐媒体，返回「消息 id → 确实落盘的文件名」映射与被拒的非法名字数。
+///
+/// **两条路按行分派**：
+///
+/// · 快路径 —— Pull 行自带 `mediaId` 的那些（服务端已保证「出现即可取」）。**直接按句柄取
+///   字节，一次导出请求都不发**。
+/// · 慢路径 —— 有 `media` 却没有可用 `mediaId` 的那些：本面不执行导出，服务端不会凭空给出
+///   句柄，所以把**这些行的时间窗**交给消息面（`/chatlab/messages?media=1`）触发按需导出，
+///   再从回填的可取句柄取字节。
+///
+/// **为什么不能整批撤掉慢路径**：撤掉就等于「媒体句柄只能靠全历史那趟预遍历拿」，而那一趟不认
+/// `--since`（本仓刚修掉的正是这个）。快路径让「已经导出过」的会话（`--resume`、重复导出）近乎
+/// 零成本，慢路径只在真需要导出时才付出成本；两条路都不再有全历史遍历。
+/// 回归位置：`media_window_follows_the_pull_page`（慢路径窗口仍跟着页走）与
+/// `media_id_from_pull_row_skips_the_export_round`（快路径零导出请求）。
+///
+/// 映射按**消息 id**：消息面回填的是内容摘要名、拉取面 `media.fileName` 给的是索引里的原始名，
 /// 两者不必相同，只有 id 能把两边对上（`retain_downloaded_media` 按 id 改写句柄）。
 ///
-/// 磁盘存在性即去重：摘要派生的名字在导出目录里内容唯一（同名即同内容），所以复用
-/// 磁盘上已有的字节是安全的 —— 这正是 `--resume` 要「只补下缺件」、以及 `--since`
-/// 重跑时不该把窗口内媒体全部重下一遍所需要的性质。折叠口径与会话名去重同一
-/// （Windows 卷大小写不敏感）：`Img.png` 与 `img.png` 是同一份。
-/// 回归位置：`with_media_reuses_bytes_already_on_disk`。
-///
-/// 单个媒体拿不到（404）只跳过，不升级成会话级失败：外链媒体本来就没有可取句柄，
-/// 把它升格会让「这个群里有一个表情包不是本地文件」变成「这个群一条都没导出」。
-async fn media_window_for_page(
+/// 句柄与名字都来自 HTTP 响应、却要拿去拼本地路径：`../`、盘符、设备名配合 `join` 能写到导出
+/// 目录之外。`media_bytes_by_id` 会做 URL 段编码，那防的是 HTTP 层、替代不了写盘前的这一道。
+/// 非法名不进下载也不计数为媒体，按**去重后的名字**计数（同一个非法名在两个面上各出现一次时
+/// 只该报一次）；静默少下载而整体退 0，是不可发现的失败。
+async fn media_for_page(
     client: &Client,
     talker: &str,
     media_dir: &std::path::Path,
@@ -663,10 +691,53 @@ async fn media_window_for_page(
 ) -> Result<(std::collections::BTreeMap<String, String>, usize)> {
     let mut by_message: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
+    // 折叠名 → 实际落盘名：同一份字节被多条消息引用（或仅大小写不同）时，一律指到同一个
+    // 物理文件，不重下也不另开一份。折叠口径与会话名去重一致（Windows 卷大小写不敏感）。
+    let mut landed: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     let mut rejected_names: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
-    let lo = page.iter().map(|m| m.timestamp).min().unwrap_or(0);
-    let hi = page.iter().map(|m| m.timestamp).max().unwrap_or(0);
+    let mut need_export:
+        Vec<&weflow_client::generated::r#gen::types::PullMessage> = Vec::new();
+    // 快路径：吃拉取面已经给出的句柄。
+    for m in page {
+        if m.media.is_none() {
+            continue;
+        }
+        let Some(handle) = m
+            .media_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .filter(|s| crate::pathsafe::safe_segment(s))
+        else {
+            // 没有句柄（或句柄不是安全分量）：交给慢路径，那里连 fileName 一起校验并计数。
+            need_export.push(m);
+            continue;
+        };
+        let folded = handle.to_lowercase();
+        if let Some(known) = landed.get(&folded) {
+            by_message.insert(m.platform_message_id.clone(), known.clone());
+            continue;
+        }
+        match fetch_one_handle(client, media_dir, handle).await? {
+            Some(name) => {
+                landed.insert(folded, name.clone());
+                by_message.insert(m.platform_message_id.clone(), name);
+            }
+            // 服务端说过「出现即可取」而我们拿到 404：句柄已过期（缓存被清理之类）。按取不到
+            // 处理 —— 宁可少一个 media 字段，也不给一个指向不存在文件的句柄。
+            None => {
+                tracing::debug!("跳过 Pull 行句柄 {handle}: 404（服务端已不再可取）");
+            }
+        }
+    }
+    if need_export.is_empty() {
+        return Ok((by_message, rejected_names.len()));
+    }
+    // 慢路径：只给「还没有句柄的那些行」配窗。窗口取这些行的时间跨度 —— 它正是消息面认的
+    // start/end（两端闭区间的秒级戳；同秒的行必然落在同一页，所以两端不漏行）。
+    let lo = need_export.iter().map(|m| m.timestamp).min().unwrap_or(0);
+    let hi = need_export.iter().map(|m| m.timestamp).max().unwrap_or(0);
     let mut q = MessageQuery::new(talker.to_string());
     q.media = true;
     q.start = Some(lo.to_string());
@@ -682,46 +753,25 @@ async fn media_window_for_page(
             if name.is_empty() {
                 continue;
             }
-            // 名字来自 HTTP 响应、却要拿去拼本地路径：`../`、盘符、设备名配合 `join`
-            // 能写到导出目录之外。`media_bytes_by_id` 做 URL 段编码，那防的是 HTTP 层，
-            // 替代不了写盘前的这一道。非法名根本不进下载，也就不可能被带出目录。
             if !crate::pathsafe::safe_segment(&name) {
-                // 计数按去重后的名字：同一个非法名在两个面上各出现一次时只该报一次。
                 rejected_names.insert(name.to_lowercase());
                 tracing::warn!("媒体文件名不是安全的单路径分量，跳过: {name}");
                 continue;
             }
             let folded = name.to_lowercase();
-            let in_page = by_message
-                .values()
-                .find(|v| v.to_lowercase() == folded)
-                .cloned();
-            let handle = match in_page {
-                // 本页已下过：一律引用**实际落盘的那个名字**，不重下、也不另开物理文件。
-                Some(known) => known,
-                None if media_dir.join(&name).exists() => name,
-                None => match client.media_bytes_by_id(&name).await {
-                    Ok(bytes) => {
-                        std::fs::create_dir_all(media_dir).with_context(|| {
-                            format!("创建媒体目录失败: {}", media_dir.display())
-                        })?;
-                        let path = media_dir.join(&name);
-                        std::fs::write(&path, &bytes).with_context(|| {
-                            format!("写媒体失败: {}", path.display())
-                        })?;
-                        name
-                    }
-                    // **只有 404 才算「不是可取句柄」**（外链、或服务端没写出副本）。
-                    // 其余错误（瞬时 5xx、传输层、鉴权）必须上抛：一并当成「不可取」会
-                    // 静默少下载若干媒体、而整体仍退 0 —— 交付物少了东西却没有信号。
-                    Err(ClientError::Status { status: 404, .. }) => {
-                        tracing::debug!("跳过不可取句柄 {name}: 404（外链或未落盘）");
-                        continue;
-                    }
-                    Err(e) => return Err(e.into()),
-                },
-            };
-            by_message.insert(m.platform_message_id.clone(), handle);
+            if let Some(known) = landed.get(&folded) {
+                by_message.insert(m.platform_message_id.clone(), known.clone());
+                continue;
+            }
+            match fetch_one_handle(client, media_dir, &name).await? {
+                Some(landed_name) => {
+                    landed.insert(folded, landed_name.clone());
+                    by_message.insert(m.platform_message_id.clone(), landed_name);
+                }
+                None => {
+                    tracing::debug!("跳过不可取句柄 {name}: 404（外链或未落盘）");
+                }
+            }
         }
         if !resp.page.has_more || count == 0 {
             break;
@@ -874,7 +924,7 @@ fn run_export(a: &ExportArgs) -> Result<()> {
                 // （jsonl 的「内存与条数无关」承诺因此不被媒体侧破坏）。
                 let downloaded = if a.with_media {
                     let (got, rejected) = rt
-                        .block_on(media_window_for_page(
+                        .block_on(media_for_page(
                             &client,
                             &talker,
                             &media_dir,

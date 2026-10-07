@@ -29,6 +29,14 @@ pub async fn handler(
     let limit = crate::server::parse_limit(&query, "limit", 5000, 5000);
     let offset = crate::server::parse_offset(&query, "offset");
 
+    let export_dir = state.cfg.media_export_dir.clone();
+    let session_id = id.clone();
+    let digest_handles = tokio::task::spawn_blocking(move || {
+        crate::media::export::digest_handles(&export_dir, &session_id)
+    })
+    .await
+    .unwrap_or_default();
+
     let store = account.store.read();
     let conv = store
         .convs
@@ -80,6 +88,9 @@ pub async fn handler(
 
     // members = senders in this page (dedup)。字段取法与消息面共用一处（server::chatlab）：
     // 两处各写一遍时，「取联系人档案还是取消息里的昵称」这种分歧不会有任何东西变红。
+    // 本会话导出目录里的摘要名集合，**一次请求算一次**（逐条 stat 会让一页变成
+    // 几十次目录打开）。目录扫描是阻塞 IO ⇒ 交给 spawn_blocking，与按名取字节那条路由同规。
+
     let mut seen = std::collections::HashSet::new();
     let members: Vec<ChatlabMember> = page
         .iter()
@@ -93,11 +104,27 @@ pub async fn handler(
             // 字段怎么填只有一处出处（`server::chatlab`）：三个面（原生面、消息面、拉取面）在
             // `replyToMessageId` 与 `media` 上同规 —— 无引用时省略该键，无媒体时省略整个 media。
             let f = crate::server::chatlab::message_fields(&store, chatroom, m);
+            // 「出现即可取」的判据与 SSE 那一路同源：只有**确实落盘**、且名字**由内容摘要
+            // 派生**的那些才配当句柄。两处各写一遍时，「一面悄悄放宽」不会有任何东西变红，
+            // 而放宽的那一面会通告必 404 的 id —— 调用方拿到 404 只会以为服务坏了。
+            //
+            // 按**摘要干**查（`digest_handles`），不是拿元数据名去 stat：图片的落盘名扩展名是
+            // 解码后嗅探出来的（可能与 XML 属性名不同，wxgf 还可能被转成 png），按全名 stat 会
+            // 漏报 —— 而漏报是静默的：调用方只会多跑一趟导出。语音的 `voice_<svr>.silk` 与视频
+            // 的平台名不是摘要派生 ⇒ 天然不在表里 ⇒ 省略（与它们不能作句柄的裁决一致）。
+            let media_id = m.parsed.media.as_ref().and_then(|hint| {
+                let stem = hint.file_name.rsplit_once('.').map(|(s, _)| s).unwrap_or(&hint.file_name);
+                if stem.len() != 32 {
+                    return None;
+                }
+                digest_handles.get(&stem.to_ascii_lowercase()).cloned()
+            });
             PullMessage {
                 account_name: f.account_name,
                 content: f.content,
                 group_nickname: f.group_nickname,
                 media: f.media,
+                media_id,
                 platform_message_id: f.platform_message_id,
                 reply_to_message_id: f.reply_to_message_id,
                 sender: f.sender,

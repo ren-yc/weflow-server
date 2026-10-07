@@ -6,6 +6,19 @@
 
 ### 变更
 
+- **拉取面新增 `messages[].mediaId`（可选键，出现即可取）**：带媒体的行在**此刻确有可取字节**时给出
+  媒体获取键（导出后的内容摘要名，即 `GET /api/v1/media/{id}` 的入参），**不可取时整个键省略**（不是 `null`、不是空串）。
+  「出现即可取」是承诺：判据与SSE **同一条**（本会话导出目录下确有该文件、且名字由内容摘要派生）。
+  键的位置在**消息这一层**、不在 `media` 对象里：`media` 的键集仍钉为 `{type, fileName, md5}`
+  （`media_shape_in_pull` 拒绝多余键），而且 `fileName` 说「这条媒体叫什么」、`mediaId` 说
+  「这份字节现在取得到」——两件事合成一个键就会混谈。正反两侧都有回归：
+  `pull_advertises_media_id_only_when_fetchable`（落盘⇒按摘要干命中且给出实际落盘名；清空⇒整键消失）。
+- **`export --with-media` 的媒体获取改为按行分派（快路径＋慢路径）**：拉取面已给出 `mediaId` 的行
+  **直接按句柄取字节，一发导出请求都不发**；只有有 `media` 却还没有句柄的那些行，才把**它们的时间窗**
+  交给消息面（`/chatlab/messages?media=1`）触发按需导出。效果：`--resume` 与重复导出近乎零成本（已导出会话零导出请求）；窗口滑动静默缺件那一类问题不受影响，按页窗口的测试原样保留。
+  回归位置：`media_id_from_pull_row_skips_the_export_round`（三行里只有没句柄的那行需要导出 ⇒
+  恰好一发导出请求，且窗口只覆盖那一行的时间戳）。
+
 - **`clients/rust`（`weflow-client`）与 `clients/python`（`weflow-sdk`）的 `media_bytes` 增加 `talker` 参数（破坏性）**：
   404 重试用的导出门需要**会话 id**，而此前用的是 `message.account_name`——那是发信人显示名，
   私聊里它是对面昵称、群聊里是发信人昵称，与会话 id 只在「显示名恰好没被改过」时相同，真实数据几乎必然对不上。**迁移方式**：

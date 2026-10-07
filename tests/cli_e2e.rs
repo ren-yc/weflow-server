@@ -20,10 +20,10 @@ const TOKEN: &str = "e2e-token-0123456789abcdef";
 const TALKER: &str = "wxid_demo";
 
 /// 媒体导出请求的**观测探针**：桩服务端记下每一次 `/chatlab/messages` 的完整查询串，
-/// 只记 `talker=win-talker` 那一个会话（其余测试共用这个进程，全局计数会被别人打到）。
+/// 只记 `win-talker` 与 `handle-talker` 两个会话（其余测试也打这个面）。记录时**带上
 /// 窗口断言靠它钉「导出请求的 `start`/`end` 跟着 Pull 页走」与「次数与窗口大小成
 /// 比例而不是与全历史成比例」——没有这个观测面，成本类的断言就只能靠推断。
-static WINDOW_QUERIES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static WINDOW_QUERIES: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
 
 fn session_json() -> Value {
     json!({
@@ -98,6 +98,35 @@ async fn pull(
     // 同一条消息 id——CLI 必须按消息 id 把导出物的句柄对回实际落盘的名字。
     // `win-talker`：250 条带媒体的消息，分两页给（150＋100），时间戳刻意跨两个秒段，
     // 用来验单遍化后「一次 Pull 页 ⇒ 一次窗口导出请求」。
+    // `handle-talker`：三行都带媒体，但只有前两行**带 mediaId**（拉取面已经给出可取句柄），
+    // 第三行只有 media、没有句柄 ⇒ 必须走「按页窗口导出」那一条路。用来钉两件事：
+    // ① 有句柄的行一发导出请求都不发；② 慢路径的窗口只覆盖**剩下那些行**的时间戳。
+    if id == "handle-talker" {
+        let rows = [
+            ("h1", 1_700_000_000i64, "aaa.png"),
+            ("h2", 1_700_000_000, "bbb.png"),
+            ("h3", 1_700_000_500, ""),
+        ];
+        let messages: Vec<Value> = rows
+            .iter()
+            .map(|(mid, ts, handle)| {
+                let mut m = pull_message();
+                m["platformMessageId"] = json!(mid);
+                m["timestamp"] = json!(ts);
+                m["media"] = json!({"fileName": "photo.png", "type": "image"});
+                if !handle.is_empty() {
+                    m["mediaId"] = json!(handle);
+                }
+                m
+            })
+            .collect();
+        return Json(json!({
+            "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
+            "members": [], "messages": messages,
+            "meta": {"groupId": "", "name": "演示会话", "ownerId": "", "platform": "wechat", "type": "private"},
+            "sync": {"hasMore": false, "nextSince": 1_700_000_500, "nextOffset": 0, "watermark": 1_700_000_500},
+        }));
+    }
     if id == "win-talker" {
         let raw = q.unwrap_or_default();
         let offset: usize = raw
@@ -198,7 +227,17 @@ async fn chatlab(axum::extract::RawQuery(q): axum::extract::RawQuery) -> Json<Va
     // 并把每一次查询原样记下来 —— 窗口断言要看的正是这些查询长什么样。只记这个会话，
     // 否则同一进程里其它用例的 ChatLab 请求会污染计数。
     if raw.contains("talker=win-talker") {
-        WINDOW_QUERIES.lock().unwrap().push(raw.clone());
+        // 键从查询串本身取（`talker=…`）：记录与过滤同源，不必每个分支各带一个常量，
+        // 也就不会出现「记的时候用 A 过滤的时候用 B」这种静默丢记录。
+        let key = raw
+            .split("&")
+            .find_map(|kv| kv.strip_prefix("talker="))
+            .unwrap_or_default()
+            .to_string();
+        WINDOW_QUERIES
+            .lock()
+            .unwrap()
+            .push((key, raw.clone()));
         let grab = |key: &str| -> Option<i64> {
             raw
                 .split('&')
@@ -220,6 +259,32 @@ async fn chatlab(axum::extract::RawQuery(q): axum::extract::RawQuery) -> Json<Va
             "count": messages.len(), "members": [], "messages": messages,
             "meta": {"groupId": "win-talker", "name": "演示会话", "ownerId": "", "platform": "wechat", "type": "private"},
             "page": {"hasMore": false, "nextCursor": null}, "talker": "win-talker",
+        }));
+    }
+
+    // `talker=handle-talker`：**只有**还没句柄的那些行才会走到这里（CLI 的慢路径按剩余行的
+    // 时间窗提问）。给出 h3 一个回填名，并把查询记下来 —— 「这一跳到底发了几次、带什么窗口」
+    // 就是本用例要钉的东西。
+    if raw.contains("talker=handle-talker") {
+        // 键从查询串本身取（`talker=…`）：记录与过滤同源，不必每个分支各带一个常量，
+        // 也就不会出现「记的时候用 A 过滤的时候用 B」这种静默丢记录。
+        let key = raw
+            .split("&")
+            .find_map(|kv| kv.strip_prefix("talker="))
+            .unwrap_or_default()
+            .to_string();
+        WINDOW_QUERIES
+            .lock()
+            .unwrap()
+            .push((key, raw.clone()));
+        let mut m = pull_message();
+        m["platformMessageId"] = json!("h3");
+        m["media"] = json!({"fileName": "ccc.png", "type": "image"});
+        return Json(json!({
+            "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
+            "count": 1, "members": [], "messages": [m],
+            "meta": {"groupId": "handle-talker", "name": "演示会话", "ownerId": "", "platform": "wechat", "type": "private"},
+            "page": {"hasMore": false, "nextCursor": null}, "talker": "handle-talker",
         }));
     }
     // `keyword=big` 时给一页**远超字符预算**的消息，用来钉「截断时 hasMore 必须为真」与
@@ -821,7 +886,6 @@ fn export_rows_keeps_peak_rss_flat() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn media_window_follows_the_pull_page() {
     let base = spawn_stub().await;
-    WINDOW_QUERIES.lock().unwrap().clear();
     let dir = std::env::temp_dir().join(format!("weflow-e2e-window-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let (code, stdout, stderr) = run(
@@ -832,7 +896,15 @@ async fn media_window_follows_the_pull_page() {
         ],
     );
     assert_eq!(code, 0, "stdout: {stdout} stderr: {stderr}");
-    let queries = WINDOW_QUERIES.lock().unwrap().clone();
+    // 只取本会话那几条：同一进程里另一条记录型用例（handle-talker）也在打这个面，
+    // 不过滤就会被它写进来的记录打挂 —— 清表救不了（并发，另一条用例可能正好在清表与
+    // 读表之间写入）。
+    let all = WINDOW_QUERIES.lock().unwrap().clone();
+    let queries: Vec<String> = all
+        .into_iter()
+        .filter(|(k, _)| k == "win-talker")
+        .map(|(_, q)| q)
+        .collect();
     assert_eq!(queries.len(), 2, "一页 Pull 配一次窗口导出（桩给 150＋100 两页）: {queries:?}");
     for q in &queries {
         assert!(q.contains("start="), "导出请求必须带下推的 start: {q}");
@@ -906,5 +978,55 @@ async fn with_media_reuses_bytes_already_on_disk() {
     assert_eq!(again.0, 0, "重跑应成功: {}", again.2);
     let after = std::fs::metadata(&landed).unwrap().modified().unwrap();
     assert_eq!(before, after, "磁盘上已有的摘要文件不得被重下覆盖（复用已落盘字节）");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 拉取面句柄的**快路径**：带 `mediaId` 的行直接取字节，**一发导出请求都不发**；只有没有
+/// 句柄的那些行才走「按页窗口导出」，且窗口只覆盖**那些行**的时间戳。
+///
+/// 为什么这条必须单独钉：两条路的分派写在同一个函数里，撤掉快路径（一律走窗口）时
+/// `media_window_follows_the_pull_page` 仍然全绿 —— 它看的是「窗口跟着页走」，而全走窗口恰好
+/// 是它的期望形状。只有「有句柄时导出请求数为 0」能抓住快路径被删掉这件事。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn media_id_from_pull_row_skips_the_export_round() {
+    let base = spawn_stub().await;
+    let dir = std::env::temp_dir().join(format!("weflow-e2e-handle-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (code, stdout, stderr) = run(
+        &base,
+        &[
+            "export", "--out", dir.to_str().unwrap(), "--format", "jsonl", "--with-media",
+            "--session", "handle-talker",
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {stdout} stderr: {stderr}");
+    let all = WINDOW_QUERIES.lock().unwrap().clone();
+    let queries: Vec<String> = all
+        .into_iter()
+        .filter(|(k, _)| k == "handle-talker")
+        .map(|(_, q)| q)
+        .collect();
+    assert_eq!(queries.len(), 1, "三行里只有第三行需要导出 ⇒ 恰好一发导出请求: {queries:?}");
+    // 窗口只覆盖**剩下那一行**的时间戳：1_700_000_500（前两行的 1_700_000_000 不得进窗口）。
+    assert!(queries[0].contains("start=1700000500"), "窗口应只覆盖缺句柄那些行: {}", queries[0]);
+    assert!(queries[0].contains("end=1700000500"), "同上（end 也是那一行的时间戳）: {}", queries[0]);
+    // 三行都要有字节：前两行来自拉取面句柄，第三行来自窗口导出。
+    for name in ["aaa.png", "bbb.png", "ccc.png"] {
+        assert!(
+            dir.join("media").join(name).is_file(),
+            "{name} 应落盘（快路径与慢路径各按其份）"
+        );
+    }
+    let jsonl = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .expect("应有 jsonl");
+    let body = std::fs::read_to_string(&jsonl).unwrap();
+    for name in ["aaa.png", "bbb.png", "ccc.png"] {
+        assert!(body.contains(name), "导出物要引用实际落盘的名字 {name}: {body}");
+    }
+    assert!(!body.contains("photo.png"), "拉取面的元数据名不得留在导出物里: {body}");
     let _ = std::fs::remove_dir_all(&dir);
 }

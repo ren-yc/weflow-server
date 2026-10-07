@@ -437,6 +437,19 @@ pub struct PullMessage {
     /// 媒体元数据；无媒体时**整个键省略**（见 `MediaBrief`）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media: Option<MediaBrief>,
+    /// 本条消息的媒体**此刻就能取字节**时给出的句柄（`GET /api/v1/media/{id}`）。
+    ///
+    /// 「出现即可取」是承诺而非尽力而为：判据见 `chatlab_pull`（本会话导出目录里**确实
+    /// 落盘**、且名字**由内容摘要派生**的那些才出现），取不到时**整个键省略**而不是给
+    /// `null` —— 通告一个必 404 的 id 比不给更坏：调用方会以为服务坏了，而它无从区分这两种情况。
+    ///
+    /// 它在**消息这一层**而不在 `media` 对象里：`media` 的键集由契约钉死为
+    /// `{type, fileName, md5}`（`media_shape_in_pull` 拒绝多余键），而 `fileName` 在未导出时
+    /// 只是元数据名、可取时才等于句柄 —— 把两者塞进同一个键会让「有名字」与「取得到」混谈。
+    /// 消息面（`ChatlabMessage`）**不加**这一键：那里导出后直接回填 `fileName`，两套表达同一件事
+    /// 反而会分叉。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_id: Option<String>,
     pub platform_message_id: String,
     /// **省略**（不是 `null`）：规范把它列为可选 *string*，`null` 会让信任类型的读者
     /// 拿到解析不了的值。

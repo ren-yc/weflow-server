@@ -405,10 +405,22 @@ qqflow-server 的 `type` 取值为 `1` 私聊 / `2` 群聊，数值含义与本�
 `members` 仅含**本页**出现过的发送者，已去重。
 
 `messages[].media` 是**媒体元数据**（`{type, fileName, md5}`）：无媒体时**整个键省略**，`md5`
-取不到时省略该键。它**不代表字节可取** —— 只有先 `media=1` 在 `/api/v1/messages` 或
-`/chatlab/messages` 上真正导出、且该条确实写出了本地副本（那时 `fileName` 是实际导出文件名）
-之后，它才能当句柄喂给 `GET /api/v1/media/{id}`。拉取面本身**不接受** `media` 参数：它是拉取面，
-不做导出。
+取不到时省略该键。它**不代表字节可取** —— `fileName` 在这里始终是元数据名（本面不执行导出，
+不会回填成实际导出名）。
+
+`messages[].mediaId` 才是「**此刻取得到字节**」的承诺：出现时，按它去
+`GET /api/v1/media/{id}` **必须成功**。判据是「本会话的导出目录下确实有这份文件、且名字由
+内容摘要派生」——两个条件缺一个就**整个键省略**（不是给 `null`、也不是给一个必 404 的句柄：
+调用方拿到 404 只会以为服务坏了，而它无从区分）。
+
+**为什么句柄在消息这一层、不在 `media` 里**：`media` 的键集由一致性套件钉成
+`{type, fileName, md5}` 并拒绝多余键（`media_shape_in_pull`）；更根本的是两件事含义不同 ——
+`fileName` 说「这条媒体叫什么」，`mediaId` 说「这份字节现在取得到」。合成一键就会把
+「有名字」与「可取」混谈。回归位置：`media_id_shape_in_pull`（契约）与
+`media_id_from_pull_row_skips_the_export_round`（本仓 CLI）。
+
+拉取面本身**不接受** `media` 参数：它是拉取面，不做导出。要**还没导出过**的那些媒体拿到
+字节，走 `/chatlab/messages?media=1`（每请求上限 200 项，可带 `start`/`end` 限定时间窗）。
 
 本接口**含** `messages[].replyToMessageId`。该字段在规范的**中文**字段表里，英文表漏了它，
 而两种语言的版本历史都写它属于 0.0.2 新增——判据是版本历史，因此按中文表实现。
@@ -517,7 +529,9 @@ qqflow-server 的 `type` 取值为 `1` 私聊 / `2` 群聊，数值含义与本�
 | `GET /api/v1/messages` | `media.exportPath`、`media.enabled`、`media.count` | **恒出现**（`enabled: false` 时也给） | `exportPath` 是本次会话的导出根目录 |
 | `GET /chatlab/sessions` | `sessions[].memberCount` | 不掌握名册时**省略键** | 可选字段，断言不得写成必填 |
 | `GET /chatlab/sessions`、`GET /chatlab/messages` | `page.nextCursor` | 键恒出现，已排空时 `null` | 与「整个 `page` 块不存在」（＝完整单页）是两件事 |
-| `GET /chatlab/messages`、拉取面（两条路径同形） | `messages[].replyToMessageId`、`messages[].media` | 无值时**省略键** | `media.md5` 取不到摘要时也省略 |
+| `GET /chatlab/messages` | `messages[].replyToMessageId`、`messages[].media` | 无值时**省略键** | `media.md5` 取不到摘要时也省略 |
+| 拉取面 | `messages[].replyToMessageId`、`messages[].media` | 无值时**省略键** | 与消息面同形；**但 `media.fileName` 在本面不回填**（本面不导出） |
+| 拉取面 | `messages[].mediaId` | 不可取时**省略键**（不给 `null`） | 「出现即可取」是承诺；判据＝本会话导出目录下确有该文件且名字由内容摘要派生（与 SSE 同一条规则） |
 | 拉取面 | `page` | **不出现在响应里** | 进度走 `sync` 块（`hasMore` / `nextSince` / `nextOffset` / `watermark`），四个键恒出现 |
 | SSE `message.new` | `groupName`、`media` | 键恒出现，无该物时 `null` | 键集本身是契约（回归见 `sse_payload_keys_are_pinned`） |
 | SSE `message.new` | `media.md5` | 键恒出现，取不到摘要时 `null` | |
@@ -953,14 +967,27 @@ feeds 条目字段（以源码 `sns.rs` 为准）：`tid/userName/content(明文
 - **`--with-media`**：把本会话用到的媒体字节下载到 `<目录>/media/`，并把导出物里的
   `media.fileName` **限定为确实落盘的那些句柄**。实现是**单遍**的：每取到一页 Pull 行，就用这一页的时间窗
   （`(since, nextSince]` 正好对应消息面认的 `start`/`end`，两端都是闭区间的秒级戳；同秒的行必然落在同一页里，
-  所以窗口两端不漏行）调一次 `/chatlab/messages?media=1` 触发导出（该面**每请求最多导出 200 项**，超出部分
-  靠翻页续传）并取字节，然后才写这一页的行；顺序不能反 —— 服务端只有在真的写出了本地副本之后，才把
-  `fileName` 回填成可取句柄。**`--since` 因此同时下推到导出面**：过去它是两趟独立的全历史遍历，`--since`
-  只管住写出来的行、媒体照样把整个会话导出并重下一遍；而两趟之间若有并发同步推进水位，第一趟没覆盖到的
-  消息会「有行、无句柄」地静默缺件。磁盘上已有的摘要文件**不重下**（内容摘要名同名即同内容，按存在性复用
-  是安全的）——这也是 `--resume` 能「只补下缺件」的依据。回归位置：`cli_e2e::media_window_follows_the_pull_page`
-  （每个导出请求都带 `start`/`end`、请求条数等于 Pull 页数、两页窗口互不重叠，且 250 条句柄与 `media/`
-  文件集合大小相等）与 `cli_e2e::with_media_reuses_bytes_already_on_disk`（第二次跑不得重下覆盖）。注意**两个面给的名字不必相同**：消息面回填的是
+  所以窗口两端不漏行）**按行分两条路**：
+
+  · **快路径**——拉取面已经给出 `messages[].mediaId` 的那些行，**直接按那个句柄取字节，一发导出请求都不发**。
+  · **慢路径**——有 `media` 却还没有句柄的那些行，把**这些行的时间窗**交给消息面（`/chatlab/messages?media=1`，
+    该面**每请求最多导出 200 项**，超出部分靠翻页续传）触发按需导出，再从回填的可取句柄取字节。
+
+  然后才写这一页的行；顺序不能反 —— 服务端只有在真的写出了本地副本之后，才把 `fileName` 回填成可取句柄。
+  **为什么不能整批撤掉慢路径**：撤掉就等于「媒体句柄只能靠全历史那趟预遍历拿」，而那一趟不认 `--since`
+  （本仓刚修掉的正是这个）。快路径让「已经导出过」的会话（`--resume`、重复导出）近乎零成本，慢路径只在
+  真需要导出时才付出成本；两条路都不再有全历史遍历。
+
+  **`--since` 因此同时下推到导出面**：过去它是两趟独立的全历史遍历，`--since` 只管住写出来的行、媒体照样把
+  整个会话导出并重下一遍；而两趟之间若有并发同步推进水位，第一趟没覆盖到的消息会「有行、无句柄」地静默缺件。
+  磁盘上已有的摘要文件**不重下**（内容摘要名同名即同内容，按存在性复用是安全的）——这也是 `--resume` 能
+  「只补下缺件」的依据。
+
+  回归位置：`cli_e2e::media_window_follows_the_pull_page`（慢路径的窗口跟着 Pull 页走：每个导出请求都带
+  `start`/`end`、请求条数等于 Pull 页数、两页窗口互不重叠，且 250 条句柄与 `media/` 文件集合大小相等）、
+  `cli_e2e::media_id_from_pull_row_skips_the_export_round`（快路径：三行里只有没句柄的那一行需要导出 ⇒
+  恰好一发导出请求，且窗口只覆盖那一行的时间戳）、`cli_e2e::with_media_reuses_bytes_already_on_disk`
+  （第二次跑不得重下覆盖）。注意**两个面给的名字不必相同**：消息面回填的是
   导出后的内容摘要名，拉取面携带的仍是索引里的原始名，所以句柄**按消息 id 对账**（不是按名字比对），
   导出物里写的是实际落盘的那个名字。外链媒体与未能导出的媒体**不会**留下句柄：宁可少一个 `media`
   字段，也不给一个指向不存在文件的句柄。单个媒体取不到只跳过，不升级成会话级失败。

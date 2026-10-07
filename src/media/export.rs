@@ -181,6 +181,44 @@ pub fn kind_dir_for(kind: crate::parser::MediaKind) -> Option<&'static str> {
         _ => None,
     }
 }
+/// 参与导出的四个类型目录，**唯一一份**。
+///
+/// 它同时是「按名取字节」那条路由的白名单与 `digest_handles` 的扫描范围。此前这两个用途各自
+/// 持有一份同样的数组，而数组写两遍必然漂移（漂移的表现是「导出到了 `images/`、查找却去
+/// `photos/`」，两边都静默）。`kind_dir_for` 的每个返回值都必须在这里出现 —— 由
+/// `kind_dir_matches_the_export_layout` 那条测试钉住。
+pub const EXPORT_TYPE_DIRS: [&str; 4] = ["images", "voices", "videos", "emojis"];
+/// 本会话导出目录里**由内容摘要派生**的那些文件：`摘要干 → 实际落盘名`。
+///
+/// 为什么按「干」而不是按全名查：图片的落盘名扩展名是**解码后嗅探**出来的（可能与消息 XML
+/// 里的属性名不同，wxgf 还可能被转成 png），拿元数据里的名字去 stat 会漏报 —— 而漏报的表现是
+/// 「拉取面不说 mediaId」，调用方只能多跑一趟导出，永远看不到这里其实已经有字节。
+///
+/// 只收摘要派生名（同 `fetchable_media_id` 的判据）：非摘要名（语音的 `voice_<svr>.silk`、视频
+/// 的平台名）在别的会话里可能是同名异内容的文件，按名跨会话解析不安全，因此不作句柄。
+///
+/// 同一摘要在多个类型目录里都出现时取**字典序第一个**：内容相同、扩展名只是容器命名差异，
+/// 两个名字指向的字节一致，取哪个都对；固定顺序是为了让响应可复现。
+pub fn digest_handles(export_dir: &Path, talker: &str) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    if !crate::pathsafe::safe_segment(talker) {
+        return out;
+    }
+    let base = export_dir.join(talker);
+    for dir in EXPORT_TYPE_DIRS {
+        let Ok(entries) = std::fs::read_dir(base.join(dir)) else { continue };
+        for e in entries.flatten() {
+            let Some(name) = e.file_name().to_str().map(str::to_string) else { continue };
+            if !e.path().is_file() || !name_is_content_digest(&name) {
+                continue;
+            }
+            let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(&name).to_ascii_lowercase();
+            out.entry(stem).or_insert_with(|| name.clone());
+        }
+    }
+    out
+}
+
 
 /// 媒体 id 的「**出现即可取**」判据：导出根下确有这个文件才通告。
 ///

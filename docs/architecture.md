@@ -461,6 +461,20 @@ SSE 键集断言钉住，按「看着多余就顺手统一」改会直接让门�
 变成随机 404，或者更糟：服务了错的那一份。生成侧同理：只有本次请求确实写出了摘要派生的本地文件
 时才通告句柄（原生面的 `mediaId`、消息面回填的 `media.fileName`），非摘要派生的一律不给。
 
+拉取面（`GET /chatlab/sessions/{id}/messages`）也通告 `messages[].mediaId`，但判据要绕一个弯：
+它**不执行导出**，只能报告「已经导出过的那些」。而**不能拿元数据名去 stat** —— 图片的落盘名
+扩展名是解码后由内容嗅探得出的（`sniff_image_ext`；wxgf 还可能被 ffmpeg 转成 png），与消息 XML
+里那个属性名不必相同，按全名 stat 会**静默漏报**（表现为「明明有字节却不说 mediaId」，调用方只能
+多跑一趟导出，永远看不出这里其实能省）。所以本面按**摘要干**查（`media::export::digest_handles`
+列出本会话导出目录里所有摘要派生名，`干 → 实际落盘名`），命中才把那个**实际名字**当句柄给出。
+目录扫描是阻塞 IO 且按请求算一次（逐条 stat 会让一页变成几十次目录打开），因此走
+`spawn_blocking`，并且**放在取 store 读锁之前** —— `RwLockReadGuard` 不是 `Send`，跨 `.await`
+会让 axum 的 `Handler` bound 直接编译失败。
+
+两条通告口径一致的地方：语音的 `voice_<svr>.silk` 与视频的平台名都不是摘要派生 ⇒ 拉取面
+同样不给句柄（与「不能作句柄」的裁决一致）。回归位置：`api_smoke` 的拉取面媒体键集断言，
+服务端正反两侧钉在 `api_smoke::pull_advertises_media_id_only_for_exported_digest_files`，CLI 侧快路径钉在 `cli_e2e::media_id_from_pull_row_skips_the_export_round`（有句柄的行不发导出请求）。
+
 ### 没有 `page` 块的响应会被读成「完整一页」
 
 会话列表默认只给 100 条，而 ChatLab 的约定是：**响应里没有 `page` 块，就表示「这就是全部」**。

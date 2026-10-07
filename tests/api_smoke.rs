@@ -892,6 +892,68 @@ async fn chatlab_message_face_runs_the_media_export() {
     );
 }
 
+/// 拉取面的 `mediaId`：**只在导出目录下确有这份文件**时才出现，且出现时那个句柄真的取得到字节。
+///
+///
+/// 正向刻意落一个**扩展名与元数据名不同**的文件（元数据是 `…jpg`，落盘给 `…png`）：那正是
+/// 「按全名 stat 会静默漏报」的形态 —— 只有按**摘要干**查才命中，而且给出的必须是实际落盘的
+/// 那个名字（不是元数据名）。顺带钉住两个键的分工：`media.fileName` 仍是元数据名。
+#[tokio::test]
+async fn pull_advertises_media_id_only_for_exported_digest_files() {
+    let stem = "00112233445566778899aabbccddeeff";
+    let uri = format!(
+        "/api/v1/sessions/{}/messages?limit=5000&access_token={}",
+        common::FAKE_GROUP, TOKEN
+    );
+    // —— 反向：全新的导出根（没有落盘过的媒体）。
+    {
+        let dir = common::tmp_dir("smoke-pullmediaid-off");
+        let app = server::build_router(test_state(&dir));
+        let (s, v) = json_body(app.oneshot(request("GET", &uri, None)).await.unwrap()).await;
+        assert_eq!(s, StatusCode::OK);
+        let row = pull_media_row(&v).expect("夹具里应有一条带媒体的消息");
+        assert!(
+            row.get("mediaId").is_none(),
+            "没有导出就不给句柄（而不是给一个必 404 的 id 或 null）: {row}"
+        );
+    }
+    // —— 正向：本会话导出目录里确实有这份摘要命名的文件。
+    {
+        let dir = common::tmp_dir("smoke-pullmediaid-on");
+        let landed = format!("{stem}.png");
+        let export_dir = dir.join("api-media").join(common::FAKE_GROUP).join("images");
+        std::fs::create_dir_all(&export_dir).unwrap();
+        std::fs::write(export_dir.join(&landed), b"PNG-BYTES").unwrap();
+        let app = server::build_router(test_state(&dir));
+        let (s, v) = json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await;
+        assert_eq!(s, StatusCode::OK);
+        let row = pull_media_row(&v).expect("夹具里应有一条带媒体的消息");
+        assert_eq!(
+            row["mediaId"].as_str(),
+            Some(landed.as_str()),
+            "按摘要干命中时，句柄必须是**实际落盘的那个名字**（不是元数据名）: {row}"
+        );
+        assert_eq!(
+            row["media"]["fileName"].as_str(),
+            Some(format!("{stem}.jpg").as_str()),
+            "media.fileName 仍是元数据名：本面不执行导出，不回填"
+        );
+        // 端到端：通告出去的句柄真的取得到字节。
+        let byte_uri = format!("/api/v1/media/{}?access_token={}", landed, TOKEN);
+        let resp = app.oneshot(request("GET", &byte_uri, None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "句柄 {landed} 必须取到字节");
+    }
+}
+
+/// 取第一行带 `media` 对象的消息。找不到就返回 `None`，让断言以「夹具里应有一条带媒体的
+/// 消息」失败，而不是在索引上 panic —— 拉取面的行序由时间戳决定，硬写索引会让夹具改动
+/// 变成误报。
+fn pull_media_row(v: &Value) -> Option<&Value> {
+    v.get("messages")
+        .and_then(|m| m.as_array())
+        .and_then(|arr| arr.iter().find(|m| m.get("media").is_some()))
+}
+
 /// `messages[].replyToMessageId` 在**三个面**上同规：有引用时是字符串，无引用时**省略该键**。
 ///
 /// 这条曾经是「混合面恒出现、无引用给 `null`」与「拉取面省略」的分歧。分歧的代价是下游要按
