@@ -1155,10 +1155,22 @@ async def test_transport_failures_are_client_errors() -> None:
     httpx error escape for that route alone).
     """
     client = Client("http://127.0.0.1:1", TOKEN, timeout=2.0)
+    # Every public request entry, not just one representative per transport
+    # method: the packaging rule lives in _http_get/_http_post, and an entry
+    # that bypasses them escapes the tree even when the other 11 are covered.
+    # One entry per public method (watch is a stream with its own reconnect
+    # loop and is exercised by the SSE tests; drain_session/list_all_sessions/
+    # media_bytes reuse pull_page / pull_page / media_bytes_by_id).
     get_entries = [
         lambda: client.health(),
         lambda: client.accounts(),
         lambda: client.group_members("10001"),
+        lambda: client.pull_page("10001", None),
+        lambda: client.list_all_sessions(),
+        lambda: client.list_messages("10001"),
+        lambda: client.chatlab_messages("10001"),
+        lambda: client.contacts(),
+        lambda: client.media_bytes_by_id("abc.png"),
     ]
     post_entries = [
         lambda: client.register({"qq": "10001", "key": "k", "db_path": "X:/a"}),
