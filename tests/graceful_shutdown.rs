@@ -143,7 +143,14 @@ impl std::fmt::Display for UpFailure {
 /// when the server would actually accept the token it is about to use.
 async fn wait_until_up(port: u16) -> Result<ServerProbe, UpFailure> {
     let started = std::time::Instant::now();
-    let deadline = started + Duration::from_secs(10);
+    // Readiness waits on the slowest stage of "boot + credential store + first
+    // authenticated round trip", and every stage degrades on a loaded runner:
+    // parallel test binaries, a cold credential daemon, antivirus scans. A
+    // too-tight budget here turns "slow boot" into a panic that reads as a
+    // shutdown failure, so this is the one budget sized for load. The deadlines
+    // after the signal are the opposite: they ARE the assertion, so they stay
+    // tight.
+    let deadline = started + Duration::from_secs(30);
     loop {
         let mut stuck = UpFailure::Port {
             port,
