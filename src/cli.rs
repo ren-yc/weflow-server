@@ -749,6 +749,12 @@ async fn media_for_page(
         let count = resp.messages.len();
         for m in &resp.messages {
             let Some(media) = &m.media else { continue };
+            // 已经拿到句柄的消息不再重取：同一份字节在两个面上的**名字形态**可以不同
+            // （拉取面句柄 vs 导出回填名），只按折叠名去重会漏掉「同一消息、两个名字」。
+            // 与 qqflow 侧同一条守卫。
+            if by_message.contains_key(&m.platform_message_id) {
+                continue;
+            }
             let name = media.file_name.clone();
             if name.is_empty() {
                 continue;
