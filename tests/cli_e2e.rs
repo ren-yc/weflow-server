@@ -827,12 +827,20 @@ async fn mcp_search_pagination_actually_advances() {
 
 // ---- --rows 的 RSS 平坦（验收时显式跑）--------------------------------------
 
-/// 验收 3：大语料下**峰值 RSS 与条数无关**。
+/// 验收 3：大语料下**导出阶段的峰值 RSS 与条数无关**。
 ///
 /// `#[ignore]`：造 20 万行要几十秒，不适合每次 `cargo test`。验收时显式跑：
 ///   cargo test --locked --features testing --test cli_e2e -- --ignored --nocapture
 ///
-/// 断言取 `[rss]` 的**首/末**采样点，要求末点相对首点的增量小于一成。
+/// 断言取 `[rss]` 的**首/末大会话**采样点，要求末点相对首点的增量小于一成。
+///
+/// **为什么不做「N 与 2N 两档、跨进程对比峰值」**（实测踩过）：`--rows` 在**同一进程内
+/// 先造库再导出**（`export_corpus` → `build_account_with_rows`），而 `peak_rss_kb()` 取的是
+/// 进程级峰值（VmHWM）——**单调只增、含造库阶段**。两档的进程峰值自然随条数近线性上涨
+/// （实测 N=100k≈108 MB → 2N=200k≈198 MB），测到的是造库器而不是导出路径。同一进程内
+/// HWM 只增不减 ⇒ 「首个大会话采样」就是造库峰值的下界，末采样仍平坦才真正证明
+/// 「导出阶段没有把内存推高」——这是 C4a 验收过的正确口径，两档改造是本批的一次
+/// 设计错误，据此恢复并记录原因。
 #[test]
 #[ignore = "验收专用：造大语料很慢"]
 fn export_rows_keeps_peak_rss_flat() {
@@ -846,7 +854,7 @@ fn export_rows_keeps_peak_rss_flat() {
         .expect("spawn weflow-server");
     assert!(out.status.success(), "export --rows 应退 0；stderr: {}", String::from_utf8_lossy(&out.stderr));
     let text = String::from_utf8_lossy(&out.stdout);
-    // 采样行是 `[rss] session=<i> rows=<n> peak_kb=Some(<kb>)`；取不到峰值时打印 `None`，那种点跳过。
+    // 采样行是 `[rss] session=<i> rows=<n> peak_kb=Some(<kb>)`；取不到峰值的点跳过。
     let samples: Vec<(u64, u64)> = text
         .lines()
         .filter(|l| l.starts_with("[rss]"))
