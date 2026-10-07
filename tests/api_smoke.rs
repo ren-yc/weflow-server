@@ -892,6 +892,55 @@ async fn chatlab_message_face_runs_the_media_export() {
     );
 }
 
+/// `updatedAt` 的两条性质此前从未被钉：只有「值存在且 >0」，下面的行为性质都没有。
+///
+/// `updatedAt` ＝ **索引构建时刻**（`store.index_built_at_ms`），且**只有真正动过索引的那轮
+/// 同步才会前移**（空转的一轮不该让它看起来更新了）。这两条性质此前从未被钉：
+///
+/// · 同一索引连续请求不变 —— 如果它每请求都取墙钟，客户端「数据有多旧」的判断就失效；
+/// · 有新消息进索引后前移 —— 如果它只在首建时赋值，增量同步就永远不可见。
+///
+/// 反向那条的关键在**不触碰库**的空转同步必须不动它（这正是实现里那条注释的语义）。
+#[tokio::test]
+async fn group_members_updated_at_is_the_index_built_at() {
+    let dir = common::tmp_dir("smoke-updatedat");
+    let state = test_state(&dir);
+    let app = server::build_router(state.clone());
+    let uri = format!(
+        "/api/v1/group-members?chatroomId={}&includeMessageCounts=1&access_token={}",
+    common::FAKE_GROUP, TOKEN
+    );
+    let get = || async { json_body(app.clone().oneshot(request("GET", &uri, None)).await.unwrap()).await };
+    let (s1, v1) = get().await;
+    assert_eq!(s1, StatusCode::OK);
+    let t1 = v1["updatedAt"].as_i64().expect("updatedAt 必须是真值");
+    // 同一索引连续请求：值**不变**（它不是墙钟）。
+    let (s2, v2) = get().await;
+    assert_eq!(s2, StatusCode::OK);
+    assert_eq!(v2["updatedAt"].as_i64(), Some(t1), "同一索引连续请求 updatedAt 不得变化");
+
+    // 空转同步（库未变）：updatedAt 不得被「看起来更新」。
+    let sync_uri = format!("/api/v1/sync?access_token={TOKEN}");
+    let (ss, sv) = json_body(app.clone().oneshot(request("POST", &sync_uri, None)).await.unwrap()).await;
+    assert_eq!(ss, StatusCode::OK);
+    assert_eq!(sv["newMessages"], 0, "夹具未动 ⇒ 无新消息");
+    let (s3, v3) = get().await;
+    assert_eq!(s3, StatusCode::OK);
+    assert_eq!(v3["updatedAt"].as_i64(), Some(t1), "空转同步不得前移 updatedAt");
+
+    // 有新消息真正进索引：updatedAt 必须**前移**。
+    let key = weflow_server::keystore::parse_db_key(common::FAKE_KEY_HEX).unwrap().0;
+    let storage = state.accounts.lock().values().next().expect("registered account").info.db_storage.clone();
+    common::append_group_message(&storage, &key);
+    let (s4, sv4) = json_body(app.clone().oneshot(request("POST", &sync_uri, None)).await.unwrap()).await;
+    assert_eq!(s4, StatusCode::OK);
+    assert!(sv4["newMessages"].as_i64().unwrap_or(0) > 0, "追加了一条消息 ⇒ newMessages > 0: {sv4}");
+    let (s5, v5) = get().await;
+    assert_eq!(s5, StatusCode::OK);
+    let t5 = v5["updatedAt"].as_i64().expect("updatedAt 必须是真值");
+    assert!(t5 > t1, "有新消息进索引后 updatedAt 必须前移: t1={t1} t5={t5}");
+}
+
 /// 拉取面的 `mediaId`：**只在导出目录下确有这份文件**时才出现，且出现时那个句柄真的取得到字节。
 ///
 ///
