@@ -55,7 +55,15 @@ jobs:
   # 防止「测试红着打 tag」——发布二进制里带进去的代码必须与主干同一质量线。
   quality-gate:
     name: Quality gate (clippy + test + conformance)
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        # 与 build 作业同两个 OS：发布二进制跑在 Windows 上，质量门也必须在
+        # Windows 上跑过 —— 平台特定的 cfg/依赖（如 OpenSSL 的 Windows 形态）
+        # 只在 Windows 编译时暴露，ubuntu 一条线守不住它们。
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v5
 
@@ -63,9 +71,19 @@ jobs:
         run: rustup show
 
       - name: clippy (deny warnings)
+        if: runner.os == 'Windows'
+        run: powershell -File scripts/build.ps1 clippy --all-targets --locked -- -D warnings
+
+      - name: clippy (deny warnings)
+        if: runner.os != 'Windows'
         run: bash scripts/build.sh clippy --all-targets --locked -- -D warnings
 
       - name: test
+        if: runner.os == 'Windows'
+        run: powershell -File scripts/build.ps1 test --locked
+
+      - name: test
+        if: runner.os != 'Windows'
         run: bash scripts/build.sh test --locked
 
       - name: conformance nails (contract data invariants)
@@ -76,7 +94,6 @@ jobs:
           git clone --depth 1 --branch "$pin" https://github.com/ren-yc/flow-contract.git conformance-nails
           FLOW_CONTRACT_DIR="$PWD/conformance-nails" FLOW_CONTRACT_CASE="nails" \
             bash scripts/build.sh test --locked --test conformance_runner -- --ignored
-  build:
     name: Build ${{ matrix.target }}
     needs: [guard, quality-gate]
     runs-on: ${{ matrix.os }}
