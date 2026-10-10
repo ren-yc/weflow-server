@@ -104,8 +104,12 @@ publisher；或给本仓配一个 scoped 的 `CARGO_REGISTRY_TOKEN` secret（pub
 
 ```powershell
 powershell -File scripts/build.ps1 publish --locked -p weflow-client
+# 发布失败必须**当场停**：不加这道检查，下一步会先白轮询 5 分钟、再抛「未出现在稀疏
+# 索引里」，把方向指到索引传播上，而真实原因是 publish 自己失败了（凭据、脏树、编译错）。
+if ($LASTEXITCODE -ne 0) { throw "weflow-client 发布失败（退出码 $LASTEXITCODE），先修它再往下走" }
 # 轮询稀疏索引到条目可见（上传成功≠可解析；上限 5 分钟）。
 $idx = 'https://index.crates.io/we/fl/weflow-client'
+$hit = $null
 for ($i = 0; $i -lt 60; $i++) {
   $hit = (curl.exe -s -A flow-release-guard $idx) | Select-String -SimpleMatch '"vers":"0.9.0"'
   if ($hit) { break }
@@ -113,6 +117,7 @@ for ($i = 0; $i -lt 60; $i++) {
 }
 if (-not $hit) { throw 'weflow-client 0.9.0 五分钟内未出现在稀疏索引里，根包发布无法继续' }
 powershell -File scripts/build.ps1 publish --locked -p weflow-server
+if ($LASTEXITCODE -ne 0) { throw "weflow-server 发布失败（退出码 $LASTEXITCODE）" }
 ```
 
 （`index.crates.io/<前两字符>/<第3-4字符>/<crate名>` 是稀疏索引路径规则；`-p` 让两条命令都在仓库根
@@ -155,7 +160,9 @@ powershell -File scripts/build.ps1 package --list --allow-dirty -p weflow-server
 #   本轮为此补了 `clients/python/.gitignore`（`dist/`、`.venv/`）：仓库根那条 `/dist`
 #   只锚定仓库根，管不到 `clients/python/dist`，而 `python -m build` 就在那里产出。
 #   实测补上后 `git check-ignore` 命中该规则，且 `python -m build` 出的 sdist 里
-#   `.venv` 条目为 0（sdist 共 62 个条目、wheel 122 KB，没有把 1 亿字节的本地虚拟环境带上）。
+#   `.venv` 条目为 0（**本仓实测：sdist 67 个条目、wheel 129,161 字节**，没有把 1 亿字节
+#   的本地虚拟环境带上。姊妹仓 qqflow 是 62 条目／121,965 字节——两仓生成树文件数不同，
+#   **核对时按各自的数，别互相顶替**）。
 # --allow-dirty 只让工作树有未提交改动时也能看清单，不改变打包内容。
 ```
 
@@ -182,16 +189,21 @@ cargo 走包装脚本。`Invoke-WebRequest` 遇 404 会**抛异常**，故用 tr
 ```powershell
 # 先查该版本是否已上架（200＝已上架，跳过本步）；未配置凭据时 cargo publish 会响亮失败。
 foreach ($crate in 'weflow-client', 'weflow-server') {
+  # URI 必须先存进变量。原先写成 `Invoke-WebRequest … -Headers @{…}` 换行再接 URI：PowerShell
+  # 在哈希表字面量收尾处就判定语句结束，下一行变成游离 token ⇒ 实测 PS 5.1 与 7 都报
+  # 「Missing closing ')' in expression」，整块根本跑不起来（兜底路径平时不跑，出事那天才验就晚了）。
+  $uri = "https://crates.io/api/v1/crates/$crate/0.9.0"
   $code = try {
-    (Invoke-WebRequest -UseBasicParsing -Headers @{ 'User-Agent' = 'flow-release-guard' }
-      "https://crates.io/api/v1/crates/$crate/0.9.0").StatusCode
+    (Invoke-WebRequest -UseBasicParsing -Headers @{ 'User-Agent' = 'flow-release-guard' } $uri).StatusCode
   } catch { [int]$_.Exception.Response.StatusCode }
   if ($code -eq 200) { Write-Host "$crate 0.9.0 已上架，跳过"; continue }
   powershell -File scripts/build.ps1 publish --locked -p $crate
+  if ($LASTEXITCODE -ne 0) { throw "$crate 发布失败（退出码 $LASTEXITCODE）" }
   if ($crate -eq 'weflow-client') {   # 根包要等 SDK 在索引里可见
+    $idx = 'https://index.crates.io/we/fl/weflow-client'
+    $hit = $null
     for ($i = 0; $i -lt 60; $i++) {
-      $hit = (curl.exe -s -A flow-release-guard https://index.crates.io/we/fl/weflow-client) |
-        Select-String -SimpleMatch '"vers":"0.9.0"'
+      $hit = (curl.exe -s -A flow-release-guard $idx) | Select-String -SimpleMatch '"vers":"0.9.0"'
       if ($hit) { break }
       Start-Sleep -Seconds 5
     }

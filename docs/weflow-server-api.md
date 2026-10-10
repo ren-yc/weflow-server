@@ -1104,7 +1104,7 @@ weflow-server.exe sessions --json        # 子命令面
   退回任一路由即变红）、`test_published_timeout_budgets_travel_per_request` 与
   `test_watch_stream_is_not_bounded_by_the_json_read_timeout`（Python：断言 transport 实际收到的 per-request 值，
   不是只读常量）、`published_timeouts_match_the_documented_budgets`（三个常量的数值与大小关系）。
-- 鉴权走 `Authorization: Bearer`；客户端从不把 token 放进 URL（`/health` 是唯一免鉴权端点）。
+- 鉴权走 `Authorization: Bearer`；客户端从不把 token 放进 URL（免鉴权的只有 `/health`、`/api/v1/health` 与描述面 `/openapi.json`）。
 - 自 0.9.0 起发布到 crates.io（crate `weflow-client`）；本地开发仍可直接 `cargo build -p weflow-client`。
 
 - **Python 侧**：`clients/python`（包 `weflow-sdk`）。模型生成走 `scripts/regen.py`
