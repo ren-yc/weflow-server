@@ -65,15 +65,18 @@ publisher；或给本仓配一个 scoped 的 `CARGO_REGISTRY_TOKEN` secret（pub
 
 ## 首发（本机，只做一次）
 
-新 crate 的首发。顺序＝先 SDK 后根包（根包要解析 registry 上的 SDK 版本）：
+新 crate 的首发。顺序＝先 SDK 后根包（根包要解析 registry 上的 SDK 版本）。**全程在仓库根执行**，
+且 cargo 一律走包装脚本——它负责定位 MSVC 环境，直接跑 cargo 会在 vendored OpenSSL 上失败
+（`publish` 子命令不会被注入 `--features testing`，那条注入只服务 test/clippy）：
 
 ```
-cd clients/rust && cargo publish --locked
+powershell -File scripts/build.ps1 publish --locked -p weflow-client
 until curl -sf -A flow-release-guard https://index.crates.io/we/fl/weflow-client | grep -q '"vers":"0.9.0"'; do sleep 5; done
-cd .. && cargo publish --locked
+powershell -File scripts/build.ps1 publish --locked -p weflow-server
 ```
 
-（`index.crates.io/<前两字符>/<第3-4字符>/<crate名>` 是稀疏索引路径规则。）
+（`index.crates.io/<前两字符>/<第3-4字符>/<crate名>` 是稀疏索引路径规则；`-p` 让两条命令都在仓库根
+选到目标 package，不需要 cd 进子目录。）
 做完回到第 3 步重跑 publish 作业，它会跳过已上架的两步、继续跑 PyPI。
 
 ## 预演
@@ -104,15 +107,19 @@ SDK 真上架前必然失败——它按发布后的清单解析依赖，那时 
 
 ## 人工兜底（CI publish 不可用时）
 
-每一步之前先查该版本是否已上架（两个索引都拒绝重复版本）：
+**仓库根执行**；每一步之前先查该版本是否已上架（两个索引都拒绝重复版本），cargo 走包装脚本：
 
 ```
 curl -s -o NUL -w '%{http_code}\n' -A flow-release-guard https://crates.io/api/v1/crates/weflow-client/0.9.0
-cd clients/rust   && cargo publish --locked     # 200 则跳过
+powershell -File scripts/build.ps1 publish --locked -p weflow-client    # 上一步 200 则跳过
 until curl -sf -A flow-release-guard https://index.crates.io/we/fl/weflow-client | grep -q '"vers":"0.9.0"'; do sleep 5; done
-cd ..             && cargo publish --locked     # 同上，先查 weflow-server
-cd clients/python && twine upload dist/*       # 先查 pypi.org/pypi/weflow-sdk/0.9.0/json
+powershell -File scripts/build.ps1 publish --locked -p weflow-server    # 同上，先查根包
 ```
+
+PyPI 侧**默认没有本机兜底**：本仓按设计不保存任何长期上传凭据（`~/.pypirc` 只有
+`[testpypi]`，正式 PyPI 由 CI 走 OIDC 发）。真要本机补发，得先在 `~/.pypirc` 补一个
+`[pypi]` 段与对应 token，再执行 `cd clients/python; twine upload dist/*`（先查
+`pypi.org/pypi/weflow-sdk/0.9.0/json`）；用完请撤掉该凭据，别让它长期躺在本机。
 
 ## 注意
 

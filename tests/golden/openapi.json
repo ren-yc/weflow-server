@@ -114,7 +114,9 @@
         "AccountRegistered": {
           "description": "注册**受理**（或幂等命中：`already_ready` / `in_progress`）。",
           "properties": {
-            "db_storage": "<volatile>",
+            "db_storage": {
+              "type": "string"
+            },
             "state": {
               "type": "string"
             },
@@ -139,7 +141,10 @@
         },
         "AccountStateView": {
           "properties": {
-            "db_storage": "<volatile>",
+            "db_storage": {
+              "description": "字段**按字母序声明**：此前它是经 `json!` 序列化的（走 BTreeMap，键被排序），\n而 struct 用声明序 —— 「换 DTO」时若不同步调整，响应里的键序会变。\n快照的 `keys` 字段就是为抓这个而加的。\n\nResolved live-database directory (`<account>/db_storage`). Same field\nname the registration endpoint echoes back.",
+              "type": "string"
+            },
             "error": {
               "type": [
                 "string",
@@ -238,7 +243,10 @@
         "ChatlabHeader": {
           "description": "ChatLab 信封头。`exportedAt` 是**墙钟**（每次请求都不同）——快照里靠时钟哨兵掩码。",
           "properties": {
-            "exportedAt": "<volatile>",
+            "exportedAt": {
+              "format": "int64",
+              "type": "integer"
+            },
             "generator": {
               "type": "string"
             },
@@ -704,7 +712,11 @@
             "success": {
               "type": "boolean"
             },
-            "updatedAt": "<volatile>"
+            "updatedAt": {
+              "description": "索引构建完成时刻（**毫秒**）：客户端据此判断这份成员表有多旧。秒级会让同一秒内的\n两次构建无法区分，而成员表的更新恰恰可能落在同一秒里。",
+              "format": "int64",
+              "type": "integer"
+            }
           },
           "required": [
             "chatroomId",
@@ -769,7 +781,9 @@
             "enabled": {
               "type": "boolean"
             },
-            "exportPath": "<volatile>"
+            "exportPath": {
+              "type": "string"
+            }
           },
           "required": [
             "count",
@@ -792,7 +806,13 @@
               "description": "文件名**始终是字符串**；没有名字时是空串（不是 `null`）。",
               "type": "string"
             },
-            "localPath": "<volatile>",
+            "localPath": {
+              "description": "未导出时**省略**（不是空串）：空串会被读成「有路径、只是空的」。",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "md5": {
               "description": "**取不到摘要时才省略**（不是给 `null`）：未导出不等于没有摘要。",
               "type": [
@@ -1122,8 +1142,14 @@
               "minimum": 0,
               "type": "integer"
             },
-            "nextSince": "<volatile>",
-            "watermark": "<volatile>"
+            "nextSince": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "watermark": {
+              "format": "int64",
+              "type": "integer"
+            }
           },
           "required": [
             "hasMore",
@@ -1361,7 +1387,9 @@
             "table": {
               "type": "string"
             },
-            "watermark": "<volatile>"
+            "watermark": {
+              "$ref": "#/components/schemas/WatermarkValue"
+            }
           },
           "required": [
             "table",

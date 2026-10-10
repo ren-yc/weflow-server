@@ -1763,7 +1763,13 @@ mod golden {
             serde_json::Value::Object(map) => {
                 for (key, val) in map.iter_mut() {
                     if VOLATILE_KEYS.contains(&key.as_str()) {
-                        *val = serde_json::Value::String("<volatile>".into());
+                        // 只掩**标量**。对象/数组位置上的同名键装的是形状而非取值：
+                        // /openapi.json 里 `updatedAt` 的值就是整个 schema，整值替换会把
+                        // description 与类型一起从比对里抹掉——字段语义写红也不会红。
+                        match val {
+                            serde_json::Value::Object(_) | serde_json::Value::Array(_) => mask(val, tmp),
+                            _ => *val = serde_json::Value::String("<volatile>".into()),
+                        }
                     } else {
                         mask(val, tmp);
                     }
