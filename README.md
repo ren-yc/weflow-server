@@ -117,8 +117,9 @@ curl -X POST http://127.0.0.1:5033/api/v1/accounts \
 
 每库独立密钥时传 `keys` 映射（相对路径 → 64hex），至少 session.db 的 key 必须匹配
 （用于 page-1 HMAC 校验）。可选 `img_code` 用于图片 `.dat` 解密（xorKey=code 的**首个字节**（按字节串处理，
-不是整数码掩码：`"0"` 得 0x30），aesKey=MD5(code+wxid)[:16]），或直接指定 `img_aes_key`/`img_xor_key`（推荐）。
-密钥错误时账号进入 `error` 状态，重新注册即可恢复。
+不是整数码掩码：`"0"` 得 0x30），aesKey=MD5(code+wxid)[:16]），或直接指定 `img_aes_key`/`img_xor_key`（推荐，**两者必须成对给**，只给其一会被整体忽略并回落到 `img_code`）。
+密钥错误时注册**当场被拒**（返回 `400`，账号不会建立；页 1 HMAC 预校验见
+`docs/weflow-server-api.md`）——改正密钥后重新注册即可。
 
 注册响应带真实状态：`{"state":"accepted","status":"indexing",...}`（后随 `ready`）。**强制单账号**：
 一个进程只绑定一个 wxid，注册别的账号直接回 `account_conflict`（冲突判定在密钥校验之前），
@@ -197,7 +198,7 @@ tests/
 本项目借鉴了以下项目的部分功能特性（均为行为规格层面的参考，代码独立编写）：
 
 - [hicccc77/WeFlow](https://github.com/hicccc77/WeFlow)（HTTP API 契约、监控/推送语义、db_storage 布局）
-- [qqflow-server](https://github.com/)（同目录本地仓库：服务架构、watch/SSE/两段式同步模式）
+- [qqflow-server](https://github.com/ren-yc/qqflow-server)（同组织的姊妹仓库：服务架构、watch/SSE/两段式同步模式）
 - [328336690/wechat-decrypt](https://github.com/328336690/wechat-decrypt)（微信 4.0 页密码实测参数）
 - [0xlane/wechat-dump-rs](https://github.com/0xlane/wechat-dump-rs)（特征与格式参考，仓库已 DMCA 下架）
 

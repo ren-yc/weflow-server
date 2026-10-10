@@ -1,0 +1,11 @@
+# 本目录自己的忽略规则。放在项目根（clients/python）而不是只依赖仓库根那一份：
+# - cargo 收包时跳过「被 gitignore 的文件」，而仓库根的 `/dist` 只锚定仓库根——
+#   `python -m build` 产出的 wheel/sdist 若不在此声明，会作为「未跟踪且未忽略」文件
+#   被静默收进**根 crate 的 .crate**（预演一跑就把上百 MB 构建产物发上 crates.io）。
+# - hatchling 只读「项目根或其父目录里第一个 .gitignore」，且把模式**相对项目根**匹配；
+#   仓库根那条 `clients/python/.venv/` 带路径前缀、相对本项目匹配不上，实际挡住 .venv 的
+#   只是 hatchling 的硬编码常量。这里用无前缀写法，让规则真正生效（换后端也不裸奔）。
+.venv/
+dist/
+__pycache__/
+*.py[cod]

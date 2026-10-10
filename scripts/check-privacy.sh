@@ -59,6 +59,25 @@ report() {
   fi
 }
 
+# report_strict <label> <fixed-string-pattern>
+# Same, but WITHOUT the self-exclusion. Used for values derived from the local
+# config: PATHSPEC drops this script because it legitimately holds *pattern
+# strings*, but that exemption is exactly how a real machine root once ended up
+# hardcoded here unnoticed (the gate cannot see its own file). A config-derived
+# value has no legitimate reason to appear in the scanner source, so it gets
+# scanned there too.
+report_strict() {
+  local label="$1"
+  local pattern="$2"
+  local found
+  found=$(git grep -lF -e "$pattern" -- ':!*.lock' 2>/dev/null)
+  if [ -n "$found" ]; then
+    echo "[隐私检查] 检测到 $label:" >&2
+    echo "$found" | sed 's/^/    /' >&2
+    hits=$((hits + 1))
+  fi
+}
+
 # JSON field reader for the config: tries the interpreters that may exist on a
 # dev machine (python / python3 / the Windows `py` launcher). Prints one value
 # per line for `keys` (a nested object), a single line otherwise. Returns 1
@@ -82,6 +101,27 @@ for field in ("wxid", "db_path", "img_aes_key"):
     value = cfg.get(field)
     if isinstance(value, str) and value:
         print("%s\t%s" % (field, value))
+
+# Data root: db_path cut at the "xwechat_files" marker (else drive + first
+# segment). Scanned as a prefix class so a doc showing only the deeper path
+# still trips. Derived here rather than hardcoded: this file is tracked, gets
+# published inside the root crate, and is excluded from the pattern layer below
+# — a literal machine path stored here would be invisible to the gate forever.
+import re
+db = cfg.get("db_path")
+if isinstance(db, str) and db:
+    parts = re.split(r"[\\/]", db)
+    cut = None
+    for i, seg in enumerate(parts):
+        if seg.lower() == "xwechat_files":
+            cut = i
+            break
+    if cut is None:
+        cut = min(1, len(parts) - 1)
+    root = "\\".join(parts[: cut + 1])
+    if root:
+        print("data_root\t%s" % root)
+        print("data_root_fwd\t%s" % root.replace("\\", "/"))
 keys = cfg.get("keys")
 if isinstance(keys, dict):
     for name, value in sorted(keys.items()):
@@ -111,10 +151,14 @@ if [ -f "$CONFIG" ]; then
     value="${value%$'\r'}"
     [ -n "${value:-}" ] || continue
     case "$label" in
-      wxid)        report "真实 wxid（$CONFIG）" "$value" ;;
-      db_path)     report "真实数据库路径（$CONFIG 的 db_path）" "$value" ;;
-      img_aes_key) report "真实图片 AES 密钥（$CONFIG 的 img_aes_key）" "$value" ;;
-      *)           report "真实数据库密钥（$CONFIG 的 $label）" "$value" ;;
+      # all of these come from the local config: none may appear in tracked
+      # files, this scanner's own source included.
+      wxid)        report_strict "真实 wxid（$CONFIG）" "$value" ;;
+      data_root)     report_strict "本机数据根（由 $CONFIG 的 db_path 派生）" "$value" ;;
+      data_root_fwd) report_strict "本机数据根的正斜杠变体" "$value" ;;
+      db_path)     report_strict "真实数据库路径（$CONFIG 的 db_path）" "$value" ;;
+      img_aes_key) report_strict "真实图片 AES 密钥（$CONFIG 的 img_aes_key）" "$value" ;;
+      *)           report_strict "真实数据库密钥（$CONFIG 的 $label）" "$value" ;;
     esac
   done <<< "$CONFIG_VALUES"
 fi

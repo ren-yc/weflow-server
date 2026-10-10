@@ -127,7 +127,7 @@
       "wxid": "wxid_xxxx_1234",
       "state": "ready",
       "message_count": 217272,
-      "db_storage": "D:\\AppData\\xwechat_files\\wxid_xxxx_1234\\db_storage"
+      "db_storage": "C:\\Users\\<用户名>\\Documents\\xwechat_files\\wxid_xxxx_1234\\db_storage"
     }
   ]
 }
@@ -148,7 +148,7 @@
 ```json
 {
   "wxid": "wxid_xxxxxxxxxxxxxxxx_1234",
-  "db_path": "D:\\AppData\\xwechat_files\\wxid_xxxx_xxxx",
+  "db_path": "C:\\Users\\<用户名>\\Documents\\xwechat_files\\wxid_xxxx_xxxx",
   "keys": { "session/session.db": "<64-hex enc_key>", "message/message_0.db": "<64-hex>" },
   "img_aes_key": "<16 位 hex>",
   "img_xor_key": "0x64"
@@ -162,12 +162,12 @@
 | `key` | 可选：每库统一 enc_key（`keys` 缺省时的单一密钥） |
 | `keys` | 可选：`db_storage` 相对路径 → 64-hex enc_key 映射（微信 4.x 每库独立密钥） |
 | `img_code` | 可选：WeFlow 兼容的图片密钥代号（由服务端派生 aes/xor） |
-| `img_aes_key` / `img_xor_key` | 可选：直接指定图片解密密钥（优先于 `img_code`） |
+| `img_aes_key` / `img_xor_key` | 可选：直接指定图片解密密钥（优先于 `img_code`）；**必须成对给**——只给其一会被当作未提供，静默回落到 `img_code` 派生，既不报错也不记日志 |
 
 响应：
 
 ```json
-{ "success": true, "wxid": "wxid_xxxx_1234", "state": "accepted", "status": "indexing", "db_storage": "D:\\AppData\\xwechat_files\\wxid_xxxx_1234\\db_storage" }
+{ "success": true, "wxid": "wxid_xxxx_1234", "state": "accepted", "status": "indexing", "db_storage": "C:\\Users\\<用户名>\\Documents\\xwechat_files\\wxid_xxxx_1234\\db_storage" }
 ```
 
 - `state`：注册结果语义（qqflow-server 风格）——`accepted`（已接受，开始后台构建）/ `already_ready`（重复注册，账号已就绪）/ `in_progress`（重复注册，正在构建中）/ `account_conflict`（本服务已绑定**另一个** wxid，拒绝注册）；
@@ -1105,7 +1105,7 @@ weflow-server.exe sessions --json        # 子命令面
   `test_watch_stream_is_not_bounded_by_the_json_read_timeout`（Python：断言 transport 实际收到的 per-request 值，
   不是只读常量）、`published_timeouts_match_the_documented_budgets`（三个常量的数值与大小关系）。
 - 鉴权走 `Authorization: Bearer`；客户端从不把 token 放进 URL（`/health` 是唯一免鉴权端点）。
-- 本轮**不发布** crates.io：本地 `cargo build -p weflow-client` 即可使用。
+- 自 0.9.0 起发布到 crates.io（crate `weflow-client`）；本地开发仍可直接 `cargo build -p weflow-client`。
 
 - **Python 侧**：`clients/python`（包 `weflow-sdk`）。模型生成走 `scripts/regen.py`
   （spec 经 Rust 生成工具的 `--dump-spec` 取得，绕开 golden 的占位掩码）；行为层是

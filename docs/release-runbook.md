@@ -144,9 +144,18 @@ powershell -File scripts/build.ps1 package --list --allow-dirty -p weflow-server
 # 核对两件事：
 # - SDK 包里必须有 Cargo.toml／README／LICENSE／src —— LICENSE 是这一轮才挪进打包范围的
 #   （原先放在 clients/ 下，在打包目录之外，crate 里其实没有许可证全文）。
-# - 根包按 git 跟踪文件收，会带上 docs／tests／.github 等；重点是**别**把本机参数文件
-#   （weflow-server.json，含真实库路径与密钥）带进去 —— 它未被 git 跟踪，所以不会出现在
-#   清单里，看到它就说明有人把它 add 了，立即停手。
+# - 根包按 git 跟踪文件收：除 docs／tests／.github／scripts 外，**`clients/python` 与 `clients/ts`
+#   整树也会进 .crate**（它们没有自己的 Cargo.toml，不算「子包」，cargo 的子包排除规则不适用；
+#   实测清单里 `clients/python/**` 占六十多行）。重点是**别**把本机参数文件
+#   （weflow-server.json，含真实库路径与密钥）带进去。** cargo 收的是「git 跟踪的文件
+#   ＋ 未跟踪但也没被 .gitignore 掉的文件」**（本机实测：临时放一个未跟踪的
+#   `zz-stray-probe.txt`，它照样出现在清单里）——所以「未跟踪」不等于「不会进包」，
+#   只有被 ignore 的才不会。看到参数文件出现在清单里，说明它要么被 add 了、要么
+#   没进 `.gitignore`，两种都得立即停手处理。
+#   本轮为此补了 `clients/python/.gitignore`（`dist/`、`.venv/`）：仓库根那条 `/dist`
+#   只锚定仓库根，管不到 `clients/python/dist`，而 `python -m build` 就在那里产出。
+#   实测补上后 `git check-ignore` 命中该规则，且 `python -m build` 出的 sdist 里
+#   `.venv` 条目为 0（sdist 共 62 个条目、wheel 122 KB，没有把 1 亿字节的本地虚拟环境带上）。
 # --allow-dirty 只让工作树有未提交改动时也能看清单，不改变打包内容。
 ```
 
