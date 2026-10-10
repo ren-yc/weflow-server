@@ -228,8 +228,10 @@ jobs:
     # 等人放行——PyPI 的 trusted publisher 也必须登记成这个环境名，否则换取凭据即失败。
     environment: pypi
     permissions:
-      contents: read  # 本作业只读仓库内容；写手是 release 作业
-      id-token: write # OIDC 短期凭据只对 pypa 的上传动作可见（本机不持有任何上传凭据）
+      contents: read    # 本作业只读仓库内容；写手是 release 作业
+      id-token: write   # OIDC 短期凭据只对 pypa 的上传动作可见（本机不持有任何上传凭据）
+      attestations: write # pypa 动作的 attestations 输入**默认为 true**（PEP 740 构建证明）；
+                          # 不给这个权限，上传步会在发完之后报错——比不给更糟的是失败点在半程。
     env:
       # 可选：不配时首发在本机做（见文件头注释与 runbook）；配了则 CI 代劳，下面的
       # 守卫自动改走发布路径。令牌走环境变量而不是 --token argv：后者会短暂出现在
