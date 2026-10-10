@@ -24,8 +24,9 @@ pypi.org → 账号 → Publishing → **Add trusted publisher** → 选 GitHub�
 
 首发之前只能用 **pending publisher**：项目还不存在，无法把权限限定到具体项目。
 首发成功后建议升级成绑定 `weflow-sdk` 的正式 publisher，并勾上 latest 标记
-（否则后续版本在页面上会被标成「非最新发布版」）。TestPyPI 预演同理：那边的
-pending publisher 的环境名要与 workflow 里 testpypi 一步所用的 environment 名一致。
+（否则后续版本在页面上会被标成「非最新发布版」）。
+**CI 里没有 TestPyPI 步骤**（只有一个上传到正式 PyPI 的动作），所以 TestPyPI 的
+预演在本机做（见「预演」一节），不需要在 test.pypi.org 登记 publisher。
 
 ### crates.io：新 crate 首发在本机做
 
@@ -75,6 +76,10 @@ cd .. && cargo publish --locked
 ## 预演
 
 ### PyPI（testpypi，本机）
+
+0.9.0 这一轮**已做过**（两仓的 wheel＋sdist 已在 test.pypi.org 上，且验证过可安装、
+可导入）。同一版本不能重复上传 testpypi，所以再预演时要么换个开发号（如
+`0.9.0.dev1`，试完还原），要么把 CI 也接上 TestPyPI 并给上传步加 `skip-existing`。
 
 ```
 cd clients/python
