@@ -101,7 +101,7 @@ struct ContactsArgs {
     /// 进程内直读本地库，不经过 HTTP（仅只读查询类可用）
     #[arg(long)]
     embedded: bool,
-    /// 单页条数（服务端上限 200）
+    /// 单页条数（服务端上限 10000；MCP 工具层另有 200 的自限，不是同一个面）
     #[arg(long)]
     limit: Option<u32>,
     /// 起始偏移（翻页用）

@@ -51,8 +51,11 @@ publisher；或给本仓配一个 scoped 的 `CARGO_REGISTRY_TOKEN` secret（pub
 
 ## 正式发布流程
 
-1. 确认 `Cargo.toml` 根包与 `clients/rust` 版本一致，CHANGELOG 有对应段；
-   **并把 `## [0.9.0]` 的日期回填成实际发布日**（与 tag 同提交）——准备阶段写的是
+1. 版本号有**四处**要一起改，CI 只兜其中一处：`Cargo.toml`（根包）、`clients/rust/Cargo.toml`
+   （SDK crate）、`clients/python/pyproject.toml`（Python SDK）、`clients/ts/package.json`
+   （示例，不发 npm 但会渲染进页面）。guard 作业只比对 tag 与**根包**版本，SDK 与 pyproject
+   漏改不会有任何东西变红——它们会安静地把旧版本号发布出去（registry 不可撤销）。
+   `CHANGELOG.md` 的 `## [0.9.0]` 段日期**回填成实际发布日**并与 tag 同提交：准备阶段写的是
    准备日，Keep a Changelog 的段日期应当是发布日。
 2. 打 tag 并推送（Windows PowerShell 5.1 不认 `&&`，分两行跑）：
    `git tag v0.9.0` ＋ `git push origin v0.9.0`。
@@ -70,6 +73,18 @@ publisher；或给本仓配一个 scoped 的 `CARGO_REGISTRY_TOKEN` secret（pub
 里整块执行**（`curl.exe` 在 Windows 上是真 curl，不是 PowerShell 别名）；cargo 一律走包装脚本——
 它负责定位 MSVC 环境，直接跑 cargo 会在 vendored OpenSSL 上失败（`publish` 子命令不在注入
 `--features testing` 的名单里，那条注入只服务 test/clippy）。
+
+这两条命令**刻意不带** `--allow-dirty`：首发要发的就是提交里的那份内容，工作树有未提交改动时
+应当先提交再发。被挡住时 cargo 的原话是（实测，逐字）：
+
+> `error: 3 files in the working directory contain changes that were not yet committed into git:`
+> 后跟文件清单，再跟 `to proceed despite this and include the uncommitted changes, pass the`
+> ``--allow-dirty` flag`
+
+那是它在替你把关，别用 `--allow-dirty` 绕过。**作用域不对称**（实测）：脏检查以**各 package
+自己的目录**为界——根包的 package root 就是仓库根，因此根级任何未提交跟踪文件（包括本手册）
+都会挡住它；而 `-p <仓名>-client` 的根在 `clients/rust`，仓库根有未提交改动时那一步照样通过
+（实测退出码 0）。所以**别把「SDK 那步没报错」当成工作树干净**，两都要看过。
 
 ```powershell
 powershell -File scripts/build.ps1 publish --locked -p weflow-client

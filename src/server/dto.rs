@@ -223,9 +223,10 @@ pub struct ChatlabMessage {
 
 /// `message.new` 事件载荷。
 ///
-/// **`media` 是第三种媒体形状**：只有 `type` / `fileName` / `md5` —— 推送里不含任何路径
-/// 与取字节用的键（字节走 REST 的 `media=1` 导出），也**永远不含**解密密钥。推一个取不到
-/// 的地址只会让客户端误以为有东西可拿。
+/// **`media` 是第三种媒体形状**：`type` / `fileName` / `md5`，外加**出现即可取**的
+/// `mediaId`（单段路由 `GET /api/v1/media/{id}` 用它取字节）。推送里**不含任何本地路径**，
+/// 也**永远不含**解密密钥 —— 通告一个取不到的地址只会让客户端误以为有东西可拿，所以
+/// `mediaId` 是条件键：导出根下确有该文件时才出现。
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EventNew {

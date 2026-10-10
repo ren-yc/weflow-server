@@ -71,17 +71,20 @@ bash 或 Python 3 缺失时，钩子**报错并阻止提交**（而非放行）�
 
 ## 发布
 
-版本号以 `Cargo.toml` 为唯一来源：`-V`/`--version` 与运行时版本信息均编译自 `env!("CARGO_PKG_VERSION")`，
+版本号以 `Cargo.toml` 为准（根包与 `clients/rust` 两处都要改）：`-V`/`--version` 与运行时版本信息均编译自 `env!("CARGO_PKG_VERSION")`，
 不要在其他文件里再写一遍版本号。推送 `v<版本>` tag 后，GitHub Actions（`.github/workflows/release.yml`）
 自动在 Windows / Linux / macOS 三平台构建 release 二进制，校验 tag 与 `Cargo.toml` 版本一致后，
 打包为 `weflow-server-<版本>-<平台目标>` 归档并附 `SHA256SUMS` 发布到 GitHub Release。
 
-```bash
-cargo install cargo-edit            # 一次性；提供 cargo set-version
-cargo set-version 0.1.1             # 或手动编辑 Cargo.toml 的 version 字段
-git commit -am "chore: release v0.1.1"
-git tag v0.1.1 && git push origin master --tags   # tag 触发自动发布
-```
+发版步骤以 [`docs/release-runbook.md`](docs/release-runbook.md) 为唯一权威（凭据模型、
+首发顺序、人工审批闸门都在那里）。这里不复述流程——复述过就会漂移：被替换掉的那段
+示例里，版本号停在 0.1.1，而仓库已经发到 v0.7.0（第 11 个 tag）。要点三句：
+
+- 版本号在 `Cargo.toml`（根包与 `clients/rust`）与 `clients/python/pyproject.toml` 三处声明，
+  必须同步；tag 与根包版本不一致时 CI 的 guard 直接失败。
+- 推送 `v<版本>` tag 触发发布链；不可撤销的 registry 上传排在人工审批之后。
+- CI 的 guard **只**比对 tag 与根包版本（`cargo metadata` 取 `weflow-server` 一条）；
+  `clients/rust` 与 `clients/python` 的版本没有门禁兜着，漏改不会有人拦——手册第 1 步就是干这个的。
 
 ## 运行
 
@@ -100,7 +103,7 @@ git tag v0.1.1 && git push origin master --tags   # tag 触发自动发布
 `--media-export-dir`（默认 `<data-dir>/api-media`）/ `--base-url`。
 
 子命令面（`cli` feature，默认开）：**裸跑仍等于 `serve`**，上面那种写法一个字符都不用改。
-另有 `serve` / `token` / `sessions` / `messages` / `search` / `contacts` / `accounts` / `sync`，默认走 HTTP 并
+另有 `serve` / `token` / `sessions` / `messages` / `search` / `contacts` / `accounts` / `sync` / `export`，默认走 HTTP 并
 复用本仓库的 Rust SDK；`--json` 出机器可读形状，`--embedded` 只对只读查询类开放。退出码 `0`/`1`/`2` =
 成功／运行期错误／用法错误。`--no-default-features` 时整面消失（`clap` 与 SDK 都不进依赖树）。
 详见 `docs/weflow-server-api.md` 的「命令行子命令」一节。
@@ -163,7 +166,7 @@ bash scripts/build.sh test --test downstream_client -- --ignored --nocapture
 ```
 
 下游客户端模拟走真实 HTTP 层：零账号启动 → `POST /api/v1/accounts` 注册 → 等待索引
-就绪 → 覆盖五种鉴权传输、GET/POST 参数、ChatLab Pull 全量翻页排空、联系人分页、
+就绪 → 覆盖两条鉴权传输（Bearer 与 `?access_token=`）、GET/POST 参数、ChatLab Pull 全量翻页排空、联系人分页、
 群成员、媒体导出与取回、SNS、SSE。
 
 ## 目录结构
@@ -180,7 +183,7 @@ src/
 ├─ parser/                     # 消息内容解析（XML / zstd / 类型占位符 / 引用 / 撤回）
 ├─ store/                      # 内存索引（会话/联系人/消息/水位）+ 查询
 ├─ sync/                       # 实时同步引擎（poll + 事件）+ watch（notify 防抖/兜底）
-└─ server/                     # axum：鉴权五通道、账号注册、HTTP 端点、SSE、媒体直服
+└─ server/                     # axum：鉴权两条通道、账号注册、HTTP 端点、SSE、媒体直服
 tests/
 ├─ common/                     # SQLCipher 假库夹具（微信同构布局 + 造数 + WAL）
 ├─ wcdb_roundtrip.rs           # 互操作仲裁：sqlcipher 造库 → 本实现解密 → SQLite 重开

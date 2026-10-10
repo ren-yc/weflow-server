@@ -499,7 +499,7 @@
         "type": "object"
       },
       "EventNew": {
-        "description": "`message.new` 事件载荷。\n\n**`media` 是第三种媒体形状**：只有 `type` / `fileName` / `md5` —— 推送里不含任何路径\n与取字节用的键（字节走 REST 的 `media=1` 导出），也**永远不含**解密密钥。推一个取不到\n的地址只会让客户端误以为有东西可拿。",
+        "description": "`message.new` 事件载荷。\n\n**`media` 是第三种媒体形状**：`type` / `fileName` / `md5`，外加**出现即可取**的\n`mediaId`（单段路由 `GET /api/v1/media/{id}` 用它取字节）。推送里**不含任何本地路径**，\n也**永远不含**解密密钥 —— 通告一个取不到的地址只会让客户端误以为有东西可拿，所以\n`mediaId` 是条件键：导出根下确有该文件时才出现。",
         "properties": {
           "content": {
             "type": "string"
