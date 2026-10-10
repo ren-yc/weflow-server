@@ -313,4 +313,6 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: clients/python/dist/
+          # 与上面 crates.io 侧的守卫同一目的：重跑作业不该因为「这版本已发过」而红。
+          skip-existing: true
 
