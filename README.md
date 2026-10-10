@@ -71,8 +71,8 @@ bash 或 Python 3 缺失时，钩子**报错并阻止提交**（而非放行）�
 
 ## 发布
 
-版本号以 `Cargo.toml` 为准（根包与 `clients/rust` 两处都要改）：`-V`/`--version` 与运行时版本信息均编译自 `env!("CARGO_PKG_VERSION")`，
-不要在其他文件里再写一遍版本号。推送 `v<版本>` tag 后，GitHub Actions（`.github/workflows/release.yml`）
+`-V`/`--version` 与运行时版本信息都编译自 `env!("CARGO_PKG_VERSION")`，所以**Rust 侧的版本号只有 `Cargo.toml`（根包与 `clients/rust` 两处）说了算**；
+Python/ts 各是自己的声明、不读 Cargo.toml，完整清单与同步要求见 `docs/release-runbook.md` 第 1 步。推送 `v<版本>` tag 后，GitHub Actions（`.github/workflows/release.yml`）
 自动在 Windows / Linux / macOS 三平台构建 release 二进制，校验 tag 与 `Cargo.toml` 版本一致后，
 打包为 `weflow-server-<版本>-<平台目标>` 归档并附 `SHA256SUMS` 发布到 GitHub Release。
 
