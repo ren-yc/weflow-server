@@ -94,7 +94,9 @@ pub fn parse_db_key(raw: &str) -> anyhow::Result<DbKey> {
 }
 
 /// An optional image-decryption code supplied at registration time
-/// (`img_code`). Derives `xorKey = code & 0xff` and
+/// (`img_code`). Derives `xorKey` = the **first byte of the code read as a byte
+/// string** — NOT an integer `code & 0xff` (`ImgCode("0")` yields 0x30, the ASCII
+/// digit; pinned by `img_code_derivation_matches_weflow`), and
 /// `aesKey = MD5(code + wxid)[..16]` for `.dat` V2 files.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImgCode(pub String);

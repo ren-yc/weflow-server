@@ -51,17 +51,32 @@ publisher；或给本仓配一个 scoped 的 `CARGO_REGISTRY_TOKEN` secret（pub
 
 ## 正式发布流程
 
-1. 版本号有**四处**要一起改，CI 只兜其中一处：`Cargo.toml`（根包）、`clients/rust/Cargo.toml`
-   （SDK crate）、`clients/python/pyproject.toml`（Python SDK）、`clients/ts/package.json`
-   （示例，不发 npm 但会渲染进页面）。guard 作业只比对 tag 与**根包**版本，SDK 与 pyproject
-   漏改不会有任何东西变红——它们会安静地把旧版本号发布出去（registry 不可撤销）。
+1. 版本号有**五处**要一起改，CI 的 guard 只兜第一处（根包）：`Cargo.toml`（根包）、
+   `clients/rust/Cargo.toml`（SDK crate）、`clients/python/pyproject.toml`（Python SDK）、
+   `clients/ts/package.json` ＋ `clients/ts/package-lock.json`（示例，不发 npm 但进页面与包）。
+   另有**三类生成物内嵌版本号**不能手改、只能靠重新生成对齐：`clients/rust/src/generated/gen.rs`、
+   `clients/python/src/*_sdk/generated/**`（spec.json ＋ 每个模块 docstring）、
+   `tests/golden/openapi.json`。改完版本号**必须**重跑两仓 regen ＋ golden（`UPDATE_GOLDEN=1`）——
+   否则 `regen --check` 与快照比对会在 push 时红，那正是版本链完整性的唯一机器判据。
    `CHANGELOG.md` 的 `## [0.9.0]` 段日期**回填成实际发布日**并与 tag 同提交：准备阶段写的是
    准备日，Keep a Changelog 的段日期应当是发布日。
-2. 打 tag 并推送（Windows PowerShell 5.1 不认 `&&`，分两行跑）：
-   `git tag v0.9.0` ＋ `git push origin v0.9.0`。
+2. **先 `git push origin master`、等那条 check 变绿，再打 tag**——这一步不能省，也不能只推 tag。
+   `check.yml` 的触发是 `push: branches: [master]`，**推 tag 不触发它**；而 release 链的 quality-gate
+   只有 clippy＋test＋契约 nails，比 check.yml 少十几道门（编号引用扫描、公共段哈希、embed 例子、
+   **Rust/Python 的 regen --check**、typed SDK 测试、ruff、构建脚本透传测试、完整契约套件）。
+   regen --check 那道守的是「陈旧的 gen.rs／Python 生成树被不可撤销地发上 registry」——本流程里
+   最能安静发错东西的口子，且 tag 链**不跑**它。所以顺序固定为：
+   `git push origin master` → 等 check 绿（它跑的就是 tag 将要指向的提交）→
+   `git tag v0.9.0` ＋ `git push origin v0.9.0`（Windows PowerShell 5.1 不认 `&&`，分两行）。
 3. CI 跑到 publish 时停在环境审批 → 你放行。作业内部顺序：先 SDK crate、轮询
    crates.io 稀疏索引确认条目可见、再发根包（根包的依赖声明带 `version`，registry
    上必须先有那个版本的 SDK）；PyPI 侧构建 wheel＋sdist 后用 pypa 官方动作上传。
+   **首次发新 crate 时，这个 publish 作业必定在 SDK 那一步红**：本仓刻意不在 CI 里放
+   crates.io 长期凭据（`CARGO_REGISTRY_TOKEN` 未配置），新 crate 的首发按 crates.io 的要求
+   只能本机手工做一次。红的这步会打印下一步指引；此时 **GitHub Release 已经建好并公开**
+   （release 作业排在 publish 之前），而 crates.io/PyPI 还什么都没有——这是**预期状态**，
+   不是事故。照「首发（本机）」一节发完两个 crate，再**重跑这个失败的 publish 作业**，
+   幂等守卫会跳过已上架的、继续往下走。
 4. 核对：crates.io 两个 crate 页、PyPI 项目页、GitHub Release 三平台产物。
 5. 发布后：重建 sdk-dist 供应分支——
    `git subtree split -P clients/python/src/weflow_sdk -b sdk-dist` ＋
@@ -177,3 +192,25 @@ PyPI 侧**默认没有本机兜底**：本仓按设计不保存任何长期上�
   `weflow-sdk` 当时都是 404。**临近发布日请重测一次**。
 - 本地只发布到 testpypi；正式 PyPI 一律由 CI 执行（OIDC，无人持有 token）。
 - CI 的 publish 作业对「已发布过」是幂等的（跳过而非报错），因此**重跑作业是安全的**。
+  PyPI 侧同理：pypa 动作带 `skip-existing`，上传中途失败重跑会跳过已传的文件、补齐其余的。
+  **唯一的例外**：若某个 dist 是用**别的路径**（本机 `twine upload`、或曾关掉 attestations）
+  传上去的，重跑会永久跳过它、不再补构建证明——所以正式 PyPI 一律走 CI，别在本机补传。
+- **其余不可逆点**（除 registry 外）：`git tag v0.9.0` 推上去后删/移得干净、但 GitHub Release
+  的资产不会随之消失；`release` 作业在 publish **之前**就把 Release 建好并公开了（见上）；
+  sdk-dist 供应分支的 `--force-with-lease` 是重写历史。三者都不像 registry 那样不可撤，
+  但都会留下公开痕迹，动手前想清楚。
+
+## tag 之后 CI 红了怎么办
+
+按触发顺序，越靠前越该停下来修、而不是硬着头皮往下发：
+
+- **guard 红**（tag 与根包版本不一致）：说明 tag 打错或版本号没对齐。此时**什么都没发布**、
+  Release 也还没建。改正提交 → `git push origin master` → 等 check 绿 → 删旧 tag 重打：
+  `git tag -d v0.9.0` ＋ `git push origin :refs/tags/v0.9.0`（PowerShell 里删远端 tag 用冒号路径，
+  不是 `--delete v0.9.0` 那种写法也行但冒号式最稳）→ 再按第 2 步打 tag 推 tag。
+- **quality-gate / build / release 红**：同上去掉那个 tag、修好、重推。**别**在红的中间态
+  去手工补发 registry——那样 GitHub Release 与 registry 会长期不一致。
+- **publish 红在 crates.io SDK 步**（首次新 crate）：按「首发（本机）」发完，重跑该作业即可。
+- **publish 红在 PyPI 上传步**：先分清是「OIDC 换凭据失败」（多半是 pypi.org 的 pending
+  publisher 没登记，或 environment 名不是 `pypi`／workflow 名不是 `release.yml`）还是
+  「上传本身失败」。前者去 pypi.org 补登记后重跑；后者直接重跑（`skip-existing` 兜幂等）。

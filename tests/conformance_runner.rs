@@ -6,8 +6,9 @@
 //!   cargo test --locked --test conformance_runner -- --ignored --nocapture
 //!
 //! 需要环境变量 `FLOW_CONTRACT_DIR` 指向契约仓库的检出（CI 会按 pin 的 tag clone）。
-//! 没有它时本测试**跳过并通过**，这样在没检出契约仓库的开发机上 `cargo test` 依然全绿 ——
-//! 而 CI 上它一定会跑（那里一定有）。
+//! **缺它就是失败，不是静默跳过**（判据见本文件 `contract_dir()` 处的 panic）——「没检出契约
+//! 仓库于是整套跳过、依然全绿」正是最危险的失效方式：一个端点都没被验过，报表却好看。
+//! 开发机上想跳过整套请显式 `cargo test -- --skip conformance`，而不是让它假装通过。
 //!
 //! ## 为什么自己构造 `AppState` 而不是跑服务端二进制
 //!

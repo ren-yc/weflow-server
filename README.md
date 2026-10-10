@@ -80,8 +80,8 @@ bash 或 Python 3 缺失时，钩子**报错并阻止提交**（而非放行）�
 首发顺序、人工审批闸门都在那里）。这里不复述流程——复述过就会漂移：被替换掉的那段
 示例里，版本号停在 0.1.1，而仓库已经发到 v0.7.0（第 11 个 tag）。要点三句：
 
-- 版本号在 `Cargo.toml`（根包与 `clients/rust`）与 `clients/python/pyproject.toml` 三处声明，
-  必须同步；tag 与根包版本不一致时 CI 的 guard 直接失败。
+- 版本号不止 `Cargo.toml`：完整清单（含 ts 示例与**必须重新生成**的生成物）以手册第 1 步为准。
+  tag 与根包版本不一致时 CI 的 guard 直接失败——但 guard **只**看根包，其余各漏改不会有人拦。
 - 推送 `v<版本>` tag 触发发布链；不可撤销的 registry 上传排在人工审批之后。
 - CI 的 guard **只**比对 tag 与根包版本（`cargo metadata` 取 `weflow-server` 一条）；
   `clients/rust` 与 `clients/python` 的版本没有门禁兜着，漏改不会有人拦——手册第 1 步就是干这个的。
@@ -117,8 +117,8 @@ curl -X POST http://127.0.0.1:5033/api/v1/accounts \
 ```
 
 每库独立密钥时传 `keys` 映射（相对路径 → 64hex），至少 session.db 的 key 必须匹配
-（用于 page-1 HMAC 校验）。可选 `img_code` 用于图片 `.dat` 解密（xorKey=code&0xff，
-aesKey=MD5(code+wxid)[:16]），或直接指定 `img_aes_key`/`img_xor_key`（推荐）。
+（用于 page-1 HMAC 校验）。可选 `img_code` 用于图片 `.dat` 解密（xorKey=code 的**首个字节**（按字节串处理，
+不是整数码掩码：`"0"` 得 0x30），aesKey=MD5(code+wxid)[:16]），或直接指定 `img_aes_key`/`img_xor_key`（推荐）。
 密钥错误时账号进入 `error` 状态，重新注册即可恢复。
 
 注册响应带真实状态：`{"state":"accepted","status":"indexing",...}`（后随 `ready`）。**强制单账号**：
