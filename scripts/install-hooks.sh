@@ -44,7 +44,9 @@ fi
 # 不能只靠 command -v：Windows 上 python3 常被应用执行别名占据，命令存在但不能用。
 # python 优先于 python3 是刻意的：那个别名 stub 在环境变量缺失的进程里运行时，
 # 会在当前目录下创建字面命名的垃圾目录树（把注册表里未展开的 %SystemDrive% 路径
-# 当成相对路径写盘）；排在循环末尾可以让常规机器永远不触到它。
+# 当成相对路径写盘）；排在循环末尾是**缓解**而非根除——若连真 python 也被
+# WindowsApps 的 stub 占据（机器上没有任何真实 Python），它仍会被执行，
+# 此时靠下一行的版本校验判它不可用。
 py=""
 for candidate in "$PYTHON" python python3; do
     [ -n "$candidate" ] || continue

@@ -894,7 +894,7 @@ feeds 条目字段（以源码 `sns.rs` 为准）：`tid/userName/content(明文
 
 ## 命令行子命令（`cli` feature）
 
-同一个二进制带一个子命令面。**默认 feature 是 `["server", "cli"]`**，所以 `cargo install weflow-server`
+同一个二进制带一个子命令面。**默认 feature 是 `["server", "cli", "mcp"]`**，所以 `cargo install weflow-server`
 装出来即有；`--no-default-features` 时整面消失（连 `clap` 与 SDK 都不进依赖树）。
 
 **兼容口径（重要）**：

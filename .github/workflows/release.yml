@@ -207,14 +207,22 @@ jobs:
             artifacts/SHA256SUMS
           generate_release_notes: true
           fail_on_unmatched_files: true
-  # crates.io / PyPI 首发通道（v0.9.0 起）。依赖完整质量门＋三平台构建，任何一步红
-  # 都不发布。凭据来自 Repo secrets（CARGO_REGISTRY_TOKEN / PYPI_TOKEN_WEFLOW，
-  # 配置步骤见本仓 docs/release-runbook.md）；密钥缺失时本作业会立即失败——
-  # 那是部署配置问题，不是代码问题。
+  # crates.io / PyPI 首发通道（v0.9.0 起）。依赖完整质量门＋三平台构建＋GitHub Release
+  # （needs 含 release：发布不可撤销，别在 Release 产物没齐时先把包发出去），任何一步
+  # 红都不发布。凭据来自 Repo secrets（CARGO_REGISTRY_TOKEN / PYPI_TOKEN_WEFLOW，配置
+  # 步骤见 docs/release-runbook.md）；密钥缺失时本作业立即失败——那是部署配置问题。
+  # 每步 publish 前都先查「这个版本是否已在 registry」：不可撤销的发布遇到失败重跑时，
+  # 没有这道守卫就会撞 already-uploaded、把后面的步骤（含 PyPI）永远卡死。
   publish:
     name: Publish to crates.io and PyPI
-    needs: [build]
+    needs: [guard, build, release]
     runs-on: ubuntu-latest
+    timeout-minutes: 60 # 根包 publish 会 verify 整包（含 vendored OpenSSL），比 SDK 慢一个量级
+    permissions:
+      contents: read # 本作业只读仓库内容；写手是 release 作业
+    env:
+      # token 走环境变量而不是 --token argv：后者会短暂出现在 runner 的进程列表里。
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
       - uses: actions/checkout@v5
 
@@ -225,13 +233,43 @@ jobs:
       # 存在该版本才发布得出去。
       - name: Publish Rust SDK to crates.io
         working-directory: clients/rust
-        run: cargo publish --locked --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+        env:
+          CRATE: weflow-client
+          VERS: ${{ needs.guard.outputs.version }}
+        run: |
+          # crates.io 的 API 对无 User-Agent 的请求一律 403（会误判成「没发布过」），必须带。
+          if curl -sf -A "flow-release-guard" "https://crates.io/api/v1/crates/${CRATE}/${VERS}" >/dev/null; then
+            echo "::notice::${CRATE} ${VERS} 已发布过，跳过（幂等重跑）"
+          else
+            cargo publish --locked
+          fi
 
-      - name: Wait for crates.io index to settle
-        run: sleep 30
+      # 上传成功 ≠ 可解析：稀疏索引经 CDN 传播有窗口，根包 verify 要解析 SDK；轮询到
+      # 条目可见为止（上限 5 分钟），而不是靠一个没有依据的固定 sleep。
+      - name: Wait for the sparse index to expose the SDK
+        env:
+          CRATE: weflow-client
+          VERS: ${{ needs.guard.outputs.version }}
+        run: |
+          path="https://index.crates.io/${CRATE:0:2}/${CRATE:2:2}/${CRATE}"
+          for _ in $(seq 1 60); do
+            if curl -sf -A "flow-release-guard" "$path" | grep -q "\"vers\":\"${VERS}\""; then exit 0; fi
+            sleep 5
+          done
+          echo "::error::${VERS} 五分钟内未出现在稀疏索引里；根包发布无法安全继续"
+          exit 1
 
       - name: Publish server root to crates.io
-        run: cargo publish --locked --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+        env:
+          CRATE: weflow-server
+          VERS: ${{ needs.guard.outputs.version }}
+        run: |
+          # crates.io 的 API 对无 User-Agent 的请求一律 403（会误判成「没发布过」），必须带。
+          if curl -sf -A "flow-release-guard" "https://crates.io/api/v1/crates/${CRATE}/${VERS}" >/dev/null; then
+            echo "::notice::${CRATE} ${VERS} 已发布过，跳过（幂等重跑）"
+          else
+            cargo publish --locked
+          fi
 
       - name: Set up Python for PyPI build
         uses: actions/setup-python@v5
@@ -245,11 +283,17 @@ jobs:
           python -m build
           twine check dist/*
 
+      # PyPI 同样先查重：0.9.0 已上架时跳过，不撞 already exists。
       - name: Upload Python SDK to PyPI
         working-directory: clients/python
-        run: >
-          twine upload --non-interactive --disable-progress-bar dist/*
+        run: |
+          if curl -sf "https://pypi.org/pypi/weflow-sdk/${VERS}/json" >/dev/null; then
+            echo "::notice::weflow-sdk ${VERS} 已发布过，跳过（幂等重跑）"
+          else
+            twine upload --non-interactive --disable-progress-bar dist/*
+          fi
         env:
+          VERS: ${{ needs.guard.outputs.version }}
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN_WEFLOW }}
 
