@@ -23,8 +23,11 @@ pypi.org → 账号 → Publishing → **Add trusted publisher** → 选 GitHub�
 - **Environment** `pypi`（与上面的 GitHub 环境同名；写成别的名字换不到凭据）
 
 首发之前只能用 **pending publisher**：项目还不存在，无法把权限限定到具体项目。
-首发成功后建议升级成绑定 `weflow-sdk` 的正式 publisher，并勾上 latest 标记
-（否则后续版本在页面上会被标成「非最新发布版」）。
+**首次成功上传后它会自动变成绑定该项目的正式 publisher，不需要再配置**（PyPI 官方
+文档明确如此）。两点注意：① pending publisher **不预留名字**——正式发布前若项目名
+被他人注册，这条 pending 记录失效；② 表单字段＝**项目名**（pending 特有：项目还不
+存在，得告诉 PyPI 要创建哪个项目）＋ Owner／Repository／Workflow name／Environment，
+**没有 latest 之类的开关**（「是否最新发布版」由 PyPI 按版本号与 pre-release 标记自行判定）。
 **CI 里没有 TestPyPI 步骤**（只有一个上传到正式 PyPI 的动作），所以 TestPyPI 的
 预演在本机做（见「预演」一节），不需要在 test.pypi.org 登记 publisher。
 
