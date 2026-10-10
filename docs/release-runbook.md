@@ -100,7 +100,7 @@ publisher；或给本仓配一个 scoped 的 `CARGO_REGISTRY_TOKEN` secret（pub
 那是它在替你把关，别用 `--allow-dirty` 绕过。**作用域不对称**（实测）：脏检查以**各 package
 自己的目录**为界——根包的 package root 就是仓库根，因此根级任何未提交跟踪文件（包括本手册）
 都会挡住它；而 `-p <仓名>-client` 的根在 `clients/rust`，仓库根有未提交改动时那一步照样通过
-（实测退出码 0）。所以**别把「SDK 那步没报错」当成工作树干净**，两都要看过。
+（实测退出码 0）。所以**别把「SDK 那步没报错」当成工作树干净**：两步都要各自确认，根包那步才是真正会挡你的地方。
 
 ```powershell
 powershell -File scripts/build.ps1 publish --locked -p weflow-client
