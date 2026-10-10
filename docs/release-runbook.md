@@ -54,7 +54,8 @@ publisher；或给本仓配一个 scoped 的 `CARGO_REGISTRY_TOKEN` secret（pub
 1. 确认 `Cargo.toml` 根包与 `clients/rust` 版本一致，CHANGELOG 有对应段；
    **并把 `## [0.9.0]` 的日期回填成实际发布日**（与 tag 同提交）——准备阶段写的是
    准备日，Keep a Changelog 的段日期应当是发布日。
-2. `git tag v0.9.0 && git push origin v0.9.0`。
+2. 打 tag 并推送（Windows PowerShell 5.1 不认 `&&`，分两行跑）：
+   `git tag v0.9.0` ＋ `git push origin v0.9.0`。
 3. CI 跑到 publish 时停在环境审批 → 你放行。作业内部顺序：先 SDK crate、轮询
    crates.io 稀疏索引确认条目可见、再发根包（根包的依赖声明带 `version`，registry
    上必须先有那个版本的 SDK）；PyPI 侧构建 wheel＋sdist 后用 pypa 官方动作上传。
@@ -65,13 +66,21 @@ publisher；或给本仓配一个 scoped 的 `CARGO_REGISTRY_TOKEN` secret（pub
 
 ## 首发（本机，只做一次）
 
-新 crate 的首发。顺序＝先 SDK 后根包（根包要解析 registry 上的 SDK 版本）。**全程在仓库根执行**，
-且 cargo 一律走包装脚本——它负责定位 MSVC 环境，直接跑 cargo 会在 vendored OpenSSL 上失败
-（`publish` 子命令不会被注入 `--features testing`，那条注入只服务 test/clippy）：
+新 crate 的首发。顺序＝先 SDK 后根包（根包要解析 registry 上的 SDK 版本）。**在仓库根、PowerShell
+里整块执行**（`curl.exe` 在 Windows 上是真 curl，不是 PowerShell 别名）；cargo 一律走包装脚本——
+它负责定位 MSVC 环境，直接跑 cargo 会在 vendored OpenSSL 上失败（`publish` 子命令不在注入
+`--features testing` 的名单里，那条注入只服务 test/clippy）。
 
-```
+```powershell
 powershell -File scripts/build.ps1 publish --locked -p weflow-client
-until curl -sf -A flow-release-guard https://index.crates.io/we/fl/weflow-client | grep -q '"vers":"0.9.0"'; do sleep 5; done
+# 轮询稀疏索引到条目可见（上传成功≠可解析；上限 5 分钟）。
+$idx = 'https://index.crates.io/we/fl/weflow-client'
+for ($i = 0; $i -lt 60; $i++) {
+  $hit = (curl.exe -s -A flow-release-guard $idx) | Select-String -SimpleMatch '"vers":"0.9.0"'
+  if ($hit) { break }
+  Start-Sleep -Seconds 5
+}
+if (-not $hit) { throw 'weflow-client 0.9.0 五分钟内未出现在稀疏索引里，根包发布无法继续' }
 powershell -File scripts/build.ps1 publish --locked -p weflow-server
 ```
 
@@ -87,38 +96,63 @@ powershell -File scripts/build.ps1 publish --locked -p weflow-server
 可导入）。同一版本不能重复上传 testpypi，所以再预演时要么换个开发号（如
 `0.9.0.dev1`，试完还原），要么把 CI 也接上 TestPyPI 并给上传步加 `skip-existing`。
 
-```
-cd clients/python
+```powershell
+Push-Location clients/python
 python -m build
 twine check dist/*
 twine upload --repository testpypi dist/*
 pip install --index-url https://test.pypi.org/simple/ --no-deps weflow-sdk==0.9.0
+Pop-Location
 ```
 
-### crates.io（本机，只打包不上传）
+### crates.io（本机，只列清单不上传）
 
-```
-cd clients/rust && cargo package --list --allow-dirty
+```powershell
+powershell -File scripts/build.ps1 package --list --allow-dirty -p weflow-client
+powershell -File scripts/build.ps1 package --list --allow-dirty -p weflow-server
+# 核对两件事：
+# - SDK 包里必须有 Cargo.toml／README／LICENSE／src —— LICENSE 是这一轮才挪进打包范围的
+#   （原先放在 clients/ 下，在打包目录之外，crate 里其实没有许可证全文）。
+# - 根包按 git 跟踪文件收，会带上 docs／tests／.github 等；重点是**别**把本机参数文件
+#   （weflow-server.json，含真实库路径与密钥）带进去 —— 它未被 git 跟踪，所以不会出现在
+#   清单里，看到它就说明有人把它 add 了，立即停手。
+# --allow-dirty 只让工作树有未提交改动时也能看清单，不改变打包内容。
 ```
 
-在仓库根执行同样命令可核对根包清单。**注意**：`cargo publish --dry-run` 对根包在
+仓库根对两个 package 都用 `-p` 选包，不必切进子目录。**注意**：`cargo publish --dry-run` 对根包在
 SDK 真上架前必然失败——它按发布后的清单解析依赖，那时 registry 上还没有
 `weflow-client = "0.9.0"`。这不是缺陷，是发布顺序的直接后果。
 
 ## 人工兜底（CI publish 不可用时）
 
-**仓库根执行**；每一步之前先查该版本是否已上架（两个索引都拒绝重复版本），cargo 走包装脚本：
+**仓库根、PowerShell 里整块执行**；每一步之前先查该版本是否已上架（两个索引都拒绝重复版本），
+cargo 走包装脚本。`Invoke-WebRequest` 遇 404 会**抛异常**，故用 try/catch 把状态码折出来——
+不折的话，版本未上架（首发时正是如此）会把脚本打断。
 
-```
-curl -s -o NUL -w '%{http_code}\n' -A flow-release-guard https://crates.io/api/v1/crates/weflow-client/0.9.0
-powershell -File scripts/build.ps1 publish --locked -p weflow-client    # 上一步 200 则跳过
-until curl -sf -A flow-release-guard https://index.crates.io/we/fl/weflow-client | grep -q '"vers":"0.9.0"'; do sleep 5; done
-powershell -File scripts/build.ps1 publish --locked -p weflow-server    # 同上，先查根包
+```powershell
+# 先查该版本是否已上架（200＝已上架，跳过本步）；未配置凭据时 cargo publish 会响亮失败。
+foreach ($crate in 'weflow-client', 'weflow-server') {
+  $code = try {
+    (Invoke-WebRequest -UseBasicParsing -Headers @{ 'User-Agent' = 'flow-release-guard' }
+      "https://crates.io/api/v1/crates/$crate/0.9.0").StatusCode
+  } catch { [int]$_.Exception.Response.StatusCode }
+  if ($code -eq 200) { Write-Host "$crate 0.9.0 已上架，跳过"; continue }
+  powershell -File scripts/build.ps1 publish --locked -p $crate
+  if ($crate -eq 'weflow-client') {   # 根包要等 SDK 在索引里可见
+    for ($i = 0; $i -lt 60; $i++) {
+      $hit = (curl.exe -s -A flow-release-guard https://index.crates.io/we/fl/weflow-client) |
+        Select-String -SimpleMatch '"vers":"0.9.0"'
+      if ($hit) { break }
+      Start-Sleep -Seconds 5
+    }
+    if (-not $hit) { throw 'SDK 未在索引出现，中止（别在解析不到依赖时发根包）' }
+  }
+}
 ```
 
 PyPI 侧**默认没有本机兜底**：本仓按设计不保存任何长期上传凭据（`~/.pypirc` 只有
 `[testpypi]`，正式 PyPI 由 CI 走 OIDC 发）。真要本机补发，得先在 `~/.pypirc` 补一个
-`[pypi]` 段与对应 token，再执行 `cd clients/python; twine upload dist/*`（先查
+`[pypi]` 段与对应 token，再进 `clients/python` 执行 `twine upload dist/*`（先查
 `pypi.org/pypi/weflow-sdk/0.9.0/json`）；用完请撤掉该凭据，别让它长期躺在本机。
 
 ## 注意
