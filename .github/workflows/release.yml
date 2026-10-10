@@ -90,7 +90,25 @@ jobs:
         if: runner.os != 'Windows'
         run: bash scripts/build.sh test --locked
 
+      # 与上面 clippy／test 两步同一成对模式：**Windows 必须走 build.ps1**。
+      # 这一步刚加进 release 链时只有单一 bash 形态，第一次 tag 运行就在 windows 上红了：
+      # Git Bash 自带的 MSYS perl 缺 Locale::Maketext::Simple，vendored OpenSSL 的 Configure
+      # 直接失败（本机复现同一报错，退出码 101；而 powershell -File scripts/build.ps1 同一条
+      # 命令在 Windows 上通过）——build.sh 不负责 MSVC／Strawberry Perl 环境，这是本仓的硬前置。
       - name: conformance nails (contract data invariants)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          pin="$(tr -d '[:space:]' < conformance.pin)"
+          git clone --depth 1 --branch "$pin" https://github.com/ren-yc/flow-contract.git conformance-nails
+          # bash 里 $PWD 是 /d/a/... 形态，PowerShell 不认；用 pwd -W 取 Windows 形态路径。
+          dir="$(pwd -W)/conformance-nails"
+          FLOW_CONTRACT_DIR="$dir" FLOW_CONTRACT_CASE="nails" \
+            powershell -File scripts/build.ps1 test --locked --test conformance_runner -- --ignored
+
+      - name: conformance nails (contract data invariants)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
