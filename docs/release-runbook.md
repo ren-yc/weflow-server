@@ -59,9 +59,16 @@ publisher；或给本仓配一个 scoped 的 `CARGO_REGISTRY_TOKEN` secret（pub
    `openapi.json` **与 `health.json`／`health-alias.json`**（三份都带版本串）；`Cargo.lock` 里本包那条
    由 `cargo update -w` ＋ `--locked` 兜住。改完版本号**必须**重跑两仓 regen ＋ golden（`UPDATE_GOLDEN=1`）——
    否则 `regen --check` 与快照比对会在 push 时红，那正是版本链完整性的唯一机器判据。
-   `CHANGELOG.md` 的 `## [0.9.0]` 段日期**回填成实际发布日**并与 tag 同提交：准备阶段写的是
-   准备日，Keep a Changelog 的段日期应当是发布日。
+   `CHANGELOG.md` 的 `## [0.9.0]` 段日期**回填成实际发布日**：准备阶段写的是准备日，
+   Keep a Changelog 的段日期应当是发布日。落法——回填是一笔**独立提交**（版本号那一笔早已推上去，
+   合并成同一笔在时序上做不到），而 **tag 必须指向这笔回填提交**：`CHANGELOG.md` 是 git 跟踪
+   文件、会随根包的清单进 .crate，tag 指错就会把准备日永久发出去。（实测：除本手册与扫描器的
+   豁免表外没有任何代码或测试读 CHANGELOG；`docs_anchors` 的扫描面是 README／AGENTS／
+   architecture／mcp／*-api.md，不含它；golden 与 regen 也与之无关，故这笔不触发任何重生成。）
 2. **先 `git push origin master`、等那条 check 变绿，再打 tag**——这一步不能省，也不能只推 tag。
+   实操顺序写死：回填提交推上去 → 盯**它**的 check 绿 → 中间不夹任何提交 → 在本地当前 HEAD 上
+   `git tag v0.9.0`；打之前用 `git rev-parse HEAD` 与 `git ls-remote origin refs/heads/master`
+   逐字比一次，两者必须相同（不同就说明有东西插进来了，重来）。
    `check.yml` 的触发是 `push: branches: [master]`，**推 tag 不触发它**；而 release 链的 quality-gate
    只有 clippy＋test＋契约 nails，比 check.yml 少十几道门（编号引用扫描、公共段哈希、embed 例子、
    **Rust/Python 的 regen --check**、typed SDK 测试、ruff、构建脚本透传测试、完整契约套件）。
@@ -85,7 +92,16 @@ publisher；或给本仓配一个 scoped 的 `CARGO_REGISTRY_TOKEN` secret（pub
 
 ## 首发（本机，只做一次）
 
-新 crate 的首发。顺序＝先 SDK 后根包（根包要解析 registry 上的 SDK 版本）。**在仓库根、PowerShell
+新 crate 的首发。**动手前先确认「要发的内容」与「tag 指向的提交」是同一个**——crates.io 不可撤销，
+若打 tag 之后、publish 之前又提交了任何东西（哪怕只是改文档），本机发的就是新 HEAD，而 tag 与
+GitHub Release 还指在旧提交上，这个不一致会永久留在 registry 里：
+
+```powershell
+git pull --ff-only
+if ((git rev-parse HEAD) -ne (git rev-parse 'v0.9.0^{commit}')) { throw 'HEAD 与 v0.9.0 不是同一提交：先弄清差了什么再发' }
+```
+
+确认一致后按下面顺序执行：**先 SDK、后根包**（根包要解析 registry 上的 SDK 版本），**在仓库根、PowerShell
 里整块执行**（`curl.exe` 在 Windows 上是真 curl，不是 PowerShell 别名）；cargo 一律走包装脚本——
 它负责定位 MSVC 环境，直接跑 cargo 会在 vendored OpenSSL 上失败（`publish` 子命令不在注入
 `--features testing` 的名单里，那条注入只服务 test/clippy）。
@@ -223,10 +239,12 @@ PyPI 侧**默认没有本机兜底**：本仓按设计不保存任何长期上�
 - 首发前实测未占用：crates.io 四个名字（本仓两个 crate ＋ 姊妹仓两个）与 PyPI 的
   `weflow-sdk` 当时都是 404。**临近发布日请重测一次**。
 - 本地只发布到 testpypi；正式 PyPI 一律由 CI 执行（OIDC，无人持有 token）。
-- 预演打包时留意 `warning: package ... in Cargo.lock is yanked`。本轮 weflow 的锁里就有一条
-  `chacha20 v0.10.1`（上游已 yanked，0.10.2 可用；qqflow 那边已经是 0.10.2）。`cargo tree -i`
-  查不到任何包 require 它——那是锁里的**孤儿条目**，`cargo update -p chacha20` 原地解掉即可，
-  门禁复跑 `--locked` 全绿。留着它不会让构建失败，但下游用 `--locked` 构建时会撞同样的警告。
+- 预演打包时留意 `warning: package ... in Cargo.lock is yanked`。**本轮本仓已遇到并解掉**：锁里
+  原有一条 `chacha20 v0.10.1`（上游已 yanked），`cargo tree -i` 查不到任何包 require 它——
+  锁里的**孤儿条目**，`cargo update -p chacha20` 原地解掉即可（**两仓现均为 0.10.2**），门禁复跑
+  `--locked` 全绿。留着它不会让构建失败，但下游带 `--locked` 构建时会撞同样的警告。
+  再遇到同类条目按同一法处置：**只 `-p` 那一个包**，不要顺手全量 `cargo update`——那会把一次
+  发版变成一次依赖大改，评审面完全不成比例。
 - CI 的 publish 作业对「已发布过」是幂等的（跳过而非报错），因此**重跑作业是安全的**。
   PyPI 侧同理：pypa 动作带 `skip-existing`，上传中途失败重跑会跳过已传的文件、补齐其余的。
   **唯一的例外**：若某个 dist 是用**别的路径**（本机 `twine upload`、或曾关掉 attestations）
