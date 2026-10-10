@@ -150,9 +150,19 @@ powershell -File scripts/build.ps1 package --list --allow-dirty -p weflow-server
 # --allow-dirty 只让工作树有未提交改动时也能看清单，不改变打包内容。
 ```
 
-仓库根对两个 package 都用 `-p` 选包，不必切进子目录。**注意**：`cargo publish --dry-run` 对根包在
-SDK 真上架前必然失败——它按发布后的清单解析依赖，那时 registry 上还没有
-`weflow-client = "0.9.0"`。这不是缺陷，是发布顺序的直接后果。
+仓库根对两个 package 都用 `-p` 选包，不必切进子目录。
+
+**实测的两种结果，别混**（SDK 尚未上架时跑）：
+- `package --list` **能跑通**（退出码 0）：列清单不需要解析依赖，所以上面这段预演可以照抄。
+- **任何真打包／发布都会失败**——`cargo package`、`cargo publish`、`cargo publish --dry-run`
+  对根包在 SDK 上架前必然红，原文（本机 cargo 1.97.1 实测）：
+  > `error: failed to prepare local package for uploading`
+  > `Caused by:` → no matching package named `weflow-client` found
+  > location searched: crates.io index → required by package `weflow-server v0.9.0`
+  带不带 `--locked` 都一样失败（实测两条都是退出码 101）。根包的依赖声明带 `version`，
+  打包时按**发布后的形状**解析，而那时 registry 上还没有 `weflow-client = "0.9.0"`。
+  这不是缺陷，是发布顺序的直接后果——也正是 publish 作业必须「先 SDK、轮询索引可见、再根包」
+  的原因。**别**把它当环境问题去 `cargo update`、加 `--allow-dirty` 或改依赖声明绕过去。
 
 ## 人工兜底（CI publish 不可用时）
 
@@ -192,6 +202,10 @@ PyPI 侧**默认没有本机兜底**：本仓按设计不保存任何长期上�
 - 首发前实测未占用：crates.io 四个名字（本仓两个 crate ＋ 姊妹仓两个）与 PyPI 的
   `weflow-sdk` 当时都是 404。**临近发布日请重测一次**。
 - 本地只发布到 testpypi；正式 PyPI 一律由 CI 执行（OIDC，无人持有 token）。
+- 预演打包时留意 `warning: package ... in Cargo.lock is yanked`。本轮 weflow 的锁里就有一条
+  `chacha20 v0.10.1`（上游已 yanked，0.10.2 可用；qqflow 那边已经是 0.10.2）。`cargo tree -i`
+  查不到任何包 require 它——那是锁里的**孤儿条目**，`cargo update -p chacha20` 原地解掉即可，
+  门禁复跑 `--locked` 全绿。留着它不会让构建失败，但下游用 `--locked` 构建时会撞同样的警告。
 - CI 的 publish 作业对「已发布过」是幂等的（跳过而非报错），因此**重跑作业是安全的**。
   PyPI 侧同理：pypa 动作带 `skip-existing`，上传中途失败重跑会跳过已传的文件、补齐其余的。
   **唯一的例外**：若某个 dist 是用**别的路径**（本机 `twine upload`、或曾关掉 attestations）
