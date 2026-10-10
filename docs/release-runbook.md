@@ -54,9 +54,10 @@ publisher；或给本仓配一个 scoped 的 `CARGO_REGISTRY_TOKEN` secret（pub
 1. 版本号有**五处**要一起改，CI 的 guard 只兜第一处（根包）：`Cargo.toml`（根包）、
    `clients/rust/Cargo.toml`（SDK crate）、`clients/python/pyproject.toml`（Python SDK）、
    `clients/ts/package.json` ＋ `clients/ts/package-lock.json`（示例，不发 npm 但进页面与包）。
-   另有**三类生成物内嵌版本号**不能手改、只能靠重新生成对齐：`clients/rust/src/generated/gen.rs`、
-   `clients/python/src/*_sdk/generated/**`（spec.json ＋ 每个模块 docstring）、
-   `tests/golden/openapi.json`。改完版本号**必须**重跑两仓 regen ＋ golden（`UPDATE_GOLDEN=1`）——
+   另有**生成物与快照内嵌版本号**不能手改、只能靠重新生成对齐：`clients/rust/src/generated/gen.rs`、
+   `clients/python/src/*_sdk/generated/**`（spec.json ＋ 每个模块 docstring）、`tests/golden/` 下的
+   `openapi.json` **与 `health.json`／`health-alias.json`**（三份都带版本串）；`Cargo.lock` 里本包那条
+   由 `cargo update -w` ＋ `--locked` 兜住。改完版本号**必须**重跑两仓 regen ＋ golden（`UPDATE_GOLDEN=1`）——
    否则 `regen --check` 与快照比对会在 push 时红，那正是版本链完整性的唯一机器判据。
    `CHANGELOG.md` 的 `## [0.9.0]` 段日期**回填成实际发布日**并与 tag 同提交：准备阶段写的是
    准备日，Keep a Changelog 的段日期应当是发布日。
@@ -206,8 +207,8 @@ PyPI 侧**默认没有本机兜底**：本仓按设计不保存任何长期上�
 
 - **guard 红**（tag 与根包版本不一致）：说明 tag 打错或版本号没对齐。此时**什么都没发布**、
   Release 也还没建。改正提交 → `git push origin master` → 等 check 绿 → 删旧 tag 重打：
-  `git tag -d v0.9.0` ＋ `git push origin :refs/tags/v0.9.0`（PowerShell 里删远端 tag 用冒号路径，
-  不是 `--delete v0.9.0` 那种写法也行但冒号式最稳）→ 再按第 2 步打 tag 推 tag。
+  `git tag -d v0.9.0` ＋ `git push origin :refs/tags/v0.9.0`（实测 PS 5.1 下 `--delete v0.9.0` 也原样
+  透传、两种写法等效，冒号式只是与「推 tag」对称、少记一条参数形态）→ 再按第 2 步打 tag 推 tag。
 - **quality-gate / build / release 红**：同上去掉那个 tag、修好、重推。**别**在红的中间态
   去手工补发 registry——那样 GitHub Release 与 registry 会长期不一致。
 - **publish 红在 crates.io SDK 步**（首次新 crate）：按「首发（本机）」发完，重跑该作业即可。

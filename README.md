@@ -78,13 +78,12 @@ Python/ts 各是自己的声明、不读 Cargo.toml，完整清单与同步要�
 
 发版步骤以 [`docs/release-runbook.md`](docs/release-runbook.md) 为唯一权威（凭据模型、
 首发顺序、人工审批闸门都在那里）。这里不复述流程——复述过就会漂移：被替换掉的那段
-示例里，版本号停在 0.1.1，而仓库已经发到 v0.7.0（第 11 个 tag）。要点三句：
+示例里，版本号停在 0.1.1，而仓库已经发到 v0.7.0（第 11 个 tag）。要点两句：
 
-- 版本号不止 `Cargo.toml`：完整清单（含 ts 示例与**必须重新生成**的生成物）以手册第 1 步为准。
-  tag 与根包版本不一致时 CI 的 guard 直接失败——但 guard **只**看根包，其余各漏改不会有人拦。
+- 版本号不止 `Cargo.toml`：完整清单以手册第 1 步为准。**CI 的 guard 只比对 tag 与根包版本**
+  （`cargo metadata` 取 `weflow-server` 一条），SDK／pyproject／ts 漏改不会有任何东西变红——
+  它们会安静地把旧版本号发上 registry（不可撤销）。
 - 推送 `v<版本>` tag 触发发布链；不可撤销的 registry 上传排在人工审批之后。
-- CI 的 guard **只**比对 tag 与根包版本（`cargo metadata` 取 `weflow-server` 一条）；
-  `clients/rust` 与 `clients/python` 的版本没有门禁兜着，漏改不会有人拦——手册第 1 步就是干这个的。
 
 ## 运行
 

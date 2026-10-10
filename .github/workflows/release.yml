@@ -8,7 +8,11 @@
 # Usage:
 #   cargo set-version 0.1.1        # or edit Cargo.toml
 #   git commit -am "chore: release v0.1.1"
-#   git tag v0.1.1 && git push origin master --tags
+#   先 push 分支并等 CI 绿，再打 tag（见 docs/release-runbook.md 第 2 步：
+#   check.yml 只在 push 到 master 时触发，推 tag 不跑它，所以别用 --tags 一锅推）：
+#   git push origin master   # → 等 check 绿
+#   git tag v0.9.0           # 单独两行：Windows PowerShell 5.1 不认 &&
+#   git push origin v0.9.0
 #
 name: release
 

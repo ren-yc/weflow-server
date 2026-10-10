@@ -214,7 +214,8 @@
 | **契约套件** | 「**两个仓库是否一致**」：同一份用例跑两边 | `tests/conformance_runner.rs`（`#[ignore]`，CI 独立步骤） |
 
 契约套件在 CI 里是**独立一步**（不是靠 `cargo test` 顺带跑的）：克隆 `conformance.pin` 所指的
-tag，再驱动上面的执行入口。另有一步只跑 `nails-*`（五条数据不变量；`FLOW_CONTRACT_CASE` 是子串过滤，改名别改漏——第五条约 2024 起就在跑，防的是拉取面复活 `mediaPath`）。**停用某一步时要在
+tag，再驱动上面的执行入口。另有一步只跑 `nails-*`（五条数据不变量；`FLOW_CONTRACT_CASE` 是子串过滤，改名别改漏——第五条 `no_mediaPath_in_pull` 防的是拉取面复活
+`mediaPath`，它自契约建仓（2026-09-26）就在用例目录里，nails 门禁自 2026-09-27 起在 CI 开着）。**停用某一步时要在
 注释里写清原因** —— 一个不会红的门禁等于没有门禁。
 
 

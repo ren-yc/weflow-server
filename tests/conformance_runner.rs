@@ -6,9 +6,11 @@
 //!   cargo test --locked --test conformance_runner -- --ignored --nocapture
 //!
 //! 需要环境变量 `FLOW_CONTRACT_DIR` 指向契约仓库的检出（CI 会按 pin 的 tag clone）。
-//! **缺它就是失败，不是静默跳过**（判据见本文件 `contract_dir()` 处的 panic）——「没检出契约
-//! 仓库于是整套跳过、依然全绿」正是最危险的失效方式：一个端点都没被验过，报表却好看。
-//! 开发机上想跳过整套请显式 `cargo test -- --skip conformance`，而不是让它假装通过。
+//! 本文件的套件测试带 `#[ignore]`：日常 `cargo test` 不跑它（这是设计，不是漏洞），CI 用
+//! `--ignored` 显式跑。**跑它而缺环境变量时是 panic，不是静默通过**——判据不在 `contract_dir()`
+//! （它只返回 Option），在 `conformance_suite_passes` 体内的 `let Some(contract) = … else { panic! }`。
+//! 之所以失败开放：CI 那步就是带着 `--ignored` 来的，若缺环境也返回 Ok，报表上会出现
+//! 「一致性套件绿了」而实际一个端点都没验过。
 //!
 //! ## 为什么自己构造 `AppState` 而不是跑服务端二进制
 //!
