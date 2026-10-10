@@ -197,6 +197,9 @@
   `test_package_selection_does_not_inject_root_only_feature`。
 ## [0.8.0] - 2026-10-04
 
+> 说明：本段仅是**版本号编年**——0.8.0 从未作为发布物存在（无 `v0.8.0` tag、无 GitHub Release、未上任何索引）。
+> 当时根包`weflow-server`的依赖声明缺 `version`，按 registry 规则根本发不出去；该缺陷到 0.9.0 发布准备时才修。
+
 ### 变更
 
 - **`clients/rust`（`weflow-client`）与 `clients/python`（`weflow-sdk`）删除 `search`（破坏性）**：

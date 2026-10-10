@@ -20,6 +20,8 @@
 ## 正式发布流程
 
 1. 确认 `Cargo.toml` 根包与 `clients/rust` 版本一致（0.9.0），CHANGELOG 有对应段。
+   **并把 `## [0.9.0]` 的日期回填成实际发布日**（与 tag 同提交）——准备阶段写的是准备日，
+   Keep a Changelog 的段日期应当是发布日。
 2. `git tag v0.9.0 && git push origin v0.9.0`。
 3. CI 链：guard（tag/版本一致性）→ quality-gate（双 OS clippy＋test＋契约 nails）
    → build（三平台产物）→ release（GitHub Release）→ **publish**。publish 刻意
