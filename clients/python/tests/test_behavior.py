@@ -1422,4 +1422,3 @@ async def test_watch_raises_on_an_unusable_base_url_instead_of_looping_forever()
     assert isinstance(exc.value, TransportError), repr(exc.value)
     assert "base_url" in str(exc.value).lower(), str(exc.value)
     await client.aclose()
-

@@ -39,7 +39,7 @@ pub fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
-    
+
     stmt
         .query_map([], |r| r.get::<_, String>(1))
         .and_then(|rows| rows.collect::<rusqlite::Result<Vec<String>>>())

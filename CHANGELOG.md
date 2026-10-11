@@ -337,7 +337,7 @@
 鉴权通道减到两条。**破坏性变更较多**，逐条迁移见文末「迁移」。
 
 - **`GET /chatlab/messages`** —— ChatLab 形状的消息面，也是原「混合面」
-  （`/api/v1/messages?chatlab=1`）的新家：参数 `talker`（必填）/ `limit` / `offset` / `cursor` / 
+  （`/api/v1/messages?chatlab=1`）的新家：参数 `talker`（必填）/ `limit` / `offset` / `cursor` /
   `start` / `end` / `media` / `keyword`；信封
   `{talker,count,page,chatlab,meta,members,messages}`，**不带 `success`**，
   `count` 是**本页条数**，消息**升序**，`page{hasMore,nextCursor}` 报告截断。
