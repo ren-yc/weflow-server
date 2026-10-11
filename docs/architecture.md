@@ -263,6 +263,27 @@ OpenSSL，后者的 perl `Configure` 会直接调 `cl.exe` / `link.exe`，**绕�
 ——没有 `vcvars64.bat` 注入的 `INCLUDE`/`LIB`/`PATH` 就编译不过。脚本同时把 **Strawberry Perl**
 放到 `PATH` 前面：Git 自带的 MSYS perl 会把 Windows 路径写坏。工具链版本钉在 `rust-toolchain.toml`。
 
+### 构建 profile 的两个刻意取舍
+
+`[profile.dev]` 里有两项非默认设置，目的都是让开发机的构建产物不再无限膨胀：
+
+- **`incremental = false`**：增量编译只对「同一个编译单元被反复小改」有收益。本仓的 `clippy` 与
+  `test` 走的是两套不同的 rustc 调用（`clippy` 经 workspace wrapper），各自的产物与增量目录
+  **互不复用**；而增量目录里的条目绝大多数来自本仓自己的单元与集成测试目标，并随依赖图变动持续
+  累积，Cargo **不会回收**它们。关掉它意味着**每次改动都要完整重编本仓 crate** —— 这是有意接受
+  的代价，不是遗漏。
+- **`debug = "line-tables-only"`**：依赖侧的调试信息已由 `[profile.dev.package."*"]` 关掉，
+  剩下的全部来自本仓 crate。降到行号表仍保留 backtrace 的文件名与行号，只是不再有变量与类型级
+  信息。
+
+**`[profile.dev.package."*"] debug = 0` 是上面两条成立的前提，不要删。** 它把非成员单元的调试
+信息直接钉成关闭，使 Cargo 针对宿主单元（构建脚本、proc-macro 及其依赖）的调试信息推断
+（`Deferred` → `finalize` / `weaken`）根本不参与；一旦删掉，宿主单元的 profile 会重新进入那套
+推断，构建脚本所在目录的哈希随之改变，会触发 vendored OpenSSL 的完整重建。
+
+**不要用 `CARGO_INCREMENTAL` 在这两个值之间来回切。** 该环境变量的优先级高于清单里的 profile：
+在本仓设为 `false` 之后，`0` 与不设置等价，但 `1` 会静默压过它。
+
 ### 提交钩子
 
 `scripts/install-hooks.*` 装两个钩子：`pre-commit`（隐私扫描 + 编号引用扫描，**累积退出码**，

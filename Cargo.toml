@@ -98,7 +98,8 @@ required-features = ["server"]
 tower = { version = "0.5", features = ["util"] }
 
 [profile.dev]
-debug = true
+debug = "line-tables-only"
+incremental = false
 
 [profile.dev.package."*"]
 debug = 0
