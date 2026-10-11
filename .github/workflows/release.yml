@@ -82,11 +82,11 @@ jobs:
         if: runner.os != 'Windows'
         run: bash scripts/build.sh clippy --all-targets --locked -- -D warnings
 
-      - name: test
+      - name: Test
         if: runner.os == 'Windows'
         run: powershell -File scripts/build.ps1 test --locked
 
-      - name: test
+      - name: Test
         if: runner.os != 'Windows'
         run: bash scripts/build.sh test --locked
 
@@ -95,7 +95,7 @@ jobs:
       # Git Bash 自带的 MSYS perl 缺 Locale::Maketext::Simple，vendored OpenSSL 的 Configure
       # 直接失败（本机复现同一报错，退出码 101；而 powershell -File scripts/build.ps1 同一条
       # 命令在 Windows 上通过）——build.sh 不负责 MSVC／Strawberry Perl 环境，这是本仓的硬前置。
-      - name: conformance nails (contract data invariants)
+      - name: Conformance nails (contract data invariants)
         if: runner.os == 'Windows'
         shell: bash
         run: |
@@ -107,7 +107,7 @@ jobs:
           FLOW_CONTRACT_DIR="$dir" FLOW_CONTRACT_CASE="nails" \
             powershell -File scripts/build.ps1 test --locked --test conformance_runner -- --ignored
 
-      - name: conformance nails (contract data invariants)
+      - name: Conformance nails (contract data invariants)
         if: runner.os != 'Windows'
         shell: bash
         run: |
