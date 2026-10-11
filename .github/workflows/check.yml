@@ -78,6 +78,22 @@ jobs:
       # ── 文档门（廉价，放在最前：失败要在昂贵的 vendored OpenSSL 编译之前暴露）──
       # 两项都只在 Linux 上跑：扫描器没有任何平台条件编译，Windows 开发机由本地
       # pre-commit / commit-msg 钩子覆盖；而 Linux 上 python3 必定存在，不必做解释器探测。
+
+      # 空白/冲突标记检查。基线取**空树的 SHA** 而不是 push 范围：一次覆盖全部跟踪
+      # 文件，push 与 PR 行为一致，也不必为「首次 push 的全零 base」特判。
+      #
+      # 为什么上游没有 fmt 门禁却有这一步：本仓库故意不设 `cargo fmt --check`
+      # （见文件头注释），Python 侧的 ruff 规则集也**不含 W 族**，所以行尾空白与
+      # 文件末尾多空行在两个仓库里都没有任何自动化拦截点 —— 一次机械改写就能把
+      # 尾随空格写进手写层并一路进 master，被下游按镜像搬运时才发现（`_validate`
+      # 重构留下的 7+7 处即此路径）。这一步只拦**新增**：历史残留已一次洗完（洗完=0
+      # 实测），此后任何一行空白都是新引入的。
+      #
+      # 口径与下游 briefdesk 的同名门禁逐字一致（含这个空树 SHA 字面量），两仓共用。
+      - name: whitespace / conflict marker check
+        if: runner.os != 'Windows'
+        run: git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904..HEAD
+
       - name: forbidden references (tracked files)
         if: runner.os != 'Windows'
         run: python3 scripts/forbidden_refs.py --tree
