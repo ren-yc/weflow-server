@@ -37,6 +37,7 @@ from weflow_sdk.generated.weflow_sdk.models.event_sync import EventSync
 from weflow_sdk.generated.weflow_sdk.models.group_member import GroupMember
 from weflow_sdk.generated.weflow_sdk.models.group_members import GroupMembers
 from weflow_sdk.generated.weflow_sdk.models.health import Health
+from weflow_sdk.generated.weflow_sdk.models.index_progress_dto import IndexProgressDto
 from weflow_sdk.generated.weflow_sdk.models.media_brief import MediaBrief
 from weflow_sdk.generated.weflow_sdk.models.media_envelope import MediaEnvelope
 from weflow_sdk.generated.weflow_sdk.models.media_object import MediaObject

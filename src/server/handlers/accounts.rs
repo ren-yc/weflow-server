@@ -124,6 +124,7 @@ pub async fn handler(
                     serde_json::to_value(AccountConflict {
                         occupied_by: b.info.wxid.clone(),
                         occupied_status: b.status(),
+                        progress: crate::server::indexing_progress(&b),
                         state: "account_conflict".to_string(),
                         success: true,
                         wxid: wxid_in,
@@ -145,6 +146,7 @@ pub async fn handler(
             return Ok(Json(
                 serde_json::to_value(AccountRegistered {
                     db_storage: h.info.db_storage.to_string_lossy().into_owned(),
+                    progress: crate::server::indexing_progress(&h),
                     state: state_name.to_string(),
                     status: h.status(),
                     success: true,
@@ -167,11 +169,16 @@ pub async fn handler(
             if h.status().is_ready() { "already_ready" } else { "in_progress" },
         ),
         // Lost the race against a concurrent registration.
-        BindOutcome::Occupied { wxid, status } => {
+        BindOutcome::Occupied {
+            wxid,
+            status,
+            progress,
+        } => {
             return Ok(Json(
                 serde_json::to_value(AccountConflict {
                     occupied_by: wxid,
                     occupied_status: status,
+                    progress,
                     state: "account_conflict".to_string(),
                     success: true,
                     wxid: wxid_in,
@@ -184,6 +191,7 @@ pub async fn handler(
     Ok(Json(
         serde_json::to_value(AccountRegistered {
             db_storage: handle.info.db_storage.to_string_lossy().into_owned(),
+            progress: crate::server::indexing_progress(&handle),
             state: state_name.to_string(),
             status: handle.status(),
             success: true,

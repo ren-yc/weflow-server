@@ -1,0 +1,26 @@
+{
+  "body": {
+    "db_storage": "<volatile>",
+    "progress": {
+      "messages_indexed": 8,
+      "tables_done": 1,
+      "tables_total": 3
+    },
+    "state": "in_progress",
+    "status": "indexing",
+    "success": true,
+    "wxid": "wxid_fake000000000000001"
+  },
+  "keys": [
+    "db_storage",
+    "progress",
+    "messages_indexed",
+    "tables_done",
+    "tables_total",
+    "state",
+    "status",
+    "success",
+    "wxid"
+  ],
+  "status": 200
+}

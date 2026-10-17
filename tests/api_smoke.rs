@@ -21,7 +21,17 @@ use weflow_server::sync::AccountSync;
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
 fn test_state(dir: &std::path::Path) -> Arc<server::AppState> {
-    test_state_with(dir, |_, _| {})
+    test_state_inner(dir, |_, _| {}, false)
+}
+
+/// `test_state` 的 `indexing` 态变体：同一批夹具，但账号还没建完，且进度计数器有已知值。
+///
+/// 为什么必须是**独立的**计数器：夹具构建时同步引擎已经用真实计数器跑过一遍
+/// `full_sync`，共用它就只能拿到「夹具恰好有几张表」那种不可读的数（而且是
+/// `done == total`，与 `indexing` 自相矛盾）。这里换成 1/3 张表、8 条消息，
+/// 快照里的三个数才能一眼看出对应关系。
+fn test_state_indexing(dir: &std::path::Path) -> Arc<server::AppState> {
+    test_state_inner(dir, |_, _| {}, true)
 }
 
 /// `test_state`, but `mutate(storage, key)` runs against the freshly built
@@ -29,6 +39,14 @@ fn test_state(dir: &std::path::Path) -> Arc<server::AppState> {
 fn test_state_with(
     dir: &std::path::Path,
     mutate: impl FnOnce(&std::path::Path, &[u8; 32]),
+) -> Arc<server::AppState> {
+    test_state_inner(dir, mutate, false)
+}
+
+fn test_state_inner(
+    dir: &std::path::Path,
+    mutate: impl FnOnce(&std::path::Path, &[u8; 32]),
+    indexing: bool,
 ) -> Arc<server::AppState> {
     let key = keystore::parse_db_key(common::FAKE_KEY_HEX).unwrap();
     let key_bytes = key.0;
@@ -69,15 +87,29 @@ fn test_state_with(
     sync.lock().full_sync().unwrap();
 
     let stopped = sync.lock().stop_flag();
+    // `indexing` 变体用独立计数器：夹具构建时真实计数器已经跑完一整遍（`done == total`），
+    // 沿用它会得到与 `indexing` 自相矛盾的数。`ready` 变体则沿用同步引擎那一份，与线上路径一致。
+    let progress = if indexing {
+        let p = Arc::new(weflow_server::store::index::IndexProgress::default());
+        p.set_tables_total(3);
+        for _ in 0..8 {
+            p.row_indexed();
+        }
+        p.finish_table();
+        p
+    } else {
+        sync.lock().progress_handle()
+    };
     let handle = Arc::new(AccountHandle {
         info,
-        status: AtomicU8::new(2), // Ready
+        status: AtomicU8::new(if indexing { 1 } else { 2 }),
         error: Mutex::new(None),
         store,
         sync,
         media_keys: None,
         watcher: Mutex::new(None),
         stopped,
+        progress,
     });
     state
         .accounts
@@ -1937,6 +1969,78 @@ mod golden {
         ]
     }
 
+    /// 一次快照比对需要的输入。打包成结构体是为了让签名留在 clippy 的阈值内
+    /// （超过 7 个参数时 lint 会红），同时把「一个端点」的四要素放在一起读。
+    struct Case<'a> {
+        name: &'a str,
+        method: &'a str,
+        uri: String,
+        payload: Option<serde_json::Value>,
+    }
+
+    /// 跑一个端点，比对（或更新）它对应的快照。
+    ///
+    /// 抽出来是因为 `progress` 只在 `indexing` 态出现，而那份端点清单共用同一个 `ready`
+    /// 状态——换状态必须重造 `AppState`，所以是另一条用例，但快照口径（键序、易变值掩盖、
+    /// 缺失即失败）必须与主清单**逐字相同**，否则两条用例会各说各话。
+    async fn check_case(
+        app: &axum::Router,
+        case: Case<'_>,
+        update: bool,
+        tmp: &str,
+        drifted: &mut Vec<String>,
+    ) {
+        let Case {
+            name,
+            method,
+            uri,
+            payload,
+        } = case;
+        let mut req = Request::builder().method(method).uri(&uri);
+        let body = match payload {
+            Some(v) => {
+                req = req.header("content-type", "application/json");
+                Body::from(v.to_string())
+            }
+            None => Body::empty(),
+        };
+        let resp = app.clone().oneshot(req.body(body).unwrap()).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024).await.unwrap();
+        let raw_body = String::from_utf8_lossy(&bytes).into_owned();
+        let body: serde_json::Value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|e| panic!("{name} 的响应不是 JSON（HTTP {status}）：{e}"));
+        // 状态码也进快照：只钉住 body 会漏掉「同一个 body 换了状态码」。
+        let keys = key_order(&raw_body);
+        let mut snapshot = serde_json::json!({
+            "status": status.as_u16(),
+            "keys": keys,
+            "body": body,
+        });
+        mask(&mut snapshot, tmp);
+        assert_no_wall_clock(&snapshot, name);
+        let actual = serde_json::to_string_pretty(&snapshot).unwrap() + "\n";
+
+        let path = golden_dir().join(format!("{name}.json"));
+        if update {
+            std::fs::write(&path, &actual).unwrap();
+            println!("[GOLDEN] 写入 {}", path.display());
+            return;
+        }
+        // 快照**缺失即失败**：此前写成 `if update || !path.exists()` 静默重建，
+        // 于是删掉一个快照文件（或新增端点后忘了提交快照）不会红 —— 下一次运行会把它
+        // 按当时的实现重新写出来，drift 检测就此失效。缺失与漂移是两种不同的失败，
+        // 但都必须看得见。
+        assert!(
+            path.exists(),
+            "golden 快照缺失：{}（新增端点后必须 UPDATE_GOLDEN=1 生成并提交）",
+            path.display()
+        );
+        if std::fs::read_to_string(&path).unwrap() != actual {
+            drifted.push(name.to_string());
+        }
+    }
+
     #[tokio::test]
     async fn responses_match_their_golden_snapshots() {
         let dir = common::tmp_dir("golden");
@@ -1948,55 +2052,68 @@ mod golden {
 
         let mut drifted: Vec<String> = Vec::new();
         for (name, method, uri, payload) in endpoints() {
-            let mut req = Request::builder().method(method).uri(&uri);
-            let body = match payload {
-                Some(v) => {
-                    req = req.header("content-type", "application/json");
-                    Body::from(v.to_string())
-                }
-                None => Body::empty(),
-            };
-            let resp = app.clone().oneshot(req.body(body).unwrap()).await.unwrap();
-            let status = resp.status();
-            let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024).await.unwrap();
-            let raw_body = String::from_utf8_lossy(&bytes).into_owned();
-            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-                panic!("{name} 的响应不是 JSON（HTTP {status}）：{e}")
-            });
-            // 状态码也进快照：只钉住 body 会漏掉「同一个 body 换了状态码」。
-            let keys = key_order(&raw_body);
-            let mut snapshot = serde_json::json!({
-                "status": status.as_u16(),
-                "keys": keys,
-                "body": body,
-            });
-            mask(&mut snapshot, &tmp);
-            assert_no_wall_clock(&snapshot, name);
-            let actual = serde_json::to_string_pretty(&snapshot).unwrap() + "\n";
-
-            let path = golden_dir().join(format!("{name}.json"));
-            if update {
-                std::fs::write(&path, &actual).unwrap();
-                println!("[GOLDEN] 写入 {}", path.display());
-                continue;
-            }
-            // 快照**缺失即失败**：此前写成 `if update || !path.exists()` 静默重建，
-            // 于是删掉一个快照文件（或新增端点后忘了提交快照）不会红 —— 下一次运行会把它
-            // 按当时的实现重新写出来，drift 检测就此失效。缺失与漂移是两种不同的失败，
-            // 但都必须看得见。
-            assert!(
-                path.exists(),
-                "golden 快照缺失：{}（新增端点后必须 UPDATE_GOLDEN=1 生成并提交）",
-                path.display()
-            );
-            if std::fs::read_to_string(&path).unwrap() != actual {
-                drifted.push(name.to_string());
-            }
+            let case = Case { name, method, uri, payload };
+            check_case(&app, case, update, &tmp, &mut drifted).await;
         }
         assert!(
             drifted.is_empty(),
             "这些端点的响应与快照不一致：{drifted:?}\n\n若改动是有意的，设 UPDATE_GOLDEN=1 重跑后**人工读一遍 diff**。"
         );
+    }
+
+    /// 建索引进度：`indexing` 态的两处响应（列表项与幂等命中）必须带 `progress`，
+    /// 且三个数就是计数器里的值；`ready` 态则**整块省略**。
+    ///
+    /// 为什么不是塞进上面那份端点清单：它共用同一个 `ready` 夹具，而进度只在 `indexing`
+    /// 态出现——换状态要重造 `AppState`，混进「按序执行、会改状态」的清单会破坏前提。
+    /// 三条用例的分工也因此清楚：清单守 `ready` 形状、这里守 `indexing` 形状、
+    /// 单元测试守计数器本身。
+    #[tokio::test]
+    async fn indexing_progress_shapes_match_golden() {
+        let dir = common::tmp_dir("golden-indexing");
+        let tmp = dir.to_string_lossy().to_string();
+        let state = test_state_indexing(&dir);
+        let app = server::build_router(state);
+        let update = std::env::var("UPDATE_GOLDEN").is_ok();
+        std::fs::create_dir_all(golden_dir()).unwrap();
+
+        let mut drifted: Vec<String> = Vec::new();
+        // 列表项：`AccountStateView.progress`。
+        check_case(
+            &app,
+            Case {
+                name: "accounts-indexing",
+                method: "GET",
+                uri: format!("/api/v1/accounts?access_token={TOKEN}"),
+                payload: None,
+            },
+            update,
+            &tmp,
+            &mut drifted,
+        )
+        .await;
+        // 幂等命中（`state: in_progress`）：`AccountRegistered.progress`。
+        check_case(
+            &app,
+            Case {
+                name: "accounts-progress",
+                method: "POST",
+                uri: format!("/api/v1/accounts?access_token={TOKEN}"),
+                payload: Some(serde_json::json!({
+                    "wxid": common::FAKE_WXID,
+                    "key": common::FAKE_KEY_HEX,
+                })),
+            },
+            update,
+            &tmp,
+            &mut drifted,
+        )
+        .await;
+        assert!(
+            drifted.is_empty(),
+            "indexing 面的响应与快照不一致：{drifted:?}\n\n若改动是有意的，设 UPDATE_GOLDEN=1 重跑后**人工读一遍 diff**。"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 /// **路由 ↔ 接口描述的对等**。

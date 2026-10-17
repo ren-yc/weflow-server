@@ -206,6 +206,11 @@ pub struct AccountSync {
     /// set it WITHOUT taking this struct's mutex, which a `full_sync` on a real
     /// account holds for minutes.
     stopped: Arc<AtomicBool>,
+    /// 建索引进度，与账号句柄共享同一个 `Arc`。
+    ///
+    /// 与 `stopped` 同族的理由：它必须能在 `full_sync` 持锁期间被 HTTP 侧读到，
+    /// 所以复制的是 `Arc`，不是值；读侧永远不碰这把锁。
+    progress: Arc<index::IndexProgress>,
 }
 
 /// 单轮排空的页数上限：防坏数据（水位推不动的表）把一轮 poll 拖死。
@@ -233,6 +238,7 @@ impl AccountSync {
             last_files: Vec::new(),
             stamps: std::collections::HashMap::new(),
             stopped: Arc::new(AtomicBool::new(false)),
+            progress: Arc::new(index::IndexProgress::default()),
         }
     }
 
@@ -255,6 +261,7 @@ impl AccountSync {
             last_files: Vec::new(),
             stamps: std::collections::HashMap::new(),
             stopped: Arc::new(AtomicBool::new(false)),
+            progress: Arc::new(index::IndexProgress::default()),
         }
     }
 
@@ -291,6 +298,14 @@ impl AccountSync {
         self.stopped.clone()
     }
 
+    /// 建索引进度的共享句柄，给拥有它的 `AccountHandle`。
+    ///
+    /// 与 [`AccountSync::stop_flag`] 同一条理由：HTTP 侧要在 `full_sync` 持锁期间读进度，
+    /// 所以交出去的是 `Arc`，读路径永远不碰这把锁。
+    pub fn progress_handle(&self) -> Arc<index::IndexProgress> {
+        self.progress.clone()
+    }
+
     pub fn is_stopped(&self) -> bool {
         self.stopped.load(Ordering::SeqCst)
     }
@@ -300,7 +315,7 @@ impl AccountSync {
     pub fn full_sync(&mut self) -> Result<usize> {
         let files = self.rescan();
         let keys = self.keys.clone();
-        let store = index::build_all_live(&mut self.pool, &keys, &self.wxid, &files)?;
+        let store = index::build_all_live(&mut self.pool, &keys, &self.wxid, &files, &self.progress)?;
         // A build on a real account runs for minutes; a deregistration in that
         // window already cleared the store, so installing this index would
         // resurrect it. The caller checks the same flag before flipping to

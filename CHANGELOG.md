@@ -6,6 +6,13 @@
 
 ### 新增
 
+- **accounts 响应的可选 `progress`**：账号处于 `indexing` 时，列表项、受理/幂等命中与
+  冲突体（在位账号正在构建时）附带 `tables_done` / `tables_total` / `messages_indexed`
+  三个观察值；`ready` / `awaiting_key` / `error` 整块省略。计数逐行推进，分母只数消息表，
+  `tables_total` 为 `0` 表示分母尚未确定。纯 additive：不读它的客户端零感知。
+  回归位置：`tests/api_smoke.rs::indexing_progress_shapes_match_golden`、
+  `tests/golden/accounts-indexing.json` / `accounts-progress.json`、
+  `store::index::tests::progress_counters_advance_per_row_and_table`。
 - **CLI 子命令面的日志旗标 `--log` / `--log-format`**（global 旗标）。子命令此前**从不初始化
   tracing subscriber**（`logging::init` 只在 serve 分支调用），而 `export` 把会话级失败降级成
   `skipped` 时写的是 `tracing::warn!` —— 没有 subscriber 的进程里那是 no-op：用户只剩退出码 1

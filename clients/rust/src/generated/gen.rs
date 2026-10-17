@@ -13,6 +13,8 @@ pub mod types {
     pub struct AccountConflict {
         pub occupied_by: ::std::string::String,
         pub occupied_status: AccountStatus,
+        #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+        pub progress: ::std::option::Option<IndexProgressDto>,
         pub state: ::std::string::String,
         pub success: bool,
         pub wxid: ::std::string::String,
@@ -113,6 +115,8 @@ behind the token-protected `GET /api/v1/accounts`.*/
     #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
     pub struct AccountRegistered {
         pub db_storage: ::std::string::String,
+        #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+        pub progress: ::std::option::Option<IndexProgressDto>,
         pub state: ::std::string::String,
         pub status: AccountStatus,
         pub success: bool,
@@ -131,6 +135,8 @@ name the registration endpoint echoes back.*/
         #[serde(skip_serializing_if = "::std::option::Option::is_none")]
         pub error: ::std::option::Option<::std::string::String>,
         pub message_count: u64,
+        #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+        pub progress: ::std::option::Option<IndexProgressDto>,
         pub state: AccountStatus,
         pub wxid: ::std::string::String,
     }
@@ -473,6 +479,24 @@ coarser [`AccountPhase`] instead, which has no `AwaitingKey` variant.*/
         pub account: AccountPhase,
         pub status: ::std::string::String,
         pub version: ::std::string::String,
+    }
+    /**建索引进度（**只在 `indexing` 态出现**）。
+
+三个键同生同灭：客户端要么一次拿到完整的三个数，要么整块缺失——所以每个承载它的
+响应字段都是 `Option` ＋ `skip_serializing_if`（缺省即没有，不是 `null`）。
+
+分母口径是**消息表**：`tables_total` 只数消息库里的 Msg_* 表。session/contact/sns
+是毫秒级，混进分母会让开跑时的百分比虚高再卡住，反而误导「还要等多久」。
+行数逐行推进；读失败的行不计入。表失败时 `tables_done` 会比 `tables_total` 少一格 ——
+那正是「有一条表确实没读成」的诚实表达。*/
+    #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+    pub struct IndexProgressDto {
+        ///已成功读入索引的消息行累计值（逐行推进；读失败的行不计）。
+        pub messages_indexed: u64,
+        ///已扫完的消息表数。
+        pub tables_done: u64,
+        ///消息表总数（本账号本次构建的枚举结果）。
+        pub tables_total: u64,
     }
     /**一条消息的媒体**元数据**（拉取面与消息面同形）。
 

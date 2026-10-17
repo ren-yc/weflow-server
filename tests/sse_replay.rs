@@ -86,6 +86,7 @@ async fn start(dir: &std::path::Path) -> TestServer {
         session_db: Some(storage.join("session/session.db")),
     };
     let stopped = sync.lock().stop_flag();
+    let progress = sync.lock().progress_handle();
     let handle = Arc::new(AccountHandle {
         info,
         status: AtomicU8::new(2), // Ready
@@ -95,6 +96,7 @@ async fn start(dir: &std::path::Path) -> TestServer {
         media_keys: None,
         watcher: Mutex::new(None),
         stopped,
+        progress,
     });
     state
         .accounts

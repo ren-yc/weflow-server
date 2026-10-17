@@ -112,7 +112,13 @@ pub enum BindOutcome {
     /// live handle is returned as-is (no rebuild, no watcher aborted).
     Existing(Arc<AccountHandle>),
     /// A different wxid holds the binding; nothing changed.
-    Occupied { wxid: String, status: AccountStatus },
+    Occupied {
+        wxid: String,
+        status: AccountStatus,
+        /// 占位账号若正在建索引，把它的进度一起带回去：调用方拿到 409/冲突体时，
+        /// 「还要等多久」与 `occupied_by` 同等重要。
+        progress: Option<crate::server::dto::IndexProgressDto>,
+    },
 }
 
 /// One registered account's runtime state.
@@ -139,6 +145,9 @@ pub struct AccountHandle {
     /// able to set it WITHOUT taking `sync`'s mutex, which a `full_sync` on a
     /// real account can hold for minutes.
     pub stopped: Arc<std::sync::atomic::AtomicBool>,
+    /// 建索引进度。`Arc` 的理由与 `stopped` 相同：`full_sync` 持锁数分钟，HTTP 侧
+    /// 必须能在锁外读进度，否则「问一句到哪了」会阻塞到建索引结束。
+    pub progress: Arc<crate::store::index::IndexProgress>,
 }
 
 pub use crate::sync::history::{HistoryBuf, HistoryItem};
@@ -302,6 +311,7 @@ impl AppState {
                     wxid: h.info.wxid.clone(),
                     state: h.status(),
                     message_count: h.store.read().total_messages(),
+                    progress: indexing_progress(h),
                     error: h.error.lock().clone(),
                     db_storage: h.info.db_storage.to_string_lossy().into_owned(),
                 })
@@ -315,6 +325,8 @@ impl AppState {
                     wxid: info.wxid.clone(),
                     state: AccountStatus::AwaitingKey,
                     message_count: 0,
+                    // 发现项从未开始构建，没有进度可言——缺省而不是 0 值。
+                    progress: None,
                     error: None,
                     db_storage: info.db_storage.to_string_lossy().into_owned(),
                 });
@@ -337,8 +349,35 @@ pub struct AccountStateView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub message_count: usize,
+    /// `indexing` 态才有；其余态整块省略（条件键，与 `error` 同族）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<crate::server::dto::IndexProgressDto>,
     pub state: AccountStatus,
     pub wxid: String,
+}
+
+/// `indexing` 态才给进度，其余态整块省略。
+///
+/// 从 `AccountHandle` 的 `Arc<IndexProgress>` 读、而不是从 `AccountSync` 读：后者那把锁
+/// 在建索引期间被 `full_sync` 占着，走它会把「问一句到哪了」变成「等到建完」。
+pub(crate) fn indexing_progress(
+    h: &AccountHandle,
+) -> Option<crate::server::dto::IndexProgressDto> {
+    if h.status() == AccountStatus::Indexing {
+        Some(progress_dto(h.progress.snapshot()))
+    } else {
+        None
+    }
+}
+
+pub(crate) fn progress_dto(
+    s: crate::store::index::ProgressSnapshot,
+) -> crate::server::dto::IndexProgressDto {
+    crate::server::dto::IndexProgressDto {
+        messages_indexed: s.messages_indexed,
+        tables_done: s.tables_done,
+        tables_total: s.tables_total,
+    }
 }
 
 /// `GET /openapi.json` —— 由 DTO 的 `ToSchema` 生成的接口描述。
@@ -730,8 +769,14 @@ pub fn register_account(
         store.clone(),
         state.bus.clone(),
     )));
-    // No second owner of `sync` yet, so this lock cannot contend.
-    let stopped = sync.lock().stop_flag();
+    // No second owner of `sync` yet, so this lock cannot contend. Both handles are
+    // `Arc`s out of the sync engine: `stopped` lets deregistration skip in-flight
+    // writes, `progress` lets HTTP read the build's position — neither may take
+    // this mutex, which `full_sync` holds for minutes.
+    let (stopped, progress) = {
+        let guard = sync.lock();
+        (guard.stop_flag(), guard.progress_handle())
+    };
     let handle = Arc::new(AccountHandle {
         info,
         status: AtomicU8::new(1), // indexing
@@ -741,6 +786,7 @@ pub fn register_account(
         media_keys,
         watcher: Mutex::new(None),
         stopped,
+        progress,
     });
 
     let mut accounts = state.accounts.lock();
@@ -749,6 +795,7 @@ pub fn register_account(
             return BindOutcome::Occupied {
                 wxid: incumbent.info.wxid.clone(),
                 status: incumbent.status(),
+                progress: indexing_progress(&incumbent),
             };
         }
         if matches!(incumbent.status(), AccountStatus::Ready | AccountStatus::Indexing) {
@@ -1166,9 +1213,15 @@ mod tests {
         a.set_status(AccountStatus::Ready);
 
         match register_account(&state, info("wxid_b"), crate::keystore::KeyMap::default(), None) {
-            BindOutcome::Occupied { wxid, status } => {
+            BindOutcome::Occupied {
+                wxid,
+                status,
+                progress,
+            } => {
                 assert_eq!(wxid, "wxid_a");
                 assert_eq!(status, AccountStatus::Ready);
+                // `ready` 态必须整块省略进度：完成度 100% 再报一遍只是冗余键。
+                assert!(progress.is_none(), "ready incumbent must not carry progress");
             }
             _ => panic!("a second wxid must not bind"),
         }
@@ -1178,6 +1231,32 @@ mod tests {
         let accounts = state.accounts.lock();
         assert_eq!(accounts.len(), 1, "the rejected wxid must not be inserted");
         assert!(accounts.contains_key("wxid_a"));
+    }
+
+    /// An indexing incumbent's counters travel in the conflict body: "how long" matters as
+    /// much as "who" when a client is told someone else holds the binding.
+    #[test]
+    fn occupied_indexing_reports_the_incumbents_progress() {
+        let state = test_state();
+        let a = bind(&state, "wxid_a");
+        a.set_status(AccountStatus::Indexing);
+        a.progress.set_tables_total(2);
+        a.progress.row_indexed();
+        a.progress.row_indexed();
+        a.progress.finish_table();
+
+        match register_account(&state, info("wxid_b"), crate::keystore::KeyMap::default(), None) {
+            BindOutcome::Occupied {
+                status, progress, ..
+            } => {
+                assert_eq!(status, AccountStatus::Indexing);
+                let p = progress.expect("indexing incumbent must carry progress");
+                assert_eq!(p.messages_indexed, 2);
+                assert_eq!(p.tables_done, 1);
+                assert_eq!(p.tables_total, 2);
+            }
+            _ => panic!("a second wxid must not bind"),
+        }
     }
 
     /// An `error` account still HOLDS the binding: one transient decrypt

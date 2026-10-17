@@ -132,13 +132,14 @@ class Mock:
                     body = mock.accounts_page
                 else:
                     state = mock.states.pop(0) if mock.states else "ready"
-                    body = {
-                        "success": True,
-                        "accounts": [
-                            {"wxid": "wxid_mock", "db_storage": "",
+                    entry = {"wxid": "wxid_mock", "db_storage": "",
                              "message_count": 1, "state": state}
-                        ],
-                    }
+                    if state == "indexing":
+                        entry["progress"] = {
+                            "tables_done": 1, "tables_total": 3,
+                            "messages_indexed": 8,
+                        }
+                    body = {"success": True, "accounts": [entry]}
             elif path.endswith("/messages") and path.startswith("/api/v1/sessions/"):
                 mock.pull_queries.append(query)
                 if mock.pull_pages:
@@ -294,7 +295,7 @@ async def test_ensure_ready_times_out_with_last_state() -> None:
         await client.ensure_ready("wxid_mock",
                                   {"wxid": "wxid_mock", "db_path": "X:/db"},
                                   timeout=0.6)
-    assert exc.value.last_state == "indexing"
+    assert exc.value.last_state == "indexing (1 / 3 tables, 8 messages indexed)"
     await client.aclose()
 
 

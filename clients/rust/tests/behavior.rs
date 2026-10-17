@@ -172,12 +172,18 @@ async fn accounts_get(State(mock): State<Mock>, headers: HeaderMap) -> Response 
     } else {
         mock.states.lock().unwrap().pop().unwrap_or_else(|| "ready".to_string())
     };
+    let mut entry = serde_json::json!({
+        "wxid": "wxid_mock", "db_storage": "", "message_count": 1,
+        "state": state,
+    });
+    if state == "indexing" {
+        entry["progress"] = serde_json::json!({
+            "tables_done": 1, "tables_total": 3, "messages_indexed": 8
+        });
+    }
     Json(serde_json::json!({
         "success": true,
-        "accounts": [{
-            "wxid": "wxid_mock", "db_storage": "", "message_count": 1,
-            "state": state,
-        }],
+        "accounts": [entry],
     }))
     .into_response()
 }
@@ -405,7 +411,11 @@ async fn ensure_ready_times_out_with_the_last_observed_state() {
         .await
         .expect_err("must time out");
     match err {
-        ClientError::NotReady { last_state, .. } => assert_eq!(last_state, "indexing"),
+        ClientError::NotReady { last_state, .. } => assert_eq!(
+            last_state,
+            "indexing (1 / 3 tables, 8 messages indexed)",
+            "the deadline diagnosis must carry the last counters, not just the state"
+        ),
         other => panic!("expected NotReady, got {other:?}"),
     }
 }

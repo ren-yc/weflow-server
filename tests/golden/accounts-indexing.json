@@ -1,0 +1,31 @@
+{
+  "body": {
+    "accounts": [
+      {
+        "db_storage": "<volatile>",
+        "message_count": 8,
+        "progress": {
+          "messages_indexed": 8,
+          "tables_done": 1,
+          "tables_total": 3
+        },
+        "state": "indexing",
+        "wxid": "wxid_fake000000000000001"
+      }
+    ],
+    "success": true
+  },
+  "keys": [
+    "accounts",
+    "db_storage",
+    "message_count",
+    "progress",
+    "messages_indexed",
+    "tables_done",
+    "tables_total",
+    "state",
+    "wxid",
+    "success"
+  ],
+  "status": 200
+}

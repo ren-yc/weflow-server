@@ -57,7 +57,15 @@ pub fn open(
 ) -> anyhow::Result<Index> {
     let files = crate::db::scan::enum_db_files(storage);
     let mut pool = LivePool::new();
-    let store = crate::store::index::build_all_live(&mut pool, keys, my_wxid, &files)?;
+    // 嵌入面没有账号句柄可挂进度：一次同步构建，调用方拿到 `Index` 时已经建完，
+    // 记进度没有任何观察窗口。
+    let store = crate::store::index::build_all_live(
+        &mut pool,
+        keys,
+        my_wxid,
+        &files,
+        &crate::store::index::IndexProgress::default(),
+    )?;
     Ok(Index::new(Arc::new(RwLock::new(store))))
 }
 

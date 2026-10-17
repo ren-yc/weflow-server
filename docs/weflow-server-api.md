@@ -141,6 +141,24 @@
 - **不受就绪门控**：账号 `indexing` 时服务器正是「未就绪」，而那恰好是客户端要轮询本接口的
   时候。GET 无 body，token 走请求头或查询串。
 
+### accounts 响应的可选 `progress`
+
+账号处于 `indexing` 时，列表项、受理/幂等命中响应，以及在位账号正在构建时的冲突体，
+额外带一个**可选对象** `progress`：
+
+```json
+"progress": { "tables_done": 3, "tables_total": 12, "messages_indexed": 184321 }
+```
+
+- 只在 `indexing` 态出现；`ready` / `awaiting_key` / `error` 等其余状态**整块省略**
+  （不给 `null`，也不给全零对象）。
+- `tables_total` 只数消息表；为 `0` 表示分母尚未确定（枚举还没开始），不是「零张表」。
+- `messages_indexed` 是已成功读入索引的消息行累计值，逐行推进；读失败的行不计入。
+- 三个数不是同一瞬间的一致快照，仅用于观察；能否服务看 `state`，不要只看 `progress`。
+- 契约仓库的 `INTERPRETATION.md` 已把该键登记为 additive 可选对象，不读它的客户端零感知。
+  回归位置：`tests/api_smoke.rs::indexing_progress_shapes_match_golden` 与
+  `tests/golden/accounts-indexing.json` / `accounts-progress.json`。
+
 ### POST `/api/v1/accounts` — 注册账号（客户端驱动启动）
 
 请求体（JSON）：
@@ -172,6 +190,7 @@
 
 - `state`：注册结果语义（qqflow-server 风格）——`accepted`（已接受，开始后台构建）/ `already_ready`（重复注册，账号已就绪）/ `in_progress`（重复注册，正在构建中）/ `account_conflict`（本服务已绑定**另一个** wxid，拒绝注册）；
 - `status`：账号当前状态机值 ∈ `awaiting_key | indexing | ready | error`；
+- `progress`：`status` 为 `indexing` 时附进度对象（形状与省略规则见上节）；
 - `db_storage`：实际使用的库目录。
 
 `account_conflict` 时不含 `status` / `db_storage`，改附在位账号信息（HTTP 仍为 `200`，`success`
@@ -181,6 +200,8 @@
 { "success": true, "wxid": "wxid_new_5678", "state": "account_conflict",
   "occupied_by": "wxid_xxxx_1234", "occupied_status": "ready" }
 ```
+
+在位账号正在 `indexing` 时，冲突体也会带它的 `progress`（形状与省略规则见上节）。
 
 行为契约：
 - **强制单账号**：一个进程同时只绑定一个 wxid。要换账号必须先注销（见下节），服务器不会为你

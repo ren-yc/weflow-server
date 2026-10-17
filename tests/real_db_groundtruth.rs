@@ -64,7 +64,7 @@ fn real_account_indexes() {
     let files = scan::enum_db_files(&storage);
     assert!(!files.is_empty());
     let mut pool = LivePool::new();
-    let store = index::build_all_live(&mut pool, &keys, "real", &files).unwrap();
+    let store = index::build_all_live(&mut pool, &keys, "real", &files, &index::IndexProgress::default()).unwrap();
     eprintln!("index ok");
     assert!(
         !store.sessions.is_empty() || !store.convs.is_empty(),
@@ -105,7 +105,7 @@ fn real_db_full_probe() {
 
     // live-pool index build
     let mut pool = LivePool::new();
-    let store = index::build_all_live(&mut pool, &keys, "real", &files).unwrap();
+    let store = index::build_all_live(&mut pool, &keys, "real", &files, &index::IndexProgress::default()).unwrap();
     eprintln!(
         "sessions={} convs={} contacts={}",
         store.sessions.len(),
@@ -292,7 +292,7 @@ fn real_group_metadata_has_values() {
     let storage = root.join("db_storage");
     let files = scan::enum_db_files(&storage);
     let mut pool = LivePool::new();
-    let store = index::build_all_live(&mut pool, &keys, "real", &files).unwrap();
+    let store = index::build_all_live(&mut pool, &keys, "real", &files, &index::IndexProgress::default()).unwrap();
 
     // 群主为什么可能是 0：`chat_room.owner` 存的到底是 rowid（要用本库 name2id 解析）还是
     // 用户名本身？两种形态的修法完全不同，不能猜 —— 探一次，只看形态与计数。

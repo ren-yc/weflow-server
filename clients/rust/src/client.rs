@@ -502,7 +502,20 @@ impl Client {
                             last_state: format!("error: {}", a.error.clone().unwrap_or_default()),
                         });
                     }
-                    Some(a) => last_state = a.state.to_string(),
+                    Some(a) => {
+                        // Carry the index counters into the deadline diagnosis: "still
+                        // indexing" alone cannot tell a caller whether it is moving or
+                        // wedged. A missing `progress` is a valid older server (the key
+                        // is additive), so the bare state stays as the fallback.
+                        let state = a.state.to_string();
+                        last_state = match a.progress.as_ref() {
+                            Some(p) => format!(
+                                "{state} ({} / {} tables, {} messages indexed)",
+                                p.tables_done, p.tables_total, p.messages_indexed
+                            ),
+                            None => state,
+                        };
+                    }
                     None => last_state = "not-registered".to_string(),
                 },
                 // A dropped round is **waiting**, not failure. The whole point of a

@@ -8,6 +8,7 @@
 
 use anyhow::Result;
 use rusqlite::{Connection, Row};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{Contact, MessageRecord, Session, SessionKind, Store, Watermark};
 use crate::db::live::LivePool;
@@ -511,6 +512,7 @@ fn load_message_table(
     uid_map: &std::collections::HashMap<i64, String>,
     contacts: &std::collections::HashMap<String, Contact>,
     my_wxid: &str,
+    progress: &IndexProgress,
 ) -> Result<(Vec<MessageRecord>, Watermark)> {
     let cols = MsgCols::probe(conn, table).ok_or_else(|| anyhow::anyhow!("no local_id column"))?;
     let order = [
@@ -527,7 +529,19 @@ fn load_message_table(
     let mut rows = stmt.query([])?;
     let mut records = Vec::new();
     let mut watermark = Watermark::default();
-    while let Some(row) = rows.next()? {
+    // 行数在解析时先加；这张表若中途读失败，调用方会丢弃 `records`，
+    // 所以失败路径必须把本表已加的行数**回滚**——否则进度声称「已入索引」
+    // 的条数会多于真正装进 store 的条数。
+    let mut counted = 0usize;
+    loop {
+        let row = match rows.next() {
+            Ok(Some(row)) => row,
+            Ok(None) => break,
+            Err(e) => {
+                progress.rollback_rows(counted);
+                return Err(e.into());
+            }
+        };
         let owned = cols.extract(row, uid_map);
         watermark = max_watermark(
             watermark,
@@ -538,6 +552,8 @@ fn load_message_table(
             },
         );
         records.push(row_to_record(owned, my_wxid, contacts));
+        progress.row_indexed();
+        counted += 1;
     }
     Ok((records, watermark))
 }
@@ -550,6 +566,70 @@ fn max_watermark(a: Watermark, b: Watermark) -> Watermark {
     }
 }
 
+/// 建索引期间**可被无锁读取**的进度计数。
+///
+/// 为什么不是 `Store` 的字段：`Store` 在建索引期间整体还没发布（`full_sync` 把构建结果
+/// 一次性换入），而 HTTP 侧要在这几分钟里回答「现在到哪了」。放进 `Store` 就得先拿到写锁，
+/// 那正是最长的那把锁 —— 所以这里是 `Arc` 包着的原子量，挂在账号句柄上。
+///
+/// 口径：分母只数**消息表**。session/contact/contact_fts/sns 都是毫秒级，混进分母会让
+/// 开跑时的百分比虚高再卡住，反而误导「还要等多久」。
+///
+/// 行数**逐行**推进：表越大，`messages_indexed` 越能反映真实进展；只在表末一次性加
+/// `records.len()` 会让大表在整个读取期间都停在旧值上，客户端看到的进度反而更假。
+#[derive(Debug, Default)]
+pub struct IndexProgress {
+    tables_done: AtomicUsize,
+    tables_total: AtomicUsize,
+    messages_indexed: AtomicUsize,
+}
+
+/// [`IndexProgress`] 的一致性快照（三个数取自同一时刻之后，允许彼此差一两张表）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgressSnapshot {
+    pub messages_indexed: usize,
+    pub tables_done: usize,
+    pub tables_total: usize,
+}
+
+impl IndexProgress {
+    /// 分母落定，同时把上一轮的两个累计清零。
+    ///
+    /// 复用一个 `Arc` 做第二次全量构建时（例如将来允许「就绪后重建」），进度必须从零开始；
+    /// 继承上一轮的数会让 `messages_indexed` 超过新分母，读起来像卡住或倒流。
+    pub fn set_tables_total(&self, total: usize) {
+        self.tables_total.store(total, Ordering::Relaxed);
+        self.tables_done.store(0, Ordering::Relaxed);
+        self.messages_indexed.store(0, Ordering::Relaxed);
+    }
+
+    /// 成功读入索引一行：只推进行数，不动表计数。
+    pub fn row_indexed(&self) {
+        self.messages_indexed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 回滚一张中途读失败的表已计入的行数。
+    ///
+    /// 只由扫描该表的同一线程调用，`n` 不超过它自己已加的计数，因此不会下溢；
+    /// 失败表的 `tables_done` 本来就不推进。
+    pub fn rollback_rows(&self, n: usize) {
+        self.messages_indexed.fetch_sub(n, Ordering::Relaxed);
+    }
+
+    /// 一张消息表读完：只推进表计数（行数已由 [`IndexProgress::row_indexed`] 累计）。
+    pub fn finish_table(&self) {
+        self.tables_done.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> ProgressSnapshot {
+        ProgressSnapshot {
+            messages_indexed: self.messages_indexed.load(Ordering::Relaxed),
+            tables_done: self.tables_done.load(Ordering::Relaxed),
+            tables_total: self.tables_total.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Build the full index for one account by reading its live databases
 /// directly through the pooled read-only connections.
 pub fn build_all_live(
@@ -557,8 +637,9 @@ pub fn build_all_live(
     keys: &KeyMap,
     my_wxid: &str,
     db_files: &[DbFile],
+    progress: &IndexProgress,
 ) -> Result<Store> {
-    let mut store = build_all_live_inner(pool, keys, my_wxid, db_files)?;
+    let mut store = build_all_live_inner(pool, keys, my_wxid, db_files, progress)?;
     // 时刻在**外层**记：内层有多条提前返回的路径（缺密钥、库打不开），漏掉任何一条都会让
     // updatedAt 停在 0 —— 那种「字段在、值是零」比字段缺失更难查。
     store.mark_index_built();
@@ -570,6 +651,7 @@ fn build_all_live_inner(
     keys: &KeyMap,
     my_wxid: &str,
     db_files: &[DbFile],
+    progress: &IndexProgress,
 ) -> Result<Store> {
     let mut store = Store {
         my_wxid: my_wxid.to_string(),
@@ -625,7 +707,25 @@ fn build_all_live_inner(
 
     // 3) message databases (contacts snapshot is immutable during build)
     let contacts = store.contacts.clone();
-    for f in db_files.iter().filter(|f| f.kind == DbKind::Message) {
+    let message_files: Vec<&DbFile> = db_files
+        .iter()
+        .filter(|f| f.kind == DbKind::Message)
+        .collect();
+    // 3a) 先只枚举表名定分母。为什么必须先枚举：百分比要么有分母、要么只能边扫边猜；
+    // 后者会让客户端看到的进度先虚高再回落。枚举只查 sqlite_master，不读任何行。
+    // 打不开的库不进分母 —— 它们本来也扫不到，进了分母就永远差最后一格。
+    let mut total_tables = 0usize;
+    for f in &message_files {
+        let Some(key) = keys.key_for(&f.rel) else {
+            continue;
+        };
+        if let Ok(conn) = pool.get_or_open(f, key) {
+            total_tables += message_tables(conn).len();
+        }
+    }
+    progress.set_tables_total(total_tables);
+    // 3b) 再逐表扫描并按表推进计数。
+    for f in message_files {
         let Some(key) = keys.key_for(&f.rel) else {
             tracing::warn!("no key for {}", f.rel);
             continue;
@@ -639,7 +739,7 @@ fn build_all_live_inner(
         };
         let uid_map = load_uid_map(conn, name2id_table(conn).as_deref());
         for (table, md5_suffix) in message_tables(conn) {
-            match load_message_table(conn, &table, &uid_map, &contacts, my_wxid) {
+            match load_message_table(conn, &table, &uid_map, &contacts, my_wxid, progress) {
                 Ok((records, watermark)) => {
                     let session = table_session(&md5_suffix, &store);
                     let conv = store.convs.entry(session).or_default();
@@ -651,8 +751,11 @@ fn build_all_live_inner(
                         .unwrap_or_default();
                     let wm = max_watermark(current, watermark);
                     store.watermarks.insert(format!("{}:{table}", f.rel), wm);
+                    progress.finish_table();
                 }
                 Err(e) => {
+                    // 读失败的表现在也不推进计数：分母里仍算它一格，客户端会看到
+                    // 「少一格」——这比悄悄把分母也减一格更诚实（有一条表确实没读成）。
                     tracing::warn!("message table {table} skipped: {e}");
                 }
             }
@@ -814,5 +917,109 @@ mod tests {
         assert_eq!(rows.len(), 1, "对照基线: {rows:?}");
         assert_eq!(rows[0].local_id, 1, "读到的必须是那一行本体: {rows:?}");
         assert_eq!(rows[0].create_time, 1700000000, "时间列必须被真正用于窗口读: {rows:?}");
+    }
+
+    /// 进度计数：分母由枚举设定；行数逐行推进，表完成只推进 done。
+    ///
+    /// 这条守的是「计数器本身」——`indexing` 形状的快照用例守序列化，两者分开，
+    /// 因为一个坏掉的计数器可以被一份同样坏掉的快照固化成「预期值」。
+    #[test]
+    fn progress_counters_advance_per_row_and_table() {
+        let p = IndexProgress::default();
+        assert_eq!(
+            p.snapshot(),
+            ProgressSnapshot {
+                messages_indexed: 0,
+                tables_done: 0,
+                tables_total: 0
+            },
+            "未设分母时三个数都该是零（客户端按「未知」处理）"
+        );
+        p.set_tables_total(3);
+        for _ in 0..8 {
+            p.row_indexed();
+        }
+        p.finish_table();
+        for _ in 0..5 {
+            p.row_indexed();
+        }
+        p.finish_table();
+        let s = p.snapshot();
+        assert_eq!(s.tables_total, 3, "分母只由 set_tables_total 设定");
+        assert_eq!(s.tables_done, 2);
+        assert_eq!(s.messages_indexed, 13, "行数逐行累加，不按表批量加");
+    }
+
+    /// 一张表中途读失败：它已计入的行数必须回滚，且 `tables_done` 不推进。
+    ///
+    /// 这条守的是「进度声称的条数 ≤ 真正装进 store 的条数」；只看快照形状的用例
+    /// 抓不到这种「表失败但行数照涨」的偏差。
+    #[test]
+    fn rollback_rows_discards_a_failed_tables_partial_count() {
+        let p = IndexProgress::default();
+        p.set_tables_total(2);
+        for _ in 0..5 {
+            p.row_indexed();
+        }
+        p.rollback_rows(5);
+        let s = p.snapshot();
+        assert_eq!(s.messages_indexed, 0, "失败表已计入的行必须回滚");
+        assert_eq!(s.tables_done, 0, "失败表不推进 tables_done");
+    }
+
+    /// 分母重设同时清零上一轮的累计：同一个 `Arc` 被第二次构建复用时不能继承旧值。
+    #[test]
+    fn set_tables_total_resets_previous_accumulation() {
+        let p = IndexProgress::default();
+        p.set_tables_total(3);
+        for _ in 0..4 {
+            p.row_indexed();
+        }
+        p.finish_table();
+        p.set_tables_total(2);
+        let s = p.snapshot();
+        assert_eq!(s.messages_indexed, 0, "新一轮的行数必须从零开始");
+        assert_eq!(s.tables_done, 0, "新一轮的表数必须从零开始");
+        assert_eq!(s.tables_total, 2);
+    }
+
+    /// 进度不是只在计数器 API 上「自说自话」：真实读表路径每解析一行就必须推进同一个
+    /// `IndexProgress`。缺了这条，`row_indexed()` 的接线被删掉，计数器单测与 golden 都仍绿。
+    #[test]
+    fn load_message_table_advances_the_shared_counter() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE msg_2021f50af0b435101c0219d73dd2d44b (
+                local_id INTEGER PRIMARY KEY,
+                server_id TEXT,
+                local_type INTEGER,
+                create_time INTEGER,
+                sender_username TEXT
+            );
+            INSERT INTO msg_2021f50af0b435101c0219d73dd2d44b
+                (local_id, server_id, local_type, create_time, sender_username)
+                VALUES (1, 's1', 1, 1700000000, 'u1'),
+                       (2, 's2', 1, 1700000001, 'u2');
+        "
+        )
+        .unwrap();
+        let progress = IndexProgress::default();
+        progress.set_tables_total(1);
+        let uid_map: std::collections::HashMap<i64, String> = Default::default();
+        let contacts: std::collections::HashMap<String, Contact> = Default::default();
+        let (records, _) = load_message_table(
+            &conn,
+            "msg_2021f50af0b435101c0219d73dd2d44b",
+            &uid_map,
+            &contacts,
+            "me",
+            &progress,
+        )
+        .expect("夹具表必须可读");
+        progress.finish_table();
+        assert_eq!(records.len(), 2);
+        let s = progress.snapshot();
+        assert_eq!(s.messages_indexed, 2, "每解析一行都要推进同一个计数器");
+        assert_eq!(s.tables_done, 1, "表完成后只推进一次表计数");
     }
 }
