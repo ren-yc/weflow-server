@@ -7,6 +7,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import queue
+import threading
 from typing import Any
 
 import httpx
@@ -21,6 +23,7 @@ from weflow_sdk import (
     NotReady,
     ShapeError,
     StatusError,
+    SyncClient,
     TransportError,
 )
 from weflow_sdk import client as sdkmod
@@ -240,6 +243,20 @@ def make_client(mock: Mock) -> Client:
         base_url="http://mock",
     )
     return client
+
+
+def make_sync_client(mock: Mock, monkeypatch) -> SyncClient:
+    """Build a SyncClient whose async core talks to the in-process mock."""
+    async def _new_client(self, base_url, token, timeout, stall_timeout):
+        client = Client(base_url, token, timeout, stall_timeout)
+        client._http = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=mock.asgi_app()),
+            base_url="http://mock",
+        )
+        return client
+
+    monkeypatch.setattr(sdkmod.SyncClient, "_new_client", _new_client)
+    return SyncClient("http://mock", TOKEN)
 
 
 def pull_page(msgs: list[dict], has_more: bool, next_since: int, next_offset: int) -> dict:
@@ -1423,3 +1440,101 @@ async def test_watch_raises_on_an_unusable_base_url_instead_of_looping_forever()
     assert isinstance(exc.value, TransportError), repr(exc.value)
     assert "base_url" in str(exc.value).lower(), str(exc.value)
     await client.aclose()
+
+
+# ---- SyncClient: same judgments, synchronous entry ------------------------
+
+
+def test_sync_client_health_and_accounts(monkeypatch) -> None:
+    mock = Mock()
+    mock.health_body = {"account": "ready", "status": "ok", "version": "9.9.9"}
+    mock.accounts_page = {
+        "success": True,
+        "accounts": [
+            {"wxid": "wxid_a", "db_storage": "X:/a", "message_count": 12,
+             "state": "ready"},
+            {"wxid": "wxid_b", "db_storage": "X:/b", "message_count": 0,
+             "state": "error", "error": "bad key"},
+        ],
+    }
+    with make_sync_client(mock, monkeypatch) as client:
+        health = client.health()
+        assert health.version == "9.9.9"
+        assert health.account is gen.AccountPhase.READY
+        accounts = client.accounts()
+        assert accounts[0].message_count == 12
+        assert accounts[1].error == "bad key"
+        assert mock.health_auth == [False], "/health is unauthenticated: no credentials"
+    # The context manager must actually stop the loop thread: the next call
+    # would fail fast instead of running on a half-closed client.
+    assert client._closed
+    assert not client._thread.is_alive()
+
+
+def test_sync_client_drain_session_runs_callbacks_on_the_caller_thread(monkeypatch) -> None:
+    mock = Mock()
+    mock.pull_pages = [
+        pull_page([msg(1, 990), msg(2, 1000)], True, 1000, 7),
+        pull_page([msg(3, 1500)], False, 2000, 0),
+    ]
+    client = make_sync_client(mock, monkeypatch)
+    caller = threading.get_ident()
+    seen: list[tuple[int, list[str]]] = []
+    try:
+        total = client.drain_session(
+            "alice",
+            500,
+            lambda batch: seen.append(
+                (threading.get_ident(), [str(m.platform_message_id) for m in batch])
+            ),
+        )
+    finally:
+        client.close()
+    assert total == 3
+    assert [ids for _, ids in seen] == [["1", "2"], ["3"]]
+    assert all(ident == caller for ident, _ in seen), "on_page must stay on the caller thread"
+    assert mock.pull_queries[0] == {"since": "500"}
+    assert mock.pull_queries[1] == {"since": "1000", "offset": "7"}
+
+
+def test_sync_client_wait_ready_timeout_names_the_last_state(monkeypatch) -> None:
+    mock = Mock()
+    mock.states = ["indexing"] * 100
+    client = make_sync_client(mock, monkeypatch)
+    try:
+        with pytest.raises(NotReady) as exc:
+            client.wait_ready("wxid_mock", timeout=0.6)
+    finally:
+        client.close()
+    assert exc.value.last_state == "indexing (1 / 3 tables, 8 messages indexed)"
+
+
+def test_sync_client_watch_yields_events_without_an_async_loop(monkeypatch) -> None:
+    # The sync watch iterator must keep the same reconnect framing as the async
+    # one; this pins the first frame and the early-close path.
+    mock = Mock()
+    mock.sse_body = (
+        "\n".join(sse_frame("message.new", new_payload("9", "hi"), 7)) + "\n\n"
+    ).encode()
+    client = make_sync_client(mock, monkeypatch)
+    events = client.watch()
+    pulled: queue.Queue[Any] = queue.Queue()
+
+    def _pull() -> None:
+        try:
+            pulled.put(next(events))
+        except BaseException as exc:  # noqa: BLE001 - handed back to the test
+            pulled.put(exc)
+
+    thread = threading.Thread(target=_pull, daemon=True)
+    thread.start()
+    try:
+        item = pulled.get(timeout=5)
+        if isinstance(item, BaseException):
+            raise item
+        assert isinstance(item, gen.EventNew)
+        assert item.rawid == "9"
+        assert mock.sse_connections == 1
+    finally:
+        events.close()
+        client.close()

@@ -1139,6 +1139,14 @@ weflow-server.exe sessions --json        # 子命令面
   | `watch()` | SSE `/api/v1/push/messages` | `Last-Event-ID` 重连（游标**只在帧被消费时推进**：只有 `id:` 没有 `data:` 的悬空帧不推进，否则那条事件会从重放窗口消失）、心跳注释帧过滤、`generation` 变化上报给调用方决定是否回退 Pull 补拉 |
   | `sync_now()` | `POST /api/v1/sync` | **写动作**（推进水位、可能导出媒体）：刻意不进入任何轮询路径，只有显式调用才触发（有测试钉住读路径零命中） |
 
+  **Python 同步门面 `SyncClient`**：方法面与 `Client` 一一对应，导出自 `weflow_sdk`；内部跑一条
+  专属事件循环线程（不占用调用方的 loop，也不要求调用方在协程里），`with SyncClient(...) as c:`
+  即用即关。`watch()` 返回普通迭代器，断连/`Last-Event-ID` 重放语义与 async 版相同；`drain_session`
+  的 `on_page` 在调用方线程执行。回归位置：`test_sync_client_health_and_accounts`、
+  `test_sync_client_drain_session_runs_callbacks_on_the_caller_thread`、
+  `test_sync_client_wait_ready_timeout_names_the_last_state`、
+  `test_sync_client_watch_yields_events_without_an_async_loop`（Python 两侧同名）。
+
   **两个容易读错的地方**：① `list_all_sessions` 与 `drain_session` 是取尽，而 `pull_page`/
   `list_messages` 只取一页；`contacts` 是一页语义但响应带 `total`/`hasMore`（CLI 的 `contacts` 子命令
   也透传分页参数并回给这两个字段）；② 时间界收 `YYYYMMDD` **或** unix 秒，`end` 作为上界时裸日期覆盖**整天**。

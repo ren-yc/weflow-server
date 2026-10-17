@@ -13,6 +13,13 @@
   回归位置：`tests/api_smoke.rs::indexing_progress_shapes_match_golden`、
   `tests/golden/accounts-indexing.json` / `accounts-progress.json`、
   `store::index::tests::progress_counters_advance_per_row_and_table`。
+- **Python 同步门面 `SyncClient`**：与 `Client` 方法一一对应，内部跑一条专属事件循环线程
+  （不占用调用方的 loop）；`watch()` 返回普通迭代器并保留断连重放语义，`with SyncClient(...) as c:`
+  即用即关，`drain_session` 的 `on_page` 在调用方线程执行。导出自 `weflow_sdk`。
+  回归位置：`test_sync_client_health_and_accounts`、
+  `test_sync_client_drain_session_runs_callbacks_on_the_caller_thread`、
+  `test_sync_client_wait_ready_timeout_names_the_last_state`、
+  `test_sync_client_watch_yields_events_without_an_async_loop`。
 - **CLI 子命令面的日志旗标 `--log` / `--log-format`**（global 旗标）。子命令此前**从不初始化
   tracing subscriber**（`logging::init` 只在 serve 分支调用），而 `export` 把会话级失败降级成
   `skipped` 时写的是 `tracing::warn!` —— 没有 subscriber 的进程里那是 no-op：用户只剩退出码 1
