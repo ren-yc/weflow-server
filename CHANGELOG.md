@@ -19,6 +19,9 @@
   （自本批起行内多了 target 段）。
 - **日志行恢复模块 target**（如 `weflow_server::export`）：模块很多（store/sync/server/media/watch…），
   没有归属信息时排障只能靠猜文案。
+- **子命令日志不带 ANSI 颜色码**：stderr 是机器消费面（`2> 文件`、采集器按行解析），转义序列会
+  毁掉按行解析；`tracing-subscriber` 不做 TTY 检测，靠环境变量 `NO_COLOR` 兜不住的场合（CI）就会
+  露出转义码。serve 的 stdout 输出维持库默认观感，本批不动。
 - serve／裸跑路径**新增** `--log-format`（老解析器里 `--log` 的同族旗标，值域 `text|json`）。
   既有的 `--log` 旗标与 serve 的 info 默认**逐字不变**（回归位置：
   `tests/cli.rs::serve_log_flag_still_goes_through_the_old_parser`）。

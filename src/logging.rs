@@ -98,9 +98,16 @@ fn install(level: &str, format: &str, to_stderr: bool) -> bool {
     // （判据：`tests/cli.rs::serve_logs_stay_on_stdout`）。
     let json = format == "json";
     if to_stderr {
+        // **子命令支显式关 color**，不是样式偏好：stderr 是子命令的机器消费面（`2>file`
+        // 收日志、采集器按行解析、脚本 grep 级别与 target）。tracing-subscriber 不做 TTY
+        // 检测，不关就会在重定向场景里写下 `\x1b[33m WARN\x1b[0m` —— 判据
+        // `tests/cli_e2e.rs::subcommand_failures_are_logged_on_stderr` 遂依赖运行环境的
+        // `NO_COLOR`（本机有、CI 没有 ⇒ 本地绿、CI 红，实测踩中）。
+        // serve 支刻意保持库默认：那是既有输出的样子，本批不改它的观感。
         let builder = tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_target(true)
+            .with_ansi(false)
             .with_writer(std::io::stderr);
         if json {
             builder.json().try_init().is_ok()

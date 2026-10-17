@@ -306,6 +306,11 @@ OpenSSL，后者的 perl `Configure` 会直接调 `cl.exe` / `link.exe`，**绕�
   依赖上只多一个 `tracing-serde`（json formatter 的 serde 粘合层），不拉 axum/tokio/clap，
   嵌入契约的依赖树钉子照常成立。
 - **target 必须开着**：模块多（store/sync/server/media/watch…），关掉后日志行没有「谁说的」。
+- **子命令日志不带 ANSI 颜色码**：`tracing-subscriber` 不做 TTY 检测，重定向时照样写转义序列；
+  stderr 是脚本与采集器的消费面（`2> 文件`、按行解析），所以子命令那支显式 `with_ansi(false)`。
+  靠环境变量 `NO_COLOR` 不行——开发机设了它、CI 没设，判据就变成「本地绿 CI 红」（实测踩中）。
+  serve 支保持库默认观感，本批不动。判据：`tests/cli_e2e.rs::subcommand_failures_are_logged_on_stderr`
+  里的「stderr 不得含 ESC 字节」断言（测试基座同时清掉子进程的 `NO_COLOR`，否则本机测不出）。
 - **语言口径与脱敏红线**：见 `src/logging.rs` 模块头（用户句中文、模块级诊断英文；日志禁入完整
   密钥／完整 token／消息正文，例外只有 serve 路径那两条「不打印就拿不到」的 token 行——首次生成
   的 info 行与凭据库不可用时的 warn 行）。

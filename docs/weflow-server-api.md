@@ -963,6 +963,9 @@ feeds 条目字段（以源码 `sns.rs` 为准）：`tid/userName/content(明文
 - 非法取值（`--log verbose`、`--log-format yaml`）是**用法错误（退出码 2）**，与 `--since` 同一契约。
 - 环境变量 `RUST_LOG` **优先于 `--log`**（EnvFilter 的既有语义）：设了它时命令行旗标被忽略。脚本与
   测试基座里一律 `env_remove` 它，避免级别随环境漂移。
+- 子命令日志**不带 ANSI 颜色码**（`--log-format json` 与 text 同）：stderr 是脚本与采集器的消费面，
+  `2> 日志文件` 里出现 `\x1b[33m` 会毁掉按行解析。这条是产品保证、不依赖 `NO_COLOR` 环境变量。
+  serve 的输出维持库默认（本批不动它的观感）。
 
 ## 批量导出（`export`）
 

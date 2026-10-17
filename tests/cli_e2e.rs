@@ -384,6 +384,9 @@ fn run(base: &str, args: &[&str]) -> (i32, String, String) {
         // EnvFilter 的取值是「环境变量优先于命令行 --log」：开发机设过 RUST_LOG 时，
         // 级别类判据（json 用例的 debug 起手行）会随环境漂移。基座一律清掉。
         .env_remove("RUST_LOG")
+        // `NO_COLOR` 同理必须清：tracing-subscriber 会尊重它，留着时本机永远测不出
+        // 「子命令日志带 ANSI 码」这一类回归（CI 没这个变量，于是本地绿、CI 红）。
+        .env_remove("NO_COLOR")
         .output()
         .expect("spawn weflow-server");
     (
@@ -1069,6 +1072,13 @@ async fn subcommand_failures_are_logged_on_stderr() {
     assert!(
         stderr.contains("HTTP 503"),
         "原因（状态码）必须随 warn 行出现，实际 stderr:\n{stderr}"
+    );
+    // 子命令日志是机器消费面：不得出现 ANSI 转义序列（`2> 文件`、采集器按行解析都靠纯文本）。
+    // 这条钉的是**产品保证**而不是运行环境：关掉 `with_ansi(false)` 时 CI（无 `NO_COLOR`）
+    // 必红——上一版只靠子串断言，实现机恰好设了 `NO_COLOR` 就本地绿、CI 红。
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "子命令日志不得带 ANSI 转义码，实际 stderr: {stderr:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
