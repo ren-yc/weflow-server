@@ -937,6 +937,33 @@ feeds 条目字段（以源码 `sns.rs` 为准）：`tid/userName/content(明文
 
 输出：默认是人类可读的紧凑行（每类只挑最常看的几列），`--json` 给机器可读形状。
 
+### 日志旗标（`--log` / `--log-format`）
+
+子命令面带两个 **global 旗标**（在任何子命令的位置都可用）：
+
+| 旗标 | 取值 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `--log` | `error\|warn\|info\|debug` | 子命令 **warn**；serve **info** | 日志详细度。子命令默认只播失败原因，正常路径不刷屏 |
+| `--log-format` | `text\|json` | `text` | `json` 为**逐行一个对象**（含 `level`/`target`/`fields`），给日志采集器消费；去向随入口（子命令 stderr、serve stdout） |
+
+关键口径（回归位置：`tests/cli_e2e.rs::subcommand_failures_are_logged_on_stderr` 与
+`tests/cli_e2e.rs::log_json_format_emits_parseable_lines`、`tests/cli.rs::invalid_log_flags_are_usage_errors_exit_2`）：
+
+- **子命令的日志只进 stderr，stdout 永远是命令输出**。`--json` 的 stdout 可被管道直接解析，加 `--log-format json`
+  也不会让 JSON 日志混进 stdout（serve 的日志去向见下下条）。
+- **子命令在动手执行前就装好日志**——所以 `export` 把某个会话标记为 `skipped` 时，「**为什么**跳过」会以
+  `warn` 行出现在 stderr（改造前那行 `tracing::warn!` 落在没装 subscriber 的进程里，是 no-op：只剩退出码 1
+  与一行「跳过」，原因永远看不到）。
+- **`serve` 的 `--log` 仍走老解析器**：`serve --log debug` 与裸跑 `--log debug` 逐字等价，info 默认也不被子命令
+  预装的 warn 劫走（dispatch 在构造 clap 之前就短路进 legacy；回归位置：`tests/cli.rs::serve_log_flag_still_goes_through_the_old_parser`）。
+- **输出去向按入口分流**：子命令的日志走 **stderr**（stdout 留给命令输出），serve 的日志维持 **stdout**
+  （既有 `weflow-server > 日志文件` 部署的重定向习惯，改通道属破坏性变更）。回归位置：
+  `tests/cli.rs::serve_logs_stay_on_stdout`。两入口分叉的理由与已知代价写在 `docs/architecture.md`
+  的「日志：装在哪、写去哪、说什么话」。
+- 非法取值（`--log verbose`、`--log-format yaml`）是**用法错误（退出码 2）**，与 `--since` 同一契约。
+- 环境变量 `RUST_LOG` **优先于 `--log`**（EnvFilter 的既有语义）：设了它时命令行旗标被忽略。脚本与
+  测试基座里一律 `env_remove` 它，避免级别随环境漂移。
+
 ## 批量导出（`export`）
 
 `weflow-server export --out <目录> [--format jsonl|json] [--session <id> …] [--since <t>] [--resume] [--with-media]`

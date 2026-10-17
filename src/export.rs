@@ -628,6 +628,11 @@ where
         };
         // 文件名先算出来才能判断 --resume：确定性（同样的输入→同样的名字）是续跑的前提。
         let path = opts.out_dir.join(format!("{stem}.{ext}"));
+        // 起手进度行：export 是长任务，「现在走到哪个会话」只有 debug 级才值得逐会话打——
+        // 默认 warn 静默，排障时 `--log debug` 就能看到游动位置。这行同时充当 json 判据的
+        // 样本行（`tests/cli_e2e.rs::log_json_format_emits_parseable_lines` 需要一行必定
+        // 出现的 debug 级日志，否则它只能依赖碰巧出现的第三方日志）。
+        tracing::debug!("导出开始: {} → {}", target.talker, path.display());
         if !opts.resume && path.exists() {
             // 判据是**归属**，不是「本轮有没有写过」：既有产物属于别的会话、或谁都不
             // 认领时，本轮写下去就是把别人的交付物静默换成这个会话的内容——而新清单里

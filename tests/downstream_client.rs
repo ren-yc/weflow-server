@@ -144,6 +144,7 @@ fn build_real_app(export_dir: &std::path::Path) -> Option<(axum::Router, Arc<App
         host: "127.0.0.1".into(),
         port: TEST_PORT,
         log: "info".into(),
+        log_format: "text".into(),
         watch_debounce_ms: 50,
         watch_fallback_ms: 0,
         media_export_dir: export_dir.join("media"),

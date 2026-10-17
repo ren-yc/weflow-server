@@ -2,6 +2,39 @@
 
 本文件从 0.5.0 起维护。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [未发布]
+
+### 新增
+
+- **CLI 子命令面的日志旗标 `--log` / `--log-format`**（global 旗标）。子命令此前**从不初始化
+  tracing subscriber**（`logging::init` 只在 serve 分支调用），而 `export` 把会话级失败降级成
+  `skipped` 时写的是 `tracing::warn!` —— 没有 subscriber 的进程里那是 no-op：用户只剩退出码 1
+  与一行「跳过: <会话>」，**为什么跳过永远看不到**。现在子命令在执行任何动作前装 warn 级
+  subscriber，失败原因以 `WARN <模块>: 跳过会话 …` 的形式出现在 stderr。
+  回归位置：`tests/cli_e2e.rs::subcommand_failures_are_logged_on_stderr`、
+  `tests/cli_e2e.rs::log_json_format_emits_parseable_lines`、
+  `tests/cli.rs::invalid_log_flags_are_usage_errors_exit_2`。
+- **`--log-format json`**：逐行一个 JSON 对象（含 `level`/`target`/`fields`），给日志采集器消费；
+  输出去向跟随所在入口（子命令 stderr、serve stdout）。text 是默认，形态为 `时间 级别 target: 消息`
+  （自本批起行内多了 target 段）。
+- **日志行恢复模块 target**（如 `weflow_server::export`）：模块很多（store/sync/server/media/watch…），
+  没有归属信息时排障只能靠猜文案。
+- serve／裸跑路径**新增** `--log-format`（老解析器里 `--log` 的同族旗标，值域 `text|json`）。
+  既有的 `--log` 旗标与 serve 的 info 默认**逐字不变**（回归位置：
+  `tests/cli.rs::serve_log_flag_still_goes_through_the_old_parser`）。
+
+### 变更
+
+- **子命令的日志改到 stderr**（此前根本无日志）。子命令的 stdout 是机器可读输出（`--json`）或
+  人类摘要行，日志混进 stdout 会毁掉 `… --json | jq` 这类管道消费。
+  **serve 的日志仍在 stdout，未改**：既有部署用 `weflow-server > 日志文件` 收服务日志，改通道会让
+  那个文件变空。两入口 stdout 契约不同（serve 无输出契约、子命令有），因此输出去向不同；
+  理由与判据写在 `src/logging.rs` 模块头与 `docs/architecture.md` 的「日志：装在哪、写去哪、说什么话」。
+- **日志入口 `logging::init` 移除**，改由两个显式入口承载：`init_with_format`（子命令形态，
+  写 stderr）与 `init_for_serve`（serve 形态，写 stdout），二者都返回 `bool`（是否真的装了）。
+  **只影响库内调用**：`logging` 不是承诺面（默认构建下 `pub(crate)`），`pub mod api` 里没有它，
+  所以嵌入者无迁移动作。
+
 ## [0.9.0] - 2026-10-11
 
 ### 变更

@@ -35,7 +35,9 @@ tokio-stream = { optional = true, version = "0.1", features = ["sync"] }
 tokio-util = { optional = true, version = "0.7", features = ["io"] }
 tower-http = { optional = true, version = "0.6", features = ["trace"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# json feature 供 `--log-format json`（stderr 逐行 JSON）。新增的唯一依赖是 tracing-serde
+# （json formatter 的 serde 粘合层）；它不拉 axum/tokio/clap——嵌入契约的依赖树钉子照常成立。
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # OpenAPI 描述生成。**只加在服务层**：schema 是 HTTP 面的东西，解析/存储层不该依赖它。
 utoipa = { optional = true, version = "6", features = ["axum_extras"] }
 zstd = "0.13"

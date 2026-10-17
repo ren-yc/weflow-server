@@ -381,6 +381,9 @@ fn run(base: &str, args: &[&str]) -> (i32, String, String) {
         .env("WEFLOW_BASE_URL", base)
         .env("WEFLOW_TOKEN", TOKEN)
         .env_remove("WEFLOW_EMBED_CONFIG")
+        // EnvFilter 的取值是「环境变量优先于命令行 --log」：开发机设过 RUST_LOG 时，
+        // 级别类判据（json 用例的 debug 起手行）会随环境漂移。基座一律清掉。
+        .env_remove("RUST_LOG")
         .output()
         .expect("spawn weflow-server");
     (
@@ -1036,5 +1039,78 @@ async fn media_id_from_pull_row_skips_the_export_round() {
         assert!(body.contains(name), "导出物要引用实际落盘的名字 {name}: {body}");
     }
     assert!(!body.contains("photo.png"), "拉取面的元数据名不得留在导出物里: {body}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 子命令的会话级失败必须以 tracing 行出现在 **stderr** 上。
+///
+/// 改造前 `export` 子命令根本不装 subscriber（`logging::init` 只在 serve 分支调用），
+/// 而 `export::run` 的失败原因是 `tracing::warn!` —— 没有 subscriber 的进程里那是 no-op：
+/// 用户只剩退出码 1 与 stdout 的「跳过: boom-talker」摘要行，**为什么跳过永远看不到**。
+/// 撤掉 `dispatch` 里的子命令预装，本用例的 stderr 里既没有 warn 行也没有状态码 ⇒ 红。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subcommand_failures_are_logged_on_stderr() {
+    let base = spawn_stub().await;
+    let dir = std::env::temp_dir().join(format!("weflow-e2e-logboom-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (code, _stdout, stderr) = run(
+        &base,
+        &[
+            "export", "--out", dir.to_str().unwrap(), "--format", "jsonl", "--with-media",
+            "--session", "boom-talker",
+        ],
+    );
+    assert_eq!(code, 1, "取字节 5xx 仍应非零退出");
+    // text 格式行：级别与模块 target 一起被钉住（target 恢复的判据也在这里）。
+    assert!(
+        stderr.contains(" WARN weflow_server::export: 跳过会话 boom-talker"),
+        "warn 行要带级别与模块 target 并点名会话，实际 stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("HTTP 503"),
+        "原因（状态码）必须随 warn 行出现，实际 stderr:\n{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--log-format json`：stderr 的**每一行**都是可独立解析的 JSON 对象（level/target 齐全），
+/// 且 stdout 不混入日志 —— 钉住「采集器可逐行消费」与「日志与机器输出分流」两件事。
+/// `--log debug` 同时验证 global 旗标能把级别提上去（export 的逐会话起手行是 debug 级）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn log_json_format_emits_parseable_lines() {
+    let base = spawn_stub().await;
+    let dir = std::env::temp_dir().join(format!("weflow-e2e-logjson-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (code, stdout, stderr) = run(
+        &base,
+        &[
+            "export", "--out", dir.to_str().unwrap(), "--format", "jsonl",
+            "--log", "debug", "--log-format", "json", "--session", TALKER,
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {stdout} stderr: {stderr}");
+    let mut saw_export_debug = false;
+    for line in stderr.lines().filter(|l| !l.trim().is_empty()) {
+        let v: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("json 日志行必须逐行可解析: {line}（{e}）"));
+        assert!(
+            v.get("level").and_then(Value::as_str).is_some(),
+            "行应带 level: {v}"
+        );
+        let target = v.get("target").and_then(Value::as_str).unwrap_or_default();
+        assert!(!target.is_empty(), "json 形态必须带 target（模块归属）: {v}");
+        if target.contains("export") && v["level"] == "DEBUG" {
+            saw_export_debug = true;
+        }
+    }
+    // 只钉这一件承重的事：默认 warn 下 export 的 debug 起手行本不该出现，`--log debug`
+    // 让它出现 ⇒ 旗标确实提了级别。（曾经这里还有一条「有 export 行」的断言，但它是这条
+    //  debug 断言的子集——同一条行满足两者，恒真无区分力，已删。）
+    assert!(saw_export_debug, "debug 级下应有 export 的「导出开始」起手行（--log 覆盖默认 warn 的判据）");
+    // stdout 只该有摘要行与产物路径，不该混入 JSON 日志。
+    assert!(
+        !stdout.lines().any(|l| l.trim_start().starts_with('{')),
+        "stdout 不得混入 json 日志: {stdout}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

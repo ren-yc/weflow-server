@@ -105,7 +105,9 @@ use crate::config::Config;
 pub fn run_cli() -> Result<()> {
     match cli::dispatch()? {
         cli::Entry::Serve(cfg) => {
-            logging::init(&cfg.log);
+            // serve 走老解析器：级别与格式来自 Config；输出**维持 stdout**（既有 `> 日志文件`
+            // 部署的重定向习惯，理由见 logging 模块头「输出去向」）。
+            let _ = logging::init_for_serve(&cfg.log, &cfg.log_format);
             run(cfg)
         }
         // 子命令已经把活干完（token / 查询 / sync），或 --help/--version 已经打印过。
@@ -122,7 +124,8 @@ pub fn run_cli() -> Result<()> {
     let Some(cfg) = config::load()? else {
         return Ok(()); // --help / --version 已经打印过了
     };
-    logging::init(&cfg.log);
+    // serve 形态：输出 stdout（见上）。返回值在首次安装处必然为 true，丢弃是有意的。
+    let _ = logging::init_for_serve(&cfg.log, &cfg.log_format);
     run(cfg)
 }
 

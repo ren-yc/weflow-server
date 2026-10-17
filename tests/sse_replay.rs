@@ -50,6 +50,7 @@ fn bare_state(dir: &std::path::Path) -> (Arc<server::AppState>, std::path::PathB
         host: "127.0.0.1".into(),
         port: 0,
         log: "info".into(),
+        log_format: "text".into(),
         watch_debounce_ms: 10,
         watch_fallback_ms: 0,
         media_export_dir: dir.join("api-media"),

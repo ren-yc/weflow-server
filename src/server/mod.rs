@@ -1066,6 +1066,7 @@ mod tests {
             host: "127.0.0.1".into(),
             port: 0,
             log: "info".into(),
+            log_format: "text".into(),
             watch_debounce_ms: 10,
             watch_fallback_ms: 0,
             media_export_dir: std::path::PathBuf::from("target/test-tmp/state"),

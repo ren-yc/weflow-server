@@ -29,6 +29,7 @@ fn test_cfg(dir: &std::path::Path, port: u16) -> Config {
         host: "127.0.0.1".into(),
         port,
         log: "info".into(),
+        log_format: "text".into(),
         watch_debounce_ms: 20,
         watch_fallback_ms: 0,
         media_export_dir: dir.join("media"),

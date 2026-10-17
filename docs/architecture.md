@@ -284,6 +284,32 @@ OpenSSL，后者的 perl `Configure` 会直接调 `cl.exe` / `link.exe`，**绕�
 **不要用 `CARGO_INCREMENTAL` 在这两个值之间来回切。** 该环境变量的优先级高于清单里的 profile：
 在本仓设为 `false` 之后，`0` 与不设置等价，但 `1` 会静默压过它。
 
+### 日志：装在哪、写去哪、说什么话
+
+`src/logging.rs` 的模块头是这三条口径的事实源，这里只记架构层面的取舍：
+
+- **subscriber 的安装位置**：CLI 分流（`cli::dispatch`）在执行任何子命令**之前**装 warn 级
+  subscriber。原因是一个容易被忽略的事实：没有 subscriber 时 `tracing::warn!` 展开成
+  `if enabled { … }`，整体是 no-op —— 于是子命令里那些「会话级失败原因」的日志会**静默消失**，
+  用户只剩退出码与一行摘要。serve 分支不在这里装：`dispatch` 在构造 clap 之前就把 `serve`
+  短路进老解析器，级别与格式仍由 `Config.log`/`Config.log_format` 决定，默认 info 与 stdout
+  去向不变（行内多出的 target 段属「恢复 target」条，两入口同受影响）。
+- **输出去向按入口分叉**：**子命令**日志走 **stderr**——`fmt()` 的默认 writer 是 stdout，而子命令
+  的 stdout 是命令输出本身（`--json` 形状），日志混进去会毁掉管道消费。**serve** 日志维持
+  **stdout**——既有部署在用 `weflow-server > 日志文件` 收服务日志，改通道会让那些脚本静默拿到空
+  文件，属破坏性变更、不在本批。判据两条：`tests/cli_e2e.rs::log_json_format_emits_parseable_lines`
+  （stderr 逐行可解析**且 stdout 无日志行**）与 `tests/cli.rs::serve_logs_stay_on_stdout`
+  （启动行在 stdout、不在 stderr）。已知代价（如实登记）：同一次运行里 `[fatal]` 在 stderr、
+  serve 普通日志在 stdout，「只看 `2>` 收错误」拿不到 `[init]` 上下文；合并成一条通道要等一个
+  愿意接受破坏性的版本窗口。
+- **`--log-format json`**：逐行一个 JSON 对象（`level`/`target`/`fields`），给日志采集器消费。
+  依赖上只多一个 `tracing-serde`（json formatter 的 serde 粘合层），不拉 axum/tokio/clap，
+  嵌入契约的依赖树钉子照常成立。
+- **target 必须开着**：模块多（store/sync/server/media/watch…），关掉后日志行没有「谁说的」。
+- **语言口径与脱敏红线**：见 `src/logging.rs` 模块头（用户句中文、模块级诊断英文；日志禁入完整
+  密钥／完整 token／消息正文，例外只有 serve 路径那两条「不打印就拿不到」的 token 行——首次生成
+  的 info 行与凭据库不可用时的 warn 行）。
+
 ### 提交钩子
 
 `scripts/install-hooks.*` 装两个钩子：`pre-commit`（隐私扫描 + 编号引用扫描，**累积退出码**，

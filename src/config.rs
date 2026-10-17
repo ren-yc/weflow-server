@@ -13,6 +13,9 @@ pub struct Config {
     pub host: String,
     /// Log level: error | warn | info | debug.
     pub log: String,
+    /// Log format: text | json（json = 逐行一个 JSON 对象，含 level/target/fields；
+    /// 输出去向随入口：serve 走 stdout、子命令走 stderr）。
+    pub log_format: String,
     /// Watch event debounce in milliseconds.
     pub watch_debounce_ms: u64,
     /// Slow fallback poll interval in milliseconds (0 disables it).
@@ -56,6 +59,7 @@ impl Default for Config {
             port: 5033,
             host: "127.0.0.1".to_string(),
             log: "info".to_string(),
+            log_format: "text".to_string(),
             watch_debounce_ms: 350,
             watch_fallback_ms: 30_000,
             media_export_dir: dir.join("api-media"),
@@ -145,6 +149,12 @@ pub fn parse_args(args: Vec<String>) -> anyhow::Result<Option<Config>> {
                 }
                 cfg.log = value;
             }
+            "--log-format" => {
+                if !["text", "json"].contains(&value.as_str()) {
+                    anyhow::bail!("--log-format 需为 text|json: {value}");
+                }
+                cfg.log_format = value;
+            }
             "--watch-debounce-ms" => {
                 cfg.watch_debounce_ms = value
                     .parse()
@@ -173,6 +183,7 @@ fn print_help() {
          \x20   --port <PORT>              监听端口（默认 5033）\n\
          \x20   --host <HOST>              绑定地址（默认 127.0.0.1）\n\
          \x20   --log <LEVEL>              日志级别: error|warn|info|debug（默认 info）\n\
+         \x20   --log-format <FMT>         日志格式: text|json（默认 text；json 为逐行 JSON，serve 下在 stdout）\n\
          \x20   --watch-debounce-ms <MS>   文件事件防抖（默认 350）\n\
          \x20   --watch-fallback-ms <MS>   慢速兜底轮询，0 关闭（默认 30000）\n\
          \x20   --media-export-dir <DIR>   媒体导出根目录\n\

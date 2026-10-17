@@ -54,6 +54,16 @@ use crate::config::Config;
 #[derive(Parser)]
 #[command(name = "weflow-server", version, about = "本地微信 4.x 消息库只读服务与查询命令行")]
 struct Cli {
+    /// 日志级别：error|warn|info|debug。子命令默认 warn——stdout 是输出，stderr 只播报失败。
+    ///
+    /// 为什么默认不是 info：子命令正常路径不需要刷屏；而**没有 subscriber 时 tracing 宏是
+    /// no-op**，export/sync 的会话级失败原因会永久不可见（只剩退出码 1 与一行「跳过」）。
+    /// 裸跑与老旗标的 serve 不经这里，维持 info 默认逐字不变。
+    #[arg(long, global = true, value_parser = ["error", "warn", "info", "debug"])]
+    log: Option<String>,
+    /// 日志格式：text|json（json 为 stderr 逐行一个对象，含 level/target/fields）。
+    #[arg(long, global = true, value_parser = ["text", "json"])]
+    log_format: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -222,8 +232,19 @@ pub(crate) fn dispatch() -> Result<Entry> {
         // 写法弄坏，而不是新增能力。
         return legacy(&argv[1..]);
     }
-    let cli = Cli::parse_from(std::iter::once("weflow-server".to_string()).chain(argv.clone()));
-    match cli.command {
+    let Cli { command, log, log_format } =
+        Cli::parse_from(std::iter::once("weflow-server".to_string()).chain(argv.clone()));
+    // 子命令在执行任何动作之前先装日志（原因见 Cli 的 --log 字段文档）。serve 不在这里装：
+    // dispatch 在上面就把 `serve` 交给了老解析器，这个 matches! 是防御性的（保证即便未来
+    // 分流顺序变了，serve 的 info 默认也不会被 warn 预装吞掉）；级别与格式由
+    // `Config.log`/`Config.log_format` 决定。
+    if !matches!(command, Command::Serve) {
+        crate::logging::init_with_format(
+            log.as_deref().unwrap_or("warn"),
+            log_format.as_deref().unwrap_or("text"),
+        );
+    }
+    match command {
         // serve 之后的旗标交给老解析器：`serve --port 6002` 与 `--port 6002` 必须等价。
         Command::Serve => legacy(&argv[1..]),
         Command::Token => match crate::config::show_token()? {
@@ -307,6 +328,10 @@ pub(crate) fn dispatch() -> Result<Entry> {
         Command::Export(a) => {
             #[cfg(feature = "testing")]
             if let Some(rows) = a.rows {
+                // `--rows` 造的是**假账号语料**，不是用户任务；起手行同样值得 debug 级可见，
+                // 让长任务的游动位置在两条路径上都有。json 判据不依赖这行——它走 `--session`，
+                // 样本行由 `export::run` 的起手 debug 行提供。
+                tracing::debug!("[export] 造测试语料：{rows} 行 → {}", a.out.display());
                 return export_corpus(&a.out, rows).map(|_| Entry::Done);
             }
             run_export(&a).map(|_| Entry::Done)
