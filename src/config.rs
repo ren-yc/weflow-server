@@ -203,6 +203,23 @@ fn print_help() {
 const TOKEN_SERVICE: &str = "weflow-server";
 const TOKEN_USER: &str = "http-api-token";
 
+/// Credential-store service name.
+///
+/// Production always uses [`TOKEN_SERVICE`]. Under the `testing` feature an
+/// override lets an integration test use a unique, empty namespace: otherwise
+/// a developer's real stored token would decide whether the "no token" test
+/// sees the fallback error or a network error. The env var is compiled out of
+/// release binaries.
+#[cfg(feature = "testing")]
+fn token_service() -> String {
+    std::env::var("WEFLOW_TOKEN_SERVICE").unwrap_or_else(|_| TOKEN_SERVICE.to_string())
+}
+
+#[cfg(not(feature = "testing"))]
+fn token_service() -> String {
+    TOKEN_SERVICE.to_string()
+}
+
 /// Access token kept in the OS credential store (Windows Credential
 /// Manager / macOS Keychain / Linux Secret Service). Never written to a
 /// token file.
@@ -212,7 +229,7 @@ const TOKEN_USER: &str = "http-api-token";
 /// per-session). On subsequent launches it is fetched silently; use the
 /// `--show-token` flag to retrieve it on demand.
 pub fn load_token() -> Result<String> {
-    let entry = keyring::Entry::new(TOKEN_SERVICE, TOKEN_USER)
+    let entry = keyring::Entry::new(&token_service(), TOKEN_USER)
         .map_err(|e| anyhow::anyhow!("凭据库初始化失败: {e}"))?;
     match entry.get_password() {
         Ok(t) if t.len() >= 16 => Ok(t),
@@ -247,7 +264,7 @@ pub fn load_token() -> Result<String> {
 /// Read the stored token without generating one; `None` when none exists.
 /// Used by `--show-token`.
 pub fn show_token() -> Result<Option<String>> {
-    let entry = keyring::Entry::new(TOKEN_SERVICE, TOKEN_USER)
+    let entry = keyring::Entry::new(&token_service(), TOKEN_USER)
         .map_err(|e| anyhow::anyhow!("凭据库初始化失败: {e}"))?;
     match entry.get_password() {
         Ok(t) if !t.is_empty() => Ok(Some(t)),

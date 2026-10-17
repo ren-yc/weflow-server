@@ -23,8 +23,9 @@ MCP 进程**不碰数据库密钥**，也不重复实现解密与索引：它只
 ## 前置与启动
 
 1. 服务端已启动（默认 `http://127.0.0.1:5033`）；
-2. 环境变量 `WEFLOW_TOKEN` 已设置（值用 `weflow-server token` 取；token 不经命令行传递，以免
-   落进 shell history 与进程列表）；
+2. 环境变量 `WEFLOW_TOKEN` 已设置，**或**本机凭据库已有记录（CLI 会从 `WEFLOW_TOKEN`
+   回落到与 `weflow-server token` 同一份凭据；同机免 export）；token 不经命令行传递，以免
+   落进 shell history 与进程列表；
 3. 一个支持 stdio MCP 的客户端。
 
 ```bash

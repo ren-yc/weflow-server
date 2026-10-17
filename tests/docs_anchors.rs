@@ -126,6 +126,7 @@ fn targets() -> Vec<PathBuf> {
         root.join("AGENTS.md"),
         root.join("docs/architecture.md"),
         root.join("docs/mcp.md"),
+        root.join("docs/quickstart.md"),
     ];
     if let Ok(entries) = fs::read_dir(root.join("docs")) {
         let mut api: Vec<PathBuf> = entries

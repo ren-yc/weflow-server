@@ -1539,6 +1539,39 @@ async fn accounts_registration_is_idempotent_and_health_reports_a_scalar_phase()
     assert!(!acc["db_storage"].as_str().unwrap().is_empty());
 }
 
+/// 页 1 HMAC 失配是「密钥轮换/参数过期」最像的场景：400 体必须直接给出恢复动作，
+/// 而不是只回一句英文的 HMAC validation failed 让调用方猜。
+#[tokio::test]
+async fn page1_hmac_failure_names_the_key_recovery_step() {
+    let dir = common::tmp_dir("smoke-key-hint");
+    let state = test_state(&dir);
+    // 页 1 校验发生在绑定检查之前；清掉在位账号才能走到它（否则先得到 account_conflict）。
+    state.accounts.lock().clear();
+    let app = server::build_router(state);
+    let wrong_key = "11".repeat(32);
+    let body = serde_json::json!({
+        "wxid": "wxid_keycheck",
+        "db_path": dir.to_string_lossy(),
+        "keys": { "session/session.db": wrong_key },
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/accounts?access_token={TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = json_body(resp).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(message.contains("疑似密钥已轮换"), "要点名最可能的原因: {message}");
+    assert!(message.contains("重新注册"), "要给出恢复动作: {message}");
+}
+
 /// Registering a SECOND wxid is rejected with `account_conflict` at HTTP 200,
 /// and the incumbent keeps serving. Deregistering it frees the binding.
 #[tokio::test]

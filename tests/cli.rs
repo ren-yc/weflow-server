@@ -23,6 +23,7 @@ fn run(args: &[&str], extra: &[(&str, &str)]) -> Out {
     let mut c = Command::new(env!("CARGO_BIN_EXE_weflow-server"));
     c.env_remove("WEFLOW_BASE_URL");
     c.env_remove("WEFLOW_TOKEN");
+    c.env_remove("WEFLOW_TOKEN_SERVICE");
     c.env_remove("WEFLOW_EMBED_CONFIG");
     // `RUST_LOG` 必须一并清掉：`logging::install` 里 EnvFilter 的取值是「环境变量优先」，
     // 开发者本机设了它，`--log` 的判据（级别、debug 行存在性）就会随环境漂移。
@@ -105,17 +106,28 @@ fn messages_over_http_requires_talker() {
     assert!(o.stderr.contains("talker"), "报错要点名 --talker，实际: {}", o.stderr);
 }
 
-/// HTTP 形态缺 token 是运行期错误（1），并且要指路。
+/// HTTP 形态在「环境变量未设且凭据库无记录」时是运行期错误（1），并且要指路。
 ///
 /// 这里必须「还没连上就失败」：若实现是先连再报鉴权，本断言会因端口上有没有服务而变成
-/// 非确定性的。
+/// 非确定性的。测试用独立的凭据库命名空间，免得开发者本机真实存着的 token 把这条断言
+/// 变成看环境运气（testing feature 才编译该覆盖）。
 #[test]
 fn missing_token_fails_before_touching_the_network() {
     // 指向一个**保证没有监听**的端口：若实现是「先连、连不上再报鉴权」，错误文案会退化成连接失败，
     // 下面那条「不得出现连接失败措辞」的断言就会抓住它 —— 只断言「退 1 ＋ 提到变量名」抓不住。
-    let o = run(&["sessions"], &[("WEFLOW_BASE_URL", "http://127.0.0.1:1")]);
+    let o = run(
+        &["sessions"],
+        &[
+            ("WEFLOW_BASE_URL", "http://127.0.0.1:1"),
+            (
+                "WEFLOW_TOKEN_SERVICE",
+                "weflow-server-test-missing-token",
+            ),
+        ],
+    );
     assert_eq!(o.code, 1, "缺 token 是运行期错误；stderr: {}", o.stderr);
     assert!(o.stderr.contains("WEFLOW_TOKEN"), "报错要给出补救（环境变量名），实际: {}", o.stderr);
+    assert!(o.stderr.contains("凭据库"), "报错要点名回落来源，实际: {}", o.stderr);
     let lower = o.stderr.to_lowercase();
     for wording in ["connection refused", "tcp connect", "error sending request", "connect error"] {
         assert!(!lower.contains(wording), "缺 token 不该走到网络（出现「{wording}」）: {}", o.stderr);

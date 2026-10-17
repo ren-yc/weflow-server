@@ -28,6 +28,28 @@ use crate::store::Store;
 use crate::sync::{watch::WatchConfig, AccountSync, Event};
 use crate::sync::history::EventBus;
 
+/// 密钥轮换/参数过期的统一诊断文案。
+///
+/// 三个输出面（注册页 1 HMAC 失败的 400 体、账号 `error` 状态、`warn!` 日志）共用同一句，
+/// 运维不必在三种措辞之间猜是不是同一件事。
+pub(crate) const KEY_RECOVERY_HINT: &str =
+    "疑似密钥已轮换、参数过期或 key 集不全：请重新注册并带全 key 集（含图片键）";
+
+/// 只给「看起来是密钥问题」的错误追加恢复提示。
+///
+/// 不无条件追加：缺文件、权限错误等构建失败与密钥无关，硬套「密钥轮换」会把排查方向带偏。
+fn with_key_recovery_hint(message: String) -> String {
+    let lower = message.to_lowercase();
+    let key_like = ["hmac", "解密", "cipher", "sqlcipher", "not a database", "encrypted", "no key", "密钥"]
+        .iter()
+        .any(|needle| lower.contains(needle));
+    if key_like && !message.contains(KEY_RECOVERY_HINT) {
+        format!("{message}（{KEY_RECOVERY_HINT}）")
+    } else {
+        message
+    }
+}
+
 /// One account's state-machine value, exposed via the token-protected
 /// `GET /api/v1/accounts` and echoed by the registration endpoint.
 ///
@@ -609,9 +631,9 @@ pub async fn start_account(
         if let Ok(bytes) = std::fs::read(&session_path) {
             let head = bytes.len().min(4096);
             if !crate::db::wcdb::verify_page1(&sk.0, &bytes[..head]) {
-                return Err(ApiError::bad_request(
-                    "session.db key failed page-1 HMAC validation",
-                ));
+                let message = format!("session.db 的页 1 HMAC 校验失败：{KEY_RECOVERY_HINT}");
+                tracing::warn!("[register] {message}");
+                return Err(ApiError::bad_request(message));
             }
         }
     } else {
@@ -720,9 +742,13 @@ pub async fn start_account(
                 }
             }
             Ok(Err(e)) => {
+                let message = with_key_recovery_hint(format!("{e:#}"));
                 handle2.set_status(crate::server::AccountStatus::Error);
-                *handle2.error.lock() = Some(format!("{e:#}"));
-                tracing::warn!("[init] 账号 {} 初始化失败（重新注册可恢复）: {e:#}", handle2.info.wxid);
+                *handle2.error.lock() = Some(message.clone());
+                tracing::warn!(
+                    "[init] 账号 {} 初始化失败（重新注册可恢复）: {message}",
+                    handle2.info.wxid
+                );
             }
             Err(e) => {
                 handle2.set_status(crate::server::AccountStatus::Error);
@@ -1526,5 +1552,19 @@ mod tests {
             derive_base_url("0.0.0.0", 5033, Some("http://example.test/")),
             "http://example.test"
         );
+    }
+
+    /// 只有「像密钥问题」的构建错误才追加恢复提示；缺文件/权限错误不许被误诊成密钥轮换。
+    #[test]
+    fn key_like_errors_carry_the_recovery_hint() {
+        let hinted = with_key_recovery_hint("数据库解密失败：hmac check failed".into());
+        assert!(hinted.contains("疑似密钥已轮换"), "{hinted}");
+        assert!(hinted.contains("重新注册"), "{hinted}");
+        let missing = with_key_recovery_hint("no key for message/0.db".into());
+        assert!(missing.contains("key 集不全"), "缺 key 也要指向补全: {missing}");
+        let encrypted = with_key_recovery_hint("file is encrypted".into());
+        assert!(encrypted.contains("疑似密钥已轮换"), "英文错钥文案也要命中: {encrypted}");
+        let plain = with_key_recovery_hint("permission denied".into());
+        assert!(!plain.contains("疑似密钥"), "{plain}");
     }
 }

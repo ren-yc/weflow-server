@@ -934,7 +934,7 @@ feeds 条目字段（以源码 `sns.rs` 为准）：`tid/userName/content(明文
 | 码 | 含义 | 例子 |
 | --- | --- | --- |
 | `0` | 成功 | `weflow-server sessions` |
-| `1` | 运行期错误：连不上、被拒、缺密钥、缺配置文件 | 未设 `WEFLOW_TOKEN` 就跑查询 |
+| `1` | 运行期错误：连不上、被拒、缺密钥、缺配置文件 | 未设 `WEFLOW_TOKEN` 且本机凭据库无记录就跑查询 |
 | `2` | 用法错误：未知子命令、缺必需参数 | `weflow-server bogus`、`search` 不带 `--keyword` |
 
 | 子命令 | 打哪个面 | 要点 |
@@ -950,6 +950,9 @@ feeds 条目字段（以源码 `sns.rs` 为准）：`tid/userName/content(明文
 | `export` | SDK `list_all_sessions` ＋ `pull_page` ＋ `chatlab_messages` | **只走 HTTP**（不提供 `--embedded`）：批量导出到 ChatLab Format 文件；`--with-media` 时用同一页的时间窗调 `chatlab_messages(media=1)` 触发导出并下载字节，见下一节 |
 
 环境变量：`WEFLOW_BASE_URL`（默认 `http://127.0.0.1:5033`）、`WEFLOW_TOKEN`（API token）。
+**token 来源链**：`WEFLOW_TOKEN`（非空）→ 本机凭据库（与 `weflow-server token` 同一份）。
+同机运行不必每次 export；跨机仍走环境变量。环境变量未设且凭据库无记录（或后端不可读）时，
+错误会分别点名这两种成因并指路 `weflow-server token`。
 **token 一律不经命令行传递**——命令行会落进 shell history 与进程列表，而这个值能读出整份聊天记录。
 
 `--embedded`（进程内直读本地库，不起也不打 HTTP）**只开放给只读查询类**（`sessions`／`messages`／

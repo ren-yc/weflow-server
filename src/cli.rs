@@ -422,11 +422,35 @@ fn http_client(c: &Common) -> Result<Client> {
     Ok(Client::new(base, env_token()?))
 }
 
-/// API token 只从环境变量取：它不经命令行传递，以免落进 shell history 与进程列表。
+/// API token 的来源链：环境变量 → 本机凭据库。
+///
+/// 为什么回落：同机运行 CLI 的人已经让 `weflow-server token` 把 token 存进凭据库，
+/// 再要求他每次 export 一遍环境变量是没必要的税；跨机仍走环境变量。
+/// token 不经命令行传递（shell history / 进程列表）。
 fn env_token() -> Result<String> {
-    std::env::var("WEFLOW_TOKEN").map_err(|_| {
-        anyhow::anyhow!("缺少 API token：请设环境变量 WEFLOW_TOKEN（值可用 `weflow-server token` 取）；token 不经命令行传递，以免落进 shell history 与进程列表")
-    })
+    let env = std::env::var("WEFLOW_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
+    token_from_sources(env, crate::config::show_token)
+}
+
+/// 纯决策函数：`stored` 只在环境变量缺失时调用（避免每次都在凭据库上做一次读）。
+fn token_from_sources(
+    env: Option<String>,
+    stored: impl FnOnce() -> Result<Option<String>>,
+) -> Result<String> {
+    if let Some(token) = env {
+        return Ok(token);
+    }
+    match stored() {
+        Ok(Some(token)) if !token.is_empty() => Ok(token),
+        Ok(_) => anyhow::bail!(
+            "缺少 API token：环境变量 WEFLOW_TOKEN 未设置（或为空），且本机凭据库没有记录；请设环境变量，或先运行 `weflow-server token` 生成并查看 token（token 不经命令行传递，以免落进 shell history 与进程列表）"
+        ),
+        Err(e) => anyhow::bail!(
+            "缺少 API token：环境变量 WEFLOW_TOKEN 未设置（或为空），且本机凭据库不可读：{e}；请设环境变量，或修复凭据库后运行 `weflow-server token`（token 不经命令行传递，以免落进 shell history 与进程列表）"
+        ),
+    }
 }
 
 /// SDK 的方法都是 async；子命令是「跑一次就退出」，所以用一个当前线程运行时把 future 拉完。
@@ -1216,5 +1240,43 @@ mod tests {
         assert!(none.is_empty(), "无句柄的产物不该被报为悬空: {none:?}");
 
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 环境变量优先，且**完全跳过**凭据库：不能为了回落而让每次 CLI 都读一次钥匙串。
+    #[test]
+    fn token_env_wins_without_touching_the_keyring() {
+        let called = std::cell::Cell::new(false);
+        let token = token_from_sources(Some("envtok".into()), || {
+            called.set(true);
+            Ok(None)
+        })
+        .unwrap();
+        assert_eq!(token, "envtok");
+        assert!(!called.get(), "环境变量已给值时不该读凭据库");
+    }
+
+    /// 环境变量缺失时回落本机凭据库；这是「同机免 export」的唯一依赖路径。
+    #[test]
+    fn token_falls_back_to_the_keyring() {
+        let token = token_from_sources(None, || Ok(Some("storedtok".into()))).unwrap();
+        assert_eq!(token, "storedtok");
+    }
+
+    /// 两态失败必须分开点名：无记录要指路去生成，后端故障要报后端错误。
+    #[test]
+    fn missing_env_and_no_entry_names_both_sources() {
+        let e = token_from_sources(None, || Ok(None)).unwrap_err().to_string();
+        assert!(e.contains("WEFLOW_TOKEN"), "要点名环境变量: {e}");
+        assert!(e.contains("凭据库"), "要点名凭据库: {e}");
+        assert!(e.contains("weflow-server token"), "要指路生成 token: {e}");
+    }
+
+    #[test]
+    fn keyring_backend_error_is_named() {
+        let e = token_from_sources(None, || Err(anyhow::anyhow!("后端不可用")))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("不可读"), "要区分后端故障: {e}");
+        assert!(e.contains("后端不可用"), "要带原始原因: {e}");
     }
 }
