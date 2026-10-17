@@ -6,6 +6,9 @@
 - 服务默认监听 `127.0.0.1:5033`（`--port` 可改）
 - 数据目录 = `%LOCALAPPDATA%\weflow-server`；访问 token 存于**系统凭据库**（Windows 凭据管理器 / macOS 钥匙串 / Linux Secret Service；无凭据库平台为会话级 token，随启动日志打印）
 - 所有 `/api/v1/*` 端点需要鉴权；`/health` 与 `/api/v1/health` 不需要
+- 与 qqflow-server 的**有意差异**（SNS 仅本仓、`messageCount` 条件键、`meta.type` 推导面、
+  默认端口、SDK/ts 状态）见
+  [flow-contract ADAPTATION.md](https://github.com/ren-yc/flow-contract/blob/master/ADAPTATION.md)。
 
 ## 鉴权
 

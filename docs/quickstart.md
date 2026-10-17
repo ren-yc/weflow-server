@@ -1,11 +1,84 @@
 # weflow-server quickstart
 
-本文件收任务导向的接入配方。当前先收「重启后恢复账号」；其余配方（接 ChatLab、增量同步、
-批量导出、MCP）随后补齐。
+任务导向的接入配方。先选获取方式，再按要做的事挑一节。
 
-## 重启后恢复账号
+## 获取
 
-密钥只存进程内存（见 `docs/architecture.md` 的「密钥不落盘」），所以**服务重启后账号回到
+| 方式 | 入口 | 说明 |
+|---|---|---|
+| Release 二进制 | GitHub Releases 的最新 tag，下载对应平台归档＋`SHA256SUMS` | 免工具链；校验 `sha256sum -c SHA256SUMS` 后再运行 |
+| `cargo install` | `cargo install --locked weflow-server` | 从 crates.io 编译；仍需 C 工具链（SQLCipher/OpenSSL 源码编译） |
+| 源码构建 | Windows `powershell -File scripts\build.ps1 build --release`；Linux/macOS `bash scripts/build.sh build --release` | 前置（MSVC/Perl/nasm、gcc/make）与命令见 [AGENTS.md](../AGENTS.md)，产物在 `target/release/` |
+
+## 起服务与停服务
+
+```powershell
+weflow-server            # 等价于 serve，默认 127.0.0.1:5033
+weflow-server --port 5033 --host 127.0.0.1 --log info
+```
+
+- token：首次启动生成并存入系统凭据库；`weflow-server token` 打印。CLI 的 token 来源链是
+  `WEFLOW_TOKEN` → 本机凭据库。
+- 数据目录：Windows `%LOCALAPPDATA%\weflow-server`。
+- 停服务：前台 `Ctrl-C`；收到信号会停止 watcher 与 SSE 并退出。
+- **零账号启动**：先注册再查询；注册前业务端点返回 503（`/health` 仍是 `starting`）。
+  注册/密钥/账号面的细节见 [api 文档](weflow-server-api.md)。
+
+## 第一个请求
+
+```bash
+curl http://127.0.0.1:5033/health
+curl -H "Authorization: Bearer $WEFLOW_TOKEN" \
+  "http://127.0.0.1:5033/api/v1/sessions?limit=10"
+```
+
+（`/health` 免鉴权且只回标量阶段；账号身份与消息数在 `GET /api/v1/accounts`。）
+
+## 配方一：接 ChatLab 前端（pull 面四步）
+
+把 ChatLab 的 `baseUrl` 设为 `http://127.0.0.1:5033/chatlab`：
+
+1. 发现：`GET /chatlab/sessions?limit=50`，记下 `sessions[].id` 与 `page.nextCursor`。
+2. 全量：`GET /chatlab/sessions/{id}/messages?since=0&limit=500`，用响应里的 `sync.nextSince`
+   原样作为下一次的 `since`，直到 `sync.hasMore == false`。
+3. 增量：`GET /chatlab/sessions/{id}/messages?since={lastPullAt}`（`since` 是**排他**下界）。
+4. 通知（可选）：`GET /chatlab/push/messages`（SSE）接收新消息元信息，再按需拉取。
+
+`since` 缺省等于全量；`limit` 分页时响应**必须**带 `sync` 块。去重按 `platformMessageId`。
+
+## 配方二：只要增量（watcher / SSE）
+
+1. 注册账号并等到 `GET /api/v1/accounts` 的 `state == "ready"`。
+2. 连 `GET /api/v1/push/messages?access_token=<token>`；零账号时也会先收到 `ready` 基线帧。
+3. 之后服务端的文件 watcher（防抖 350ms，慢速兜底轮询 30s）会把变更作为 SSE 事件推出。
+4. 断线重连带 `Last-Event-ID` 续放；推送端点**无就绪门控**，换账号不会静默断开订阅者。
+
+## 配方三：导出全部消息（含媒体）
+
+```bash
+weflow-server export --out ./export --format jsonl --with-media
+```
+
+- `--with-media` 把媒体字节下载到 `<out>/media/`，导出物里的 `media.fileName` 是可取句柄。
+- `--resume` 复用上一轮已完成的会话；**媒体承诺按轮成立**：带 `--with-media` 复用时会核对句柄。
+- 只导出个别会话用 `--session <id>`（可重复）；只要某时间之后用 `--since`。
+- 媒体可取性以**客户端落地**为准：新图在客户端全图落地前（数十秒到分钟级）可能仍无句柄；
+  缺句柄时退回消息面的按需导出，不要当错误。
+
+## 配方四：让 agent 接入（MCP）
+
+```bash
+weflow-server mcp
+```
+
+在支持 stdio MCP 的客户端里把 command 指向该二进制、args 设为 `["mcp"]`；服务端需已启动并注册
+账号。工具默认只读，详见 [mcp 文档](mcp.md)。
+
+> **工具输出会进入模型上下文 —— 也就是对话内容离开本机。**
+
+## 配方五：重启后恢复账号
+
+密钥只存进程内存（见 [架构文档](architecture.md) 的「密钥不落盘」），所以**服务重启后账号回到
 未注册**：`/health` 的 `account` 是 `unregistered`，业务端点返回 503。恢复动作只有一步——
 用**与重启前相同的 key 集**重新调 `POST /api/v1/accounts`。
 
@@ -52,3 +125,15 @@ bash scripts/examples/register-accounts.sh <你的配置.json>
 # 需要 token；同机未设 WEFLOW_TOKEN 时 CLI 会回落到凭据库
 weflow-server accounts
 ```
+
+## 语义提示
+
+- **媒体可取性以客户端落地为准**：`mediaId`/`fileName` 出现不代表字节一定可取；服务端只承诺
+  「出现即可取」，缺句柄时退回消息面按需导出。
+- **两套游标**：`sessions` 的 `cursor` 是 offset 语义（列表会随新消息变化）；`messages`/pull 面的
+  `since` 是时间游标（排他）。不要混用。
+
+## TypeScript 客户端
+
+`clients/ts` **未发布到 npm**；需要时从源码取（`clients/ts/README.md`，随仓库版本走）。Rust/Python
+SDK 的用法见 [api 文档](weflow-server-api.md)。

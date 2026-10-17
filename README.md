@@ -2,16 +2,54 @@
 
 无头 HTTP API + SSE 服务：实时监控、解密并提取本地 **微信 4.x** 聊天记录（`xwechat_files/<wxid>/db_storage`，
 WCDB/SQLCipher-4 风格加密）。独立纯 Rust 实现，架构参考同目录 `qqflow-server`，接口契约对齐
-**WeFlow HTTP API**（本仓库接口细节见 `docs/weflow-server-api.md`；上游为 WeFlow 的 `docs/HTTP-API.md`）。
+**WeFlow HTTP API**。
 
-> **作为库嵌入**：`default-features = false`。默认 feature 是 `["server", "cli", "mcp"]`
-> （连带 axum、tokio、clap 与 rmcp）——嵌入者必须显式关掉默认 feature，否则会把整个服务栈
-> 拉进依赖树。feature 矩阵、承诺面（`pub mod api`）与真库示例见
-> [docs/architecture.md](docs/architecture.md) 的「库面与 feature」与
-> [examples/embed.rs](examples/embed.rs)（CI 以 `--no-default-features` 编译它作为守门）。
->
-> **MCP（agent 客户端）**：`weflow-server mcp` 在 stdio 上暴露只读查询工具，见
-> [docs/mcp.md](docs/mcp.md)。**工具输出会进入模型上下文 —— 也就是对话内容离开本机。**
+## 获取
+
+| 方式 | 入口 | 说明 |
+|---|---|---|
+| Release 二进制 | GitHub Releases 的最新 tag（三平台归档 ＋ `SHA256SUMS`） | 免工具链；校验后再运行 |
+| `cargo install` | `cargo install --locked weflow-server` | 从 crates.io 编译 |
+| 源码构建 | `powershell -File scripts\build.ps1 build --release`（Windows）／`bash scripts/build.sh build --release` | 前置工具链见 [AGENTS.md](AGENTS.md) 的「命令」 |
+
+## 起服务
+
+```powershell
+weflow-server            # 默认 127.0.0.1:5033
+weflow-server --port 5033 --host 127.0.0.1 --log info
+```
+
+- token 首次启动生成并存入系统凭据库（Windows 凭据管理器 / macOS 钥匙串 / Linux Secret Service）；
+  `weflow-server token` 打印。CLI 的 token 来源链是 `WEFLOW_TOKEN` → 本机凭据库。
+- 数据目录：Windows `%LOCALAPPDATA%\weflow-server`。
+- 停服务：前台 `Ctrl-C`。
+- **零账号启动**：先注册再查询；注册前业务端点返回 503（`/health` 仍是 `starting`）。
+  注册、密钥与账号面的细节见 [api 文档](docs/weflow-server-api.md)。
+
+## 第一个请求
+
+```bash
+curl http://127.0.0.1:5033/health
+curl -H "Authorization: Bearer $WEFLOW_TOKEN" \
+  "http://127.0.0.1:5033/api/v1/sessions?limit=10"
+```
+
+`/health` 免鉴权且只回标量阶段；账号身份、消息数与库路径在需鉴权的 `GET /api/v1/accounts`。
+
+## 范围
+
+- ✅ 解密/读取层：纯 Rust 实现微信 4.0 页密码（AES-256-CBC + HMAC-SHA512，reserve=80，
+  每库独立 enc_key + 16B salt）；活库直读（只读长连接，无镜像、无明文落盘），
+  原始钥 PRAGMA key="x.." 跳过 KDF；页 1 HMAC 注册预校验。
+- ✅ 密钥：**仅 API 注册**（不读取微信进程）：`POST /api/v1/accounts` 传 64-hex 密钥
+  （每库独立 key 或统一 key）；密钥仅内存，重启后需重新注册。
+- ✅ 数据读取：session.db（会话）/ message_*.db（`Msg_<md5>` 消息表 + Name2Id 反查）/ contact.db
+  全量建内存索引，时间窗口水位增量同步。
+- ✅ 实时监控：notify 监听 `db_storage`，防抖 350ms，慢速兜底轮询 30s；撤回检测。
+- ✅ 服务封装：axum HTTP + SSE（health/accounts/messages/sessions/contacts/group-members/
+  media/push/sync），另含 SNS 只读全套；默认端口 **5033**（WeFlow 5031、qqflow-server 5032）。
+- ✅ 任务配方：[quickstart](docs/quickstart.md)（接 ChatLab、只要增量、导出含媒体、MCP、重启恢复）。
+- ❌ 不做：微信进程内存读取/注入、防撤回钩子、桌面通知。
 
 ## 重启后恢复账号
 
@@ -20,185 +58,17 @@ WCDB/SQLCipher-4 风格加密）。独立纯 Rust 实现，架构参考同目录
 [`.sh`](scripts/examples/register-accounts.sh)）从你自备的本地配置读 key 后重新注册；完整配方
 见 [docs/quickstart.md](docs/quickstart.md#重启后恢复账号)。脚本只读配置、不代存密钥。
 
-## 范围
+## 去哪看细节
 
-- ✅ 解密/读取层：纯 Rust 实现微信 4.0 页密码（AES-256-CBC + HMAC-SHA512，reserve=80，
-  每库独立 enc_key + 16B salt）；活库直读（qqflow 式只读长连接，无镜像、无明文落盘），
-  原始钥 PRAGMA key="x.." 跳过 KDF；页 1 HMAC 注册预校验；WAL 合并工具保留（探针/验证用）
-- ✅ 密钥：**仅 API 注册**（不读取微信进程）：`POST /api/v1/accounts` 传 64-hex 密钥
-  （每库独立 key 或统一 key），页 1 HMAC 确定性校验；密钥仅内存
-- ✅ 数据读取：session.db（会话）/ message_*.db（`Msg_<md5>` 消息表 + Name2Id 反查）/ contact.db
-  全量建内存索引，时间窗口水位（create_time, sort_seq, local_id）增量同步
-- ✅ 实时监控：notify（ReadDirectoryChangesW/inotify/FSEvents）监听 `db_storage`，防抖 350ms，
-  慢速兜底轮询 30s；撤回检测（local_type 10000/10002 + 关键词 + XML msgid 回溯）
-- ✅ 服务封装：axum HTTP + SSE（WeFlow 契约：health/accounts/messages/sessions/contacts/
-  group-members/media/push/sync），另含 SNS 只读全套（timeline/usernames/stats/export/
-  export-stats/media-proxy），默认端口 **5033**（WeFlow 5031、qqflow-server 5032）
-- ✅ 测试：SQLCipher 互操作 roundtrip（bundled sqlcipher 造库 → 本实现解密）、假库夹具驱动
-  索引/增量/撤回、HTTP 契约、文件事件 e2e；真库探针 `#[ignore]`（环境变量开启）
-- ❌ 不做：微信进程内存读取/注入、防撤回钩子、桌面通知
-
-## 构建
-
-| 平台 | 前置条件 | 构建命令 |
-|---|---|---|
-| Windows | Rust MSVC toolchain + Visual Studio（Desktop C++）+ [Strawberry Perl](https://strawberryperl.com) | `powershell -File scripts\build.ps1 build` |
-| Linux | Rust + build-essential（gcc/make；perl 系统自带） | `bash scripts/build.sh build` |
-| macOS | Rust + Xcode CLT | `bash scripts/build.sh build` |
-| 全平台 | **Python 3**（提交钩子的编号扫描与一致性套件执行器；纯标准库，无第三方包） | `python scripts/forbidden_refs.py --tree`（提交前自检） |
-
-SQLCipher 与 OpenSSL 为源码编译（测试夹具互操作需要），故要求 C 工具链与 perl；wrapper 自动定位
-MSVC 环境与 Perl/nasm（Windows 专属），透传全部 cargo 参数（`test`/`clippy`/`build --release` 同理）。
-
-## 提交钩子（隐私 + 编号引用）
-
-本仓库的**隐私扫描**与**编号引用扫描**都通过 git 钩子执行。`.git/hooks/` 不受版本控制，
-因此**克隆后需手动装一次**（可重复执行，幂等）：
-
-```powershell
-powershell -File scripts\install-hooks.ps1   # Windows
-bash scripts/install-hooks.sh                # Linux/macOS
-```
-
-- `pre-commit` 跑两项：`scripts/check-privacy.sh`（暂存内容里的本机信息：wxid、数据库密钥、
-  账号路径、用户名）与 `python scripts/forbidden_refs.py`（指向仓库外材料的编号引用）；
-- `commit-msg` 对**提交信息**跑同一支编号扫描器；
-- 两个检查**都执行、任一失败即阻止**；退出码 `2`（扫描未执行）同样按拒绝处理——**空 diff 不等于干净**。
-
-手动单次执行：
-
-```bash
-bash scripts/check-privacy.sh
-python scripts/forbidden_refs.py --tree    # 全量跟踪文件
-```
-
-bash 或 Python 3 缺失时，钩子**报错并阻止提交**（而非放行）——失败开放的检查等于没有检查。
-`git commit --no-verify` **仅限**「工具确实不可用、且已人工完成等价复核」，并须在提交信息写明原因；
-**不得**用它跳过隐私检查或编号引用检查来「先提交再说」。CI 会对全量跟踪文件与提交信息各再扫一遍。
-
-## 发布
-
-`-V`/`--version` 与运行时版本信息都编译自 `env!("CARGO_PKG_VERSION")`，所以**Rust 侧的版本号只有 `Cargo.toml`（根包与 `clients/rust` 两处）说了算**；
-Python/ts 各是自己的声明、不读 Cargo.toml，完整清单与同步要求见 `docs/release-runbook.md` 第 1 步。推送 `v<版本>` tag 后，GitHub Actions（`.github/workflows/release.yml`）
-自动在 Windows / Linux / macOS 三平台构建 release 二进制，校验 tag 与 `Cargo.toml` 版本一致后，
-打包为 `weflow-server-<版本>-<平台目标>` 归档并附 `SHA256SUMS` 发布到 GitHub Release。
-
-发版步骤以 [`docs/release-runbook.md`](docs/release-runbook.md) 为唯一权威（凭据模型、
-首发顺序、人工审批闸门都在那里）。这里不复述流程——复述过就会漂移：被替换掉的那段
-示例里，版本号停在 0.1.1，而仓库已经发到 v0.7.0（第 11 个 tag）。要点两句：
-
-- 版本号不止 `Cargo.toml`：完整清单以手册第 1 步为准。**CI 的 guard 只比对 tag 与根包版本**
-  （`cargo metadata` 取 `weflow-server` 一条），SDK／pyproject／ts 漏改不会有任何东西变红——
-  它们会安静地把旧版本号发上 registry（不可撤销）。
-- 推送 `v<版本>` tag 触发发布链；不可撤销的 registry 上传排在人工审批之后。
-
-## 运行
-
-```powershell
-# 1. 准备密钥：用你信任的工具获得每库 32 字节(64 hex) 的 enc_key（微信 4.x 每库独立）；
-#    或使用 WeFlow/wechat-dump 系工具导出 keys 列表后手动填入
-#    密钥提取参考 repo（本地只读取证工具，不入库）：
-#     https://github.com/TANGandXUE/wcdb-key-tool
-# 2. 启动
-.\weflow-server.exe
-.\weflow-server.exe --port 5033 --host 127.0.0.1 --log info
-```
-
-命令行参数：`--show-token`（打印已存 token 后退出）/ `--port`（默认 5033）/ `--host`（默认 127.0.0.1）/ `--log`（默认 info）/
-`--watch-debounce-ms`（默认 350）/ `--watch-fallback-ms`（默认 30000，0 关闭）/
-`--media-export-dir`（默认 `<data-dir>/api-media`）/ `--base-url`。
-
-子命令面（`cli` feature，默认开）：**裸跑仍等于 `serve`**，上面那种写法一个字符都不用改。
-另有 `serve` / `token` / `sessions` / `messages` / `search` / `contacts` / `accounts` / `sync` / `export`，默认走 HTTP 并
-复用本仓库的 Rust SDK；`--json` 出机器可读形状，`--embedded` 只对只读查询类开放。退出码 `0`/`1`/`2` =
-成功／运行期错误／用法错误。`--no-default-features` 时整面消失（`clap` 与 SDK 都不进依赖树）。
-详见 `docs/weflow-server-api.md` 的「命令行子命令」一节。
-数据目录：Windows `%LOCALAPPDATA%\weflow-server`；访问 token 生成后存入**系统凭据库**（Windows 凭据管理器 / macOS 钥匙串 / Linux Secret Service；无凭据库平台为会话级并在启动日志打印）。token **仅在首次生成时**打印到启动日志，之后可用 `--show-token` 随时获取。
-**账号为客户端驱动**：启动后无账号，密钥由客户端注册（仅内存保存，不落盘）：
-
-```bash
-curl -X POST http://127.0.0.1:5033/api/v1/accounts \
-  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
-  -d '{"wxid":"wxid_xxx","key":"<64hex 统一密钥>", "db_path":"C:\\Users\\<用户>\\Documents\\xwechat_files\\wxid_xxx"}'
-```
-
-每库独立密钥时传 `keys` 映射（相对路径 → 64hex），至少 session.db 的 key 必须匹配
-（用于 page-1 HMAC 校验）。可选 `img_code` 用于图片 `.dat` 解密（xorKey=code 的**首个字节**（按字节串处理，
-不是整数码掩码：`"0"` 得 0x30），aesKey=MD5(code+wxid)[:16]），或直接指定 `img_aes_key`/`img_xor_key`（推荐，**两者必须成对给**，只给其一会被整体忽略并回落到 `img_code`）。
-密钥错误时注册**当场被拒**（返回 `400`，账号不会建立；页 1 HMAC 预校验见
-`docs/weflow-server-api.md`）——改正密钥后重新注册即可。
-
-注册响应带真实状态：`{"state":"accepted","status":"indexing",...}`（后随 `ready`）。**强制单账号**：
-一个进程只绑定一个 wxid，注册别的账号直接回 `account_conflict`（冲突判定在密钥校验之前），
-换账号须先 `DELETE /api/v1/accounts/{wxid}` 注销。**注册幂等**：重复注册同一 wxid 且已就绪/
-索引中时返回 `already_ready`/`in_progress` 且**不会重建索引**。
-
-`/health` 与 `/api/v1/health`（免鉴权）只回标量阶段
-`{"status":"ok|starting","version":...,"account":"unregistered|indexing|ready|error"}`——它免鉴权，
-列出账号等于向任意调用方泄露本机有哪些账号。账号身份、消息数、库路径与错误原因改由需鉴权的
-`GET /api/v1/accounts` 提供（该接口不受就绪门控）。客户端据此健康检查，避免「503 → 重注册 →
-再重建」风暴。
-
-SSE 推送（鉴权只有两条通道：`Authorization: Bearer` 与查询参数 `?access_token=`，比对为常时比较）：
-
-```bash
-curl -N "http://127.0.0.1:5033/api/v1/push/messages?access_token=<token>"
-```
-
-推送端点**无就绪门控**（对齐 qqflow-server）：事件总线与重放历史为进程级，
-零账号时连接同样返回 200 并先发 `ready` 基线，账号注册并建索引完成后事件自然流入——
-客户端不必在冷启动期反复重连。同理，替换 `error` 态账号（改正密钥后重注册）
-**不会掉线或静默中断**已连接的订阅者。业务端点（messages/sessions/…）仍按账号
-就绪与否返回 503，因为索引未建完确实无法查询。
-
-完整接口文档见 [docs/weflow-server-api.md](docs/weflow-server-api.md)（与 WeFlow `docs/HTTP-API.md` 契约对齐）。
-
-## 测试
-
-```powershell
-powershell -File scripts\build.ps1 test   # Windows
-bash scripts/build.sh test                 # Linux/macOS
-```
-
-真库验证（ground-truth 探针与下游客户端模拟）默认跳过，需真实微信数据，见
-`tests/real_db_groundtruth.rs` 与 `tests/downstream_client.rs`。两种输入源，按优先级：
-
-1. 仓库根目录的 `weflow-server.json`（已被 `.gitignore` 忽略），扁平字段
-   `wxid` / `db_path` / `keys`（每库密钥映射）或 `key`（统一密钥）；
-2. 环境变量 `WEFLOW_TEST_WXID` / `WEFLOW_TEST_DB_ROOT`（指向 `db_storage` 所在账号目录）
-   加 `WEFLOW_TEST_KEYS_JSON`（`all_keys.json` 形式的映射文件）或 `WEFLOW_TEST_KEY`。
-
-```bash
-bash scripts/build.sh test --test downstream_client -- --ignored --nocapture
-```
-
-下游客户端模拟走真实 HTTP 层：零账号启动 → `POST /api/v1/accounts` 注册 → 等待索引
-就绪 → 覆盖两条鉴权传输（Bearer 与 `?access_token=`）、GET/POST 参数、ChatLab Pull 全量翻页排空、联系人分页、
-群成员、媒体导出与取回、SNS、SSE。
-
-## 目录结构
-
-```
-src/
-├─ config.rs / logging.rs      # CLI（无配置文件）、日志
-├─ keystore/                   # 密钥形状校验（64 hex）、img_code 派生；仅内存
-├─ db/
-│  ├─ scan.rs                  # xwechat_files 账号发现 + db_storage 库枚举
-│  ├─ wcdb.rs                  # 微信 4.0 页密码（加密/解密/HMAC 校验/WAL 帧）
-│  ├─ live.rs                  # qqflow 式活库直读连接池（只读 SQLCipher，无镜像）
-│  └─ open.rs                  # rusqlite 打开/列探测辅助
-├─ parser/                     # 消息内容解析（XML / zstd / 类型占位符 / 引用 / 撤回）
-├─ store/                      # 内存索引（会话/联系人/消息/水位）+ 查询
-├─ sync/                       # 实时同步引擎（poll + 事件）+ watch（notify 防抖/兜底）
-└─ server/                     # axum：鉴权两条通道、账号注册、HTTP 端点、SSE、媒体直服
-tests/
-├─ common/                     # SQLCipher 假库夹具（微信同构布局 + 造数 + WAL）
-├─ wcdb_roundtrip.rs           # 互操作仲裁：sqlcipher 造库 → 本实现解密 → SQLite 重开
-├─ index_build.rs              # 索引/增量/降级
-├─ fs_watch_e2e.rs             # 文件事件 → 同步 → SSE
-├─ api_smoke.rs                # HTTP 契约
-└─ real_db_groundtruth.rs      # #[ignore] 真库探针
-```
+| 想知道 | 看 |
+|---|---|
+| 按任务怎么做（ChatLab/增量/导出/MCP/恢复） | [docs/quickstart.md](docs/quickstart.md) |
+| HTTP 端点、CLI、退出码、错误形状 | [docs/weflow-server-api.md](docs/weflow-server-api.md) |
+| 模块职责、feature 矩阵、嵌入与测试纪律 | [docs/architecture.md](docs/architecture.md) |
+| agent 客户端接入（stdio MCP） | [docs/mcp.md](docs/mcp.md) |
+| 发版流程与凭据/审批闸门 | [docs/release-runbook.md](docs/release-runbook.md) |
+| 贡献者命令、钩子、提交规范、作为库嵌入 | [AGENTS.md](AGENTS.md) 与 [examples/embed.rs](examples/embed.rs) |
+| 类型化 SDK | `clients/rust`、`clients/python`；`clients/ts` **未发布 npm**，从源码取 |
 
 ## 鸣谢
 
