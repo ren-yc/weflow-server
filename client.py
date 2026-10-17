@@ -374,7 +374,14 @@ class Client:
                     return
                 if mine.state is gen.AccountStatus.ERROR:
                     raise NotReady(timeout, f"error: {mine.error or ''}")
-                last_state = str(mine.state.value)
+                if mine.state is gen.AccountStatus.INDEXING and mine.progress is not None:
+                    p = mine.progress
+                    last_state = (
+                        f"indexing ({p.tables_done} / {p.tables_total} tables, "
+                        f"{p.messages_indexed} messages indexed)"
+                    )
+                else:
+                    last_state = str(mine.state.value)
             elif listing is not None:
                 last_state = "not-registered"
             if asyncio.get_running_loop().time() >= deadline:
