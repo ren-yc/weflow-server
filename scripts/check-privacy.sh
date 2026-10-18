@@ -9,9 +9,18 @@
 #   1. exact real values from the gitignored weflow-server.json — wxid,
 #      db_path, img_aes_key and every per-database enc_key (skipped when the
 #      file is absent, e.g. CI)
-#   2. generic 64-hex literals (the enc_key shape) outside the fixture
+#   2. generic 64-hex literals (the enc_key shape — and the API-token shape,
+#      config::new_token also emits 64 hex chars) outside the fixture
 #      allowlist — catches leaks on machines without the local config
 #   3. the local username and machine-specific absolute paths
+#
+# PRIVACY_SHAPE_ONLY=1 runs ONLY layer 2 and skips layers 1 and 3. This is what
+# CI uses: there is no local config there (layer 1 is moot) and the runner's own
+# username is `runner`, which appears as a substring inside wholly legitimate
+# tracked text (`.github/workflows/*.yml`, CHANGELOG, architecture) — a username
+# scan on CI would false-red on that. Layer 2 needs neither and is the real
+# machine-independent net, so CI runs just that. qqflow-server's scanner has the
+# same mode; the two stay in sync deliberately.
 #
 # Exits non-zero (and lists every hit) when anything leaks, which aborts the
 # commit; findings go to stderr, which git shows verbatim. Values are NEVER
@@ -29,6 +38,9 @@ cd "$ROOT"
 
 CONFIG="weflow-server.json"
 
+# CI runs the machine-independent shape layer only (see header).
+SHAPE_ONLY="${PRIVACY_SHAPE_ONLY:-0}"
+
 # Paths excluded from every scan:
 #   *.lock        — Cargo.lock carries ~200 crate checksums in 64-hex shape
 #   this script   — it contains the pattern strings below
@@ -38,7 +50,7 @@ PATHSPEC=(':!*.lock' ':!scripts/check-privacy.sh')
 # list exact (full literals, not markers): allowlisting by nearby marker words
 # lets a real key slide through any file that happens to say "example".
 FIXTURE_HEX=(
-  '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' # tests/common/mod.rs FAKE_KEY_HEX
+  '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' # src/testing/mod.rs 的 FAKE_KEY_HEX 定义；keystore/sync 单测与 real_sqlcipher_open 探针内联同值
 )
 
 hits=0
@@ -136,7 +148,7 @@ PY
 }
 
 # ---- 1. Real values from the gitignored local config -----------------------
-if [ -f "$CONFIG" ]; then
+if [ "$SHAPE_ONLY" != "1" ] && [ -f "$CONFIG" ]; then
   if ! CONFIG_VALUES="$(read_config_values)" || [ -z "$CONFIG_VALUES" ]; then
     # A machine holding weflow-server.json must actually run the most
     # sensitive checks. Failing silently (no python, the Windows Store stub,
@@ -164,13 +176,17 @@ if [ -f "$CONFIG" ]; then
 fi
 
 # ---- 2. Generic 64-hex literals outside the fixture allowlist --------------
-# The enc_key shape. This layer works even without the local config, so a
-# leaked key from another machine still gets caught.
+# The enc_key shape (and the API-token shape — both 64 hex chars). This layer
+# works even without the local config, so a leaked key from another machine
+# still gets caught; it is the only layer CI's shape-only pass runs.
 while IFS= read -r found_hex; do
   found_hex="${found_hex%$'\r'}"
   [ -n "$found_hex" ] || continue
   allowed=0
-  for fixture in "${FIXTURE_HEX[@]}"; do
+  # `+` 守卫形式：空数组在 `set -u` 下展开为**零个元素**——既兼容 bash 3.2（macOS
+  # 自带旧版，直接 `"${A[@]}"` 会报 unbound variable），也不留 `:-` 那种「多迭代一次
+  # 空串」的读解陷阱。qqflow-server 与 weflow-server 的同段逐字一致，两仓保持对称。
+  for fixture in ${FIXTURE_HEX[@]+"${FIXTURE_HEX[@]}"}; do
     if [ "$found_hex" = "$fixture" ]; then
       allowed=1
       break
@@ -178,7 +194,7 @@ while IFS= read -r found_hex; do
   done
   [ "$allowed" -eq 1 ] && continue
   # Report by shape, never the value itself.
-  report "疑似数据库密钥（64 位 hex 字面量，不在 fixture 白名单中）" "$found_hex"
+  report "疑似数据库密钥或 API token（64 位 hex 字面量，不在 fixture 白名单中）" "$found_hex"
 done < <(git grep -ohE '[0-9a-fA-F]{64}' -- "${PATHSPEC[@]}" 2>/dev/null | sort -u)
 
 # ---- 3. Machine-specific paths / usernames --------------------------------
@@ -190,10 +206,14 @@ done < <(git grep -ohE '[0-9a-fA-F]{64}' -- "${PATHSPEC[@]}" 2>/dev/null | sort 
 # The scan is case-SENSITIVE (`grep -F`, no -i) on purpose: a short lowercase
 # username can appear as a case-different substring inside CamelCase Windows
 # API names (e.g. ReadDirectoryChangesW), which is not a leak.
+# Skipped under SHAPE_ONLY: on CI the name is `runner`, a substring of
+# legitimate tracked text (`ubuntu-latest`, `runs-on`), so it only false-reds.
+if [ "$SHAPE_ONLY" != "1" ]; then
 USER_NAME="$(whoami 2>/dev/null | sed 's/.*[\\/@]//' || true)"
 if [ -n "$USER_NAME" ]; then
   report "本机用户名" "$USER_NAME"
   report "用户目录绝对路径 C:\\Users\\<用户名>" "C:\\Users\\$USER_NAME"
+fi
 fi
 
 if [ "$hits" -gt 0 ]; then

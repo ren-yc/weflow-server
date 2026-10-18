@@ -345,6 +345,7 @@ Linux 与 Windows 双平台跑 `clippy --all-targets -D warnings` ＋ 全量测�
 |---|---|
 | 公共段哈希比对（比对**所 pin tag** 的内容，不是本仓副本） | 三个仓库的协作规则悄悄分叉 |
 | 编号引用扫描（`--tree` 与 `--ref`） | 注释里出现仓库外材料的编号，读者无从还原上下文 |
+| 隐私形态层扫描（`PRIVACY_SHAPE_ONLY=1`，只跑 64-hex 层） | 直推 master 且本机没装钩子时，密钥/token 形状的值漏进跟踪文件；本机精确值与用户名层留钩子 |
 | `--no-default-features` 编译 `examples/embed.rs` | 承诺面被实现面「借用」，或依赖树里混进 axum/tokio |
 | 一致性套件（见下节） | 契约与实现分叉 |
 

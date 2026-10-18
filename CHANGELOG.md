@@ -24,6 +24,14 @@
 - **Python SDK 的同步门面文档补齐**：`clients/python/README.md` 增 `SyncClient` 示例与专属
   事件循环线程说明——0.9.1 上架时 PyPI 页面只呈现 async 用法，同步入口（随 0.9.1 发布）
   在其最大分发渠道上不可见。回归位置：`test_sync_client_health_and_accounts`。
+- **脱敏红线延伸到错误串**：校验失败的报错只许说长度与类别、禁把密钥或 token 值格式化进去
+  （红线文案此前只覆盖日志行，而报错一旦随 `{e:#}` 进日志就绕过了它）。本仓的 `parse_db_key`
+  本就不回显，这轮补的是判据：`keystore::tests::validation_errors_never_echo_the_key`，
+  与 qqflow-server 同名测试对称。
+- **CI 增加隐私形态层扫描**：`check.yml` 新步「Privacy shape scan」以 `PRIVACY_SHAPE_ONLY=1`
+  只跑机器无关的 64-hex 层（本机钩子仍跑全量三层）——CI 上没有本地配置文件，且 runner 的
+  用户名 `runner` 是合法跟踪文本的子串（`ubuntu-latest`），精确值与用户名层在 CI 上只会
+  假红。形态层罩的是 db key 与 API token 的共有形状。qqflow-server 同批同款。
 
 ## [0.9.1] - 2026-10-18
 

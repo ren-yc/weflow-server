@@ -134,6 +134,22 @@ mod tests {
         assert!(parse_db_key(&format!("{ok}zz")).is_err()); // non-hex
     }
 
+    /// 报错禁 echo 密钥本身（与 qqflow 同名判据对称）：长度分支只报位数、hex
+    /// 分支只报「不是合法 hex」，一旦有人把值加回 bail 文案，这条即红。
+    #[test]
+    fn validation_errors_never_echo_the_key() {
+        // 64 hex 去掉末位：走长度分支，报错若含原始 hex 即违规
+        let e = parse_db_key("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde")
+            .unwrap_err()
+            .to_string();
+        assert!(!e.contains("0123456789abcdef"), "报错含原始键值: {e}");
+        // 64 位但末两字非 hex：走 hex 解码分支
+        let e = parse_db_key("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdzz")
+            .unwrap_err()
+            .to_string();
+        assert!(!e.contains("0123456789abcdef"), "报错含原始键值: {e}");
+    }
+
     #[test]
     fn img_code_derivation_matches_weflow() {
         let c = ImgCode("0".to_string());

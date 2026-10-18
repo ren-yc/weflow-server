@@ -125,6 +125,22 @@ jobs:
           done
           exit $status
 
+      # 隐私扫描的 CI 侧：本地钩子跑全量三层，但直推 master 的机器没装钩子时，
+      # 「本机才有真密钥」的环境里唯一还能兜住的是**机器无关的形态层**（64-hex，
+      # db key 与 API token 共有的形状）。只跑那一层（PRIVACY_SHAPE_ONLY=1），
+      # 两个原因：
+      #   ① CI 上没有 weflow-server.json，精确值层无事可做；
+      #   ② runner 的 whoami 是 `runner`，而 `runner` 是合法跟踪文本的子串
+      #      （`ubuntu-latest`、`runs-on`）——用户名层在 CI 上必假红。
+      # 两仓同一模式（weflow 的形态层罩 db key 与 token，qqflow-server 的罩
+      # token；理由各自写在脚本头注释里）。
+      - name: Privacy shape scan (tracked files)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          PRIVACY_SHAPE_ONLY: "1"
+        run: bash scripts/check-privacy.sh
+
       # 公共段不漂移：本仓 AGENTS.md 里公共段标记之间的内容，必须与契约仓库
       # **所 pin tag**（conformance.pin）上的 AGENTS-common.md 逐字一致。
       #
