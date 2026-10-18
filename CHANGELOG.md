@@ -16,8 +16,10 @@
   一致点名「疑似密钥已轮换、参数过期或 key 集不全：请重新注册并带全 key 集（含图片键）」；
   非密钥类的打开失败不再误诊为密钥问题。
 - **新增 `docs/quickstart.md` 的「重启后恢复账号」配方与 `scripts/examples/register-accounts.ps1`／`.sh` 示例脚本**：脚本只读调用方自备的本地配置，不代存任何密钥。
-- **接口契约 pin 由 `v0.6.0` 升 `v0.6.2`**：`v0.6.1` 登记 accounts 的可选 `progress` 为
-  additive 形状，`v0.6.2` 新增两仓适配差异指南 `ADAPTATION.md`（api 文档顶部加了指针）。
+- **接口契约 pin 由 `v0.6.0` 升 `v0.6.3`**：`v0.6.1` 登记 accounts 的可选 `progress` 为
+  additive 形状，`v0.6.2` 新增两仓适配差异指南 `ADAPTATION.md`（api 文档顶部加了指针），
+  `v0.6.3` 把 `progress` 的携带面更正为四处（受理／幂等命中／账号明细列表／冲突体）——
+  实现与本文档此前都已是四处的形状，解释记录漏列冲突体。
 
 ### 新增
 
