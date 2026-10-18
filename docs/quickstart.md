@@ -42,7 +42,13 @@ curl -H "Authorization: Bearer $WEFLOW_TOKEN" \
 2. 全量：`GET /chatlab/sessions/{id}/messages?since=0&limit=500`，用响应里的 `sync.nextSince`
    原样作为下一次的 `since`，直到 `sync.hasMore == false`。
 3. 增量：`GET /chatlab/sessions/{id}/messages?since={lastPullAt}`（`since` 是**排他**下界）。
-4. 通知（可选）：`GET /chatlab/push/messages`（SSE）接收新消息元信息，再按需拉取。
+4. 通知（可选）：`GET /chatlab/push/messages`（SSE）接收新消息元信息，再按需拉取；通知只带
+   元数据，**媒体可取性以客户端落地为准**——新图的 `mediaId` 在全图落地前（数十秒到分钟级）
+   可能仍为空，服务端承诺的是「出现即可取」。
+
+两套游标**不能互喂**：`nextCursor` 是数字页位（列表语义），`since` 是秒级时刻（排他下界）。
+把页位当 `since` 传回去不会被报错拒绝，而是被当成一个极早的时刻——返回 200 和几乎全量的数据，
+属于最难发现的那类静默错。
 
 `since` 缺省等于全量；`limit` 分页时响应**必须**带 `sync` 块。去重按 `platformMessageId`。
 
@@ -128,13 +134,6 @@ bash scripts/examples/register-accounts.sh <你的配置.json>
 # 需要 token；同机未设 WEFLOW_TOKEN 时 CLI 会回落到凭据库
 weflow-server accounts
 ```
-
-## 语义提示
-
-- **媒体可取性以客户端落地为准**：`mediaId`/`fileName` 出现不代表字节一定可取；服务端只承诺
-  「出现即可取」，缺句柄时退回消息面按需导出。
-- **两套游标**：`sessions` 的 `cursor` 是 offset 语义（列表会随新消息变化）；`messages`/pull 面的
-  `since` 是时间游标（排他）。不要混用。
 
 ## TypeScript 客户端
 

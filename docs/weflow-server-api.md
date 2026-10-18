@@ -45,12 +45,12 @@
 |---|---|
 | `limit` | 条数上限（默认 100，上限 10000） |
 | `offset` | 偏移量（默认 0） |
-| `cursor` | 翻页游标：**只有 `/chatlab/sessions` 与 `/chatlab/messages` 认它** —— 把上一次响应的 `page.nextCursor` 原样传回，解析不了就退回 `offset`。老面（`/api/v1/*`）只按 `offset` 翻页，多传的 `cursor` 会被忽略 |
+| `cursor` | 翻页游标：**只有 `/chatlab/sessions` 与 `/chatlab/messages` 认它** —— 把上一次响应的 `page.nextCursor` 原样传回，解析不了就退回 `offset`。原生面（`/api/v1/*`，早期文档称「老面」，下文统一用「原生面」）只按 `offset` 翻页，多传的 `cursor` 会被忽略 |
 | `start` / `end` | 时间边界：Unix 秒，或 `YYYYMMDD`。**`start` 取当天 0 点，`end` 取当天 23:59:59**（上界是包含的，日期形态必须覆盖当天）。无法解析时该条件被忽略，不报 400 |
 | `keyword` | 关键词过滤（小写匹配；sessions/contacts/messages 通用） |
 | 导出开关 | `media=1` 开启媒体导出；再按类型 `image=1`/`voice=1`/`video=1`/`emoji=1` 收窄到某一类 |
 
-> **没有 ChatLab 开关**：`format=chatlab` / `chatlab=1` 已不存在，老面只输出原生/富数据形状。
+> **没有 ChatLab 开关**：`format=chatlab` / `chatlab=1` 已不存在，原生面只输出原生/富数据形状。
 > ChatLab 形状一律走 `/chatlab/*`（见「ChatLab 适配面」）—— 调用方不必知道还有另一种形状，
 > 也不会因为漏传一个开关而拿到另一种。
 
@@ -755,8 +755,8 @@ ChatLab 两面的形状由 `tests/api_smoke.rs` 与一致性套件共同钉住�
 
 ### 四条路由
 
-这四条与 `/api/v1/*` **共用同一份实现与同一条事件总线**，差别只在形状：老面只输出原生/富数据
-形状（`format=chatlab` / `chatlab=1` 开关已删除），新面**天生就是** ChatLab 形状 —— 调用方不必
+这四条与 `/api/v1/*` **共用同一份实现与同一条事件总线**，差别只在形状：原生面只输出原生/富数据
+形状（`format=chatlab` / `chatlab=1` 开关已删除），ChatLab 面**天生就是** ChatLab 形状 —— 调用方不必
 知道还有另一种，也不会因为漏传一个开关而拿到另一种。
 
 | 路由 | 行为 |
@@ -766,7 +766,7 @@ ChatLab 两面的形状由 `tests/api_smoke.rs` 与一致性套件共同钉住�
 | `GET /chatlab/sessions/{id}/messages` | 拉取面：`since=0`／缺省 = 全量，`since>0` = 增量。**两种请求都返回完整信封**（`chatlab`／`members`／`meta`／`sync`／`messages` 恒在）——差别只在 `messages` 是「自 `since` 起」还是「自最早起」；`members` 始终是**本页发言人**的去重集合。这条此前写作「`since>0` 只带 `messages`」，与实现不符（真库复验时实测到信封恒在），已按实现更正 |
 | `GET /chatlab/push/messages` | SSE **通知面**：只发元信息，不发消息体 |
 
-鉴权、错误信封、`Last-Event-ID` 重放与保活都与老面**完全一致**（同一条总线、同一套连接机制）。
+鉴权、错误信封、`Last-Event-ID` 重放与保活都与原生面**完全一致**（同一条总线、同一套连接机制）。
 
 ### `GET /chatlab/sessions` — Pull 形状的发现面
 

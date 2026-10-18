@@ -20,11 +20,31 @@ weflow-server --port 5033 --host 127.0.0.1 --log info
 ```
 
 - token 首次启动生成并存入系统凭据库（Windows 凭据管理器 / macOS 钥匙串 / Linux Secret Service）；
-  `weflow-server token` 打印。CLI 的 token 来源链是 `WEFLOW_TOKEN` → 本机凭据库。
+  `weflow-server token` 打印。CLI 的 token 来源链是 `WEFLOW_TOKEN` → 本机凭据库。凭据库不可用时
+  token 只在启动日志打印一次（会话级），详见 quickstart 配方五。
 - 数据目录：Windows `%LOCALAPPDATA%\weflow-server`。
 - 停服务：前台 `Ctrl-C`。
-- **零账号启动**：先注册再查询；注册前业务端点返回 503（`/health` 仍是 `starting`）。
-  注册、密钥与账号面的细节见 [api 文档](docs/weflow-server-api.md)。
+
+## 注册账号（第一次查询之前）
+
+服务是**零账号启动**的：`/health` 免鉴权、可先看阶段，而业务端点在账号 `ready` 之前一律返回
+503。服务也不会自己去读微信进程——密钥要你用独立工具提取的每库 64-hex（本仓库**不做密钥
+提取**）。注册就一次 POST：
+
+```bash
+curl -X POST -H "Authorization: Bearer $WEFLOW_TOKEN" -H "Content-Type: application/json" \
+  -d '{"wxid":"<你的 wxid>","key":"<64-hex 统一密钥>"}' \
+  http://127.0.0.1:5033/api/v1/accounts
+```
+
+受理返回 `state: "accepted"`，后台开始建索引；轮询到 `ready` 即可查询：
+
+```bash
+curl -H "Authorization: Bearer $WEFLOW_TOKEN" http://127.0.0.1:5033/api/v1/accounts
+```
+
+每库独立密钥用 `keys`（路径→密钥映射）代替统一 `key`；图片键、字段全谱与重启恢复见
+[quickstart 配方五](docs/quickstart.md#配方五重启后恢复账号)与 api 文档的注册端点小节。
 
 ## 第一个请求
 
