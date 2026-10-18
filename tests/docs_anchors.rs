@@ -4,10 +4,15 @@
 //! 链接仍然「看起来没问题」，直到有人点它。这类腐烂没有任何编译期信号。
 //!
 //! 三条守卫，各自**先断言自己的边界标记存在**再检查：
-//!   1. 同文档锚点：每个 `](#...)` 都必须命中本文档的某个标题；
-//!      指向其它文件的相对链接必须指向存在的文件。
+//!   1. 锚点与文件：每个 `](#...)` 都必须命中本文档的某个标题；指向其它文件的相对链接
+//!      必须指向存在的文件，且链接自带的 `#锚` 必须命中**目标文档**的某个标题；
 //!   2. 目录覆盖：含「目录」小节的文档，其目录必须覆盖全部顶层章节。
 //!   3. 模块表链接：模块表里若出现指向详解小节的链接，它们必须命中详解小节。
+//!
+//! 为什么 1 里有「跨文件锚」这一层：只查文件存在放过了真实踩过的腐烂——README 指向
+//! quickstart 的恢复配方锚，标题后来加了「配方五：」前缀，文件仍在、锚已死，守卫全绿
+//! 而读者点进去落空（回归位置：本守卫对 `README.md → docs/quickstart.md#配方五重启后恢复账号`
+//! 的命中）。围栏内的示例链接不计：那是给人读的样例，不是导航。
 //!
 //! 为什么第 3 条是「若出现」：本仓库的架构文档目前是 MVP 节集，详解小节尚未落地。
 //! 边界不存在时守卫会**打印一行说明并跳过**，而不是假装通过——
@@ -97,25 +102,72 @@ fn anchors(text: &str) -> Vec<String> {
     out
 }
 
-/// 提取 `[文字](目标)` 形式的链接目标。
-fn links(text: &str) -> Vec<String> {
-    let chars: Vec<char> = text.chars().collect();
+/// 提取 `[文字](目标)` 形式的链接，拆成 (文件部分, 锚点部分)。
+///
+/// **跳过代码围栏内的行**：围栏里的 `](...)` 多半是给人读的样例（教程里「这样写链接」
+/// 的演示），拿导航标准去要求它们只会产生假阳性——旧实现不跳围栏，跨文件锚一旦要查
+/// 目标文档标题，示例路径就会撞上「文件不存在」。锚点部分不带 `#`；无锚时为空串。
+fn links_with_anchors(text: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    let mut i = 0;
-    while i + 1 < chars.len() {
-        if chars[i] == ']' && chars[i + 1] == '(' {
-            let mut j = i + 2;
-            let mut acc = String::new();
-            while j < chars.len() && chars[j] != ')' {
-                acc.push(chars[j]);
-                j += 1;
-            }
-            out.push(acc);
-            i = j;
+    let mut in_fence = false;
+    for line in text.lines() {
+        if is_fence(line) {
+            in_fence = !in_fence;
+            continue;
         }
-        i += 1;
+        if in_fence {
+            continue;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i + 1 < chars.len() {
+            if chars[i] == ']' && chars[i + 1] == '(' {
+                let mut j = i + 2;
+                let mut acc = String::new();
+                while j < chars.len() && chars[j] != ')' {
+                    acc.push(chars[j]);
+                    j += 1;
+                }
+                let (file_part, anchor) = match acc.find('#') {
+                    Some(p) => (acc[..p].to_string(), acc[p + 1..].to_string()),
+                    None => (acc.clone(), String::new()),
+                };
+                out.push((file_part, anchor));
+                i = j;
+            }
+            i += 1;
+        }
     }
     out
+}
+
+/// 只要目标串（`文件#锚` 原样；无锚时纯路径，纯锚时 `#锚`）——守卫 2 沿用原形状。
+fn links(text: &str) -> Vec<String> {
+    links_with_anchors(text)
+        .into_iter()
+        .map(|(f, a)| match (f.is_empty(), a.is_empty()) {
+            (true, true) => String::new(),
+            (true, false) => format!("#{a}"),
+            (false, true) => f,
+            (false, false) => format!("{f}#{a}"),
+        })
+        .collect()
+}
+
+/// 目标文档的标题锚点集合；文件读不出时返回 `None`（文件存在性由调用处的分支管，
+/// 这里不重复报同一个错）。跨文件链接会反复命中同一份目标，调用处按 (目录, 目标) 缓存。
+///
+/// 除真实标题外，还按 GitHub 的规则补一个**文件名 stem 的隐式锚**：单标题文档（SDK
+/// README 那种）里 `#某sdk` 指的就是文档顶级标题——不认它会把合法链接报成悬空。
+fn target_anchors(dir: &Path, target: &str) -> Option<HashSet<String>> {
+    let joined = dir.join(target);
+    let path = joined.canonicalize().unwrap_or(joined);
+    let text = fs::read_to_string(&path).ok()?;
+    let mut set: HashSet<String> = anchors(&text).into_iter().collect();
+    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+        set.insert(slug(stem));
+    }
+    Some(set)
 }
 
 /// 扫描目标：这几份文档受守卫保护。
@@ -192,13 +244,14 @@ fn load() -> Vec<Doc> {
     docs
 }
 
-// ── 守卫 1：锚点与相对链接 ──
+// ── 守卫 1：锚点与相对链接（含跨文件锚） ──
 
 #[test]
 fn same_document_anchors_resolve() {
     let docs = load();
     assert!(!docs.is_empty(), "一份受保护的文档都没读到——路径或工作目录不对，守卫没有可检查的对象");
     let mut problems = Vec::new();
+    let mut cross_cache: HashMap<(PathBuf, String), Option<HashSet<String>>> = HashMap::new();
     for doc in &docs {
         // 边界断言：没有任何标题时，「所有锚点都命中」是空真，必须显式挡住。
         assert!(
@@ -208,15 +261,38 @@ fn same_document_anchors_resolve() {
         );
         let set: HashSet<&String> = doc.anchors.iter().collect();
         let dir = doc.path.parent().unwrap_or(Path::new(".")).to_path_buf();
-        for link in &doc.links {
-            if let Some(anchor) = link.strip_prefix('#') {
-                if !set.contains(&anchor.to_string()) {
+        for (file_part, anchor) in links_with_anchors(&doc.text) {
+            if file_part.is_empty() {
+                // 纯锚链接：必须命中本文档标题。
+                if !anchor.is_empty() && !set.contains(&anchor.to_string()) {
                     problems.push(format!("{}: 锚点 #{anchor} 不存在", doc.path.display()));
                 }
-            } else if !link.contains("://") && !link.starts_with("mailto:") {
-                let target = link.split('#').next().unwrap_or("");
-                if !target.is_empty() && !dir.join(target).exists() {
-                    problems.push(format!("{}: 链接目标 {target} 不存在", doc.path.display()));
+            } else if file_part.contains("://") || file_part.starts_with("mailto:") {
+                continue;
+            } else if !dir.join(&file_part).exists() {
+                problems.push(format!("{}: 链接目标 {file_part} 不存在", doc.path.display()));
+            } else if !anchor.is_empty() {
+                // 跨文件锚：文件存在还不够，锚必须命中目标文档的标题——「文件还在、
+                // 标题改名」正是静默腐烂发生的地方（README → quickstart 恢复配方）。
+                let key = (dir.clone(), file_part.clone());
+                let target = cross_cache
+                    .entry(key)
+                    .or_insert_with(|| target_anchors(&dir, &file_part));
+                match target {
+                    Some(set) => {
+                        if !set.contains(&anchor) {
+                            problems.push(format!(
+                                "{}: 跨文件锚 {file_part}#{anchor} 在目标文档里没有对应标题",
+                                doc.path.display()
+                            ));
+                        }
+                    }
+                    None => {
+                        problems.push(format!(
+                            "{}: 跨文件锚 {file_part}#{anchor} 无法校验（目标不是 markdown）",
+                            doc.path.display()
+                        ));
+                    }
                 }
             }
         }

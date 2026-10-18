@@ -1639,6 +1639,34 @@ async fn a_second_account_is_rejected_until_the_first_is_deregistered() {
     assert_eq!(body["state"], "not_registered");
 }
 
+/// 冲突体里的第四处 progress 构造点（与 qqflow 同形）：在位账号正在 indexing 时，
+/// 调用方拿到的「还要等多久」与 `occupied_by` 同等重要——否则它只能反复重试同一个
+/// 被拒的注册。复用 indexing 夹具：那套数（8 行／1 表完成／分母 3）与
+/// `accounts-indexing.json` golden 同源。
+#[tokio::test]
+async fn accounts_conflict_reports_indexing_progress() {
+    let dir = common::tmp_dir("smoke-conflict-progress");
+    let state = test_state_indexing(&dir);
+    let app = server::build_router(state);
+
+    let body = serde_json::json!({ "wxid": "wxid_other" });
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/accounts?access_token={TOKEN}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, v) = json_body(app.oneshot(req).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["state"], "account_conflict");
+    assert_eq!(v["occupied_status"], "indexing");
+    assert_eq!(v["progress"]["messages_indexed"], 8);
+    assert_eq!(v["progress"]["tables_done"], 1);
+    assert_eq!(v["progress"]["tables_total"], 3);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 注销要求鉴权，且**只有 DELETE 一条路** —— POST 别名已删除。
 ///
 /// 别名曾经存在是为了「发不出 DELETE 的客户端与代理」，而代价是多一条会改状态的路由：

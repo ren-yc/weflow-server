@@ -56,12 +56,13 @@ curl -H "Authorization: Bearer $WEFLOW_TOKEN" \
 密钥只存进程内存；服务重启后账号回到未注册（业务端点 503）。用
 [`scripts/examples/register-accounts.ps1`](scripts/examples/register-accounts.ps1)（或
 [`.sh`](scripts/examples/register-accounts.sh)）从你自备的本地配置读 key 后重新注册；完整配方
-见 [docs/quickstart.md](docs/quickstart.md#重启后恢复账号)。脚本只读配置、不代存密钥。
+见 [docs/quickstart.md](docs/quickstart.md#配方五重启后恢复账号)。脚本只读配置、不代存密钥。
 
 ## 去哪看细节
 
 | 想知道 | 看 |
 |---|---|
+| 这个版本改了什么（逐版行为变化与迁移） | [CHANGELOG.md](CHANGELOG.md) |
 | 按任务怎么做（ChatLab/增量/导出/MCP/恢复） | [docs/quickstart.md](docs/quickstart.md) |
 | HTTP 端点、CLI、退出码、错误形状 | [docs/weflow-server-api.md](docs/weflow-server-api.md) |
 | 模块职责、feature 矩阵、嵌入与测试纪律 | [docs/architecture.md](docs/architecture.md) |

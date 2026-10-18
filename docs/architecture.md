@@ -76,12 +76,12 @@
 | `main.rs` | 进程入口：解析配置、装日志、起服务 | — | → `server` / `config` |
 | `lib.rs` | 库入口：承诺面 `api` ＋ 实现面（默认 `pub(crate)`，见「库面与 feature」） | `api` | — |
 | `config.rs` | 命令行与数据目录解析、token 凭据库读写 | `Config` | ← 无 |
-| `logging.rs` | 日志初始化 | `init()` | ← 无 |
+| `logging.rs` | 日志初始化 | `init_with_format`（子命令→stderr）/ `init_for_serve`（serve→stdout） | ← 无 |
 | `pathsafe.rs` | **纯守卫**：路径分量与导出根目录的边界检查 | `slugify` / 校验函数 | ← 无（被 `media`、`server` 调用） |
 | `db/wcdb.rs` | WCDB 页密码：页布局、密钥派生、每页校验 | 解密原语 | ← 无 |
 | `db/live.rs` | 活库只读连接与密钥校验 | `open_read_only` / 连接池 | → `wcdb` |
 | `db/open.rs` | 快照式打开（与 `live` / `scan` 分层，仅在需要稳定视图时用） | `open_snapshot` | → `wcdb` |
-| `db/scan.rs` | **值驱动探测**：库 → 表 → 列，含账号发现 | `scan_accounts` 等 | → `live` |
+| `db/scan.rs` | **值驱动探测**：库 → 表 → 列，含账号发现 | `scan_all` / `scan_root` / `default_roots` | → `live` |
 | `parser/mod.rs` | 平台记录 → 内部类型；媒体类型归一 | `parse_message` | ← 无（纯函数为主） |
 | `store/mod.rs` | 内存索引的数据结构与查询原语 | `Store` | → 无外部 IO |
 | `store/index.rs` | 从库里**建**索引；消息表 → 会话归属 | `build_all_live` | → `db` / `parser` |
@@ -90,7 +90,7 @@
 | `media/mod.rs` | 媒体元数据与路径解析 | — | → `pathsafe` |
 | `media/export.rs` | 媒体导出（含外部工具调用） | `export_*` | → `pathsafe` / 子进程 |
 | `keystore/mod.rs` | 密钥解析与镜像密钥（图片等） | `KeyMap` / `parse_db_key` | ← 无 |
-| `server/mod.rs` | 路由装配、鉴权、共享状态、SSE 总线 | `serve_with_shutdown` | → 全部 |
+| `server/mod.rs` | 路由装配、鉴权、共享状态、SSE 总线 | `build_router`（serve 入口 `serve_with_shutdown` 在 `lib.rs`） | → 全部 |
 | `server/handlers/mod.rs` | **handler 之间的共享件**：类型码映射、参数解析、信封 | `chatlab_type` / `parse_limit` / `extract_params`（`server::merge_params` 的薄包装） | — |
 | `server/handlers/*` | 各端点的实现（account / session / message / contact / media / push / sns） | — | → `store` / `sync` |
 
@@ -312,7 +312,7 @@ OpenSSL，后者的 perl `Configure` 会直接调 `cl.exe` / `link.exe`，**绕�
 - **输出去向按入口分叉**：**子命令**日志走 **stderr**——`fmt()` 的默认 writer 是 stdout，而子命令
   的 stdout 是命令输出本身（`--json` 形状），日志混进去会毁掉管道消费。**serve** 日志维持
   **stdout**——既有部署在用 `weflow-server > 日志文件` 收服务日志，改通道会让那些脚本静默拿到空
-  文件，属破坏性变更、不在本批。判据两条：`tests/cli_e2e.rs::log_json_format_emits_parseable_lines`
+  文件，属破坏性变更、不随 0.9.1 落地。判据两条：`tests/cli_e2e.rs::log_json_format_emits_parseable_lines`
   （stderr 逐行可解析**且 stdout 无日志行**）与 `tests/cli.rs::serve_logs_stay_on_stdout`
   （启动行在 stdout、不在 stderr）。已知代价（如实登记）：同一次运行里 `[fatal]` 在 stderr、
   serve 普通日志在 stdout，「只看 `2>` 收错误」拿不到 `[init]` 上下文；合并成一条通道要等一个
@@ -324,7 +324,7 @@ OpenSSL，后者的 perl `Configure` 会直接调 `cl.exe` / `link.exe`，**绕�
 - **子命令日志不带 ANSI 颜色码**：`tracing-subscriber` 不做 TTY 检测，重定向时照样写转义序列；
   stderr 是脚本与采集器的消费面（`2> 文件`、按行解析），所以子命令那支显式 `with_ansi(false)`。
   靠环境变量 `NO_COLOR` 不行——开发机设了它、CI 没设，判据就变成「本地绿 CI 红」（实测踩中）。
-  serve 支保持库默认观感，本批不动。判据：`tests/cli_e2e.rs::subcommand_failures_are_logged_on_stderr`
+  serve 支保持库默认观感，0.9.1 不动。判据：`tests/cli_e2e.rs::subcommand_failures_are_logged_on_stderr`
   里的「stderr 不得含 ESC 字节」断言（测试基座同时清掉子进程的 `NO_COLOR`，否则本机测不出）。
 - **语言口径与脱敏红线**：见 `src/logging.rs` 模块头（用户句中文、模块级诊断英文；日志禁入完整
   密钥／完整 token／消息正文，例外只有 serve 路径那两条「不打印就拿不到」的 token 行——首次生成
@@ -393,7 +393,9 @@ Python 只用于钩子与套件执行器，**纯标准库**——CI 与开发机
 断言取大群**采样的首个与末个**点，要求增量小于起始值的一成。
 
 发布二进制里没有这个参数（默认 feature 不含 `testing`），所以它不会被用户发现并误用——
-它造的是假账号。
+它造的是假账号。同一 `testing` feature 还开放 `WEFLOW_TOKEN_SERVICE`：集成测试可把 API token
+的凭据库服务名指到专用的空服务，避免并行用例互踩真实凭据库——默认构建（`default =
+["server","cli","mcp"]`）编译掉该覆盖，用户进程永远读的是内置服务名。
 
 ### 快照与键序
 
@@ -411,7 +413,8 @@ Python 只用于钩子与套件执行器，**纯标准库**——CI 与开发机
 ### 一致性套件
 
 `tests/conformance_runner.rs` 起真服务、造夹具，跑契约仓库（版本记在 `conformance.pin`）里的
-36 条用例（`v0.6.0`：auth 1／cursor 13／discovery 3／envelope 6／lifecycle 8／nails 5；换 pin 时这里要跟着改，它没有机器判据）。两条硬规矩：**带 `--fail-on-skip`**（有用例被跳过即失败，避免「夹具少声明一个端点」
+36 条用例（`v0.6.2`：auth 1／cursor 13／discovery 3／envelope 6／lifecycle 8／nails 5——v0.6.1 与
+v0.6.2 都是纯文档 tag，用例集未增删；换 pin 时这里要跟着改，它没有机器判据）。两条硬规矩：**带 `--fail-on-skip`**（有用例被跳过即失败，避免「夹具少声明一个端点」
 让用例静默变成不跑），**缺 `FLOW_CONTRACT_DIR` 即失败**（不是跳过）。夹具里的
 `contractVersion` 与 pin 由 `pinned_contract_version_matches_the_fixture` 钉在一起。
 

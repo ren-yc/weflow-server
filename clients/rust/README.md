@@ -2,6 +2,8 @@
 
 Typed Rust client for [weflow-server](https://github.com/ren-yc/weflow-server) — a headless, read-only HTTP/SSE service over local WeChat 4.x chat databases.
 
+Published in lockstep with the server crate (currently `0.9.1`); behavioral changes are recorded in the repository's [CHANGELOG.md](https://github.com/ren-yc/weflow-server/blob/master/CHANGELOG.md).
+
 Generated from the server's OpenAPI description (types + request plumbing), with a handwritten behavior layer on top: transport failures folded into a proper error tree, readiness polling, pagination helpers, SSE streaming, and media download helpers.
 
 ## Install

@@ -86,6 +86,9 @@ weflow-server mcp
 
 token 的来源链是 `WEFLOW_TOKEN`（非空）→ 本机凭据库（与 `weflow-server token` 同一份）。
 同机可以直接从凭据库取；跨机把 `WEFLOW_TOKEN` 设成服务端实际使用的那个值。
+一个会踩的坑：本机凭据库不可用时，服务端生成的是**会话级 token**（不落库、随每次启动而变，
+只在启动日志打印一次）——此时凭据库里没有值可回落，`token` 子命令与 `--show-token` 都会
+落空，必须从启动日志取当前值并设进 `WEFLOW_TOKEN`。
 
 ### 2. 准备恢复配置
 

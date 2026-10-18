@@ -1,7 +1,9 @@
 # MCP 工具面（stdio）
 
 本服务可以作为 **MCP（Model Context Protocol）服务端**运行：把只读查询暴露成一组工具，供支持
-MCP 的 agent 客户端调用。传输走 stdio，由一个独立的 `weflow-server mcp` 进程承担。
+MCP 的 agent 客户端调用。工具共 8 个：**7 个只读查询 ＋ 1 个显式写动作**（`sync_now`，见下表——
+说「只读」指的是不解密不写库的数据面，`sync_now` 会推进服务端水位并可能触发媒体导出）。
+传输走 stdio，由一个独立的 `weflow-server mcp` 进程承担。
 
 ## 数据会离开本机
 

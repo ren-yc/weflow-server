@@ -2,6 +2,29 @@
 
 本文件从 0.5.0 起维护。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [未发布]
+
+### 补记
+
+0.9.1 已发布章节之外，下列用户可见变化在发布时漏记于本文件（功能本身在 0.9.1 里，
+此处只补登记，不改动 0.9.1 节文本）：
+
+- **CLI 的 token 来源链改为「环境变量 → 本机凭据库」**：`WEFLOW_TOKEN` 非空优先；未设时
+  回落到与 `weflow-server token` 同一份凭据，同机运行不必每次 export。env 与凭据库两态
+  失败分别点名并指路。token 仍一律不进命令行（shell history 与进程列表的既有边界不变）。
+- **密钥失配自诊断**：页 1 HMAC 校验失败的 400 错误体、账号 `error` 状态与 warn 日志三处
+  一致点名「疑似密钥已轮换、参数过期或 key 集不全：请重新注册并带全 key 集（含图片键）」；
+  非密钥类的打开失败不再误诊为密钥问题。
+- **新增 `docs/quickstart.md` 的「重启后恢复账号」配方与 `scripts/examples/register-accounts.ps1`／`.sh` 示例脚本**：脚本只读调用方自备的本地配置，不代存任何密钥。
+- **接口契约 pin 由 `v0.6.0` 升 `v0.6.2`**：`v0.6.1` 登记 accounts 的可选 `progress` 为
+  additive 形状，`v0.6.2` 新增两仓适配差异指南 `ADAPTATION.md`（api 文档顶部加了指针）。
+
+### 新增
+
+- **Python SDK 的同步门面文档补齐**：`clients/python/README.md` 增 `SyncClient` 示例与专属
+  事件循环线程说明——0.9.1 上架时 PyPI 页面只呈现 async 用法，同步入口（随 0.9.1 发布）
+  在其最大分发渠道上不可见。回归位置：`test_sync_client_health_and_accounts`。
+
 ## [0.9.1] - 2026-10-18
 
 ### 新增
@@ -30,12 +53,12 @@
   `tests/cli.rs::invalid_log_flags_are_usage_errors_exit_2`。
 - **`--log-format json`**：逐行一个 JSON 对象（含 `level`/`target`/`fields`），给日志采集器消费；
   输出去向跟随所在入口（子命令 stderr、serve stdout）。text 是默认，形态为 `时间 级别 target: 消息`
-  （自本批起行内多了 target 段）。
+  （自 0.9.1 起行内多了 target 段）。
 - **日志行恢复模块 target**（如 `weflow_server::export`）：模块很多（store/sync/server/media/watch…），
   没有归属信息时排障只能靠猜文案。
 - **子命令日志不带 ANSI 颜色码**：stderr 是机器消费面（`2> 文件`、采集器按行解析），转义序列会
   毁掉按行解析；`tracing-subscriber` 不做 TTY 检测，靠环境变量 `NO_COLOR` 兜不住的场合（CI）就会
-  露出转义码。serve 的 stdout 输出维持库默认观感，本批不动。
+  露出转义码。serve 的 stdout 输出维持库默认观感，0.9.1 不动。
 - serve／裸跑路径**新增** `--log-format`（老解析器里 `--log` 的同族旗标，值域 `text|json`）。
   既有的 `--log` 旗标与 serve 的 info 默认**逐字不变**（回归位置：
   `tests/cli.rs::serve_log_flag_still_goes_through_the_old_parser`）。
@@ -76,7 +99,7 @@
   `talker` 用发起导出时传给 ChatLab 面的同一个会话 id。`media_bytes_by_id(id)` 不受影响。
   空 `talker` 现在两语言都**本地拒绝**（Rust 报 `UnexpectedBody`，Python 报 `ShapeError`）——
   此前 Rust 会把空串发给导出端点，把「参数无效」伪装成「句柄不可导出」。回归位置：
-  `tests/behavior.rs::media_bytes_exports_then_retries_once_after_404`（夹具昵称 ≠ 会话 id，
+  `clients/rust/tests/behavior.rs::media_bytes_exports_then_retries_once_after_404`（夹具昵称 ≠ 会话 id，
   mock 拒绝错误 talker）与 `tests/cli_e2e.rs::with_media_skips_an_unfetchable_handle_without_failing`。
   消息无媒体句柄时的错误也从「合成 404 + 句子塞 url 字段」改为 `UnexpectedBody`/`ShapeError`——
   依赖旧错误形态分类的调用方需要调整。
@@ -116,7 +139,7 @@
   把它等满预算只会把可当场定位的问题拖成一次超时。但「等待」不等于「失忆」：一直连不上或一直 5xx 时，超时若仍报
   `not-registered`，就把矛头错误指向注册那一步，而真正的现象是服务端从头到尾没答过。现最终消息带上最后一次观察
   与丢掉的轮数（`…; N poll(s) never got through`）。回归位置：
-  `wait_ready_rides_out_a_transient_5xx_but_not_a_4xx`（两语言两仓）。
+  `wait_ready_rides_out_a_transient_5xx_but_not_a_4xx`（两语言两仓；Python 侧实名带 `test_` 前缀）。
 
 - **httpx 解析不出 URL 的错误进入 `ClientError` 树**：`httpx.InvalidURL` 不属于 `httpx.HTTPError`
   家族，此前畸形 `base_url`（端口非法、主机含控制字符、残缺 IPv6 字面量）会裸逃过 `except ClientError`——

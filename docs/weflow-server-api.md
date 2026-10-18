@@ -951,6 +951,7 @@ feeds 条目字段（以源码 `sns.rs` 为准）：`tid/userName/content(明文
 | `accounts` | SDK `accounts` | **只有 HTTP 形态**（没有 `--embedded`）：这一面问的是「服务端此刻实际绑定了什么」，进程内索引给的是另一个答案 |
 | `sync` | SDK `sync_now` | **写动作**：让服务端立刻跑一次增量同步；同样没有 `--embedded` |
 | `export` | SDK `list_all_sessions` ＋ `pull_page` ＋ `chatlab_messages` | **只走 HTTP**（不提供 `--embedded`）：批量导出到 ChatLab Format 文件；`--with-media` 时用同一页的时间窗调 `chatlab_messages(media=1)` 触发导出并下载字节，见下一节 |
+| `mcp` | 经 SDK 打 HTTP 面 | stdio 上的 MCP 服务端：进程不碰数据库密钥，token 走同一来源链；**必须先起服务端**。工具清单与安全提示见 [docs/mcp.md](mcp.md) |
 
 环境变量：`WEFLOW_BASE_URL`（默认 `http://127.0.0.1:5033`）、`WEFLOW_TOKEN`（API token）。
 **token 来源链**：`WEFLOW_TOKEN`（非空）→ 本机凭据库（与 `weflow-server token` 同一份）。
@@ -992,7 +993,7 @@ feeds 条目字段（以源码 `sns.rs` 为准）：`tid/userName/content(明文
   测试基座里一律 `env_remove` 它，避免级别随环境漂移。
 - 子命令日志**不带 ANSI 颜色码**（`--log-format json` 与 text 同）：stderr 是脚本与采集器的消费面，
   `2> 日志文件` 里出现 `\x1b[33m` 会毁掉按行解析。这条是产品保证、不依赖 `NO_COLOR` 环境变量。
-  serve 的输出维持库默认（本批不动它的观感）。
+  serve 的输出维持库默认（0.9.1 不动它的观感）。
 
 ## 批量导出（`export`）
 
@@ -1101,7 +1102,7 @@ weflow-server.exe serve --port 5033      # 与上一行等价
 weflow-server.exe sessions --json        # 子命令面
 ```
 
-参数：`--show-token`、`--port`、`--host`、`--log`、`--watch-debounce-ms`、
+参数：`--show-token`、`--port`、`--host`、`--log`、`--log-format`、`--watch-debounce-ms`、
 `--watch-fallback-ms`、`--media-export-dir`、`--base-url`（全部仅命令行，无配置文件）。
 数据目录不可配置：Windows `%LOCALAPPDATA%\weflow-server`；媒体导出默认落在其下的
 `api-media`，仅 `--media-export-dir` 可改。

@@ -16,7 +16,7 @@
 //! - **子命令**：`cli::dispatch` 在执行任何动作前装 `init_with_format`（warn 级、stderr）。
 //! - **serve**（含裸跑与老旗标）：`dispatch` 在构造 clap **之前**就把 `serve` 短路进老解析器，
 //!   级别与格式因此完全由 `Config.log`/`Config.log_format` 决定，`lib.rs` 的 serve 分支装
-//!   `init_for_serve`。默认 info 级别与 stdout 去向不变（行内自本批起多了模块 target 段，
+//!   `init_for_serve`。默认 info 级别与 stdout 去向不变（行内自 0.9.1 起多了模块 target 段，
 //!   那是「恢复 target」条的效果，不属于入口分叉）。
 //!
 //! 两个入口都返回 `bool`（是否真的装了）：装法是 `try_init`——**已有 subscriber 时装不上、
@@ -32,7 +32,8 @@
 //!   `tests/cli_e2e.rs::log_json_format_emits_parseable_lines` 断言 stderr 逐行可解析、
 //!   **且 stdout 没有日志行**。
 //! - **serve 的 stdout 没有输出契约**，而既有部署就在用 `weflow-server > 日志文件` 收服务日志
-//!   ——改通道会让那些脚本拿到空文件，这属于破坏性变更，不在本批范围。serve 维持 stdout。
+//!   ——改通道会让那些脚本拿到空文件，这属于破坏性变更，不属 0.9.1 范围（留待一个愿意
+//!   接受破坏性的版本窗口）。serve 维持 stdout。
 //!
 //! 已知代价（如实登记）：同一次运行里 `[fatal] {e:#}` 走 stderr、serve 普通日志走 stdout，
 //! 「只看 `2>` 收错误」的采集侧拿不到 `[init]` 上下文。两通道各自的语义写在上面；合并成
@@ -53,18 +54,19 @@
 //! 日志行**禁止**出现：完整数据库密钥、完整 API token、消息正文。
 //! 例外只有两处，都在 serve 路径，共同点是「不打印就没有第二次拿到的机会」：
 //! - `[init] 生成新 API token:`（info 级）——只在**首次生成**时打印一次，值随后可从本机
-//!   凭据库取回（`keystore` 与 `config::show_token` 的注释声明了同一例外）；
+//!   凭据库取回（`config::load_token` 的 doc 注释声明了这个例外）；
 //! - `[init] 凭据库不可用 …: {t}`（warn 级）——此时 token 不落库、重启即变，不打印就没有
-//!   这个值了（`config::load_token` 的注释声明了它）。
+//!   这个值了（同一处 doc 注释声明了它）。
 //!
 //! 子命令的日志同样不得出现 token；`token` 子命令把值写到 stdout，那是命令输出而不是日志。
-//! 透传上游错误 Display 的行（媒体下载失败等）允许点名状态码与 URL，禁止带出请求体。
+//! 透传上游／内部错误 Display 的行允许点名状态码与 URL，禁止带出请求体；新增此类行时先看清
+//! 它透传的错误形态里有没有密钥与正文（0.9.1 复核过媒体导出、SNS 代理与 watcher 三族的现状）。
 
 /// 子命令形态：指定格式，输出写 **stderr**（stdout 留给命令输出，见模块头）。
 ///
 /// json 形态是**逐行一个 JSON 对象**（tracing 的 JsonFormatter，含 level/target/fields），
 /// 给日志采集器消费。text 形态是 tracing 默认行：`时间 级别 target: 消息`（实测
-/// `2026-10-17T09:36:17Z DEBUG reqwest::connect: …`）——本批起多了 target 段；行首的
+/// `2026-10-17T09:36:17Z DEBUG reqwest::connect: …`）——0.9.1 起多了 target 段；行首的
 /// `[init]`/`[fatal]` 是**消息自带的前缀**，不是 formatter 的产物。除 `"json"` 外一律按 text 处理。
 ///
 /// 门控：调用点在 `cli` feature 里；不开 `cli` 时本函数没有调用者，
@@ -78,7 +80,7 @@ pub fn init_with_format(level: &str, format: &str) -> bool {
 /// serve 形态：指定格式，输出写 **stdout**（既有 `> 日志文件` 部署的重定向习惯，维持不动）。
 ///
 /// 为什么 serve 不用 stderr：普通部署在用 `weflow-server > 日志文件` 收服务日志，把日志挪到
-/// stderr 会让那些脚本静默拿到**空文件**——这是破坏性变更，不在本批（子命令的 stdout 有输出
+/// stderr 会让那些脚本静默拿到**空文件**——这是破坏性变更，不属 0.9.1（子命令的 stdout 有输出
 /// 契约、serve 的没有，所以两者去向不同；已知代价与判据见模块头）。
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
 pub fn init_for_serve(level: &str, format: &str) -> bool {
@@ -94,7 +96,7 @@ fn install(level: &str, format: &str, to_stderr: bool) -> bool {
     // 为什么两支各自成链而不是在一条 builder 上条件设 writer：`with_writer` 会把 builder 的
     // 泛型参数换成对应 writer（`Stderr` 与 `Stdout` 是两个不同类型），if/else 交出不同类型
     // 编译不过（这个错由门禁实测）。stdout 那支**显式写出**而不依赖 `fmt()` 的默认 ——
-    // 默认值是库的实现细节，而「serve 的日志在 stdout」是本批要钉住的行为
+    // 默认值是库的实现细节，而「serve 的日志在 stdout」是 0.9.1 钉住的行为
     // （判据：`tests/cli.rs::serve_logs_stay_on_stdout`）。
     let json = format == "json";
     if to_stderr {
@@ -103,7 +105,7 @@ fn install(level: &str, format: &str, to_stderr: bool) -> bool {
         // 检测，不关就会在重定向场景里写下 `\x1b[33m WARN\x1b[0m` —— 判据
         // `tests/cli_e2e.rs::subcommand_failures_are_logged_on_stderr` 遂依赖运行环境的
         // `NO_COLOR`（本机有、CI 没有 ⇒ 本地绿、CI 红，实测踩中）。
-        // serve 支刻意保持库默认：那是既有输出的样子，本批不改它的观感。
+        // serve 支刻意保持库默认：那是既有输出的样子，0.9.1 不改它的观感。
         let builder = tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_target(true)
