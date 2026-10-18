@@ -229,37 +229,37 @@ jobs:
             artifacts/SHA256SUMS
           generate_release_notes: true
           fail_on_unmatched_files: true
-  # crates.io / PyPI 首发通道（v0.9.0 起）。依赖完整质量门＋三平台构建＋GitHub Release
-  # （needs 含 release：发布不可撤销，别在 Release 产物没齐时先把包发出去），任何一步
-  # 红都不发布。**仓库与本机都不保存长期上传凭据**，两条路径按各自官方机制走：
-  # - PyPI＝OIDC 短期凭据：在 pypi.org 一次性登记 pending publisher（项目尚不存在，
-  #   没法限定到项目；首发后升级成绑定项目的正式 publisher）。
-  # - crates.io＝新 crate 的首发在本机手工做一次：它没有「预登记一个还不存在的 crate」
-  #   的机制，可信发布要挂在已存在的 crate 上，而 cargo 的可信发布支持也还没进 stable
-  #   （本仓 pin 1.97.1）。做完重跑本作业：守卫检测到已上架就跳过、不报错。
-  # 未配 CARGO_REGISTRY_TOKEN 时本作业会明确报「该版本尚未上架，请本机手工发一次」，
-  # 不含糊失败；若日后想让 CI 代发，配那个 scoped secret 即可（守卫自动改走 CI 路径）。
-  # 每步 publish 前都先查「这个版本是否已在 registry」：不可撤销的发布遇到失败重跑时，
-  # 没有这道守卫就会撞 already-uploaded、把后面的步骤（含 PyPI）永远卡死。
-  publish:
-    name: Publish to crates.io and PyPI
+  # crates.io / PyPI 发布通道。两条路径都用 OIDC 短期凭据：
+  # - crates.io＝Trusted Publishing：本 repo 的两个 crate 已在 Settings 里登记本仓库、
+  #   release.yml 与 `crates-io` environment；job 在这里停下等人工审批，
+  #   再用 rust-lang/crates-io-auth-action 换取 30 分钟 token。
+  # - PyPI＝pypa 的官方 action＋`pypi` environment 审批。
+  # 两个 job 分开：crates 审批不牵连 PyPI，PyPI 也不会因为 crates 的 token
+  # 没配好而拿到多余权限。crate 的首次发布仍需本机 `cargo publish`（crates.io
+  # 无法为尚不存在的 crate 预登记 trusted publisher）；首次发布后登记
+  # trusted publisher，后续版本全部由 CI 发布。
+  crates:
+    name: Publish to crates.io
     needs: [guard, build, release]
     runs-on: ubuntu-latest
-    timeout-minutes: 60 # 根包 publish 会 verify 整包（含 vendored OpenSSL），比 SDK 慢一个量级
-    # 人工闸门：发布不可撤销。pypi 环境配 Required reviewers 后，作业会停在这里
-    # 等人放行——PyPI 的 trusted publisher 也必须登记成这个环境名，否则换取凭据即失败。
-    environment: pypi
+    timeout-minutes: 60 # 根包 verify 要编译 vendored OpenSSL
+    # 人工闸门：发布不可撤销。crates-io environment 配 Required reviewers 后，
+    # 作业会停在这里；crates.io 的 trusted publisher 必须登记同名 environment。
+    environment: crates-io
     permissions:
-      contents: read    # 本作业只读仓库内容；写手是 release 作业
-      id-token: write   # OIDC 短期凭据只对 pypa 的上传动作可见（本机不持有任何上传凭据）
-      # 不需要 attestations: write——pypa 的动作虽默认开启 attestations（PEP 740），但它
-      # 走 sigstore ＋ 作业 OIDC（attestations.py 里是 detect_credential()），不调 GitHub
-      # 的 attestations API；必需项只有上一行的 id-token。此处刻意不再多给一项写权限。
+      contents: read
+      id-token: write # 只用于 OIDC 换取 crates.io 短期 token
     steps:
       - uses: actions/checkout@v5
 
       - name: Install pinned toolchain (rust-toolchain.toml)
         run: rustup show
+
+      # 一次 exchange 供同 repo 的两个 crate 共用；token 30 分钟过期，
+      # action 的 post step 在 job 结束时撤销。
+      - name: Authenticate with crates.io via OIDC
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
 
       # 顺序＝先 SDK、后根包：根包的依赖声明带 version，必须等 registry 上
       # 存在该版本才发布得出去。
@@ -268,10 +268,7 @@ jobs:
         env:
           CRATE: weflow-client
           VERS: ${{ needs.guard.outputs.version }}
-          # 刻意下移到步骤级而不是作业级：同作业的 PyPI 步骤会 pip install 未固定版本的
-          # build/twine，凭据放在作业 env 里就等于交给任何一次依赖投毒。放这里则只有真正
-          # 需要它的两步能看到；配了则 CI 代发，未配时下面的守卫给出可执行的下一步。
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
           # crates.io 对不合规的 User-Agent 一律 403（实测：默认 curl UA 与被显式清空的
           # UA 都吃 403，必须带一个自定义值）。漏掉它会把「已上架」误判成「没上架」，
@@ -279,10 +276,7 @@ jobs:
           if curl -sf -A "flow-release-guard" "https://crates.io/api/v1/crates/${CRATE}/${VERS}" >/dev/null; then
             echo "::notice::${CRATE} ${VERS} 已发布过，跳过（幂等重跑）"
           elif [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
-            # 本仓刻意不在 CI 里放长期发布凭据：新 crate 的首发按 crates.io 的要求只能
-            # 手工做一次（可信发布也没法为一个尚不存在的 crate 预先登记 publisher）。
-            # 缺凭据时把话讲明白，而不是让 cargo 报一句看不懂的「no token」。
-            echo "::error::${CRATE} ${VERS} 尚未上架，而 CI 无发布凭据。按 docs/release-runbook.md 在本机手工发布，然后重跑本作业（守卫会跳过已上架的）。"
+            echo "::error::OIDC 未换到 crates.io token；检查 crates-io environment 与 trusted publisher 配置"
             exit 1
           else
             cargo publish --locked
@@ -309,7 +303,7 @@ jobs:
         env:
           CRATE: weflow-server
           VERS: ${{ needs.guard.outputs.version }}
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
           # crates.io 对不合规的 User-Agent 一律 403（实测：默认 curl UA 与被显式清空的
           # UA 都吃 403，必须带一个自定义值）。漏掉它会把「已上架」误判成「没上架」，
@@ -317,14 +311,24 @@ jobs:
           if curl -sf -A "flow-release-guard" "https://crates.io/api/v1/crates/${CRATE}/${VERS}" >/dev/null; then
             echo "::notice::${CRATE} ${VERS} 已发布过，跳过（幂等重跑）"
           elif [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
-            # 本仓刻意不在 CI 里放长期发布凭据：新 crate 的首发按 crates.io 的要求只能
-            # 手工做一次（可信发布也没法为一个尚不存在的 crate 预先登记 publisher）。
-            # 缺凭据时把话讲明白，而不是让 cargo 报一句看不懂的「no token」。
-            echo "::error::${CRATE} ${VERS} 尚未上架，而 CI 无发布凭据。按 docs/release-runbook.md 在本机手工发布，然后重跑本作业（守卫会跳过已上架的）。"
+            echo "::error::OIDC 未换到 crates.io token；检查 crates-io environment 与 trusted publisher 配置"
             exit 1
           else
             cargo publish --locked
           fi
+
+  pypi:
+    name: Publish to PyPI
+    needs: [crates] # 保持 SDK/根包先发；PyPI 自己仍有 pypi environment 审批
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # 人工闸门：PyPI 发布不可撤销；pypi environment 配 Required reviewers 后停在这里。
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write # pypa 动作的 OIDC 短期凭据
+    steps:
+      - uses: actions/checkout@v5
 
       - name: Set up Python for PyPI build
         uses: actions/setup-python@v5
@@ -344,5 +348,5 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: clients/python/dist/
-          # 与上面 crates.io 侧的守卫同一目的：重跑作业不该因为「这版本已发过」而红。
+          # 重跑作业不该因为「这版本已发过」而红。
           skip-existing: true
