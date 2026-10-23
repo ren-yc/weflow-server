@@ -10,6 +10,20 @@
   默认端口、SDK/ts 状态）见
   [flow-contract ADAPTATION.md](https://github.com/ren-yc/flow-contract/blob/master/ADAPTATION.md)。
 
+## 最小必读路径
+
+本文近 90 KB，是端点参考而不是教程；按目标挑一条最短路径走：
+
+| 目标 | 先读这里 | 再读 |
+|---|---|---|
+| 第一次跑通（获取→起服务→注册→查询） | [quickstart](quickstart.md) | 本文「鉴权」「错误信封」 |
+| 接 ChatLab 前端 | quickstart 配方一 | 「ChatLab 适配面（`/chatlab/*`）」＋「通用查询参数」里的上限表 |
+| 程序化取数 / 翻页 | 本文「端点总览」→ 对应端点小节 | 「类型化客户端（SDK）」 |
+| 只要增量（watcher/SSE） | quickstart 配方二 | 端点小节「SSE 事件流（免轮询推送）」 |
+| 批量导出（含媒体） | quickstart 配方三 | 「批量导出（`export`）」 |
+| 让 agent 接入（MCP） | [mcp.md](mcp.md) | 「命令行子命令」小节 |
+| 账号卡住 / 排障 | 「错误信封」＋「accounts 响应的可选 `progress`」 | 「数据获取与安全模型」与 quickstart 配方五 |
+
 ## 鉴权
 
 两种传输等价（源码 `server/auth.rs::authorized`），按下表顺序检查：
@@ -71,6 +85,38 @@
 > 而 `media=1` 的 200 与这两者**无关**。
 
 ## 端点
+
+**端点总览**（逐条来自 `server/routes.rs` 的 `ROUTES`；描述与路由的等价性由
+`tests/api_smoke.rs::documented_routes_match_the_openapi_table` 钉住。鉴权面见文档顶部通用
+声明：除 `/health`、`/api/v1/health` 与 `/openapi.json` 外均需 token）：
+
+| 端点 | 方法 | 一句话说明 | 详见小节（按标题搜索） |
+|---|---|---|---|
+| `/openapi.json` | GET | 接口描述（OpenAPI 3，由 DTO 生成） | 「接口描述」上节 |
+| `/health`、`/api/v1/health` | GET、POST | 健康检查（账号只给标量阶段，不列明细） | 「GET/POST `/health`、`/api/v1/health`」 |
+| `/api/v1/accounts` | GET、POST | GET 账号明细；POST 注册账号（异步受理） | 「账号明细」「注册账号」 |
+| `/api/v1/accounts/{wxid}` | DELETE | 注销账号（幂等） | 「注销账号」 |
+| `/api/v1/messages` | GET | 消息查询；`media=1` 时兼媒体导出面 | 「消息查询 + 媒体导出」 |
+| `/api/v1/sessions` | GET | 会话列表（只认 `offset`） | 「会话列表」 |
+| `/api/v1/sessions/{id}/messages` | GET | ChatLab Pull（单页默认与上限均 5000） | 「ChatLab 拉取（消息游标）」 |
+| `/api/v1/contacts` | GET | 联系人 | 「联系人」 |
+| `/api/v1/group-members` | GET | 群成员（整名册一次给全，无 `limit`） | 「群成员」 |
+| `/api/v1/media/{id}` | GET | **唯一的字节面**：store 键或导出文件名 | 「按文件名取字节」 |
+| `/api/v1/push/messages` | GET（SSE） | 带正文的富推送面 | 「SSE 事件流（免轮询推送）」 |
+| `/chatlab/sessions` | GET | ChatLab 发现面（认 `cursor`） | 「`GET /chatlab/sessions`」 |
+| `/chatlab/messages` | GET | ChatLab 消息面 | 「`GET /chatlab/messages`」 |
+| `/chatlab/sessions/{id}/messages` | GET | ChatLab Pull（与原生 Pull 同一处理器、同一形状） | 「四条路由」 |
+| `/chatlab/push/messages` | GET（SSE） | ChatLab 通知面 | 「`GET /chatlab/push/messages`」 |
+| `/api/v1/sync` | GET、POST | 手动水位增量同步（触发器，不返回消息体） | 「手动增量同步」 |
+| `/api/v1/sns/timeline` | GET、POST | 朋友圈时间线（默认 50、上限 500） | 「SNS（朋友圈，本地缓存只读）」 |
+| `/api/v1/sns/usernames` | GET、POST | 出现过朋友圈的动态发布者列表 | 同上 |
+| `/api/v1/sns/stats` | GET、POST | 朋友圈统计 | 同上 |
+| `/api/v1/sns/export` | GET、POST | 朋友圈导出（`format=json\|html`） | 同上 |
+| `/api/v1/sns/export/stats` | GET、POST | 导出统计 | 同上 |
+| `/api/v1/sns/media/proxy` | GET、POST | 朋友圈媒体代理（CDN 鉴权墙字节的取回路径） | 同上 |
+
+> SNS 一族**不进 `/openapi.json`**：它们强绑定 XML 形状、尚未 DTO 化，豁免登记在
+> `routes.rs` 的 `NOT_DOCUMENTED`（漏写或多写豁免都会被上面那条测试判红）。
 
 ### GET `/openapi.json` — 接口描述（**免鉴权**）
 

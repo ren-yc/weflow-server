@@ -52,12 +52,16 @@ curl -H "Authorization: Bearer $WEFLOW_TOKEN" \
 
 `since` 缺省等于全量；`limit` 分页时响应**必须**带 `sync` 块。去重按 `platformMessageId`。
 
+深入：api 文档的「ChatLab 适配面（`/chatlab/*`）」各小节，翻页与条数数字看「通用查询参数」里的上限表。
+
 ## 配方二：只要增量（watcher / SSE）
 
 1. 注册账号并等到 `GET /api/v1/accounts` 的 `state == "ready"`。
 2. 连 `GET /api/v1/push/messages?access_token=<token>`；零账号时也会先收到 `ready` 基线帧。
 3. 之后服务端的文件 watcher（防抖 350ms，慢速兜底轮询 30s）会把变更作为 SSE 事件推出。
 4. 断线重连带 `Last-Event-ID` 续放；推送端点**无就绪门控**，换账号不会静默断开订阅者。
+
+深入：api 文档端点小节「SSE 事件流（免轮询推送）」；重放缓冲与事件形状见「数据获取与安全模型」。
 
 ## 配方三：导出全部消息（含媒体）
 
@@ -70,6 +74,8 @@ weflow-server export --out ./export --format jsonl --with-media
 - 只导出个别会话用 `--session <id>`（可重复）；只要某时间之后用 `--since`。
 - 媒体可取性以**客户端落地**为准：新图在客户端全图落地前（数十秒到分钟级）可能仍无句柄；
   缺句柄时退回消息面的按需导出，不要当错误。
+
+深入：api 文档「批量导出（`export`）」（产物形状、`index.json`、失败跳过语义都在那里）。
 
 ## 配方四：让 agent 接入（MCP）
 

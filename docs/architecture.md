@@ -415,8 +415,8 @@ Python 只用于钩子与套件执行器，**纯标准库**——CI 与开发机
 ### 一致性套件
 
 `tests/conformance_runner.rs` 起真服务、造夹具，跑契约仓库（版本记在 `conformance.pin`）里的
-36 条用例（`v0.6.3`：auth 1／cursor 13／discovery 3／envelope 6／lifecycle 8／nails 5——v0.6.1 至
-v0.6.3 都是纯文档 tag，用例集未增删；换 pin 时这里要跟着改，它没有机器判据）。两条硬规矩：**带 `--fail-on-skip`**（有用例被跳过即失败，避免「夹具少声明一个端点」
+36 条用例（`v0.6.4`：auth 1／cursor 13／discovery 3／envelope 6／lifecycle 8／nails 5——v0.6.1 至
+v0.6.4 都是纯文档 tag，用例集未增删；换 pin 时这里要跟着改，它没有机器判据）。两条硬规矩：**带 `--fail-on-skip`**（有用例被跳过即失败，避免「夹具少声明一个端点」
 让用例静默变成不跑），**缺 `FLOW_CONTRACT_DIR` 即失败**（不是跳过）。夹具里的
 `contractVersion` 与 pin 由 `pinned_contract_version_matches_the_fixture` 钉在一起。
 

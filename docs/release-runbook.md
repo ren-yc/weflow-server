@@ -3,6 +3,10 @@
 本文是把新版本发上 crates.io 与 PyPI 的操作手册。正式上传由 CI 的 `crates` 与 `pypi` 两个作业
 执行（tag 触发、各自带人工审批闸门），本手册覆盖前置配置、预演、首发与兜底路径。
 
+> **版本占位符约定**：正文命令与步骤里的 `<此版本>` 是**待替换占位符**（不带 `v`，形如
+> `0.9.2`；tag 写作 `v<此版本>`）。文末「历史案例」保留各轮实发的逐字命令与报错原文，
+> **不可照抄**——它们只是实证依据，下次发版一律以正文为准。
+
 ## 前置配置（一次性）
 
 **发布链不保存长期上传凭据**：crates.io 与 PyPI 都走 OIDC / Trusted Publishing。新 crate 的
@@ -42,7 +46,8 @@ Owner `ren-yc`、Repository（本仓）、Workflow `release.yml`、Environment `
 在 job 结束时撤销。因此 CI 不需要 `CARGO_REGISTRY_TOKEN` secret。
 
 新 crate 的**首次**发布仍按下面「首发（本机）」一节做；首次发布后登记 trusted publisher，
-后续版本由 CI 发布。0.9.1 已完成首次发布。
+后续版本由 CI 发布。本仓两个 crate 均已首发并登记（经过见文末「历史案例」），常规版本
+全走 CI。
 
 ### 本机凭据（预演与新 crate 首发用）
 
@@ -61,7 +66,7 @@ Owner `ren-yc`、Repository（本仓）、Workflow `release.yml`、Environment `
    `openapi.json` **与 `health.json`／`health-alias.json`**（三份都带版本串）；`Cargo.lock` 里本包那条
    由 `cargo update -w` ＋ `--locked` 兜住。改完版本号**必须**重跑两仓 regen ＋ golden（`UPDATE_GOLDEN=1`）——
    否则 `regen --check` 与快照比对会在 push 时红，那正是版本链完整性的唯一机器判据。
-   `CHANGELOG.md` 的 `## [0.9.1]` 段日期**回填成实际发布日**：准备阶段写的是准备日，
+   `CHANGELOG.md` 的 `## [<此版本>]` 段日期**回填成实际发布日**：准备阶段写的是准备日，
    Keep a Changelog 的段日期应当是发布日。落法——回填是一笔**独立提交**（版本号那一笔早已推上去，
    合并成同一笔在时序上做不到），而 **tag 必须指向这笔回填提交**：`CHANGELOG.md` 是 git 跟踪
    文件、会随根包的清单进 .crate，tag 指错就会把准备日永久发出去。（实测：除本手册与扫描器的
@@ -69,7 +74,7 @@ Owner `ren-yc`、Repository（本仓）、Workflow `release.yml`、Environment `
    architecture／mcp／*-api.md，不含它；golden 与 regen 也与之无关，故这笔不触发任何重生成。）
 2. **先 `git push origin master`、等那条 check 变绿，再打 tag**——这一步不能省，也不能只推 tag。
    实操顺序写死：回填提交推上去 → 盯**它**的 check 绿 → 中间不夹任何提交 → 在本地当前 HEAD 上
-   `git tag v0.9.1`；打之前用 `git rev-parse HEAD` 与 `git ls-remote origin refs/heads/master`
+   `git tag v<此版本>`；打之前用 `git rev-parse HEAD` 与 `git ls-remote origin refs/heads/master`
    逐字比一次，两者必须相同（不同就说明有东西插进来了，重来）。
    `check.yml` 的触发是 `push: branches: [master]`，**推 tag 不触发它**；而 release 链的 quality-gate
    只有 clippy＋test＋契约 nails，比 check.yml 少十几道门（编号引用扫描、公共段哈希、embed 例子、
@@ -77,7 +82,7 @@ Owner `ren-yc`、Repository（本仓）、Workflow `release.yml`、Environment `
    regen --check 那道守的是「陈旧的 gen.rs／Python 生成树被不可撤销地发上 registry」——本流程里
    最能安静发错东西的口子，且 tag 链**不跑**它。所以顺序固定为：
    `git push origin master` → 等 check 绿（它跑的就是 tag 将要指向的提交）→
-   `git tag v0.9.1` ＋ `git push origin v0.9.1`（Windows PowerShell 5.1 不认 `&&`，分两行）。
+   `git tag v<此版本>` ＋ `git push origin v<此版本>`（Windows PowerShell 5.1 不认 `&&`，分两行）。
 3. CI 跑到 `crates` job 停在 **`crates-io` 审批** → 你放行。`crates` 内部顺序：OIDC 换 token → 先 SDK
    crate、轮询 crates.io 稀疏索引确认条目可见、再发根包（根包的依赖声明带 `version`，registry
    上必须先有那个版本的 SDK）。crates 成功后 `pypi` job 停在 **`pypi` 审批** → 再放行；PyPI 侧构建
@@ -94,12 +99,12 @@ Owner `ren-yc`、Repository（本仓）、Workflow `release.yml`、Environment `
 若打 tag 之后、publish 之前又提交了任何东西（哪怕只是改文档），本机发的就是新 HEAD，而 tag 与
 GitHub Release 还指在旧提交上，这个不一致会永久留在 registry 里：
 
-> 0.9.1 已在用户的 crates.io 凭据下完成首次发布。**这一节只用于新 crate 首次发布或人工兜底**；
-> 常规版本由 CI 的 `crates` 作业完成，不需要本机 `cargo publish`。
+> **这一节只用于新 crate 首次发布或人工兜底**；常规版本由 CI 的 `crates` 作业完成，不需要
+> 本机 `cargo publish`。本仓现有 crate 的首发已在 2026-10-18 完成（见文末「历史案例」）。
 
 ```powershell
 git pull --ff-only
-if ((git rev-parse HEAD) -ne (git rev-parse 'v0.9.1^{commit}')) { throw 'HEAD 与 v0.9.1 不是同一提交：先弄清差了什么再发' }
+if ((git rev-parse HEAD) -ne (git rev-parse 'v<此版本>^{commit}')) { throw 'HEAD 与 v<此版本> 不是同一提交：先弄清差了什么再发' }
 ```
 
 确认一致后按下面顺序执行：**先 SDK、后根包**（根包要解析 registry 上的 SDK 版本），**在仓库根、PowerShell
@@ -128,11 +133,11 @@ if ($LASTEXITCODE -ne 0) { throw "weflow-client 发布失败（退出码 $LASTEX
 $idx = 'https://index.crates.io/we/fl/weflow-client'
 $hit = $null
 for ($i = 0; $i -lt 60; $i++) {
-  $hit = (curl.exe -s -A flow-release-guard $idx) | Select-String -SimpleMatch '"vers":"0.9.0"'
+  $hit = (curl.exe -s -A flow-release-guard $idx) | Select-String -SimpleMatch '"vers":"<此版本>"'
   if ($hit) { break }
   Start-Sleep -Seconds 5
 }
-if (-not $hit) { throw 'weflow-client 0.9.0 五分钟内未出现在稀疏索引里，根包发布无法继续' }
+if (-not $hit) { throw "weflow-client <此版本> 五分钟内未出现在稀疏索引里，根包发布无法继续" }
 powershell -File scripts/build.ps1 publish --locked -p weflow-server
 if ($LASTEXITCODE -ne 0) { throw "weflow-server 发布失败（退出码 $LASTEXITCODE）" }
 ```
@@ -145,16 +150,16 @@ if ($LASTEXITCODE -ne 0) { throw "weflow-server 发布失败（退出码 $LASTEX
 
 ### PyPI（testpypi，本机）
 
-0.9.0 这一轮**已做过**（两仓的 wheel＋sdist 已在 test.pypi.org 上，且验证过可安装、
-可导入）。同一版本不能重复上传 testpypi，所以再预演时要么换个开发号（如
-`0.9.0.dev1`，试完还原），要么把 CI 也接上 TestPyPI 并给上传步加 `skip-existing`。
+同一版本不能重复上传 testpypi，所以再预演时要么换个开发号（如
+`<此版本>.dev1`，试完还原），要么把 CI 也接上 TestPyPI 并给上传步加 `skip-existing`
+（0.9.0 一轮已实测做过，命令原文见文末「历史案例」）。
 
 ```powershell
 Push-Location clients/python
 python -m build
 twine check dist/*
 twine upload --repository testpypi dist/*
-pip install --index-url https://test.pypi.org/simple/ --no-deps weflow-sdk==0.9.0
+pip install --index-url https://test.pypi.org/simple/ --no-deps weflow-sdk==<此版本>
 Pop-Location
 ```
 
@@ -187,15 +192,11 @@ powershell -File scripts/build.ps1 package --list --allow-dirty -p weflow-server
 
 **实测的两种结果，别混**（SDK 尚未上架时跑）：
 - `package --list` **能跑通**（退出码 0）：列清单不需要解析依赖，所以上面这段预演可以照抄。
-- **任何真打包／发布都会失败**——`cargo package`、`cargo publish`、`cargo publish --dry-run`
-  对根包在 SDK 上架前必然红，原文（本机 cargo 1.97.1 实测）：
-  > `error: failed to prepare local package for uploading`
-  > `Caused by:` → no matching package named `weflow-client` found
-  > location searched: crates.io index → required by package `weflow-server v0.9.0`
-  带不带 `--locked` 都一样失败（实测两条都是退出码 101）。根包的依赖声明带 `version`，
-  打包时按**发布后的形状**解析，而那时 registry 上还没有 `weflow-client = "0.9.0"`。
-  这不是缺陷，是发布顺序的直接后果——也正是 crates 作业必须「先 SDK、轮询索引可见、再根包」
-  的原因。**别**把它当环境问题去 `cargo update`、加 `--allow-dirty` 或改依赖声明绕过去。
+- **任何真打包／发布都会失败**——根包的依赖声明带 `version`，打包时按**发布后的形状**解析；
+  SDK 还没上架时，`cargo package`、`cargo publish`、`cargo publish --dry-run` 对根包必然红，
+  带不带 `--locked` 都一样（实测退出码 101）。这不是缺陷，是发布顺序的直接后果——也正是
+  crates 作业必须「先 SDK、轮询索引可见、再根包」的原因。**别**把它当环境问题去
+  `cargo update`、加 `--allow-dirty` 或改依赖声明绕过去（0.9.0 一轮的报错原文见文末「历史案例」）。
 
 ## 人工兜底（CI publish 不可用时）
 
@@ -209,18 +210,18 @@ foreach ($crate in 'weflow-client', 'weflow-server') {
   # URI 必须先存进变量。原先写成 `Invoke-WebRequest … -Headers @{…}` 换行再接 URI：PowerShell
   # 在哈希表字面量收尾处就判定语句结束，下一行变成游离 token ⇒ 实测 PS 5.1 与 7 都报
   # 「Missing closing ')' in expression」，整块根本跑不起来（兜底路径平时不跑，出事那天才验就晚了）。
-  $uri = "https://crates.io/api/v1/crates/$crate/0.9.0"
+  $uri = "https://crates.io/api/v1/crates/$crate/<此版本>"
   $code = try {
     (Invoke-WebRequest -UseBasicParsing -Headers @{ 'User-Agent' = 'flow-release-guard' } $uri).StatusCode
   } catch { [int]$_.Exception.Response.StatusCode }
-  if ($code -eq 200) { Write-Host "$crate 0.9.0 已上架，跳过"; continue }
+  if ($code -eq 200) { Write-Host "$crate <此版本> 已上架，跳过"; continue }
   powershell -File scripts/build.ps1 publish --locked -p $crate
   if ($LASTEXITCODE -ne 0) { throw "$crate 发布失败（退出码 $LASTEXITCODE）" }
   if ($crate -eq 'weflow-client') {   # 根包要等 SDK 在索引里可见
     $idx = 'https://index.crates.io/we/fl/weflow-client'
     $hit = $null
     for ($i = 0; $i -lt 60; $i++) {
-      $hit = (curl.exe -s -A flow-release-guard $idx) | Select-String -SimpleMatch '"vers":"0.9.0"'
+      $hit = (curl.exe -s -A flow-release-guard $idx) | Select-String -SimpleMatch '"vers":"<此版本>"'
       if ($hit) { break }
       Start-Sleep -Seconds 5
     }
@@ -232,13 +233,13 @@ foreach ($crate in 'weflow-client', 'weflow-server') {
 PyPI 侧**默认没有本机兜底**：本仓按设计不保存任何长期上传凭据（`~/.pypirc` 只有
 `[testpypi]`，正式 PyPI 由 CI 走 OIDC 发）。真要本机补发，得先在 `~/.pypirc` 补一个
 `[pypi]` 段与对应 token，再进 `clients/python` 执行 `twine upload dist/*`（先查
-`pypi.org/pypi/weflow-sdk/0.9.0/json`）；用完请撤掉该凭据，别让它长期躺在本机。
+`pypi.org/pypi/weflow-sdk/<此版本>/json`）；用完请撤掉该凭据，别让它长期躺在本机。
 
 ## 注意
 
 - crates.io 与 PyPI **均不可撤销发布**（0.x 也一样，只能 yank）。
-- 首发前实测未占用：crates.io 四个名字（本仓两个 crate ＋ 姊妹仓两个）与 PyPI 的
-  `weflow-sdk` 当时都是 404。**临近发布日请重测一次**。
+- crate／项目名的占用会随时间变——**临近发布日请重测一次**（首发前 2026-10-18 实测四个
+  crates.io 名字与两个 PyPI 项目名当时都是 404，记录见文末「历史案例」）。
 - 本地只发布到 testpypi；正式 PyPI 一律由 CI 执行（OIDC，无人持有 token）。
 - 预演打包时留意 `warning: package ... in Cargo.lock is yanked`。**本轮本仓已遇到并解掉**：锁里
   原有一条 `chacha20 v0.10.1`（上游已 yanked），`cargo tree -i` 查不到任何包 require 它——
@@ -250,7 +251,7 @@ PyPI 侧**默认没有本机兜底**：本仓按设计不保存任何长期上�
   PyPI 侧同理：pypa 动作带 `skip-existing`，上传中途失败重跑会跳过已传的文件、补齐其余的。
   **唯一的例外**：若某个 dist 是用**别的路径**（本机 `twine upload`、或曾关掉 attestations）
   传上去的，重跑会永久跳过它、不再补构建证明——所以正式 PyPI 一律走 CI，别在本机补传。
-- **其余不可逆点**（除 registry 外）：`git tag v0.9.1` 推上去后删/移得干净、但 GitHub Release
+- **其余不可逆点**（除 registry 外）：`git tag v<此版本>` 推上去后删/移得干净、但 GitHub Release
   的资产不会随之消失；`release` 作业在 publish **之前**就把 Release 建好并公开了（见上）；
   sdk-dist 供应分支的 `--force-with-lease` 是重写历史。三者都不像 registry 那样不可撤，
   但都会留下公开痕迹，动手前想清楚。
@@ -261,7 +262,7 @@ PyPI 侧**默认没有本机兜底**：本仓按设计不保存任何长期上�
 
 - **guard 红**（tag 与根包版本不一致）：说明 tag 打错或版本号没对齐。此时**什么都没发布**、
   Release 也还没建。改正提交 → `git push origin master` → 等 check 绿 → 删旧 tag 重打：
-  `git tag -d v0.9.1` ＋ `git push origin :refs/tags/v0.9.1`（实测 PS 5.1 下 `--delete v0.9.1` 也原样
+  `git tag -d v<此版本>` ＋ `git push origin :refs/tags/v<此版本>`（实测 PS 5.1 下 `--delete v<此版本>` 也原样
   透传、两种写法等效，冒号式只是与「推 tag」对称、少记一条参数形态）→ 再按第 2 步打 tag 推 tag。
 - **quality-gate / build / release 红**：同上去掉那个 tag、修好、重推。**别**在红的中间态
   去手工补发 registry——那样 GitHub Release 与 registry 会长期不一致。
@@ -269,3 +270,28 @@ PyPI 侧**默认没有本机兜底**：本仓按设计不保存任何长期上�
 - **publish 红在 PyPI 上传步**：先分清是「OIDC 换凭据失败」（多半是 pypi.org 的 pending
   publisher 没登记，或 environment 名不是 `pypi`／workflow 名不是 `release.yml`）还是
   「上传本身失败」。前者去 pypi.org 补登记后重跑；后者直接重跑（`skip-existing` 兜幂等）。
+
+## 历史案例
+
+> 各轮实发的逐字记录（命令、报错原文、数字证据），仅作实证依据。**不可照抄**——
+> 下次发版以正文为准，把 `<此版本>` 换成实际版本。
+
+- **0.9.0 轮 TestPyPI 预演（已做过）**：两仓的 wheel＋sdist 已在 test.pypi.org 上，验证过
+  可安装、可导入。当时逐字命令（版本号现已过时）：
+  `twine upload --repository testpypi dist/*` ＋
+  `pip install --index-url https://test.pypi.org/simple/ --no-deps weflow-sdk==0.9.0`。
+- **SDK 尚未上架时根包的报错原文（0.9.0 轮，本机 cargo 1.97.1 实测）**：
+  > `error: failed to prepare local package for uploading`
+  > `Caused by:` → no matching package named `weflow-client` found
+  > location searched: crates.io index → required by package `weflow-server v0.9.0`
+  带不带 `--locked` 都一样失败（实测两条都是退出码 101）。这正是首发必须「先 SDK、
+  轮询索引可见、再根包」的原因。
+- **首发前名称占用实测（2026-10-18）**：crates.io 四个名字（本仓 `weflow-client`／
+  `weflow-server` ＋ 姊妹仓 `qqflow-client`／`qqflow-server`）与 PyPI 的 `weflow-sdk`
+  当时都是 404。
+- **0.9.1 首发（2026-10-18，用户本机 crates.io 凭据完成）**：四个 crate 按「先 SDK、后根包」
+  `cargo publish --locked` 发出，crates.io 查询转 200 后重跑 CI publish 作业——作业对
+  「已上架」幂等，跳过 SDK／根包两步、经 `pypi` 审批完成 PyPI 上传；随后在 crates.io
+  登记 Trusted Publishing、GitHub 建 `crates-io` environment（见「前置配置」），此后
+  版本全部由 CI 发布。首发当天 CI 未持 `CARGO_REGISTRY_TOKEN` 时 publish 第一步失败
+  属新 crate 未上架的预期状态，不是质量失败。
