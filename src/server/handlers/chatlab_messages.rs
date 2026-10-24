@@ -45,10 +45,10 @@ pub async fn handler(
         } else {
             Vec::new()
         };
-        let conv = store
-            .convs
-            .get(&q.talker)
-            .expect("page_slice 已经确认这个会话存在");
+        // page_slice 已确认会话存在；「存在但零条消息」的会话在 convs 无条目，
+        // 空切片与空页在这里统一成型，不再有 panic 分支。
+        let empty = Vec::new();
+        let conv = store.convs.get(&q.talker).unwrap_or(&empty);
         // 切片是原生面的**降序**（最新在前），这里反转回时间顺序：ChatLab 的读者按正序合并，
         // 倒序会让他们以为最新一条排在最前面。
         let mut slice: Vec<&crate::store::MessageRecord> =

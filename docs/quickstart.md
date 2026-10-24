@@ -19,6 +19,8 @@ weflow-server --port 5033 --host 127.0.0.1 --log info
 
 - token：首次启动生成并存入系统凭据库；`weflow-server token` 打印。CLI 的 token 来源链是
   `WEFLOW_TOKEN` → 本机凭据库。
+- **日志走 stderr**（0.10.0 起）：收日志用 `weflow-server 2> 服务.log`——此前 `>` 收 stdout 日志
+  的部署会拿到空文件，需改用 `2>`（`[init]`/`[fatal]` 与服务日志从此一处收齐）。
 - 数据目录：Windows `%LOCALAPPDATA%\weflow-server`。
 - 停服务：前台 `Ctrl-C`；收到信号会停止 watcher 与 SSE 并退出。
 - **零账号启动**：先注册再查询；注册前业务端点返回 503（`/health` 仍是 `starting`）。

@@ -898,7 +898,7 @@ qqflow 的取值含义不同），`sessionType` 是同一枚举的字符串形�
 #[derive(Clone, Debug)]
 /**Client for weflow-server
 
-Version: 0.9.3*/
+Version: 0.10.0*/
 pub struct Client {
     pub(crate) baseurl: String,
     pub(crate) client: reqwest::Client,
@@ -934,7 +934,7 @@ impl Client {
 }
 impl ClientInfo<()> for Client {
     fn api_version() -> &'static str {
-        "0.9.3"
+        "0.10.0"
     }
     fn baseurl(&self) -> &str {
         self.baseurl.as_str()

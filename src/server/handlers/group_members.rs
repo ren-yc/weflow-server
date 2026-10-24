@@ -35,6 +35,16 @@ pub async fn handler(
 
     let store = account.store.read();
 
+    // 存在性守卫（0.10.0 起，破坏性）：三个来源（会话名册 ∪ 消息索引 ∪ 群名册）
+    // 都不认识这个群号才 404——此前未知群返回 200 空成员表，把「问错了对象」
+    // 伪装成「这个群没有成员」。判据与消息面的存在性谓词同源。
+    // 回归位置：`group_members_rejects_an_unknown_chatroom`。
+    if !store.conversation_known(&chatroom) {
+        return Err(ApiError::not_found(format!(
+            "chatroom '{chatroom}' not found"
+        )));
+    }
+
     // 发言人计数（本页无关：这是整个会话的计数）。
     let mut counts: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
     if let Some(conv) = store.convs.get(&chatroom) {

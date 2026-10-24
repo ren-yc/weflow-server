@@ -272,6 +272,20 @@ impl Store {
         self.convs.is_empty() && self.sessions.is_empty()
     }
 
+    /// 「这个会话/群对象在索引里存在吗」——与「有没有消息」分开的存在性谓词。
+    ///
+    /// 判据是**会话名册 ∪ 消息索引 ∪ 群名册**的并集：session.db 的会话行、
+    /// 消息表派生的会话条目（`convs`，含零行消息表的空 `Vec` 条目）、群名册
+    /// 任一认识它就算存在。存在但 `convs` 无条目（或条目为空）的会话在内容面
+    /// 是「200 空页」，只有三个来源都不认识才 404——「数据丢了」与「本来就没
+    /// 消息」从此可区分。回归位置：`a_listed_session_without_messages_answers_an_empty_page`、
+    /// `unknown_conversation_is_still_not_found`。
+    pub fn conversation_known(&self, id: &str) -> bool {
+        self.sessions.contains_key(id)
+            || self.convs.contains_key(id)
+            || self.chatroom_roster.contains_key(id)
+    }
+
     /// 记下索引刚刚构建/更新完成（见 `index_built_at_ms`）。
     pub fn mark_index_built(&mut self) {
         self.index_built_at_ms = std::time::SystemTime::now()

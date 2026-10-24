@@ -240,27 +240,28 @@ fn serve_log_flag_still_goes_through_the_old_parser() {
     );
 }
 
-/// **serve 的日志维持在 stdout**（刻意分叉的判据）：既有部署用 `weflow-server > 日志文件`
-/// 收服务日志，把 serve 日志改到 stderr 会让这些脚本静默拿到空文件——那是破坏性变更，
-/// 本批不做；而**子命令**的日志必须走 stderr（stdout 是命令输出，判据在
-/// `tests/cli_e2e.rs::log_json_format_emits_parseable_lines`）。两入口的分叉理由写在
+/// **serve 的日志走 stderr**（0.10.0 起与子命令合并为一条通道）：`2>` 一处收齐服务日志与
+/// `[init]`/`[fatal]`——此前 `[fatal]` 走 stderr、普通日志走 stdout，`2>` 采集拿不到启动
+/// 上下文。**这是破坏性变更**：`weflow-server > 日志文件` 类部署会拿到空 stdout，需改用
+/// `2>`（迁移说明在 CHANGELOG 0.10.0 与 quickstart「起服务」）。**子命令**的日志本来就走
+/// stderr（stdout 是命令输出，判据在
+/// `tests/cli_e2e.rs::log_json_format_emits_parseable_lines`）。两入口的去向理由写在
 /// `src/logging.rs` 模块头。
 ///
-/// 判据刻意取「`[init] 服务启动` 行在 stdout、且**这一行**不在 stderr」：它在 listener 绑定
-/// 成功后无条件打印，钉的正是「启动日志去了哪」。不写成宽断言「stderr 不含任何 [init] 行」：
-/// 那会把未来合法走 stderr 的诊断输出也一并禁掉，而 sqlcipher 的 C 层错误行本来就是 stderr。
-/// 本测试起一个**真实 serve**：与任何真实启动一样，它可能在本机凭据库首次生成 API token
-/// （无头 Linux runner 上则走「凭据库不可用 ⇒ 会话级 token」的既有降级分支）——两种形态下
-/// 启动行都会打印，断言与凭据库状态无关。
-/// 有 15s 死线：serve 日志若被挪去 stderr，这里红而不是挂死。
+/// 判据刻意取「`[init] 服务启动` 行在 stderr、且**这一行**不在 stdout」：它在 listener 绑定
+/// 成功后无条件打印，钉的正是「启动日志去了哪」。不写成宽断言「stdout 不含任何行」：
+/// sqlcipher 的 C 层错误行本来就进 stderr，而 stdout 现在应保持安静——断言只钉启动行不在
+/// stdout，不把未来合法的 stdout 命令输出一并禁掉。本测试起一个**真实 serve**：与任何真实
+/// 启动一样，它可能在本机凭据库首次生成 API token（无头 Linux runner 上则走「凭据库不可用
+/// ⇒ 会话级 token」的既有降级分支）——两种形态下启动行都会打印，断言与凭据库状态无关。
+/// 有 15s 死线：serve 日志若退回 stdout，这里红而不是挂死。
 #[test]
-fn serve_logs_stay_on_stdout() {
+fn serve_logs_go_to_stderr() {
     /// 杀子进程并在**任何**退出路径（含 panic 展开）上执行。
     ///
-    /// 为什么必须有它：判据是一条**期望红**的变异驱动的实测产物——把 serve 的 writer 改到
-    /// stderr 之后，本测试在 15s 死线上 panic，而 panic 路径不会走到函数尾部的 `child.kill()`；
-    /// 泄漏的服务进程继续持有管道写端，整个 harness 跟着挂死（变异驱动只能靠外部杀进程才
-    /// 能往下跑）。守卫把「红」变成「快速且干净的红」。
+    /// 为什么必须有它：判据测试会 spawn 一个真实 serve 子进程，断言失败（panic）路径不会
+    /// 走到函数尾部的 `child.kill()`；泄漏的服务进程继续持有管道写端，整个 harness 跟着
+    /// 挂死（变异驱动只能靠外部杀进程才能往下跑）。守卫把「红」变成「快速且干净的红」。
     struct KillOnDrop(std::process::Child);
     impl Drop for KillOnDrop {
         fn drop(&mut self) {
@@ -286,67 +287,68 @@ fn serve_logs_stay_on_stdout() {
 
     // 后台线程收集 stdout 行（管道满会阻塞子进程，必须持续读）。
     let (tx, rx) = std::sync::mpsc::channel::<String>();
-    let reader = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         use std::io::BufRead;
-        let mut collected = Vec::new();
         for line in std::io::BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
-            let _ = tx.send(line.clone());
+            let _ = tx.send(line);
+        }
+    });
+    // stderr 也持续读掉（不读满 64KB 管道会挂起子进程），留样本供断言。
+    let (etx, erx) = std::sync::mpsc::channel::<String>();
+    let ereader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut collected = Vec::new();
+        for line in std::io::BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            let _ = etx.send(line.clone());
             collected.push(line);
         }
         collected
     });
-    // stderr 也持续读掉（不读满 64KB 管道会挂起子进程），留样本供断言。
-    let (etx, erx) = std::sync::mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        use std::io::BufRead;
-        for line in std::io::BufReader::new(stderr).lines() {
-            let Ok(line) = line else { break };
-            let _ = etx.send(line);
-        }
-    });
 
     let start = std::time::Instant::now();
     let deadline = std::time::Duration::from_secs(15);
-    let mut stdout_lines: Vec<String> = Vec::new();
+    let mut stderr_lines: Vec<String> = Vec::new();
     let init_line = loop {
-        match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+        match erx.recv_timeout(std::time::Duration::from_millis(200)) {
             Ok(line) => {
-                stdout_lines.push(line.clone());
+                stderr_lines.push(line.clone());
                 if line.contains("[init] 服务启动") {
                     break line;
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            // stdout 管道关闭 ⇒ serve 已经退出（多半是端口被占或启动即失败）。
+            // stderr 管道关闭 ⇒ serve 已经退出（多半是端口被占或启动即失败）。
             // 这里必须报出真实成因：往下走会拿空串去断言「启动行要报监听地址」，
             // 那条文案会把「没起来」误报成「日志去错了通道」。
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
-                "serve 的 stdout 提前关闭：进程没跑起来（端口 {port} 被占或启动失败？）；已收 stdout: {stdout_lines:?}"
+                "serve 的 stderr 提前关闭：进程没跑起来（端口 {port} 被占或启动失败？）；已收 stderr: {stderr_lines:?}"
             ),
         }
         if start.elapsed() > deadline {
             panic!(
-                "15s 内 stdout 没出现 [init] 服务启动 行（serve 日志被挪到 stderr 就是这种红）；已收 stdout: {stdout_lines:?}"
+                "15s 内 stderr 没出现 [init] 服务启动 行（serve 日志退回 stdout 就是这种红）；已收 stderr: {stderr_lines:?}"
             );
         }
     };
     assert!(init_line.contains(&format!("127.0.0.1:{port}")), "启动行要报监听地址: {init_line}");
 
-    // stderr 里不得有那行「服务启动」（serve 日志没有理由出现在那）。多给 1s 宽限收在途行。
-    let mut stderr_lines: Vec<String> = Vec::new();
+    // stdout 里不得有那行「服务启动」（`> 日志文件` 部署拿到空 stdout 正是迁移要点）。
+    // 多给 1s 宽限收在途行。
+    let mut stdout_lines: Vec<String> = Vec::new();
     let grace = std::time::Instant::now();
     while grace.elapsed() < std::time::Duration::from_secs(1) {
-        if let Ok(l) = erx.recv_timeout(std::time::Duration::from_millis(100)) {
-            stderr_lines.push(l);
+        if let Ok(l) = rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            stdout_lines.push(l);
         }
     }
     assert!(
-        stderr_lines.iter().all(|l| !l.contains("[init] 服务启动")),
-        "serve 的启动日志不得出现在 stderr: {stderr_lines:?}"
+        stdout_lines.iter().all(|l| !l.contains("[init] 服务启动")),
+        "serve 的启动日志不得出现在 stdout（0.10.0 起走 stderr）: {stdout_lines:?}"
     );
 
     // 走到这里就是绿：guard 的 Drop 负责杀进程与回收；reader 线程因管道关闭自然结束。
     drop(guard);
-    let _ = reader.join();
+    let _ = ereader.join();
 }

@@ -2,6 +2,33 @@
 
 本文件从 0.5.0 起维护。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.10.0] - 2026-10-24
+
+### 破坏性变更
+
+- **serve 日志通道从 stdout 迁到 stderr**：迁移方式——`weflow-server > 日志文件` 类部署改用
+  `2>` 收日志（此前 `[fatal]` 走 stderr、普通日志走 stdout，`2>` 采集拿不到启动上下文；
+  合并后 `2>` 一处收齐）。子命令支原本就在 stderr，不受影响。回归位置：
+  `serve_logs_go_to_stderr`（由 `serve_logs_stay_on_stdout` 反转更名）。
+- **空会话在消息面返回 200 空页**：迁移方式——判「这个会话有没有内容」读 `count`／
+  `page.hasMore`／`sync.hasMore`；判「这个会话是否存在」读 404。此前零消息会话返回 404，
+  与「未知会话」混在同一个状态码里；现在两者分开（存在性判据＝会话名册 ∪ 消息索引 ∪
+  群名册），`GET /api/v1/sessions` 的 `messageCount` 与内容面的空页从此一致，批量导出的
+  空会话不再进 `skipped`（`--session` 拼错不存在的 id 仍失败退 1）。回归位置：
+  `a_listed_session_without_messages_answers_an_empty_page`、`unknown_conversation_is_still_not_found`、
+  `export_completes_a_listed_session_without_messages`、`export_still_fails_on_an_unknown_session_id`。
+- **群成员面对未知群号返回 404**：迁移方式——判「群有没有成员」读 `members`；判「群是否存在」
+  读 404 或会话面。此前未知群返回 200 空成员表，会把「问错了对象」读成「这个群没有成员」。
+  回归位置：`group_members_rejects_an_unknown_chatroom`（同批补 `group_members_accepts_the_talker_alias`
+  与 `media_kind_whitelist_serves_only_requested_kinds` 两个零覆盖缺口）。
+
+### 变更
+
+- **接口契约 pin 由 `v0.6.4` 升 `v0.6.6`**：`v0.6.5` 登记两节适配差异——「不存在与存在但没有
+  内容」按面定型（消息面空会话空页、拉取面两仓 404、qqflow 未知 talker 空列表为长期保留差异）
+  与群成员面参数写法（键名/布尔取值/媒体开关方向）；`v0.6.6` 为第 7 节补落地版本的前置条件句。
+  api 文档「跨仓的允许差异」表补两行指针。
+
 ## [0.9.3] - 2026-10-24
 
 ### 修复

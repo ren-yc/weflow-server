@@ -569,3 +569,19 @@ pub fn add_sns_fixture(storage: &Path, key: &Key) {
         .unwrap();
     }
 }
+
+/// 给「存在但没有内容」语义的测试造一个**有名册行、无任何消息**的会话：
+/// session.db 加一行 `wxid_empty_session`（出现即进入会话名册），但**不建**
+/// `Msg_<md5>` 消息表——索引里它就是「列表里有、内容零条」。
+///
+/// 为什么是独立 opt-in 夹具：塞进 `build_wechat_account` 会让 sessions golden 与
+/// `sessions_contacts_group_members` 的会话数全员翻动，共用夹具的红会淹没真正的
+/// 断言（夹具纪律：不碰共用路径，按需追加）。
+pub fn add_session_row_without_messages(storage: &Path, key: &Key) {
+    let path = storage.join("session/session.db");
+    let conn = wx_conn(&path, key, false);
+    conn.execute_batch(
+        "INSERT INTO Session VALUES ('wxid_empty_session', '空会话', 1700000020, 1700000020, '', 1, 0, 0);",
+    )
+    .unwrap();
+}

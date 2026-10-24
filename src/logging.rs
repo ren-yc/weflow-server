@@ -9,35 +9,33 @@
 //! - `tests/cli_e2e.rs::subcommand_failures_are_logged_on_stderr`（warn 级默认，失败原因进 stderr）
 //! - `tests/cli_e2e.rs::log_json_format_emits_parseable_lines`（`--log-format json` 逐行可解析）
 //! - `tests/cli.rs::serve_log_flag_still_goes_through_the_old_parser`（serve 的 `--log` 归老解析器）
-//! - `tests/cli.rs::serve_logs_stay_on_stdout`（serve 维持 stdout）
+//! - `tests/cli.rs::serve_logs_go_to_stderr`（serve 日志走 stderr）
 //!
 //! # 谁装、何时装（两条互斥路径）
 //!
 //! - **子命令**：`cli::dispatch` 在执行任何动作前装 `init_with_format`（warn 级、stderr）。
 //! - **serve**（含裸跑与老旗标）：`dispatch` 在构造 clap **之前**就把 `serve` 短路进老解析器，
 //!   级别与格式因此完全由 `Config.log`/`Config.log_format` 决定，`lib.rs` 的 serve 分支装
-//!   `init_for_serve`。默认 info 级别与 stdout 去向不变（行内自 0.9.1 起多了模块 target 段，
+//!   `init_for_serve`。默认 info 级别不变（行内自 0.9.1 起多了模块 target 段，
 //!   那是「恢复 target」条的效果，不属于入口分叉）。
 //!
 //! 两个入口都返回 `bool`（是否真的装了）：装法是 `try_init`——**已有 subscriber 时装不上、
 //! 但不 panic**（`init` 会 panic）。同进程内嵌场景（宿主程序自己装了 subscriber）里，本模块
 //! 的安装退化为 no-op、宿主的 subscriber 原样保留，这个事实由返回值可查而不是靠运气。
 //!
-//! # 输出去向：子命令 stderr，serve stdout（刻意的分叉）
+//! # 输出去向：两个入口统一 stderr（0.10.0 起）
 //!
-//! `fmt()` 的**默认 writer 是 stdout**。两个入口的 stdout 契约不同，去向因此不同：
+//! `fmt()` 的**默认 writer 是 stdout**。两个入口的 stdout 契约不同：
 //!
 //! - **子命令的 stdout 是命令输出本身**（`--json` 的机器可读形状，或人类摘要行）。日志必须
 //!   走 stderr，否则 `sessions --json | jq` 拿到的是半份 JSON 流。判据：
 //!   `tests/cli_e2e.rs::log_json_format_emits_parseable_lines` 断言 stderr 逐行可解析、
 //!   **且 stdout 没有日志行**。
-//! - **serve 的 stdout 没有输出契约**，而既有部署就在用 `weflow-server > 日志文件` 收服务日志
-//!   ——改通道会让那些脚本拿到空文件，这属于破坏性变更，不属 0.9.1 范围（留待一个愿意
-//!   接受破坏性的版本窗口）。serve 维持 stdout。
-//!
-//! 已知代价（如实登记）：同一次运行里 `[fatal] {e:#}` 走 stderr、serve 普通日志走 stdout，
-//! 「只看 `2>` 收错误」的采集侧拿不到 `[init]` 上下文。两通道各自的语义写在上面；合并成
-//! 一条通道要等一个愿意接受破坏性的版本窗口。
+//! - **serve 的 stdout 曾经被 `weflow-server > 日志文件` 类部署当日志通道**——0.10.0 起
+//!   serve 日志改走 stderr，与子命令合并为一条通道：`2>` 一处收齐服务日志与 `[init]`/
+//!   `[fatal]`（此前 `[fatal]` 走 stderr、普通日志走 stdout，`2>` 采集拿不到启动上下文）。
+//!   这是**破坏性变更**：`> 日志文件` 类部署会拿到空 stdout，需改用 `2>` 收日志
+//!   （迁移说明见 CHANGELOG 0.10.0 与 quickstart「起服务」）。
 //!
 //! # 语言口径（红线）
 //!
@@ -80,14 +78,15 @@ pub fn init_with_format(level: &str, format: &str) -> bool {
     install(level, format, true)
 }
 
-/// serve 形态：指定格式，输出写 **stdout**（既有 `> 日志文件` 部署的重定向习惯，维持不动）。
+/// serve 形态：指定格式，输出写 **stderr**（0.10.0 起与子命令合并为一条通道；
+/// 此前 serve 走 stdout，既有 `> 日志文件` 部署需改用 `2>` 收日志）。
 ///
-/// 为什么 serve 不用 stderr：普通部署在用 `weflow-server > 日志文件` 收服务日志，把日志挪到
-/// stderr 会让那些脚本静默拿到**空文件**——这是破坏性变更，不属 0.9.1（子命令的 stdout 有输出
-/// 契约、serve 的没有，所以两者去向不同；已知代价与判据见模块头）。
+/// 为什么合并：`[init]`/`[fatal]` 一直走 stderr，而 serve 普通日志走 stdout——
+/// 「只看 `2>`」的采集侧拿不到启动上下文，两条通道分居的代价自 0.9.1 如实登记至今；
+/// 破坏性窗口（0.10.0）合并它们，一处 `2>` 收齐。
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
 pub fn init_for_serve(level: &str, format: &str) -> bool {
-    install(level, format, false)
+    install(level, format, true)
 }
 
 fn install(level: &str, format: &str, to_stderr: bool) -> bool {
@@ -98,17 +97,15 @@ fn install(level: &str, format: &str, to_stderr: bool) -> bool {
     //
     // 为什么两支各自成链而不是在一条 builder 上条件设 writer：`with_writer` 会把 builder 的
     // 泛型参数换成对应 writer（`Stderr` 与 `Stdout` 是两个不同类型），if/else 交出不同类型
-    // 编译不过（这个错由门禁实测）。stdout 那支**显式写出**而不依赖 `fmt()` 的默认 ——
-    // 默认值是库的实现细节，而「serve 的日志在 stdout」是 0.9.1 钉住的行为
-    // （判据：`tests/cli.rs::serve_logs_stay_on_stdout`）。
+    // 编译不过（这个错由门禁实测）。
     let json = format == "json";
     if to_stderr {
-        // **子命令支显式关 color**，不是样式偏好：stderr 是子命令的机器消费面（`2>file`
+        // **显式关 color**，不是样式偏好：stderr 是机器消费面（`2>file`
         // 收日志、采集器按行解析、脚本 grep 级别与 target）。tracing-subscriber 不做 TTY
         // 检测，不关就会在重定向场景里写下 `\x1b[33m WARN\x1b[0m` —— 判据
         // `tests/cli_e2e.rs::subcommand_failures_are_logged_on_stderr` 遂依赖运行环境的
         // `NO_COLOR`（本机有、CI 没有 ⇒ 本地绿、CI 红，实测踩中）。
-        // serve 支刻意保持库默认：那是既有输出的样子，0.9.1 不改它的观感。
+        // serve 支 0.10.0 并入本支：与子命令同一条通道、同一套观感。
         let builder = tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_target(true)

@@ -14,6 +14,7 @@ use std::process::{Command, Stdio};
 
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use axum::response::IntoResponse;
 use serde_json::{json, Value};
 
 const TOKEN: &str = "e2e-token-0123456789abcdef";
@@ -60,7 +61,7 @@ async fn spawn_stub() -> String {
         .route("/api/v1/sync", post(sync))
         .route("/api/v1/sessions", get(sessions))
         .route("/api/v1/sessions/{id}/messages", get(pull))
-        .route("/api/v1/messages", get(messages))
+        .route("/api/v1/messages", get(messages_with_status))
         .route("/api/v1/contacts", get(contacts))
         .route("/api/v1/media/{id}", get(media))
         .route("/chatlab/messages", get(chatlab));
@@ -82,18 +83,26 @@ async fn sync() -> Json<Value> {
 
 async fn sessions(axum::extract::RawQuery(q): axum::extract::RawQuery) -> Json<Value> {
     // `list_all_sessions` 翻页：第一页给一条，offset 推进后的空页终止循环。
+    // `empty-talker` 是「列表里有、内容零条」的会话（messageCount=0）：0.10.0 起
+    // 它在消息面是 200 空页，导出它不算失败（A/B 分水岭的 A 侧夹具）。
     let raw = q.unwrap_or_default();
     if raw.contains("offset=1") {
         Json(json!({"success": true, "count": 0, "sessions": []}))
     } else {
-        Json(json!({"success": true, "count": 1, "sessions": [session_json()]}))
+        let mut list = vec![session_json()];
+        list.push(json!({
+            "username": "empty-talker", "displayName": "空会话", "lastTimestamp": 1_700_000_000,
+            "sessionType": "private", "type": 0, "unreadCount": 0, "messageCount": 0,
+            "summary": null,
+        }));
+        Json(json!({"success": true, "count": list.len(), "sessions": list}))
     }
 }
 
 async fn pull(
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::extract::RawQuery(q): axum::extract::RawQuery,
-) -> Json<Value> {
+) -> axum::response::Response {
     // map-talker：拉取面给**原始名**（photo.png），而消息面给回填名（digest.png，见 chatlab 分支），
     // 同一条消息 id——CLI 必须按消息 id 把导出物的句柄对回实际落盘的名字。
     // `win-talker`：250 条带媒体的消息，分两页给（150＋100），时间戳刻意跨两个秒段，
@@ -101,6 +110,29 @@ async fn pull(
     // `handle-talker`：三行都带媒体，但只有前两行**带 mediaId**（拉取面已经给出可取句柄），
     // 第三行只有 media、没有句柄 ⇒ 必须走「按页窗口导出」那一条路。用来钉两件事：
     // ① 有句柄的行一发导出请求都不发；② 慢路径的窗口只覆盖**剩下那些行**的时间戳。
+    if id == "wxid_nope" {
+        // B 侧：不存在的会话在拉取面 404 统一信封——`--session` 拼错必须仍进
+        // skipped 并退 1（「空会话不算失败」的口径不放宽到 404）。
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(json!({
+                "success": false, "code": 404,
+                "message": "session 'wxid_nope' not found"
+            })),
+        )
+            .into_response();
+    }
+    if id == "empty-talker" {
+        // 「存在但没有内容」：0.10.0 起拉取面给 200 空页（hasMore=false），
+        // 导出得到只含 header 的空产物，不算失败。
+        return Json(json!({
+            "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
+            "members": [], "messages": [],
+            "meta": {"groupId": "", "name": "空会话", "ownerId": "", "platform": "wechat", "type": "private"},
+            "sync": {"hasMore": false, "nextSince": 1_700_000_000, "nextOffset": 0, "watermark": 1_700_000_000},
+        }))
+        .into_response();
+    }
     if id == "handle-talker" {
         let rows = [
             ("h1", 1_700_000_000i64, "aaa.png"),
@@ -125,7 +157,8 @@ async fn pull(
             "members": [], "messages": messages,
             "meta": {"groupId": "", "name": "演示会话", "ownerId": "", "platform": "wechat", "type": "private"},
             "sync": {"hasMore": false, "nextSince": 1_700_000_500, "nextOffset": 0, "watermark": 1_700_000_500},
-        }));
+        }))
+        .into_response();
     }
     if id == "win-talker" {
         let raw = q.unwrap_or_default();
@@ -152,7 +185,8 @@ async fn pull(
             "members": [], "messages": messages,
             "meta": {"groupId": "", "name": "演示会话", "ownerId": "", "platform": "wechat", "type": "private"},
             "sync": {"hasMore": !second, "nextSince": next_ts, "nextOffset": if second { 0 } else { 150 }, "watermark": next_ts},
-        }));
+        }))
+        .into_response();
     }
     let messages = if id == "gone-talker" {
         // 对账收口：同一个不可取句柄在**两个面**都出现。此前只有 ChatLab 面带它，
@@ -186,14 +220,36 @@ async fn pull(
         "meta": {"groupId": "", "name": "演示会话", "ownerId": "", "platform": "wechat", "type": "private"},
         "sync": {"hasMore": false, "nextSince": 1_700_000_000, "nextOffset": 0, "watermark": 1_700_000_000},
     }))
+    .into_response()
 }
 
-async fn messages() -> Json<Value> {
-    Json(json!({
-        "success": true, "count": 1, "hasMore": false, "talker": TALKER,
+/// 消息面对「未知会话」回 404 统一信封（A/B 分水岭的 B 侧）：
+/// `--session` 拼错不存在的 id 必须仍被记入 skipped 并退 1。
+async fn messages_with_status(
+    axum::extract::RawQuery(q): axum::extract::RawQuery,
+) -> axum::response::Response {
+    let talker = q
+        .unwrap_or_default()
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("talker="))
+        .unwrap_or("")
+        .to_string();
+    if talker == "wxid_nope" {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(json!({
+                "success": false, "code": 404,
+                "message": "conversation 'wxid_nope' not found"
+            })),
+        )
+            .into_response();
+    }
+    axum::Json(json!({
+        "success": true, "count": 1, "hasMore": false, "talker": talker,
         "media": {"count": 0, "enabled": false, "exportPath": ""},
         "messages": [native_message()],
     }))
+    .into_response()
 }
 
 async fn contacts() -> Json<Value> {
@@ -425,7 +481,7 @@ async fn export_writes_a_file_against_a_live_service() {
     let base = spawn_stub().await;
     let dir = std::env::temp_dir().join(format!("weflow-e2e-export-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let (code, stdout, stderr) = run(&base, &["export", "--out", dir.to_str().unwrap(), "--format", "jsonl"]);
+    let (code, stdout, stderr) = run(&base, &["export", "--out", dir.to_str().unwrap(), "--format", "jsonl", "--session", TALKER]);
     assert_eq!(code, 0, "export 应退出 0；stdout: {stdout} stderr: {stderr}");
     let files: Vec<String> = std::fs::read_dir(&dir)
         .expect("导出目录应存在")
@@ -458,6 +514,52 @@ async fn export_writes_a_file_against_a_live_service() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 「存在但没有内容」的会话导出**不算失败**（0.10.0 起的 A 侧）：sessions 列表
+/// 里的零条会话在消息面是 200 空页，导出得到只含 header 的空产物、不进 skipped、
+/// 退 0。此前这类会话 404、整轮被记 `[fatal] 未能导出` 退 1——大量空群在真库上
+/// 让大批量导出永远「失败」。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn export_completes_a_listed_session_without_messages() {
+    let base = spawn_stub().await;
+    let dir = std::env::temp_dir().join(format!("weflow-e2e-empty-sess-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (code, stdout, stderr) = run(
+        &base,
+        &["export", "--out", dir.to_str().unwrap(), "--format", "jsonl", "--session", "empty-talker"],
+    );
+    assert_eq!(code, 0, "空会话导出是幂等完成不是失败；stdout: {stdout} stderr: {stderr}");
+    assert!(!stdout.contains("未能导出"), "空会话不得进失败清单: {stdout}");
+    let body = std::fs::read_to_string(
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
+            .expect("应有 jsonl"),
+    )
+    .unwrap();
+    assert!(body.contains("\"_type\":\"header\""), "空产物仍带 header: {body}");
+    assert!(!body.contains("\"_type\":\"message\""), "零条消息 ⇒ 无 message 行: {body}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A/B 分水岭的 B 侧钉子：`--session` 拼错一个**不存在**的 id 仍按失败记入
+/// skipped 并退 1——「空会话不算失败」的口径不得放宽到「404 也不算失败」。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn export_still_fails_on_an_unknown_session_id() {
+    let base = spawn_stub().await;
+    let dir = std::env::temp_dir().join(format!("weflow-e2e-nope-sess-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (code, stdout, stderr) = run(
+        &base,
+        &["export", "--out", dir.to_str().unwrap(), "--format", "jsonl", "--session", "wxid_nope"],
+    );
+    assert_eq!(code, 1, "不存在的会话仍要以非零码结束；stdout: {stdout} stderr: {stderr}");
+    let combined = format!("{stdout}{stderr}");
+    assert!(combined.contains("wxid_nope"), "跳过说明要点名会话: {combined}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 验收 1c：`--with-media` 把字节落盘，且导出物里的句柄就是落盘名。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn export_with_media_lands_bytes_and_keeps_the_handle() {
@@ -466,7 +568,7 @@ async fn export_with_media_lands_bytes_and_keeps_the_handle() {
     let _ = std::fs::remove_dir_all(&dir);
     let (code, stdout, stderr) = run(
         &base,
-        &["export", "--out", dir.to_str().unwrap(), "--format", "jsonl", "--with-media"],
+        &["export", "--out", dir.to_str().unwrap(), "--format", "jsonl", "--with-media", "--session", TALKER],
     );
     assert_eq!(code, 0, "export --with-media 应退出 0；stdout: {stdout} stderr: {stderr}");
     let file = dir.join("media").join("deadbeef.png");

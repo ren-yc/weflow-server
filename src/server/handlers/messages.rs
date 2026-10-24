@@ -81,11 +81,19 @@ fn sort_key(m: &crate::store::MessageRecord) -> (i64, i64, i64) {
 }
 
 /// 筛选（时间窗 + 关键词）→ 降序 → 偏移切片。
+///
+/// 存在性语义（0.10.0 起）：「索引不认识这个 id」404；「认识但一条消息都没有」
+/// （`convs` 无条目或空条目，会话行/群名册认识它）返回空页——`count:0` 与
+/// `messageCount:0` 的会话行从此一致，「数据丢了」与「本来就没消息」可区分。
 pub(crate) fn page_slice(store: &Store, q: &MessageQuery) -> ApiResult<MessagePage> {
-    let conv = store
-        .convs
-        .get(&q.talker)
-        .ok_or_else(|| ApiError::not_found(format!("conversation '{}' not found", q.talker)))?;
+    if !store.conversation_known(&q.talker) {
+        return Err(ApiError::not_found(format!(
+            "conversation '{}' not found",
+            q.talker
+        )));
+    }
+    let empty = Vec::new();
+    let conv = store.convs.get(&q.talker).unwrap_or(&empty);
     let mut idx: Vec<usize> = conv
         .iter()
         .enumerate()
@@ -266,10 +274,10 @@ pub async fn handler(
         } else {
             Vec::new()
         };
-        let conv = store
-            .convs
-            .get(&q.talker)
-            .expect("page_slice 已经确认这个会话存在");
+        // page_slice 已确认会话存在；「存在但零条消息」的会话在 convs 无条目，
+        // 空切片与空页在这里统一成型，不再有 panic 分支。
+        let empty = Vec::new();
+        let conv = store.convs.get(&q.talker).unwrap_or(&empty);
         let messages: Vec<MessageNative> =
             page.indices.iter().map(|&i| message_dto(&store, &conv[i])).collect();
         (page, jobs, messages)

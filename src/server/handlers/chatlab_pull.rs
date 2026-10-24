@@ -38,10 +38,13 @@ pub async fn handler(
     .unwrap_or_default();
 
     let store = account.store.read();
-    let conv = store
-        .convs
-        .get(&id)
-        .ok_or_else(|| ApiError::not_found(format!("session '{id}' not found")))?;
+    // 存在性语义与消息面同款（0.10.0 起）：索引不认识这个 id 才 404；
+    // 「名册里有、零条消息」返回空页（sync.hasMore=false），与 404 分离。
+    if !store.conversation_known(&id) {
+        return Err(ApiError::not_found(format!("session '{id}' not found")));
+    }
+    let empty = Vec::new();
+    let conv = store.convs.get(&id).unwrap_or(&empty);
 
     // Upper bound of this pull, echoed as `watermark`: a client that has
     // drained the session resumes from here. It is a TIME BOUND, not the

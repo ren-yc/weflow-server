@@ -77,7 +77,7 @@
 | `main.rs` | 进程入口：解析配置、装日志、起服务 | — | → `server` / `config` |
 | `lib.rs` | 库入口：承诺面 `api` ＋ 实现面（默认 `pub(crate)`，见「库面与 feature」） | `api` | — |
 | `config.rs` | 命令行与数据目录解析、token 凭据库读写 | `Config` | ← 无 |
-| `logging.rs` | 日志初始化 | `init_with_format`（子命令→stderr）/ `init_for_serve`（serve→stdout） | ← 无 |
+| `logging.rs` | 日志初始化 | `init_with_format`（子命令→stderr）/ `init_for_serve`（serve→stderr，0.10.0 起合并） | ← 无 |
 | `pathsafe.rs` | **纯守卫**：路径分量与导出根目录的边界检查 | `slugify` / 校验函数 | ← 无（被 `media`、`server` 调用） |
 | `db/wcdb.rs` | WCDB 页密码：页布局、密钥派生、每页校验 | 解密原语 | ← 无 |
 | `db/live.rs` | 活库只读连接与密钥校验 | `open_read_only` / 连接池 | → `wcdb` |
@@ -308,16 +308,16 @@ OpenSSL，后者的 perl `Configure` 会直接调 `cl.exe` / `link.exe`，**绕�
   subscriber。原因是一个容易被忽略的事实：没有 subscriber 时 `tracing::warn!` 展开成
   `if enabled { … }`，整体是 no-op —— 于是子命令里那些「会话级失败原因」的日志会**静默消失**，
   用户只剩退出码与一行摘要。serve 分支不在这里装：`dispatch` 在构造 clap 之前就把 `serve`
-  短路进老解析器，级别与格式仍由 `Config.log`/`Config.log_format` 决定，默认 info 与 stdout
-  去向不变（行内多出的 target 段属「恢复 target」条，两入口同受影响）。
-- **输出去向按入口分叉**：**子命令**日志走 **stderr**——`fmt()` 的默认 writer 是 stdout，而子命令
-  的 stdout 是命令输出本身（`--json` 形状），日志混进去会毁掉管道消费。**serve** 日志维持
-  **stdout**——既有部署在用 `weflow-server > 日志文件` 收服务日志，改通道会让那些脚本静默拿到空
-  文件，属破坏性变更、不随 0.9.1 落地。判据两条：`tests/cli_e2e.rs::log_json_format_emits_parseable_lines`
-  （stderr 逐行可解析**且 stdout 无日志行**）与 `tests/cli.rs::serve_logs_stay_on_stdout`
-  （启动行在 stdout、不在 stderr）。已知代价（如实登记）：同一次运行里 `[fatal]` 在 stderr、
-  serve 普通日志在 stdout，「只看 `2>` 收错误」拿不到 `[init]` 上下文；合并成一条通道要等一个
-  愿意接受破坏性的版本窗口。
+  短路进老解析器，级别与格式仍由 `Config.log`/`Config.log_format` 决定，默认 info 不变
+  （行内多出的 target 段属「恢复 target」条，两入口同受影响）。
+- **输出去向统一 stderr**（0.10.0 破坏性变更）：**子命令**日志走 stderr——`fmt()` 的默认
+  writer 是 stdout，而子命令的 stdout 是命令输出本身（`--json` 形状），日志混进去会毁掉
+  管道消费。**serve** 日志自 0.10.0 起也走 stderr：此前 serve 走 stdout 而 `[fatal]` 在
+  stderr，「只看 `2>` 收错误」拿不到启动上下文；合并后 `2>` 一处收齐。破坏面（迁移方式
+  见 CHANGELOG）：`weflow-server > 日志文件` 类部署拿到空 stdout，需改用 `2>`。判据两条：
+  `tests/cli_e2e.rs::log_json_format_emits_parseable_lines`
+  （stderr 逐行可解析**且 stdout 无日志行**）与 `tests/cli.rs::serve_logs_go_to_stderr`
+  （启动行在 stderr、不在 stdout）。
 - **`--log-format json`**：逐行一个 JSON 对象（`level`/`target`/`fields`），给日志采集器消费。
   依赖上只多一个 `tracing-serde`（json formatter 的 serde 粘合层），不拉 axum/tokio/clap，
   嵌入契约的依赖树钉子照常成立。
@@ -415,8 +415,8 @@ Python 只用于钩子与套件执行器，**纯标准库**——CI 与开发机
 ### 一致性套件
 
 `tests/conformance_runner.rs` 起真服务、造夹具，跑契约仓库（版本记在 `conformance.pin`）里的
-36 条用例（`v0.6.4`：auth 1／cursor 13／discovery 3／envelope 6／lifecycle 8／nails 5——v0.6.1 至
-v0.6.4 都是纯文档 tag，用例集未增删；换 pin 时这里要跟着改，它没有机器判据）。两条硬规矩：**带 `--fail-on-skip`**（有用例被跳过即失败，避免「夹具少声明一个端点」
+36 条用例（`v0.6.6`：auth 1／cursor 13／discovery 3／envelope 6／lifecycle 8／nails 5——v0.6.1 至
+v0.6.6 都是纯文档 tag，用例集未增删；换 pin 时这里要跟着改，它没有机器判据）。两条硬规矩：**带 `--fail-on-skip`**（有用例被跳过即失败，避免「夹具少声明一个端点」
 让用例静默变成不跑），**缺 `FLOW_CONTRACT_DIR` 即失败**（不是跳过）。夹具里的
 `contractVersion` 与 pin 由 `pinned_contract_version_matches_the_fixture` 钉在一起。
 

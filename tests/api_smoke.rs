@@ -2433,3 +2433,195 @@ async fn sns_export_stats_scopes_counts_to_username() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 「存在但没有内容」的定型（0.10.0 破坏面）：sessions 列表里有、零条消息的会话
+/// 在消息面与拉取面都是 200 空页（count:0 / sync.hasMore=false），不再与「未知
+/// 会话」共用 404；三源（会话名册 ∪ 消息索引 ∪ 群名册）都不认识的 id 仍然 404。
+/// 拉取面由契约用例 `cursor-unknown-session-404` 与不变量 `unknown_session_404_envelope`
+/// 钉 404 剩余集合，本测试补「存在但空」这一格。
+#[tokio::test]
+async fn a_listed_session_without_messages_answers_an_empty_page() {
+    let dir = common::tmp_dir("smoke-empty-session-page");
+    let state = test_state_with(&dir, common::add_session_row_without_messages);
+    let app = server::build_router(state);
+
+    let call = |uri: String| {
+        let app = app.clone();
+        async move { json_body(app.oneshot(request("GET", &uri, None)).await.unwrap()).await }
+    };
+
+    // 前置：会话行确实进了名册（否则下面的 200 是空转）。
+    let (status, sessions) = call(format!("/api/v1/sessions?access_token={TOKEN}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        sessions["sessions"]
+            .as_array()
+            .expect("sessions 数组")
+            .iter()
+            .any(|s| s["username"] == "wxid_empty_session"),
+        "夹具会话必须在名册里: {sessions}"
+    );
+
+    // 消息面：200 空页（此前 404）。
+    let (status, native) =
+        call("/api/v1/messages?talker=wxid_empty_session&access_token=test-token-123456".replace("test-token-123456", TOKEN)).await;
+    assert_eq!(status, StatusCode::OK, "存在但零条 ⇒ 200 空页: {native}");
+    assert_eq!(native["count"], 0);
+    assert_eq!(native["messages"].as_array().unwrap().len(), 0);
+
+    // 拉取面：同样 200 空页（sync.hasMore=false）。
+    let (status, pull) = call(format!(
+        "/api/v1/sessions/wxid_empty_session/messages?since=0&access_token={TOKEN}"
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK, "拉取面同语义: {pull}");
+    assert_eq!(pull["messages"].as_array().unwrap().len(), 0);
+    assert_eq!(pull["sync"]["hasMore"], false);
+
+    // 未知会话仍然 404（404 的剩余集合不随本面扩大）。
+    let (status, missing) = call(format!(
+        "/api/v1/messages?talker=wxid_total_stranger&access_token={TOKEN}"
+    ))
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "三源都不认识 ⇒ 404: {missing}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 未知会话 404 的钉子：存在性谓词放宽为三源并集后，404 的剩余集合（三源都不
+/// 认识的 id）必须原样保留——这是下游「判存在读 404」的依据。
+#[tokio::test]
+async fn unknown_conversation_is_still_not_found() {
+    let dir = common::tmp_dir("smoke-unknown-conversation-404");
+    let state = test_state_with(&dir, common::add_session_row_without_messages);
+    let app = server::build_router(state);
+
+    // 消息面、拉取面、ChatLab 消息面三处对纯虚构 id 都是 404。
+    for uri in [
+        "/api/v1/messages?talker=wxid_nope&access_token={TOKEN}",
+        "/api/v1/sessions/wxid_nope/messages?since=0&access_token={TOKEN}",
+        "/chatlab/messages?talker=wxid_nope&access_token={TOKEN}",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(request("GET", &uri.replace("{TOKEN}", TOKEN), None))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "未知会话在 {uri} 必须 404"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 群成员面对未知群号 404（0.10.0 破坏面，此前 200 空表）：把「问错了对象」
+/// 与「这个群没有成员」分开。判据与消息面的存在性谓词同源（三源并集）。
+#[tokio::test]
+async fn group_members_rejects_an_unknown_chatroom() {
+    let dir = common::tmp_dir("smoke-group-members-404");
+    let state = test_state_with(&dir, common::add_session_row_without_messages);
+    let app = server::build_router(state);
+    let (status, body) = json_body(
+        app.clone()
+            .oneshot(request(
+                "GET",
+                &format!("/api/v1/group-members?chatroomId=wxid_nope&access_token={TOKEN}"),
+                None,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "未知群 ⇒ 404: {body}");
+    assert_eq!(body["code"], 404, "统一信封: {body}");
+
+    // 已存在的群（夹具的 wxid_fake_group@chatroom）仍然 200。
+    let (status, ok) = json_body(
+        app.clone()
+            .oneshot(request(
+                "GET",
+                &format!(
+                    "/api/v1/group-members?chatroomId={}&access_token={TOKEN}",
+                    common::FAKE_GROUP
+                ),
+                None,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "存在的群不受守卫影响: {ok}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// weflow 群成员面的 `talker` 别名（先 `chatroomId`、再回落 `talker`）此前零
+/// 测试覆盖；守卫落地同批补齐——别名与主键名等价。
+#[tokio::test]
+async fn group_members_accepts_the_talker_alias() {
+    let dir = common::tmp_dir("smoke-group-members-alias");
+    let state = test_state_inner(&dir, |_, _| {}, false);
+    let app = server::build_router(state);
+    let (status, by_alias) = json_body(
+        app.oneshot(request(
+            "GET",
+            &format!(
+                "/api/v1/group-members?talker={}&access_token={TOKEN}",
+                common::FAKE_GROUP
+            ),
+            None,
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "talker 别名等价: {by_alias}");
+    assert!(by_alias["count"].as_u64().unwrap() >= 1, "夹具群有名册成员: {by_alias}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 媒体类型开关的**请求制**方向（与 qqflow 的退出制相反，差异登记在适配指南）：
+/// `media=1` 不带子开关＝四类都要；带任一子开关＝只给白名单里的那些。此前
+/// `wants_kind` 无直接测试，本测试钉住方向不被顺手统一掉。
+#[tokio::test]
+async fn media_kind_whitelist_serves_only_requested_kinds() {
+    let dir = common::tmp_dir("smoke-media-kind-whitelist");
+    let state = test_state_inner(&dir, |_, _| {}, false);
+    let app = server::build_router(state);
+
+    let call = |query: String| {
+        let app = app.clone();
+        async move {
+            json_body(
+                app.oneshot(request(
+                    "GET",
+                    &format!("/api/v1/messages?talker={}&{query}&access_token={TOKEN}", common::FAKE_GROUP),
+                    None,
+                ))
+                .await
+                .unwrap(),
+            )
+            .await
+        }
+    };
+
+    // 夹具群有图片消息（`[图片]`）：裸 media=1 四类都要 ⇒ 图片在。
+    let (status, all) = call("media=1".into()).await;
+    assert_eq!(status, StatusCode::OK);
+    let kinds_all: Vec<&str> = all["messages"]
+        .as_array().unwrap()
+        .iter()
+        .filter_map(|m| m["media"].as_object().map(|_| "media"))
+        .collect();
+    assert!(!kinds_all.is_empty(), "裸 media=1 至少服务到夹具里的媒体: {all}");
+
+    // media=1&voice=1：白名单只剩语音 ⇒ 图片被排除（请求制方向的承重断言）。
+    let (status, voice_only) = call("media=1&voice=1".into()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        voice_only["media"]["count"], 0,
+        "白名单里没有的 kind 必须被排除: {voice_only}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
