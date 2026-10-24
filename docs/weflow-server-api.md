@@ -6,7 +6,7 @@
 - 服务默认监听 `127.0.0.1:5033`（`--port` 可改）
 - 数据目录 = `%LOCALAPPDATA%\weflow-server`；访问 token 存于**系统凭据库**（Windows 凭据管理器 / macOS 钥匙串 / Linux Secret Service；无凭据库平台为会话级 token，随启动日志打印）
 - 所有 `/api/v1/*` 端点需要鉴权；`/health` 与 `/api/v1/health` 不需要
-- 与 qqflow-server 的**有意差异**（SNS 仅本仓、`messageCount` 条件键、`meta.type` 推导面、
+- 与 qqflow-server 的**有意差异**（SNS 仅本仓、`messageCount` 群成员面条件键、`meta.type` 推导面、
   默认端口、SDK/ts 状态）见
   [flow-contract ADAPTATION.md](https://github.com/ren-yc/flow-contract/blob/master/ADAPTATION.md)。
 
@@ -48,6 +48,12 @@
 - `success` 布尔；`code` 为 HTTP 状态码；`message` 人类可读描述。
 - 状态码：鉴权失败 `401`；参数错误 `400`；未找到 `404`（**含未知路径**）；方法不允许 `405`；
   服务未就绪 `503`；服务异常 `500`。
+- 两条兜底文案是中文：405 为「方法不允许」、未知路径 404 为「未知路径」，与注册/参数类错误的
+  英文文案混布在同一信封内——按语言匹配提示的脚本不要假设 `message` 恒为英文。回归位置：
+  快照 `error-method-not-allowed`／`error-unknown-path`。
+- 会话/群 404 的触发条件（后续版本口径）：只有「名册与索引都不认识这个 id」才 404；
+  `messageCount:0` 的会话届时在内容面是 200 空页（判「有没有内容」读 `count`/`hasMore`，
+  判「存不存在」读 404）。
 
 > 这里**没有 403**：本服务只有「有 token / 没 token」这一种授权判断，不存在「已认证但无权访问」
 > 的场景，因此没有构造器。此前文档写了 403 —— 那是照抄通用清单，**不要为它补一个假的实现**；
@@ -307,8 +313,8 @@
 
 ### GET `/api/v1/messages` — 消息查询 + 媒体导出
 
-参数：`talker`（会话标识，必填，为空返回空结果）、`limit`、`offset`、`start`、`end`、
-`keyword`、`media` 及类型开关（见通用参数）。
+参数：`talker`（会话标识，必填，缺失或为空返回 400「talker is required」）、`limit`、`offset`、
+`start`、`end`、`keyword`、`media` 及类型开关（见通用参数）。
 
 这条只输出原生/富数据形状；ChatLab 形状走 `GET /chatlab/messages`（见「ChatLab 适配面」）。
 
@@ -953,6 +959,10 @@ feeds 条目字段（以源码 `sns.rs` 为准）：`tid/userName/content(明文
 > `url`/`proxyUrl` 里给出），不要依赖导出物内的原始凭据。`rawUrl` 刻意保留：它是协议
 > 白名单的审计线索（HTML 渲染器不读它，恶意 scheme 因此进不了 `href`，而读者要能看见
 > 被拒的原始地址）。回归位置：`sns_json_export_drops_credential_media_keys`。
+
+> **usernames 与 timeline 的取值链**：`/api/v1/sns/usernames` 默认给**显示名**，而 timeline 的
+> `username` 过滤认的是**原始 wxid**——直接拿默认输出回填 timeline 会得到 `total:0` 且无任何
+> 告警。回填请用 `verbose=1` 返回的 `username` 字段。
 
 ## 数据获取与安全模型
 

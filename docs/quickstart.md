@@ -34,6 +34,11 @@ curl -H "Authorization: Bearer $WEFLOW_TOKEN" \
 
 （`/health` 免鉴权且只回标量阶段；账号身份与消息数在 `GET /api/v1/accounts`。）
 
+第二条 curl 需要两样东西就位：
+
+- **账号已注册**：零账号时业务端点返回 503（`/health` 仍是 `starting`，免鉴权可先看）。注册步骤在下方「配方五」，README 的「注册账号」一节有最短版。
+- **token 已赋值**：`export WEFLOW_TOKEN=$(weflow-server token)`（PowerShell 写作 `$env:WEFLOW_TOKEN = (weflow-server token)`，注意 `VAR=$(…)` 是 bash 语法）。token 来源链的坑见配方五第 1 步。
+
 ## 配方一：接 ChatLab 前端（pull 面四步）
 
 把 ChatLab 的 `baseUrl` 设为 `http://127.0.0.1:5033/chatlab`：
