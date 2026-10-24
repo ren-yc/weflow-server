@@ -2,6 +2,38 @@
 
 本文件从 0.5.0 起维护。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.9.3] - 2026-10-24
+
+### 修复
+
+- **SNS `export/stats` 的 `username` 参数生效**：此前该参数被忽略，计数恒为全库口径、
+  `myPosts` 恒按注册账号自身统计，按用户过滤的调用方会把全库数当成该用户数。现带
+  `username` 时所有计数改为该用户切片（对无帖用户 `totalFriends` 为 0）；不带时行为逐字
+  不变；`myPosts` 两种形态下都恒指注册账号自身；响应键集不变。回归位置：
+  `sns_export_stats_scopes_counts_to_username`。
+- **索引期缺密钥告警聚合为一条**：库目录存在但配置未提供密钥的库此前每张一行 WARN，
+  必然出现的噪声让真正的漏配失去显著性；现一轮索引只打一条汇总并列出全部库名（保留
+  `no key for` 前缀可 grep；打开失败仍逐条点名；session/contact/sns 三处承重的缺密钥
+  单条告警维持原样，聚合只覆盖消息库循环）。回归位置：
+  `missing_key_dbs_collapse_into_one_summary_line`。
+- **SDK `wait_ready` 区分「账号不在清单」**：传会话 username 等错误标识时此前伪装成
+  超时未注册；现在一次成功的账号清单里没有该账号即立刻报 `UnknownAccount` 并附已注册
+  账号清单（Python/Rust 两 SDK 同批；传输失败与 5xx 仍按等待语义处理）。回归位置：
+  `test_wait_ready_unknown_account_fails_fast_with_registered_ids`／
+  `wait_ready_unknown_account_names_the_registered_ids`。
+- **SDK `watch` 被放弃时不再误报断线**：生成器关闭触发的清理错误此前打一条空原因的
+  「SSE stream error, reconnecting」；现识别关闭路径保持静默，真实断线日志补异常类型名。
+  回归位置：`test_watch_close_is_silent_even_when_the_stream_errors_during_cleanup`。
+
+### 文档
+
+- **api 文档 SNS 节响应键表按实现重写**：timeline/stats/export/export/stats 的键集与条目
+  字段逐格更正（`{count,total,feeds}` → `{success,count,total,hasMore,timeline}` 等），删除
+  「以源码 sns.rs 为准」转介句；`usernames` 处补「回填 `timeline` 须用 `verbose=1` 的原始
+  username」提示；quickstart「第一个请求」补零账号 503 指引与 token 赋值步骤；错误信封节补
+  405 与未知路径 404 的中文实际文案；messages 参数行更正 talker 400 的实际文案；架构文档补
+  `message/` 目录伴随库的枚举与缺密钥行为说明。
+
 ## [0.9.2] - 2026-10-23
 
 ### 补记

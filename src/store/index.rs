@@ -717,6 +717,9 @@ fn build_all_live_inner(
     let mut total_tables = 0usize;
     for f in &message_files {
         let Some(key) = keys.key_for(&f.rel) else {
+            // Denominator walk: counted in the summary below, so a bare
+            // per-file line here would only duplicate it.
+            tracing::debug!("no key for {}", f.rel);
             continue;
         };
         if let Ok(conn) = pool.get_or_open(f, key) {
@@ -724,10 +727,21 @@ fn build_all_live_inner(
         }
     }
     progress.set_tables_total(total_tables);
-    // 3b) 再逐表扫描并按表推进计数。
+    // 3b) 再逐表扫描并按表推进计数。缺密钥的库在这里聚合成**一条**告警：
+    // 库目录里存在但配置未提供密钥的库每张一行 WARN 时，真库上必然出现的
+    // 三行噪声会让真正的漏配失去显著性；一条汇总（保留 `no key for` 前缀）
+    // 既可 grep，又能一眼读出漏配全貌。打开失败的库保持逐条——那是环境
+    // 问题，不是配置问题，逐条点名才能定位。
+    let missing_keys: Vec<&str> = message_files
+        .iter()
+        .filter(|f| keys.key_for(&f.rel).is_none())
+        .map(|f| f.rel.as_str())
+        .collect();
+    if !missing_keys.is_empty() {
+        tracing::warn!("no key for {} database(s), skipped: {}", missing_keys.len(), missing_keys.join(", "));
+    }
     for f in message_files {
         let Some(key) = keys.key_for(&f.rel) else {
-            tracing::warn!("no key for {}", f.rel);
             continue;
         };
         let conn = match pool.get_or_open(f, key) {
@@ -1021,5 +1035,108 @@ mod tests {
         let s = progress.snapshot();
         assert_eq!(s.messages_indexed, 2, "每解析一行都要推进同一个计数器");
         assert_eq!(s.tables_done, 1, "表完成后只推进一次表计数");
+    }
+
+    /// 缺密钥消息库一轮索引只打**一条**汇总告警（保留 `no key for` 前缀），
+    /// 分母枚举步的同一事实只落 debug。
+    ///
+    /// 捕获方式：线程内装一个 fmt subscriber（`with_default` 只影响当前线程，
+    /// 不碰全局默认），拿 `MakeWriter` 收行。真库上三张伴随库无键是常态，
+    /// 逐行 WARN 时真正的漏配会被必然噪声淹没——这是聚合存在的理由。
+    #[test]
+    fn missing_key_dbs_collapse_into_one_summary_line() {
+        use std::sync::{Arc, Mutex};
+
+        struct Sink(Arc<Mutex<Vec<String>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().push(String::from_utf8_lossy(buf).to_string());
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Sink;
+            fn make_writer(&'a self) -> Self::Writer {
+                Sink(self.0.clone())
+            }
+        }
+
+        let lines: Arc<Mutex<Vec<String>>> = Default::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(Sink(lines.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "weflow-idx-nokey-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let mut pool = crate::db::live::LivePool::new();
+            // 两个消息库：一个有键、一个无键。有键的那张还必须真的能打开——
+            // 否则「无键库」与「打不开的库」两种失败混在一起，断言没有区分力。
+            std::fs::create_dir_all(dir.join("message")).unwrap();
+            let keyed = dir.join("message/message.db");
+            {
+                let conn = rusqlite::Connection::open(&keyed).unwrap();
+                conn.execute_batch(&format!(
+                    "PRAGMA cipher_page_size = 4096;
+                     PRAGMA key = \"x'{}'\";
+                     PRAGMA journal_mode = DELETE;",
+                    hex::encode([1u8; 32])
+                ))
+                .unwrap();
+            }
+            let files = vec![
+                crate::db::scan::DbFile {
+                    rel: "message/message.db".into(),
+                    abs: keyed,
+                    wal: None,
+                    kind: crate::db::scan::DbKind::Message,
+                },
+                crate::db::scan::DbFile {
+                    rel: "message/message_fts.db".into(),
+                    abs: dir.join("message/message_fts.db"),
+                    wal: None,
+                    kind: crate::db::scan::DbKind::Message,
+                },
+            ];
+            let keys = crate::keystore::KeyMap::Map(
+                [("message/message.db".to_string(), crate::keystore::DbKey([1; 32]))]
+                    .into_iter()
+                    .collect(),
+            );
+            let progress = IndexProgress::default();
+            let store = build_all_live(&mut pool, &keys, "wxid_x", &files, &progress)
+                .expect("缺一张伴随库不该让索引失败");
+            drop(store);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+
+        let all = lines.lock().unwrap();
+        let warns: Vec<&String> = all
+            .iter()
+            .filter(|l| l.contains("no key for") && l.contains("WARN"))
+            .collect();
+        assert_eq!(
+            warns.len(), 1,
+            "缺密钥必须恰好一条汇总告警，不得逐库点名: {warns:?}"
+        );
+        let w = warns[0];
+        assert!(
+            w.contains("1 database(s)") && w.contains("message_fts.db"),
+            "汇总要点出数量与库名: {w}"
+        );
+        let debugs = all
+            .iter()
+            .filter(|l| l.contains("no key for") && l.contains("DEBUG"))
+            .count();
+        assert!(debugs >= 1, "分母枚举步的同一事实应落 debug（至少一行）");
     }
 }

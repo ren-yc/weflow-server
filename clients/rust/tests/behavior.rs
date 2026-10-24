@@ -891,6 +891,31 @@ async fn wait_ready_rides_out_a_transient_5xx_but_not_a_4xx() {
     }
     assert_eq!(*mock.post_calls.lock().unwrap(), 0, "wait_ready stays wait-only");
 }
+
+#[tokio::test]
+async fn wait_ready_unknown_account_names_the_registered_ids() {
+    // A listing that came through without the id is a verdict, not a wait: the
+    // usual wrong input is a session username, which used to burn the whole
+    // timeout as a misleading "not-registered". One successful listing proves
+    // waiting cannot help, so the error must name who IS registered.
+    let mock = Mock::default();
+    *mock.states.lock().unwrap() = vec!["ready".into()];
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+    let err = client
+        .wait_ready("wxid_session_username_by_mistake", Duration::from_secs(30))
+        .await
+        .expect_err("an id absent from a delivered listing must fail fast");
+    assert_eq!(*mock.accounts_calls.lock().unwrap(), 1, "fail fast: one poll, no burn");
+    assert_eq!(*mock.post_calls.lock().unwrap(), 0, "wait_ready stays wait-only");
+    match err {
+        ClientError::UnknownAccount { account, registered } => {
+            assert_eq!(account, "wxid_session_username_by_mistake");
+            assert_eq!(registered, vec!["wxid_mock".to_string()]);
+        }
+        other => panic!("expected UnknownAccount, got {other:?}"),
+    }
+}
 // ---- list_messages / contacts / media_bytes_by_id ------------------------
 
 #[tokio::test]

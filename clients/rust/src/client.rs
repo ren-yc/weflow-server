@@ -69,6 +69,22 @@ pub enum ClientError {
         /// Request URL.
         url: String,
     },
+    /// `wait_ready`'s account id is not in the server's registered list.
+    ///
+    /// A listing that came through names every registered account: the
+    /// requested id not being in it can never be fixed by waiting (the usual
+    /// wrong input is a session username, which used to burn the whole
+    /// timeout as a misleading `not-registered`).
+    #[error(
+        "account {account:?} is not in the registered list: {}",
+        if registered.is_empty() { "(no accounts registered)".to_string() } else { registered.join(", ") }
+    )]
+    UnknownAccount {
+        /// The id that was asked for.
+        account: String,
+        /// Who IS registered, so the caller can compare configurations.
+        registered: Vec<String>,
+    },
 }
 
 /// 200-with-refusal vocabulary, shared verbatim with the Python SDK. The
@@ -516,7 +532,17 @@ impl Client {
                             None => state,
                         };
                     }
-                    None => last_state = "not-registered".to_string(),
+                    None => {
+                        // A listing that came through names every registered
+                        // account: the requested id not being in it can never
+                        // be fixed by waiting. A dropped round keeps its
+                        // "not-registered" state below - absence of evidence
+                        // is not evidence of absence.
+                        return Err(ClientError::UnknownAccount {
+                            account: wxid.to_string(),
+                            registered: accounts.iter().map(|a| a.wxid.clone()).collect(),
+                        });
+                    }
                 },
                 // A dropped round is **waiting**, not failure. The whole point of a
                 // deadline-based poll is to ride out a transient connect blip or a

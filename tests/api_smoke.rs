@@ -2374,3 +2374,62 @@ async fn sns_json_export_drops_credential_media_keys() {
     assert_eq!(m["resolvedUrl"].as_str(), Some("javascript:alert(1)"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `export/stats` 的 `username` 受限 opt-in：传入时全部计数改该用户切片
+/// （确有帖子时 `totalFriends` 为 1），不传时逐字节维持全库口径；`myPosts`
+/// 两种形态下都恒指注册账号自身。键集两种形态完全一致。
+#[tokio::test]
+async fn sns_export_stats_scopes_counts_to_username() {
+    let dir = common::tmp_dir("smoke-sns-export-stats-scope");
+    let state = test_state_with(&dir, common::add_sns_fixture);
+    let app = server::build_router(state);
+
+    let call = |uri: String| {
+        let app = app.clone();
+        async move { json_body(app.oneshot(request("GET", &uri, None)).await.unwrap()).await }
+    };
+
+    // 全库口径（不带 username）：夹具仅一个发布者，totalPosts=1、totalFriends=1。
+    let (status, all) =
+        call(format!("/api/v1/sns/export/stats?access_token={TOKEN}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(all["data"]["totalPosts"], 1);
+    assert_eq!(all["data"]["totalFriends"], 1);
+    assert_eq!(all["data"]["myPosts"], 0, "myPosts 恒指注册账号自身");
+    assert!(all.get("stats").is_none(), "非 verbose 态不出现 stats 键");
+
+    // 该用户切片：与全库同值（唯一发布者），键集一致。
+    let (status, scoped) = call(format!(
+        "/api/v1/sns/export/stats?username=wxid_sns_html01&access_token={TOKEN}"
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        scoped["data"], all["data"],
+        "对唯一发布者的切片应与全库口径一致: {scoped}"
+    );
+
+    // 无帖用户切片：全部计数归零（posters 是切片内去重发布者数，空切片为 0），
+    // myPosts 恒定。
+    let (status, nobody) = call(format!(
+        "/api/v1/sns/export/stats?username=wxid_nobody&access_token={TOKEN}"
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(nobody["data"]["totalPosts"], 0);
+    assert_eq!(nobody["data"]["totalFriends"], 0, "空切片没有发布者");
+    assert_eq!(nobody["data"]["myPosts"], 0, "myPosts 不随切片对象改变");
+
+    // verbose 态同样吃切片：stats.feeds 跟随 username，lastExport 键保留。
+    let (status, verbose) = call(format!(
+        "/api/v1/sns/export/stats?username=wxid_nobody&verbose=1&access_token={TOKEN}"
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(verbose["stats"]["feeds"], 0);
+    assert_eq!(verbose["stats"]["posters"], 0);
+    assert!(verbose.get("lastExport").is_some(), "verbose 态保留 lastExport 键");
+    assert!(verbose.get("data").is_none(), "verbose 态不出现 data 键");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

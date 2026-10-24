@@ -941,15 +941,18 @@ Pull，避免同一批数据出现第二种形状。WeFlow（安装版）没有�
 
 | 端点 | 参数 | 响应键 |
 |---|---|---|
-| `/api/v1/sns/timeline` | `limit`（**默认 50、上限 500**）、`offset`、`username`、`start`、`end` | `{count,total,feeds:[...]}` |
-| `/api/v1/sns/usernames` | — | `{success,count,usernames:[...]}` |
-| `/api/v1/sns/stats` | — | `{feeds, ...}` |
-| `/api/v1/sns/export` | `format=json\|html`、`username` | `{count, entries/...}` |
-| `/api/v1/sns/export/stats` | — | `{data:{totalPosts: N, ...}}` |
+| `/api/v1/sns/timeline` | `username`、`limit`（**默认 50、上限 500**）、`offset`、`start`、`end` | `{success,count,total,hasMore,timeline:[…]}` |
+| `/api/v1/sns/usernames` | `verbose` | `{success,count,usernames:[…]}`；默认元素是**显示名字符串**，`verbose=1` 时为 `{username,displayName,feedCount,lastPostTime}` |
+| `/api/v1/sns/stats` | —（不读业务参数） | `{success,stats:{feeds,posters,byKind,mediaItems,comments,timeRange}}`；时间线为空时 `timeRange` 为 `null` |
+| `/api/v1/sns/export` | `username`、`format=json\|html` | `{success,file,path,count,bytes,format,stats}`（`stats` 同 stats 端点并多一个 `byYear`） |
+| `/api/v1/sns/export/stats` | `verbose`、`username` | 默认 `{success,data:{totalPosts,totalFriends,myPosts}}`；`verbose=1` 为 `{success,stats,lastExport}`。带 `username` 时全部计数改为该用户切片（`myPosts` 恒指注册账号自身） |
 | `/api/v1/sns/media/proxy` | `url`、`referer`、`user_agent` | 媒体字节流（CDN 鉴权墙时返回明确错误） |
 
-feeds 条目字段（以源码 `sns.rs` 为准）：`tid/userName/content(明文XML 解析后)/likes/comments/mediaList/location/rawXml` 的等效 JSON 键
-（`mediaList` 每项含 `url/thumb/md5/encIdx/rawUrl/resolvedUrl/proxyUrl/proxyThumbUrl/width/height`）。
+timeline/export 的条目键：`tid/id/username/nickname/avatarUrl/createTime/contentDesc/type/media/likes/comments/rawXml/location/feedId/displayName/kind/commentCount`；
+`location` 为 `{latitude,longitude}`；`media` 每项含
+`url/thumb/md5/encIdx/rawUrl/resolvedUrl/proxyUrl/proxyThumbUrl/width/height`，
+`likes`／`comments` 每项含 `username/nickname/createTime`（`comments` 另含 `content`）。
+回归位置：`sns_json_export_drops_credential_media_keys`。
 
 > **导出物不含取图凭据**：`token`／`key`（微信侧的访问与解密参数）与两个同值冗余键
 > `rawThumb`／`resolvedThumbUrl` 已从 JSON 导出移除。代理端点只读 `url`（＋可选

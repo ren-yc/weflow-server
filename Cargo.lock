@@ -2892,7 +2892,7 @@ dependencies = [
 
 [[package]]
 name = "weflow-client"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "async-stream",
  "axum",
@@ -2921,7 +2921,7 @@ dependencies = [
 
 [[package]]
 name = "weflow-server"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "aes",
  "anyhow",

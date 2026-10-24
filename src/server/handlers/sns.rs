@@ -471,10 +471,26 @@ pub async fn export_stats(
     let params = extract_params(&query, body);
     require_auth(&state, &params, &headers)?;
     let account = ready_account(&state, &params)?;
+    // Opt-in scoping: without `username` every counter stays the whole-store
+    // aggregate it has always been. With it, the aggregate switches to that
+    // user's slice — `myPosts` stays exempt (it names the registered
+    // account's own posts by definition). Key set is unchanged either way.
+    let username = params.get("username").filter(|s| !s.is_empty()).cloned();
 
     let stats = {
         let store = account.store.read();
-        aggregate(&store.sns_feeds)
+        match username.as_deref() {
+            None => aggregate(&store.sns_feeds),
+            Some(u) => {
+                let feeds: Vec<crate::store::SnsFeed> = store
+                    .sns_feeds
+                    .iter()
+                    .filter(|f| f.user_name == *u)
+                    .cloned()
+                    .collect();
+                aggregate(&feeds)
+            }
+        }
     };
     // report the most recent export artifact if any
     let exports_dir = state.cfg.data_dir.join("exports");
@@ -505,6 +521,9 @@ pub async fn export_stats(
         }
     }
     let my_wxid = account.info.wxid.clone();
+    // `myPosts` keeps its meaning under scoping too: it always counts the
+    // registered account's own posts, scoped or not (the key names *my* posts;
+    // a slice of another user simply never intersects it).
     let my_posts = {
         // recompute from the store without holding the lock across await-free code
         let store = account.store.read();
