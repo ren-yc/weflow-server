@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 安装 weflow-server 的提交钩子：pre-commit（隐私 + 编号引用）与 commit-msg（提交信息）
+# 安装 weflow-server 的提交钩子：pre-commit（隐私 + 编号引用 + 文档折点）与 commit-msg（提交信息）
 # 用法: bash scripts/install-hooks.sh
 #
 # .git/hooks/ 不受版本控制，所以钩子需要每份 clone 各自安装一次。幂等，可重复执行。
@@ -16,9 +16,9 @@ mkdir -p "$hook_dir"
 
 cat > "$hook_dir/pre-commit" <<'HOOK'
 #!/bin/sh
-# weflow-server 预提交检查：隐私 + 编号引用（由 scripts/install-hooks.* 安装，可重复安装覆盖）
+# weflow-server 预提交检查：隐私 + 编号引用 + 文档折点（由 scripts/install-hooks.* 安装，可重复安装覆盖）
 #
-# 两个检查**都要跑**，任一失败即阻止提交。这是刻意的：
+# **各检查都要跑**，任一失败即阻止提交。这是刻意的：
 #   * 不能用 exec —— exec 会替换当前进程，其后的检查永远不会执行，等于静默失效；
 #   * 不能写成「check; scan」后只看最后一条退出码 —— 前一个失败会被后一个的成功掩盖；
 #   * 不能写成「check && scan」 —— 隐私失败时编号检查根本不跑。
@@ -69,6 +69,20 @@ if [ -n "$py" ]; then
 else
     echo "[编号检查] 未找到可用的 Python 3，无法执行 scripts/forbidden_refs.py；提交已阻止。" >&2
     echo "  安装 Python 3 后重试，或人工复核后用 git commit --no-verify 跳过（谨慎）。" >&2
+    status=1
+fi
+
+if [ -n "$py" ]; then
+    "$py" scripts/check_docs.py
+    rc=$?
+    if [ "$rc" = "2" ]; then
+        echo "[折点检查] 扫描未执行，按拒绝放行处理；提交已阻止（诊断见上）。" >&2
+        status=1
+    elif [ "$rc" != "0" ]; then
+        status=1
+    fi
+else
+    echo "[折点检查] 未找到可用的 Python 3，无法执行 scripts/check_docs.py；提交已阻止。" >&2
     status=1
 fi
 

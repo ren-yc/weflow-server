@@ -98,6 +98,11 @@ jobs:
         if: runner.os != 'Windows'
         run: python3 scripts/forbidden_refs.py --tree
 
+      # 文档折点：段内换行会被 GitHub 渲染成空格，产生词中空格。全量扫描跟踪 .md。
+      - name: Document line-break check (tracked md)
+        if: runner.os != 'Windows'
+        run: python3 scripts/check_docs.py --tree
+
       # 直推 master 的路径不经过本地钩子，所以提交信息必须在这里再扫一遍。
       - name: Forbidden references (commit messages)
         if: runner.os != 'Windows'
