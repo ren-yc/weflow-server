@@ -19,6 +19,9 @@
   4. 标题行（# 开头）；
   5. `<!-- common:begin -->` 至 `<!-- common:end -->` 公共段整段
      （由 flow-contract 的 sha256 哈希纪律维护，本仓不得私改）；
+     只豁免**成对且位于代码块外**的标记之间；标记不成对（缺 begin 或缺 end）或写在
+     代码围栏里时**不豁免**——否则漏写一个结束标记就会让其后的全文静默失去保护，
+     而「失败开放的检查等于没有检查」；
   6. clients/*/README.md —— 统一英文后不含中文，天然无折点。
 
 用法：
@@ -113,28 +116,44 @@ def classify(lines):
     return kinds
 
 
-def common_lines(lines):
-    out, inside = set(), False
-    for i, raw in enumerate(lines):
-        if raw.strip() == CB:
-            inside = True
-        if inside:
-            out.add(i)
-        if raw.strip() == CE:
-            inside = False
+def common_lines(lines, kinds):
+    """公共段标记之间的行号集合。
+
+    只认**成对**的标记，且标记行必须是 HTML 注释（kind == "c"，即不在代码围栏里）。
+    未闭合的 begin（缺 end）、或写在代码围栏内的 begin 字面量，一律**不豁免** ——
+    否则一个漏写的结束标记会让全篇静默失去保护，而「失败开放的检查等于没有检查」。
+    """
+    cbs = [i for i, l in enumerate(lines) if kinds[i] == "c" and l.strip() == CB]
+    ces = [i for i, l in enumerate(lines) if kinds[i] == "c" and l.strip() == CE]
+    out: set[int] = set()
+    k = 0
+    for start in cbs:
+        if start in out:          # 已被上一对覆盖（嵌套/重复 begin）
+            continue
+        nxt = [c for c in ces if c > start]
+        if not nxt:
+            # 未闭合的 begin（缺 end）：**不豁免**。否则漏写一个结束标记就会让
+            # 其后整篇静默失去保护——失败开放的检查等于没有检查。
+            continue
+        end = min(nxt)
+        out.update(range(start, end + 1))
     return out
+
+
+def _quote_body(line):
+    """去掉引用块前缀（一层 `>` 与可选空格）。"""
+    return re.sub(r"^\s*>\s?", "", line)
 
 
 def is_break(lines, kinds, i):
     if i + 1 >= len(lines):
         return False
     ka, kb = kinds[i], kinds[i + 1]
+    raw_a = lines[i]
     if ka == "q" and kb == "q":
-        raw_a = re.sub(r"^\s*>\s?", "", lines[i])
-        a = raw_a.rstrip()
-        b = re.sub(r"^\s*>\s?", "", lines[i + 1]).lstrip()
+        a = _quote_body(lines[i]).rstrip()
+        b = _quote_body(lines[i + 1]).lstrip()
     elif ka in ("p", "l") and kb == "p":
-        raw_a = lines[i]
         a, b = raw_a.rstrip(), lines[i + 1].lstrip()
     else:
         return False
@@ -149,7 +168,7 @@ def is_break(lines, kinds, i):
 def scan_text(text):
     lines = text.split("\n")
     kinds = classify(lines)
-    common = common_lines(lines)
+    common = common_lines(lines, kinds)
     hits = []
     for i in range(len(lines) - 1):
         if i in common or (i + 1) in common:
