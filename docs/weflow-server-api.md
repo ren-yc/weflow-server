@@ -108,11 +108,32 @@
 - **描述随 DTO 变**。改 DTO 就会改它，不需要手工同步；`tests/openapi.rs` 保证描述自身自洽（每个 `$ref` 都能解析、operationId 唯一、多形状确实用 `oneOf`），golden 快照则保证它的变更有人看过。
 - **字节面与 SSE 面如实标注媒体类型**：媒体路由是 `application/octet-stream`（binary），推送面是 `text/event-stream`；端点级 `description` 携带各面的对外闸门（导出每请求 200 项、单页上限 5000、重放缓冲 1000 条/600 秒等）——生成的客户端不必再翻散文文档找这些数字。
 
+**请求**
+
+```http
+GET /openapi.json
+```
+
+**参数**：无
+
 错误响应（401/404/405 等）**不在描述里**：它们是跨端点的统一信封，见上文「错误信封」。
 
 ### GET/POST `/health`、`/api/v1/health`（免鉴权）
 
 就绪状态 + 单个账号阶段（客户端可据此健康检查，无需轮询注册端点）：
+
+**请求**
+
+```http
+GET /health
+GET /api/v1/health
+```
+
+两路径等价，GET/POST 均可，免鉴权。
+
+**参数**：无
+
+**响应**
 
 ```json
 {
@@ -135,6 +156,17 @@
 
 `/health` 不再承载的账号信息：
 
+**请求**
+
+```http
+GET /api/v1/accounts
+Authorization: Bearer <TOKEN>
+```
+
+**参数**：无
+
+**响应**
+
 ```json
 {
   "success": true,
@@ -154,7 +186,9 @@
 - 列表按 `wxid` 升序，便于客户端做稳定 diff。
 - **不受就绪门控**：账号 `indexing` 时服务器正是「未就绪」，而那恰好是客户端要轮询本接口的时候。GET 无 body，token 走请求头或查询串。
 
-### accounts 响应的可选 `progress`
+#### accounts 响应的可选 `progress`
+
+<!-- no-skeleton -->
 
 账号处于 `indexing` 时，列表项、受理/幂等命中响应，以及在位账号正在构建时的冲突体，额外带一个**可选对象** `progress`：
 
@@ -170,7 +204,27 @@
 
 ### POST `/api/v1/accounts` — 注册账号（客户端驱动启动）
 
-请求体（JSON）：
+**请求**
+
+```http
+POST /api/v1/accounts
+```
+
+**参数**
+
+| 参数 | 类型 | 必填 | 说明 |
+| ---- | ---- | ---- | ---- |
+| `wxid` | string | 是 | 账号标识 |
+| `db_path` | string | 否 | 账号根目录（含 `db_storage/`）；默认按 wxid 推导 |
+| `key` | string | 否 | 每库统一 enc_key（`keys` 缺省时的单一密钥） |
+| `keys` | object | 否 | `db_storage` 相对路径 → 64-hex enc_key 映射（微信 4.x 每库独立密钥） |
+| `img_code` | string | 否 | WeFlow 兼容的图片密钥代号（由服务端派生 aes/xor） |
+| `img_aes_key` | string | 否 | 直接指定图片解密密钥（优先于 `img_code`）；**必须与 `img_xor_key` 成对给** |
+| `img_xor_key` | string | 否 | 同上，与 `img_aes_key` 成对 |
+
+`img_aes_key` / `img_xor_key` **必须成对给**：只给其一会被当作未提供，静默回落到 `img_code` 派生——既不报错也不记日志。
+
+**示例**
 
 ```json
 {
@@ -182,14 +236,7 @@
 }
 ```
 
-- **`wxid`**：账号标识（必填）
-- **`db_path`**：账号根目录（含 `db_storage/`；默认按 wxid 推导）
-- **`key`**：可选：每库统一 enc_key（`keys` 缺省时的单一密钥）
-- **`keys`**：可选：`db_storage` 相对路径 → 64-hex enc_key 映射（微信 4.x 每库独立密钥）
-- **`img_code`**：可选：WeFlow 兼容的图片密钥代号（由服务端派生 aes/xor）
-- **`img_aes_key` / `img_xor_key`**：可选：直接指定图片解密密钥（优先于 `img_code`）；**必须成对给**——只给其一会被当作未提供，静默回落到 `img_code` 派生，既不报错也不记日志
-
-响应：
+**响应**
 
 ```json
 { "success": true, "wxid": "wxid_xxxx_1234", "state": "accepted", "status": "indexing", "db_storage": "C:\\Users\\<用户名>\\Documents\\xwechat_files\\wxid_xxxx_1234\\db_storage" }
@@ -221,10 +268,21 @@
 
 释放绑定、清空内存索引、退场后台任务，服务器回到未注册状态（`/health` 的 `account` 变回 `unregistered`）。注销只有这一条路由（回归见 `deregistration_is_authenticated_and_the_post_alias_is_gone`）。
 
-- **`{wxid}`**：路径参数：要注销的账号。**安全联锁**——与在位账号不一致时什么都不做
-- **`purge_media`**：可选，默认 `false`。同时删除本账号会话的媒体导出目录
+**请求**
 
-响应（三种结果，HTTP 均为 `200`）：
+```http
+DELETE /api/v1/accounts/{wxid}?purge_media=1
+Authorization: Bearer <TOKEN>
+```
+
+**参数**
+
+| 参数 | 类型 | 必填 | 说明 |
+| ---- | ---- | ---- | ---- |
+| `wxid` | string(path) | 是 | 要注销的账号；**安全联锁**，与在位账号不一致时什么都不做 |
+| `purge_media` | bool | 否 | 是否同时删除本账号会话的媒体导出目录，默认 `false` |
+
+**响应**（三种结果，HTTP 均为 `200`）
 
 ```json
 { "success": true, "wxid": "wxid_xxxx_1234", "state": "deregistered",
@@ -245,7 +303,28 @@
 
 ### GET `/api/v1/messages` — 消息查询 + 媒体导出
 
-参数：`talker`（会话标识，必填，缺失或为空返回 400「talker is required」）、`limit`、`offset`、`start`、`end`、`keyword`、`media` 及类型开关（见通用参数）。
+**请求**
+
+```http
+GET /api/v1/messages?talker=<id>&limit=20
+Authorization: Bearer <TOKEN>
+```
+
+**参数**
+
+| 参数 | 类型 | 必填 | 说明 |
+| ---- | ---- | ---- | ---- |
+| `talker` | string | 是 | 会话标识；缺失或为空返回 400「talker is required」 |
+| `limit` | number | 否 | 本页条数，默认 100，上限 10000 |
+| `offset` | number | 否 | 分页偏移，默认 0 |
+| `start` / `end` | string | 否 | 时间边界，Unix 秒或 `YYYYMMDD` |
+| `keyword` | string | 否 | 关键词过滤 |
+| `media` | string | 否 | `1` 触发本页媒体导出 |
+| `image` / `voice` / `video` / `emoji` | string | 否 | 媒体导出子开关 |
+
+媒体导出细节与 `exported` 判据见本节下方「响应」。「通用查询参数」一节给出 `start`/`end` 与上限的完整口径。
+
+`talker` **必填**，缺失或为空返回 400「talker is required」。
 
 这条只输出原生/富数据形状；ChatLab 形状走 `GET /chatlab/messages`（见「ChatLab 适配面」）。
 
@@ -297,7 +376,7 @@ localType = (appmsgSubtype << 32) | baseType
 
 常见 `appmsgSubtype`（真库计数）：5 链接卡片 36629、57 引用回复 17005、6 文件 3530、19 合并转发 991、51 视频号 919、33/36 小程序 284、4 图文 384、2001 支付 269。
 
-响应：
+**响应**
 
 ```json
 { "success": true, "talker": "wxid_friend_a", "count": 20, "hasMore": true,
@@ -337,7 +416,24 @@ localType = (appmsgSubtype << 32) | baseType
 
 ### GET `/api/v1/sessions` — 会话列表
 
-参数：`limit`、`offset`、`keyword`。翻页只按 `offset`；`cursor` 属于 ChatLab 面（见 `GET /chatlab/sessions`），这里多传会被忽略。
+**请求**
+
+```http
+GET /api/v1/sessions?limit=50&offset=0
+Authorization: Bearer <TOKEN>
+```
+
+**参数**
+
+| 参数 | 类型 | 必填 | 说明 |
+| ---- | ---- | ---- | ---- |
+| `limit` | number | 否 | 本页条数，默认 100，上限 10000 |
+| `offset` | number | 否 | 分页偏移，默认 0；**本面只按 `offset` 翻页** |
+| `keyword` | string | 否 | 关键词过滤 |
+
+`cursor` 属于 ChatLab 面（见 `GET /chatlab/sessions`），这里多传会被忽略。
+
+**响应**
 
 ```json
 { "success": true, "count": 315, "sessions": [
@@ -357,7 +453,25 @@ localType = (appmsgSubtype << 32) | baseType
 
 同一份实现也挂在规范约定的 `GET /chatlab/sessions/{id}/messages` 上：**同一个 handler、同一形状**，两条路径逐字节同形（回归见 `both_pull_paths_are_byte_identical`）。`/api/v1/...` 是 WeFlow 兼容面（安装版自己就有这条路径），`/chatlab/...` 是 ChatLab 的挂载点。
 
-参数：`since`、`end`、`limit`（默认/上限 5000）、`offset`；`talker` 由路径段 `{id}` 提供。返回 ChatLab 契约形状（`platformMessageId` 等键），并附带 `sync` 游标块：
+**请求**
+
+```http
+GET /api/v1/sessions/{id}/messages?since=0&limit=500
+Authorization: Bearer <TOKEN>
+```
+
+**参数**
+
+| 参数 | 类型 | 必填 | 说明 |
+| ---- | ---- | ---- | ---- |
+| `since` | string | 否 | 排他下界，Unix 秒或 `YYYYMMDD`（取当天 0 点）；缺省 = 全量 |
+| `end` | string | 否 | 上界，Unix 秒或 `YYYYMMDD`（含当天 23:59:59） |
+| `limit` | number | 否 | 单页条数，默认与上限均为 5000 |
+| `offset` | number | 否 | 页内偏移，默认 0 |
+
+`talker` 由路径段 `{id}` 提供。`since` / `end` 接受秒级时间戳或 `YYYYMMDD`：`end=YYYYMMDD` 是**包含**上界，解析为当天 23:59:59（否则传一个日期会得到空结果），`since=YYYYMMDD` 取当天 0 点。返回 ChatLab 契约形状（`platformMessageId` 等键），并附带 `sync` 游标块（见下方「响应」）。
+
+**响应**
 
 ```json
 { "chatlab": { "version": "0.0.2", "generator": "weflow-server", "exportedAt": 1700000000 },
@@ -374,10 +488,6 @@ localType = (appmsgSubtype << 32) | baseType
 ```
 
 `since` / `end` 接受秒级时间戳或 `YYYYMMDD`。`end=YYYYMMDD` 是**包含**上界，解析为当天 23:59:59（否则传一个日期会得到空结果）；`since=YYYYMMDD` 取当天 0 点。
-
-`members` 仅含**本页**出现过的发送者，已去重。
-
-`messages[].media` 是**媒体元数据**（`{type, fileName, md5}`）：无媒体时**整个键省略**，`md5` 取不到时省略该键。它**不代表字节可取** —— `fileName` 在这里始终是元数据名（本面不执行导出，不会回填成实际导出名）。
 
 `messages[].mediaId` 才是「**此刻取得到字节**」的承诺：出现时，按它去 `GET /api/v1/media/{id}` **必须成功**。判据是「本会话的导出目录下确实有这份文件、且名字由内容摘要派生」——两个条件缺一个就**整个键省略**（不是给 `null`、也不是给一个必 404 的句柄：调用方拿到 404 只会以为服务坏了，而它无从区分）。
 
@@ -479,7 +589,22 @@ localType = (appmsgSubtype << 32) | baseType
 
 ### GET `/api/v1/contacts` — 联系人
 
-参数：`limit`（默认 100，上限 10000）、`offset`、`keyword`。
+**请求**
+
+```http
+GET /api/v1/contacts?limit=100&offset=0
+Authorization: Bearer <TOKEN>
+```
+
+**参数**
+
+| 参数 | 类型 | 必填 | 说明 |
+| ---- | ---- | ---- | ---- |
+| `limit` | number | 否 | 本页条数，默认 100，上限 10000 |
+| `offset` | number | 否 | 分页偏移，默认 0 |
+| `keyword` | string | 否 | 关键词过滤 |
+
+**响应**
 
 ```json
 { "success": true, "count": 100, "total": 4533, "hasMore": true, "contacts": [
@@ -498,7 +623,21 @@ localType = (appmsgSubtype << 32) | baseType
 
 ### GET `/api/v1/group-members` — 群成员
 
-参数：`chatroomId`（或 `talker` 别名）、`includeMessageCounts=1`。
+**请求**
+
+```http
+GET /api/v1/group-members?chatroomId=<id>&includeMessageCounts=1
+Authorization: Bearer <TOKEN>
+```
+
+**参数**
+
+| 参数 | 类型 | 必填 | 说明 |
+| ---- | ---- | ---- | ---- |
+| `chatroomId` | string | 是 | 群 id（`talker` 为别名） |
+| `includeMessageCounts` | string | 否 | `1` 时 `messageCount` 为真实值，否则恒为 `0` |
+
+**响应**
 
 ```json
 { "success": true, "chatroomId": "...@chatroom", "count": 81, "fromCache": false,
@@ -523,17 +662,41 @@ localType = (appmsgSubtype << 32) | baseType
 
 `{id}` 是**导出文件名**（形如 `<md5>.<ext>`），也就是消息 `media.fileName` 或 `mediaId` 的值。调用方只需要一个名字，不必重复会话与媒体类型（按会话与类型分层的旧路径已不再提供）。
 
+**请求**
+
+```http
+GET /api/v1/media/{id}?access_token=<TOKEN>
+```
+
+**参数**
+
+| 参数 | 类型 | 必填 | 说明 |
+| ---- | ---- | ---- | ---- |
+| `id` | string(path) | 是 | 导出文件名（`<md5>.<ext>`），即消息的 `media.fileName` / `mediaId` |
+
 - 解析范围仅限导出根下的 `<会话>/<images|voices|videos|emojis>/<文件>` 四个类型目录，**不接受任何路径**；别的目录里就算躺着同名文件也不服务——那些位置不是导出管线写出来的，服务它们等于把「导出根」变成「任意文件根」；
 - 路径段先过 `pathsafe` 的边界规则（含尾点、尾空格、冒号这类 Windows 会特殊处理的分量），再在 `canonicalize` 后校验仍落在导出根内——符号链接可以让「文件存在」为真而真实目标在根外；
 - **同名多命中**：不同会话下可能有同名文件。候选**内容一致**时服务排序后的第一个；**内容不一致** 时返回 404（同名内容冲突）——随便挑一个等于把「出现即可取」变成「出现即可取到某个东西」，而调用方无从察觉。判内容先比大小，只有大小相同才逐字节读，因此成本是「候选数 × 文件大小」的线性量（回归见 `media_by_id_serves_an_exported_file`，含「同大小不同内容」的负例）；
 - 找不到、被拒绝、内容冲突都返回**同一个 404 统一信封** `{ "success": false, "code": 404, "message": "media not found" }`（冲突细节只写日志：回给客户端等于泄露「别的会话里有什么」）；内容按扩展名推断 MIME 输出；
 - **无就绪门控**：导出文件已在磁盘上，其可读性与当前是否有账号绑定无关。因此注销后若未带 `purge_media=1`，此前导出的文件仍可访问；要一并清除须在注销时显式请求。
 
+**响应**
+
+成功时返回媒体字节流，`content-type` 按扩展名推断（`image/jpeg` / `image/png` / `image/gif` / `image/webp` / `video/mp4` / `audio/wav` 等），带 `content-length`；找不到、被拒绝、内容冲突统一返回 404 信封 `{ "success": false, "code": 404, "message": "media not found" }`。
+
 > 按文件名解析、而不是维护一张「id → 路径」的登记表：登记表会与磁盘漂移——导出被清理后登记仍在，于是「出现即保证可取」就变成谎话。**磁盘本身就是唯一事实源**。也正因如此，只有**由内容摘要派生**的名字才作为句柄下发（见消息面的 `mediaId` 一节）：它同名即同内容，遍历所有会话的结果才是确定的。
 
 ### GET `/api/v1/push/messages` — SSE 事件流（免轮询推送）
 
 **无就绪门控**（对齐 qqflow-server）：事件总线与重放历史挂在进程级状态上，不属于任何单个账号。因此——
+
+**请求**
+
+```http
+GET /api/v1/push/messages?access_token=<TOKEN>
+```
+
+**参数**：无（`wxid` 查询参数仅作语义提示，不影响订阅内容）
 
 - **零账号时连接返回 200**（不是 503），先收到 `ready` 基线；账号注册并建索引完成后事件自然流入同一条连接，客户端无需在冷启动期退避重连；
 - **替换 `error` 态账号不会孤儿化订阅者**：改正密钥后重注册，已连接的客户端继续收到新账号的事件（旧实现每次注册新建总线，订阅者会静默失聪且不断线）；
@@ -543,6 +706,8 @@ localType = (appmsgSubtype << 32) | baseType
   - **条目清空**：上一个账号的事件对下一个账号没有意义。原先不清空的理由是「会破坏无关订阅者的 `Last-Event-ID` 重放」—— 那条理由来自**多账号**场景，而多账号已明确排除，故不再成立。
   - **`id` 计数器保留**：它是总线级单调序列。若跟着归零，带着旧 `Last-Event-ID` 重连的客户端会把新事件当成「已经收过」而**静默丢掉** —— 跳号看得见，丢事件看不见。
   - **基线带 `generation`**：客户端据此区分「注销后新账号刚开始」（该丢弃本地状态重新拉）与「自己漏收了」（该补拉）。少了它，这两种情况在协议上是同一件事。
+
+**响应**（SSE 事件流，`content-type: text/event-stream`）
 
 事件（`event:` 名）：
 
@@ -568,7 +733,32 @@ localType = (appmsgSubtype << 32) | baseType
 - 订阅端滞后（broadcast 缓冲被覆盖）时补发一帧 `sync`，携带**当前真实水位**，客户端可据此重新增量拉取。该帧不占用总线序号（它只针对这一个滞后订阅者，占号会导致其他客户端跳号）。
 - 进程收到退出信号时，服务端主动结束所有 SSE 流（**不等 3 秒宽限期超时**），客户端会看到连接正常关闭。
 
+### GET/POST `/api/v1/sync` — 手动增量同步
+
+**请求**
+
+```http
+POST /api/v1/sync
+Authorization: Bearer <TOKEN>
+```
+
+立即跑一次水位增量同步（正常情况下由文件监视自动触发，此端点用于强制对账）：
+
+**参数**：无
+
+**响应**
+
+```json
+{ "success": true, "newMessages": 3, "revokeMessages": 0 }
+```
+
+撤回计数键为 `revokeMessages`，不计入 `newMessages`。新消息同时会通过 SSE 推给已订阅的客户端。
+
+**这是一个触发器，不返回消息体** —— 消息的唯一读取面是 `/api/v1/messages` 与 ChatLab Pull，避免同一批数据出现第二种形状。WeFlow（安装版）没有这个接口，因此它没有可对齐的上游契约；qqflow-server 的 `/api/v1/sync` 返回同一形状。
+
 ## ChatLab 适配面（`/chatlab/*`）
+
+ChatLab 适配面是同一批数据在 `/chatlab/*` 上的另一套形状：发现面、消息面、拉取面、通知面四条路由，外加一份四阶段接入配方。下面先给接入步骤，再逐个端点评形状。
 
 ### 接入配方（四阶段，已用真实账号走通）
 
@@ -600,9 +790,25 @@ localType = (appmsgSubtype << 32) | baseType
 
 鉴权、错误信封、`Last-Event-ID` 重放与保活都与原生面**完全一致**（同一条总线、同一套连接机制）。
 
-### `GET /chatlab/sessions` — Pull 形状的发现面
+### GET `/chatlab/sessions` — Pull 形状的发现面
 
-响应（规范形状）：
+**请求**
+
+```http
+GET /chatlab/sessions?limit=50&cursor=<nextCursor>
+Authorization: Bearer <TOKEN>
+```
+
+**参数**
+
+| 参数 | 类型 | 必填 | 说明 |
+| ---- | ---- | ---- | ---- |
+| `keyword` | string | 否 | 按名称或 id 模糊匹配 |
+| `limit` | number | 否 | 本页条数，默认 100，上限 10000 |
+| `cursor` | string | 否 | 原样回传上一页的 `page.nextCursor`；缺省或解析失败退到 `offset` |
+| `offset` | number | 否 | `cursor` 的退路，默认 0 |
+
+**响应**（规范形状）
 
 ```json
 {
@@ -624,11 +830,32 @@ localType = (appmsgSubtype << 32) | baseType
 
 排序为 `lastMessageAt` 降序、`id` 升序 —— 稳定，游标翻页因此不会跳项或重复。
 
-### `GET /chatlab/messages` — 消息面
+### GET `/chatlab/messages` — 消息面
 
 ChatLab 形状的消息查询。它是 `/api/v1/messages` 的姊妹面：**参数解析、筛选、排序、切片与导出任务收集共用同一份实现**（同一批参数在两个面上给出同一批消息），差别在参数与信封。
 
-参数：`talker`（必填）、`limit`（默认 100、上限 10000）、`offset`、`cursor`（解析不了退回 `offset`，与发现面同规）、`start` / `end`、`keyword`、`media` 及类型开关 `image`/`voice`/`video`/`emoji`。**没有 `format` 参数** —— 这条面天生就是 ChatLab 形状。
+**请求**
+
+```http
+GET /chatlab/messages?talker=<id>&limit=20
+Authorization: Bearer <TOKEN>
+```
+
+**参数**
+
+| 参数 | 类型 | 必填 | 说明 |
+| ---- | ---- | ---- | ---- |
+| `talker` | string | 是 | 会话标识 |
+| `limit` | number | 否 | 本页条数，默认 100，上限 10000 |
+| `offset` | number | 否 | 分页偏移，默认 0 |
+| `cursor` | string | 否 | 解析不了退回 `offset`，与发现面同规 |
+| `start` / `end` | string | 否 | 时间边界，Unix 秒或 `YYYYMMDD` |
+| `keyword` | string | 否 | 关键词过滤 |
+| `media` | string | 否 | `1` 触发导出；类型开关 `image`/`voice`/`video`/`emoji` |
+
+**没有 `format` 参数** —— 这条面天生就是 ChatLab 形状，参数解析、筛选、排序、切片与导出任务收集与 `/api/v1/messages` 共用同一份实现。
+
+**响应**
 
 ```json
 {
@@ -654,16 +881,30 @@ ChatLab 形状的消息查询。它是 `/api/v1/messages` 的姊妹面：**参�
 
 `media=1` 时**真正执行导出**（每请求上限 200 项，规则与原生面相同：`file` 永不导出），并把**确实写出了摘要派生本地文件**的那些条目的 `messages[].media.fileName` 回填成**实际导出文件名** ——那时它才是可取句柄，可以喂给 `GET /api/v1/media/{id}`。没落盘的（外链、失败、超上限、平台给的名字）照常给元数据，不给句柄。
 
+`members` 仅含**本页**出现过的发送者，已去重（不是群名册）。
+
+`messages[].media` 是**媒体元数据**（`{type, fileName, md5}`）：无媒体时**整个键省略**，`md5` 取不到时省略该键；它**不代表字节可取**（`fileName` 在这里是元数据名，`media=1` 时才回填实际导出名）。
+
 字段语义（`accountName` / `groupNickname` / `media` 元数据 / `type` 枚举 / `platformMessageId` /`replyToMessageId`）与拉取面完全一致，见上文的拉取面一节。
 
-### `GET /chatlab/push/messages` — 通知面
+### GET `/chatlab/push/messages` — 通知面
 
 与 `/api/v1/push/messages` 唯一的差别是**帧的形状**：
+
+**请求**
+
+```http
+GET /chatlab/push/messages?access_token=<TOKEN>
+```
+
+**参数**：无
 
 | | `/api/v1/push/messages` | `/chatlab/push/messages` |
 |---|---|---|
 | 载荷 | 完整消息（含 `content` 与媒体元数据）| **只带标识与时间** |
 | 定位 | WeFlow 兼容面 —— 已有客户端在解析它 | 规范里的通知通道 |
+
+**响应**
 
 帧：
 
@@ -677,18 +918,6 @@ ChatLab 形状的消息查询。它是 `/api/v1/messages` 的姊妹面：**参�
 - `eventId` 与 `platformMessageId` 是**两个不同的号**：前者是事件通道自己的标识，后者是那条消息在平台上的 id（拉取时用它定位）。
 - **`platformMessageId` 按事件类型给**：撤回帧带上，`message.new` 恒为 `null`。新消息要把事件里的编号翻成平台消息号，得在推送热路径上逐事件查一次索引，而规范里这个字段是**可选**的 —— 定位新消息请用拉取面返回的同名字段，「收到通知后去拉那一页」本来就是这条通道的用法。撤回则相反：它是终态，不带上号客户端只能靠时间戳猜是哪条没了。
 - `sync` 基线帧带 `generation`（注销时递增），客户端据此区分「注销后新账号刚开始」与「自己漏收了」—— 前者该丢弃本地状态重新拉，后者该补拉。
-
-## GET/POST `/api/v1/sync` — 手动增量同步
-
-立即跑一次水位增量同步（正常情况下由文件监视自动触发，此端点用于强制对账）：
-
-```json
-{ "success": true, "newMessages": 3, "revokeMessages": 0 }
-```
-
-撤回计数键为 `revokeMessages`，不计入 `newMessages`。新消息同时会通过 SSE 推给已订阅的客户端。
-
-**这是一个触发器，不返回消息体** —— 消息的唯一读取面是 `/api/v1/messages` 与 ChatLab Pull，避免同一批数据出现第二种形状。WeFlow（安装版）没有这个接口，因此它没有可对齐的上游契约；qqflow-server 的 `/api/v1/sync` 返回同一形状。
 
 ## SNS（朋友圈，本地缓存只读）
 

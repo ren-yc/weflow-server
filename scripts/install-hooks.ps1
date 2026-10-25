@@ -93,6 +93,22 @@ else
     status=1
 fi
 
+# 结构门禁（目录/段落/列表项/骨架/结论/层级）。**暂时停用，存量清零后再接线**：
+# 接线时把下面 check_docs_structure 那段整体取消注释（含 rc==2 的拒绝放行分支）即可。
+# if [ -n "$py" ]; then
+#     "$py" scripts/check_docs_structure.py
+#     rc=$?
+#     if [ "$rc" = "2" ]; then
+#         echo "[结构检查] 扫描未执行，按拒绝放行处理；提交已阻止（诊断见上）。" >&2
+#         status=1
+#     elif [ "$rc" != "0" ]; then
+#         status=1
+#     fi
+# else
+#     echo "[结构检查] 未找到可用的 Python 3，无法执行 scripts/check_docs_structure.py；提交已阻止。" >&2
+#     status=1
+# fi
+
 exit $status
 '@
 

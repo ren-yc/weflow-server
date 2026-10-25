@@ -170,29 +170,34 @@ fn target_anchors(dir: &Path, target: &str) -> Option<HashSet<String>> {
     Some(set)
 }
 
-/// 扫描目标：这几份文档受守卫保护。
+/// 扫描目标：`docs/` 下的**全部** markdown 递归纳入，加上仓库根的 README/AGENTS。
+///
+/// 此前这里是一张硬编码清单（README、AGENTS、architecture、mcp、quickstart + `docs/*-api.md`），
+/// 于是任何**新增或移动**的文档都落在守卫盲区：`docs/README.md`（文档地图）与
+/// `docs/guides/*.md`（从 api 拆出的 how-to）不会被检查，`docs/` 子目录里断掉的跨文件锚
+/// 与失配的目录项也无人发现。改成递归遍历后，新增文档自动受保护——这正是「把纪律
+/// 下沉到机器」的本意：新增文档时不需要有人记得回来改这张清单。
+///
+/// 注意：这里按**文件系统**遍历，不看 git 索引，因此开发者放在 docs/ 下的未跟踪草稿
+/// 也会被纳入检查（本地可能因草稿里的死链而假红；CI 是干净检出，不受影响）。
+/// 这个代价是有意接受的：宁可本地多一次提醒，也不让真正的文档落进盲区。
 fn targets() -> Vec<PathBuf> {
-    let root = repo_root();
-    let mut out = vec![
-        root.join("README.md"),
-        root.join("AGENTS.md"),
-        root.join("docs/architecture.md"),
-        root.join("docs/mcp.md"),
-        root.join("docs/quickstart.md"),
-    ];
-    if let Ok(entries) = fs::read_dir(root.join("docs")) {
-        let mut api: Vec<PathBuf> = entries
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.ends_with("-api.md"))
-                    .unwrap_or(false)
-            })
-            .collect();
-        api.sort();
-        out.extend(api);
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else { return };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().and_then(|s| s.to_str()) == Some("md") {
+                out.push(path);
+            }
+        }
     }
+    let root = repo_root();
+    let mut out = vec![root.join("README.md"), root.join("AGENTS.md")];
+    walk(&root.join("docs"), &mut out);
+    out.sort();
+    out.dedup();
     out
 }
 

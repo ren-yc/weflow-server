@@ -85,6 +85,8 @@ if ($LASTEXITCODE -ne 0) { throw "weflow-server 发布失败（退出码 $LASTEX
 
 ## 预演
 
+正式发布前先在**本机**把两个渠道各预演一遍：PyPI 传到 testpypi，crates.io 只列清单不真传。预演只验证打包与上传链路，不产生正式发布。
+
 ### PyPI（testpypi，本机）
 
 同一版本不能重复上传 testpypi，所以再预演时要么换个开发号（如 `<此版本>.dev1`，试完还原），要么把 CI 也接上 TestPyPI 并给上传步加 `skip-existing`（0.9.0 一轮已实测做过，命令原文见文末「历史案例」）。

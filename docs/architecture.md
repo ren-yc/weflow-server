@@ -146,6 +146,8 @@ clients/                       # 类型化 SDK（rust / python / ts；ts 未发�
 
 ## 服务层
 
+服务层是「HTTP 请求 → 路由 → 处理器 → 存储」的全部实现面：路由表、鉴权、响应信封与各端点的处理逻辑都在这里。以下按主题分述，具体源码位置随小节给出。
+
 ### 路由、方法与鉴权
 
 路由与方法的**唯一事实源**是 `server::routes::ROUTES`（`build_router` 由它构建，对等性怎么强制见「测试与夹具」）。方法口径是「**读端点只有 GET，动作端点保留 GET+POST**」：
@@ -204,6 +206,8 @@ clients/                       # 类型化 SDK（rust / python / ts；ts 未发�
 
 ## 工程与工具链
 
+工程与工具链回答「怎么构建、怎么测、怎么装钩子、CI 有哪些门」：一条包装脚本覆盖构建与测试，工具链版本与构建 profile 钉死，提交钩子与 CI 门禁在这里落地。以下逐项说明取舍。
+
 ### 一条命令：`scripts/build.ps1`（或 `.sh`）
 
 构建、测试、clippy **都必须走包装脚本**。原因不是偏好：rusqlite 捆绑 SQLCipher + vendored OpenSSL，后者的 perl `Configure` 会直接调 `cl.exe` / `link.exe`，**绕过 cc crate 的自动 MSVC 探测**——没有 `vcvars64.bat` 注入的 `INCLUDE`/`LIB`/`PATH` 就编译不过。脚本同时把 **Strawberry Perl** 放到 `PATH` 前面：Git 自带的 MSYS perl 会把 Windows 路径写坏。工具链版本钉在 `rust-toolchain.toml`。
@@ -254,6 +258,8 @@ Python 只用于钩子与套件执行器，**纯标准库**——CI 与开发机
 2. **链接期 `LNK4099`（找不到 `ossl_static.pdb`）**：vendored OpenSSL 的静态库引用了自己的调试信息，而发布物里没有那份 PDB。**只影响调试信息，不影响代码**。（**为什么不消掉**：给 Windows 链接器加 `/ignore:4099` 能一并静音，但也会**隐藏将来真实的 LNK4099**；让 vendored OpenSSL 不带调试信息实测不可靠。两害相权，选择保留噪声。）
 
 ## 测试与夹具
+
+测试分三类、各有各的诚实边界：单元测试不碰库、集成测试造库不造索引、真库探针只在门控下跑。以下说明三类怎么分、夹具为什么只能造库。
 
 ### 三类测试，三种诚实
 

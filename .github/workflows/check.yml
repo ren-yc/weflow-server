@@ -103,6 +103,18 @@ jobs:
         if: runner.os != 'Windows'
         run: python3 scripts/check_docs.py --tree
 
+      # 文档结构门禁：目录 / 段落预算 / 列表项长度 / 端点骨架 / 节首结论 / 端点层级。
+      # 覆盖 AGENTS.md「文档排版」里原本只有折点一条有守卫的其余规则。
+      #
+      # **本步暂时注释掉，等存量清零后再接线。** 理由：门禁一旦先上电就会长期变红，
+      # 把成本转给后续每一个提交者。脚本与这一步都已写好、只差取消注释——这样就不会
+      # 变成「永远不接线的待办」。接线时取消下面三行的注释即可（判据与豁免面见脚本
+      # 头部注释；退出码 2 = 扫描未执行，同样按拒绝放行）。
+      #
+      # - name: Document structure check (tracked md)
+      #   if: runner.os != 'Windows'
+      #   run: python3 scripts/check_docs_structure.py --tree
+
       # 直推 master 的路径不经过本地钩子，所以提交信息必须在这里再扫一遍。
       - name: Forbidden references (commit messages)
         if: runner.os != 'Windows'
