@@ -49,7 +49,7 @@ curl -H "Authorization: Bearer $WEFLOW_TOKEN" \
 
 `since` 缺省等于全量；`limit` 分页时响应**必须**带 `sync` 块。去重按 `platformMessageId`。
 
-深入：api 文档的「ChatLab 适配面（`/chatlab/*`）」各小节，翻页与条数数字看「通用查询参数」里的上限表。
+深入：api 文档的「ChatLab 适配面（`/chatlab/*`）」各小节，翻页与条数数字看「通用查询参数」里的上限列表。
 
 ## 配方二：只要增量（watcher / SSE）
 

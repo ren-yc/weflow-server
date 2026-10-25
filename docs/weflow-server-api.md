@@ -12,7 +12,7 @@
 本文近 90 KB，是端点参考而不是教程；按目标挑一条最短路径走：
 
 - **第一次跑通（获取→起服务→注册→查询）** — 先读这里：[quickstart](quickstart.md)；再读：本文「鉴权」「错误信封」
-- **接 ChatLab 前端** — 先读这里：quickstart 配方一；再读：「ChatLab 适配面（`/chatlab/*`）」＋「通用查询参数」里的上限表
+- **接 ChatLab 前端** — 先读这里：quickstart 配方一；再读：「ChatLab 适配面（`/chatlab/*`）」＋「通用查询参数」里的上限列表
 - **程序化取数 / 翻页** — 先读这里：本文「端点总览」→ 对应端点小节；再读：「类型化客户端（SDK）」
 - **只要增量（watcher/SSE）** — 先读这里：quickstart 配方二；再读：端点小节「SSE 事件流（免轮询推送）」
 - **批量导出（含媒体）** — 先读这里：quickstart 配方三；再读：「批量导出（`export`）」
@@ -55,15 +55,13 @@
 
 > **没有 ChatLab 开关**：`format=chatlab` / `chatlab=1` 已不存在，原生面只输出原生/富数据形状。ChatLab 形状一律走 `/chatlab/*`（见「ChatLab 适配面」）—— 调用方不必知道还有另一种形状，也不会因为漏传一个开关而拿到另一种。
 
-> **「上限」分属五个不同的面，别互相换算**（文档里 200／500／5000／10000 都出现过，混读会得出「两仓口径不一致」的错误结论；下表按源码实测逐端点列出）：
+> **「上限」分属五个不同的面，别互相换算**（文档里 200／500／5000／10000 都出现过，混读会得出「两仓口径不一致」的错误结论；下方列表按源码实测逐端点列出）：
 >
-> | 数字 | 属于哪个面 | 含义（源码位置：各 handler 的 `parse_limit`／`clamp`） |
-> |---|---|---|
-> | **10000** | `GET /api/v1/sessions`、`/api/v1/contacts`、`/api/v1/messages`、`/chatlab/messages` | **单个请求返回条数**的硬上限（`limit` 默认 100） |
-> | **5000** | Pull 面 `GET /api/v1/sessions/{id}/messages` 与 `/chatlab/sessions/{id}/messages` | 单页上限 5000，且**默认也是 5000**（与上面那几个面的默认 100 不同） |
-> | **500** | `GET /api/v1/sns/timeline` | 朋友圈时间线单请求上限（默认 50）；这是朋友圈自己的面，与消息条数无关 |
-> | **200**（MCP）| MCP 工具参数 `limit`（见 `docs/mcp.md`）| **工具层**对一次取页的默认 50／上限 200，比 HTTP 更严；它是「模型经 MCP 取数据」这一层的自限，与 HTTP 上限不构成矛盾 |
-> | **200**（导出）| `media=1` 的**每请求导出项上限**（见「媒体导出」小节）| 一次请求**最多触发 200 项媒体导出**，不是返回条数上限；超出的项保持未导出，`exported` 不为真 |
+> - **10000** — 属于哪个面：`GET /api/v1/sessions`、`/api/v1/contacts`、`/api/v1/messages`、`/chatlab/messages`；含义（源码位置：各 handler 的 `parse_limit`／`clamp`）：**单个请求返回条数**的硬上限（`limit` 默认 100）
+> - **5000** — 属于哪个面：Pull 面 `GET /api/v1/sessions/{id}/messages` 与 `/chatlab/sessions/{id}/messages`；含义（源码位置：各 handler 的 `parse_limit`／`clamp`）：单页上限 5000，且**默认也是 5000**（与上面那几个面的默认 100 不同）
+> - **500** — 属于哪个面：`GET /api/v1/sns/timeline`；含义（源码位置：各 handler 的 `parse_limit`／`clamp`）：朋友圈时间线单请求上限（默认 50）；这是朋友圈自己的面，与消息条数无关
+> - **200**（MCP） — 属于哪个面：MCP 工具参数 `limit`（见 `docs/mcp.md`）；含义（源码位置：各 handler 的 `parse_limit`／`clamp`）：**工具层**对一次取页的默认 50／上限 200，比 HTTP 更严；它是「模型经 MCP 取数据」这一层的自限，与 HTTP 上限不构成矛盾
+> - **200**（导出） — 属于哪个面：`media=1` 的**每请求导出项上限**（见「媒体导出」小节）；含义（源码位置：各 handler 的 `parse_limit`／`clamp`）：一次请求**最多触发 200 项媒体导出**，不是返回条数上限；超出的项保持未导出，`exported` 不为真
 >
 > 两点容易踩的坑：① `GET /api/v1/group-members` **没有 `limit`**（整名册一次给全，不参与上面的换算）；② SDK 形参 `page_size`（`list_all_sessions`）**不是 HTTP 参数名**——它内部发的就是 `limit`，拿它当「另一个上限」会算错。所以「联系人一次最多能拿多少」＝10000，走 MCP 则被压到 200，而 `media=1` 的 200 与这两者**无关**。
 
