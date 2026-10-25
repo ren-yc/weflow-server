@@ -29,7 +29,7 @@ async fn main() -> Result<(), ClientError> {
 }
 ```
 
-需要 `tokio`（`rt-multi-thread` ＋ `macros`）作为依赖 —— SDK 自身用 tokio 做超时与重试。
+Requires `tokio` (`rt-multi-thread` + `macros`) as a dependency — the SDK itself uses tokio for timeouts and retries.
 
 ## Scope
 

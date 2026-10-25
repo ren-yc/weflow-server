@@ -1,52 +1,63 @@
-# weflow-server TypeScript 示例客户端
+# weflow-server TypeScript example client
 
-**仅示例，不发布 npm**：TypeScript 当前没有真实消费者，本目录的定位是
-「可运行的最小参考」，不承诺兼容性、不进任何发布渠道。
+**Example only — not published to npm**: TypeScript currently has no real
+consumers; this directory is positioned as a "minimal runnable reference" with
+no compatibility guarantee and no release channel.
 
-## 内容
+## Contents
 
-- `client.ts` —— 类型化示例客户端：`health` / `accounts` / `wait_ready`
-  （wait-only 就绪轮询，不做任何注册动作）/ `ensure_ready`（注册 + 注册
-  应答里 200 拒绝态的快速失败，拒绝词表与 Rust/Python 行为层一致）/
-  `watch`（SSE 单连接连续多帧：字节级 LF 分帧、`id:`/`event:`/`data:`
-  组装、空行成帧、`Last-Event-ID` 续读、指数退避、1 MiB 缓冲上限——超限帧
-  不交付并退避重连）。演示级子集：分帧与退避的**形状**与 Rust/Python 行为层
-  对齐，不承诺逐语义一致、不承诺兼容性。
-- `smoke.ts` —— 可执行冒烟：对真实服务发请求并**真断言** HTTP 结果
-  （「import 成功」不算冒烟）。第 3 步只接受两种合法结局——业务拒绝
-  （`StatusError`，消息带 state）或受理后就绪等待超时（`NotReadyError`）；
-  其它结局（415 / 500 / 网络错误 / 未知异常）一律非零退出。凭据从环境
-  变量注入，不使用真实数据。
-- `stub-server.mjs` —— 入库的最小假服务：假的是**形状**，不是断言。没有
-  真实服务时用它跑 smoke；把注册应答改成 500（`STUB_STATUS=500`）时同一条
-  smoke **必须**非零退出——这条自证让「PASS」成为可失败的断言。
+- `client.ts` — typed example client: `health` / `accounts` / `wait_ready`
+  (wait-only readiness polling, performs no registration) / `ensure_ready`
+  (registration + fast-fail on the 200 rejection state in the registration
+  response, with the same rejection vocabulary as the Rust/Python behavior
+  layer) / `watch` (SSE single-connection multi-frame streaming: byte-level LF
+  framing, `id:`/`event:`/`data:` assembly, blank-line-delimited frames,
+  `Last-Event-ID` resume, exponential backoff, 1 MiB buffer cap — over-cap
+  frames are not delivered and trigger a backoff reconnect). Demo-grade subset:
+  the **shape** of framing and backoff matches the Rust/Python behavior layer;
+  it does not promise per-semantics equivalence and does not promise
+  compatibility.
+- `smoke.ts` — executable smoke test: sends requests to a real server and makes
+  **real assertions** on the HTTP results ("import succeeded" does not count as
+  a smoke test). Step 3 accepts only two legitimate outcomes — a business
+  rejection (`StatusError`, message carries state) or a readiness-wait timeout
+  after acceptance (`NotReadyError`); any other outcome (415 / 500 / network
+  error / unknown exception) exits non-zero. Credentials are injected via
+  environment variables; no real data is used.
+- `stub-server.mjs` — minimal in-repo fake server: what is fake is the
+  **shape**, not the assertions. Use it to run smoke without a real server;
+  when the registration response is changed to 500 (`STUB_STATUS=500`) the same
+  smoke **must** exit non-zero — this self-check makes "PASS" a failure-capable
+  assertion.
 
-## 运行
+## Running
 
-要求 Node **18+**（fetch 内置；更早版本需要额外 flag，不再支持）。
+Requires Node **18+** (fetch is built in; earlier versions need an extra flag
+and are no longer supported).
 
 ```bash
-npm install --include=dev    # 仅 devDependencies：typescript 与 @types/node
-                             # （NODE_ENV=production 的环境必须带 --include=dev，
-                             #  否则 npm 会静默跳过 devDependencies、tsc 不存在）
+npm install --include=dev    # devDependencies only: typescript and @types/node
+                             # (environments with NODE_ENV=production must pass --include=dev,
+                             #  otherwise npm silently skips devDependencies and tsc is absent)
 npm run typecheck            # tsc --noEmit
-npm run build                # tsc 编译到 dist/
+npm run build                # tsc compiles to dist/
 
-# 对真实服务：
+# Against a real server:
 WEFLOW_BASE_URL=http://127.0.0.1:5033 WEFLOW_API_TOKEN=<token> node dist/smoke.js
 
-# 对入库 stub（无需真实服务）：
-node stub-server.mjs &                              # 端口 5099，默认注册=业务拒绝
-WEFLOW_API_TOKEN=fictional node dist/smoke.js       # 必须 PASS
-# 自证（改 stub 应答后必须变红）：
+# Against the in-repo stub (no real server needed):
+node stub-server.mjs &                              # port 5099, default registration = business rejection
+WEFLOW_API_TOKEN=fictional node dist/smoke.js       # must PASS
+# Self-check (must turn red after changing the stub response):
 STUB_STATUS=500 node stub-server.mjs &
-WEFLOW_API_TOKEN=fictional node dist/smoke.js       # 必须非零退出
+WEFLOW_API_TOKEN=fictional node dist/smoke.js       # must exit non-zero
 ```
 
-两仓的 TS 示例等价：同一组端点与结局语义；`watch` 本仓是异步生成器、
-qqflow 版是回调（形状差异，非语义差异）。
+The TS examples in the two repositories are equivalent: same set of endpoints
+and outcome semantics; `watch` here is an async generator while the qqflow
+version is callback-based (a shape difference, not a semantic one).
 
-## 边界
+## Boundaries
 
-不修改 `release.yml` 的产物矩阵：TypeScript 侧保持「本机可用 + 示例」，
-不新增任何发布产物。
+`release.yml`'s artifact matrix is not modified: the TypeScript side stays
+"locally usable + example", and no release artifact is added.
