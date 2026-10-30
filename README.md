@@ -1,5 +1,11 @@
 # weflow-server
 
+[![crates.io](https://img.shields.io/crates/v/weflow-server.svg)](https://crates.io/crates/weflow-server)
+
+[![CI](https://img.shields.io/github/actions/workflow/status/ren-yc/weflow-server/check.yml)](https://github.com/ren-yc/weflow-server/actions)
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 无头 HTTP API + SSE 服务：实时监控、解密并提取本地 **微信 4.x** 聊天记录（`xwechat_files/<wxid>/db_storage`，WCDB/SQLCipher-4 风格加密）。
 
 独立纯 Rust 实现，架构参考同目录 `qqflow-server`，接口契约对齐 **WeFlow HTTP API**。
@@ -78,15 +84,15 @@ curl -H "Authorization: Bearer $WEFLOW_TOKEN" \
 
 ## 去哪看细节
 
-- **这个版本改了什么（逐版行为变化与迁移）**：[CHANGELOG.md](CHANGELOG.md)
-- **按任务怎么做（ChatLab/增量/导出/MCP/恢复）**：[docs/quickstart.md](docs/quickstart.md)
-- **HTTP 端点、错误形状**：[docs/weflow-server-api.md](docs/weflow-server-api.md)
-- **命令行子命令、退出码、日志旗标、批量导出、启动示例**：[docs/guides/](docs/guides/)
-- **模块职责、feature 矩阵、嵌入与测试纪律**：[docs/architecture.md](docs/architecture.md)
-- **agent 客户端接入（stdio MCP）**：[docs/mcp.md](docs/mcp.md)
-- **发版流程与凭据/审批闸门**：[docs/release-runbook.md](docs/release-runbook.md)
-- **贡献者命令、钩子、提交规范、作为库嵌入**：[AGENTS.md](AGENTS.md) 与 [examples/embed.rs](examples/embed.rs)
-- **类型化 SDK**：`clients/rust`、`clients/python`；`clients/ts` **未发布 npm**，从源码取
+完整文档地图见 [docs/README.md](docs/README.md)：按 [Diátaxis](https://diataxis.fr/) 四类分工组织，另单列贡献入口；先按「我要做什么」选一份开始读。
+
+- 教程（第一次跑通）：[docs/quickstart.md](docs/quickstart.md)
+- 操作指南（按任务取数、接 MCP、发版）：[docs/guides/](docs/guides/)、[docs/mcp.md](docs/mcp.md)、[docs/release-runbook.md](docs/release-runbook.md)
+- 参考（查端点、参数、字段、变更）：[docs/weflow-server-api.md](docs/weflow-server-api.md)、[CHANGELOG.md](CHANGELOG.md)
+- 解释（理解架构与取舍）：[docs/architecture.md](docs/architecture.md)
+- 贡献（命令、门禁、提交规范）：[AGENTS.md](AGENTS.md)
+
+类型化 SDK 见 `clients/`（`clients/ts` 未发布 npm，从源码取）；作为库嵌入见 [examples/embed.rs](examples/embed.rs)。
 
 ## 鸣谢
 
