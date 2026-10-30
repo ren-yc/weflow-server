@@ -72,7 +72,8 @@ curl -H "Authorization: Bearer $WEFLOW_TOKEN" \
 
 - **这个版本改了什么（逐版行为变化与迁移）**：[CHANGELOG.md](CHANGELOG.md)
 - **按任务怎么做（ChatLab/增量/导出/MCP/恢复）**：[docs/quickstart.md](docs/quickstart.md)
-- **HTTP 端点、CLI、退出码、错误形状**：[docs/weflow-server-api.md](docs/weflow-server-api.md)
+- **HTTP 端点、错误形状**：[docs/weflow-server-api.md](docs/weflow-server-api.md)
+- **命令行子命令、退出码、日志旗标、批量导出、启动示例**：[docs/guides/](docs/guides/)
 - **模块职责、feature 矩阵、嵌入与测试纪律**：[docs/architecture.md](docs/architecture.md)
 - **agent 客户端接入（stdio MCP）**：[docs/mcp.md](docs/mcp.md)
 - **发版流程与凭据/审批闸门**：[docs/release-runbook.md](docs/release-runbook.md)

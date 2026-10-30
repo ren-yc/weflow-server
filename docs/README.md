@@ -15,12 +15,19 @@
 
 ## 阅读路径
 
+按你的角色挑一条最短路径：
+
 - **第一次接触本仓**：先 [quickstart.md](quickstart.md) 跑通，再按上面的表挑任务。
 - **要改代码**：[architecture.md](architecture.md) → 根目录 [AGENTS.md](../AGENTS.md)（命令、门禁、提交规范）。
 - **改接口或行为**：[weflow-server-api.md](weflow-server-api.md) 是端点事实的唯一来源；改动须同步回写该文件与 `architecture.md`（见公共段的「文档同步义务」）。
 
 ## 其它入口
 
-- 逐版行为变化与迁移方式：[CHANGELOG.md](../CHANGELOG.md)
-- 类型化客户端：`clients/rust`、`clients/python`（`clients/ts` 未发布 npm，从源码取）
-- 本目录之外：根目录 [README.md](../README.md) 是项目门面，[AGENTS.md](../AGENTS.md) 是协作规范
+本表之外的入口（不属 Diátaxis 四类，单列）：
+
+| 我想… | 读这个 | 类型 |
+|---|---|---|
+| 逐版行为变化与迁移方式 | [CHANGELOG.md](../CHANGELOG.md) | 参考（时间序） |
+| 装 SDK 用客户端 | `clients/rust`、`clients/python`（`clients/ts` 未发布 npm，从源码取） | 操作指南 |
+| 贡献代码（命令、门禁、提交规范） | [AGENTS.md](../AGENTS.md) | 操作指南 |
+| 看项目门面 | [README.md](../README.md) | — |
