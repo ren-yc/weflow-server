@@ -42,9 +42,9 @@
 | HTTP 头 | `Authorization: Bearer <token>` |
 | 查询参数 | `?access_token=<token>` |
 
-> 只有这两条。`X-Api-Key`、`?token=` 这第二种拼写、以及 POST JSON body 都**不是**通道：每多一条就多一处凭据会被复制到的地方（请求体、代理日志、客户端抓包），而它们鉴权的是同一个东西。body 尤其不成立 —— 它连「这是谁的凭据」都区分不出来：`handlers::extract_params` 从不把 `access_token` / `token` 从 body 带进参数表。
+> [!WARNING] 只有这两条。`X-Api-Key`、`?token=` 这第二种拼写、以及 POST JSON body 都**不是**通道：每多一条就多一处凭据会被复制到的地方（请求体、代理日志、客户端抓包），而它们鉴权的是同一个东西。body 尤其不成立 —— 它连「这是谁的凭据」都区分不出来：`handlers::extract_params` 从不把 `access_token` / `token` 从 body 带进参数表。
 
-> 两种传输的 token 比对均为**常时比较**（constant-time，无提前返回，防时序侧信道；与 qqflow-server 同款）。
+> [!NOTE] 两种传输的 token 比对均为**常时比较**（constant-time，无提前返回，防时序侧信道；与 qqflow-server 同款）。
 
 ## 错误信封
 
@@ -56,7 +56,7 @@
 - 两条兜底文案是中文：405 为「方法不允许」、未知路径 404 为「未知路径」，与注册/参数类错误的英文文案混布在同一信封内——按语言匹配提示的脚本不要假设 `message` 恒为英文。回归位置：快照 `error-method-not-allowed`／`error-unknown-path`。
 - 会话/群 404 的触发条件（0.10.0 起）：只有「会话名册、消息索引、群名册都不认识这个 id」才 404；`messageCount:0` 的会话在消息面与拉取面是 200 空页（判「有没有内容」读 `count`/`hasMore`，判「存不存在」读 404）；群成员面对未知群号 404（此前 200 空表）。
 
-> 这里**没有 403**：本服务只有「有 token / 没 token」这一种授权判断，不存在「已认证但无权访问」的场景，因此没有构造器。此前文档写了 403 —— 那是照抄通用清单，**不要为它补一个假的实现**；真出现权限模型时再加。
+> [!NOTE] 这里**没有 403**：本服务只有「有 token / 没 token」这一种授权判断，不存在「已认证但无权访问」的场景，因此没有构造器。此前文档写了 403 —— 那是照抄通用清单，**不要为它补一个假的实现**；真出现权限模型时再加。
 
 ## 通用查询参数
 
@@ -67,9 +67,9 @@
 - **`keyword`**：关键词过滤（小写匹配；sessions/contacts/messages 通用）
 - **导出开关**：`media=1` 开启媒体导出；再按类型 `image=1`/`voice=1`/`video=1`/`emoji=1` 收窄到某一类
 
-> **没有 ChatLab 开关**：`format=chatlab` / `chatlab=1` 已不存在，原生面只输出原生/富数据形状。ChatLab 形状一律走 `/chatlab/*`（见「ChatLab 适配面」）—— 调用方不必知道还有另一种形状，也不会因为漏传一个开关而拿到另一种。
+> [!NOTE] **没有 ChatLab 开关**：`format=chatlab` / `chatlab=1` 已不存在，原生面只输出原生/富数据形状。ChatLab 形状一律走 `/chatlab/*`（见「ChatLab 适配面」）—— 调用方不必知道还有另一种形状，也不会因为漏传一个开关而拿到另一种。
 
-> **「上限」分属五个不同的面，别互相换算**（文档里 200／500／5000／10000 都出现过，混读会得出「两仓口径不一致」的错误结论；下方列表按源码实测逐端点列出）：
+> [!NOTE] **「上限」分属五个不同的面，别互相换算**（文档里 200／500／5000／10000 都出现过，混读会得出「两仓口径不一致」的错误结论；下方列表按源码实测逐端点列出）：
 >
 > - **10000** — 属于哪个面：`GET /api/v1/sessions`、`/api/v1/contacts`、`/api/v1/messages`、`/chatlab/messages`；含义（源码位置：各 handler 的 `parse_limit`／`clamp`）：**单个请求返回条数**的硬上限（`limit` 默认 100）
 > - **5000** — 属于哪个面：Pull 面 `GET /api/v1/sessions/{id}/messages` 与 `/chatlab/sessions/{id}/messages`；含义（源码位置：各 handler 的 `parse_limit`／`clamp`）：单页上限 5000，且**默认也是 5000**（与上面那几个面的默认 100 不同）
@@ -111,7 +111,7 @@
 | `/api/v1/sns/export/stats` | GET、POST | 导出统计 | 同上 |
 | `/api/v1/sns/media/proxy` | GET、POST | 朋友圈媒体代理（CDN 鉴权墙字节的取回路径） | 同上 |
 
-> SNS 一族**不进 `/openapi.json`**：它们强绑定 XML 形状、尚未 DTO 化，豁免登记在 `routes.rs` 的 `NOT_DOCUMENTED`（漏写或多写豁免都会被上面那条测试判红）。
+> [!NOTE] SNS 一族**不进 `/openapi.json`**：它们强绑定 XML 形状、尚未 DTO 化，豁免登记在 `routes.rs` 的 `NOT_DOCUMENTED`（漏写或多写豁免都会被上面那条测试判红）。
 
 ### GET `/openapi.json` — 接口描述（**免鉴权**）
 
@@ -432,7 +432,7 @@ localType = (appmsgSubtype << 32) | baseType
 - 例外：表情（`emoji`）可能返回 CDN 绝对地址，那是第三方地址，不是本服务的路径。
 - `type`→目录映射：`images / voices / videos / emojis`。
 
-> 文件附件（`file`）暂不参与导出：与 WeFlow 官方契约一致，媒体导出仅覆盖图片/语音/视频/表情四类。
+> [!NOTE] 文件附件（`file`）暂不参与导出：与 WeFlow 官方契约一致，媒体导出仅覆盖图片/语音/视频/表情四类。
 
 `appmsgSubtype == 6` 的文件附件会带 `media` 对象（`type: "file"`，含真实 `fileName` 与 `md5`），但 `exported` **恒为假** —— 文件类被导出闸门显式拒绝，不是因为缺字段。SSE 推送的 `media` 元数据同形。
 
@@ -770,7 +770,7 @@ content-length: <字节数>
 
 找不到、被拒绝、内容冲突统一返回 404 信封 `{ "success": false, "code": 404, "message": "media not found" }`。
 
-> 按文件名解析、而不是维护一张「id → 路径」的登记表：登记表会与磁盘漂移——导出被清理后登记仍在，于是「出现即保证可取」就变成谎话。**磁盘本身就是唯一事实源**。也正因如此，只有**由内容摘要派生**的名字才作为句柄下发（见消息面的 `mediaId` 一节）：它同名即同内容，遍历所有会话的结果才是确定的。
+> [!NOTE] 按文件名解析、而不是维护一张「id → 路径」的登记表：登记表会与磁盘漂移——导出被清理后登记仍在，于是「出现即保证可取」就变成谎话。**磁盘本身就是唯一事实源**。也正因如此，只有**由内容摘要派生**的名字才作为句柄下发（见消息面的 `mediaId` 一节）：它同名即同内容，遍历所有会话的结果才是确定的。
 
 ### GET `/api/v1/push/messages` — SSE 事件流（免轮询推送）
 
@@ -1042,9 +1042,9 @@ timeline/export 的条目键：
 - **`likes`／`comments` 每项**含 `username/nickname/createTime`（`comments` 另含 `content`）。
 - **回归位置**：`sns_json_export_drops_credential_media_keys`。
 
-> **导出物不含取图凭据**：`token`／`key`（微信侧的访问与解密参数）与两个同值冗余键 `rawThumb`／`resolvedThumbUrl` 已从 JSON 导出移除。代理端点只读 `url`（＋可选 `referer`/`user_agent`），所以移除不影响任何取图路径；导出文件常被转发、存档或贴进别处，留着凭据等于每个导出包多带一份第三方能直接使用的材料。**迁移方式**：需要凭据的调用方改走 `/api/v1/sns/media/proxy?url=…`（代理路径已在 `url`/`proxyUrl` 里给出），不要依赖导出物内的原始凭据。`rawUrl` 刻意保留：它是协议白名单的审计线索（HTML 渲染器不读它，恶意 scheme 因此进不了 `href`，而读者要能看见被拒的原始地址）。回归位置：`sns_json_export_drops_credential_media_keys`。
+> [!WARNING] **导出物不含取图凭据**：`token`／`key`（微信侧的访问与解密参数）与两个同值冗余键 `rawThumb`／`resolvedThumbUrl` 已从 JSON 导出移除。代理端点只读 `url`（＋可选 `referer`/`user_agent`），所以移除不影响任何取图路径；导出文件常被转发、存档或贴进别处，留着凭据等于每个导出包多带一份第三方能直接使用的材料。**迁移方式**：需要凭据的调用方改走 `/api/v1/sns/media/proxy?url=…`（代理路径已在 `url`/`proxyUrl` 里给出），不要依赖导出物内的原始凭据。`rawUrl` 刻意保留：它是协议白名单的审计线索（HTML 渲染器不读它，恶意 scheme 因此进不了 `href`，而读者要能看见被拒的原始地址）。回归位置：`sns_json_export_drops_credential_media_keys`。
 
-> **usernames 与 timeline 的取值链**：`/api/v1/sns/usernames` 默认给**显示名**，而 timeline 的 `username` 过滤认的是**原始 wxid**——直接拿默认输出回填 timeline 会得到 `total:0` 且无任何告警。回填请用 `verbose=1` 返回的 `username` 字段。
+> [!WARNING] **usernames 与 timeline 的取值链**：`/api/v1/sns/usernames` 默认给**显示名**，而 timeline 的 `username` 过滤认的是**原始 wxid**——直接拿默认输出回填 timeline 会得到 `total:0` 且无任何告警。回填请用 `verbose=1` 返回的 `username` 字段。
 
 ## 数据获取与安全模型
 
