@@ -881,7 +881,6 @@ Authorization: Bearer <TOKEN>
 
 `media=1` 时**真正执行导出**（每请求上限 200 项，规则与原生面相同：`file` 永不导出），并把**确实写出了摘要派生本地文件**的那些条目的 `messages[].media.fileName` 回填成**实际导出文件名** ——那时它才是可取句柄，可以喂给 `GET /api/v1/media/{id}`。没落盘的（外链、失败、超上限、平台给的名字）照常给元数据，不给句柄。
 
-`members` 仅含**本页**出现过的发送者，已去重（不是群名册）。
 
 `messages[].media` 是**媒体元数据**（`{type, fileName, md5}`）：无媒体时**整个键省略**，`md5` 取不到时省略该键；它**不代表字节可取**（`fileName` 在这里是元数据名，`media=1` 时才回填实际导出名）。
 
@@ -1036,6 +1035,7 @@ timeline/export 的条目键：`tid/id/username/nickname/avatarUrl/createTime/co
    回归位置：`export::tests::resume_rewrites_an_incomplete_artifact`、`export::tests::failed_rerun_keeps_the_previous_complete_artifact`、`cli_e2e::export_writes_a_file_against_a_live_service`（含续跑第二次退 0）。
 
 内存：JSONL 逐页写盘、写完即丢，**峰值常驻集与消息条数无关**；`--with-media` 的句柄映射现在**只活在这一页**（O(本页不同媒体数)，不随会话长度增长），因此媒体侧不再破坏这条承诺。同秒组的消息会被服务端扩页带出（Pull 段的「同秒扩页」），那一项仍在承诺之外。大语料的实测口径与造库工具（隐藏的 `--rows` 参数，仅 `testing` feature 下编译进二进制）见 `docs/architecture.md` 的「测试与夹具」。
+
 ## 启动示例
 
 ```powershell
