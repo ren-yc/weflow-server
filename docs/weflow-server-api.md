@@ -7,6 +7,20 @@
 - 所有 `/api/v1/*` 端点需要鉴权；`/health` 与 `/api/v1/health` 不需要
 - 与 qqflow-server 的**有意差异**（SNS 仅本仓、`messageCount` 群成员面条件键、`meta.type` 推导面、默认端口、SDK/ts 状态）见 [flow-contract ADAPTATION.md](https://github.com/ren-yc/flow-contract/blob/master/ADAPTATION.md)。
 
+> 本文是**端点参考**；任务型操作见 [quickstart](quickstart.md) 与 [guides/](guides/)（命令行子命令、批量导出、启动示例）。
+
+## 目录
+
+- [最小必读路径](#最小必读路径)
+- [鉴权](#鉴权)
+- [错误信封](#错误信封)
+- [通用查询参数](#通用查询参数)
+- [端点](#端点)
+- [ChatLab 适配面](#chatlab-适配面chatlab)
+- [SNS](#sns朋友圈本地缓存只读)
+- [数据获取与安全模型](#数据获取与安全模型)
+- [类型化客户端（SDK）](#类型化客户端sdk)
+
 ## 最小必读路径
 
 本文近 90 KB，是端点参考而不是教程；按目标挑一条最短路径走：
@@ -15,8 +29,8 @@
 - **接 ChatLab 前端** — 先读这里：quickstart 配方一；再读：「ChatLab 适配面（`/chatlab/*`）」＋「通用查询参数」里的上限列表
 - **程序化取数 / 翻页** — 先读这里：本文「端点总览」→ 对应端点小节；再读：「类型化客户端（SDK）」
 - **只要增量（watcher/SSE）** — 先读这里：quickstart 配方二；再读：端点小节「SSE 事件流（免轮询推送）」
-- **批量导出（含媒体）** — 先读这里：quickstart 配方三；再读：「批量导出（`export`）」
-- **让 agent 接入（MCP）** — 先读这里：[mcp.md](mcp.md)；再读：「命令行子命令」小节
+- **批量导出（含媒体）** — 先读这里：quickstart 配方三；再读：[批量导出](guides/export.md)
+- **让 agent 接入（MCP）** — 先读这里：[mcp.md](mcp.md)；再读：[命令行子命令](guides/cli.md)
 - **账号卡住 / 排障** — 先读这里：「错误信封」＋「accounts 响应的可选 `progress`」；再读：「数据获取与安全模型」与 quickstart 配方五
 
 ## 鉴权
@@ -893,7 +907,6 @@ Authorization: Bearer <TOKEN>
 
 `media=1` 时**真正执行导出**（每请求上限 200 项，规则与原生面相同：`file` 永不导出），并把**确实写出了摘要派生本地文件**的那些条目的 `messages[].media.fileName` 回填成**实际导出文件名** ——那时它才是可取句柄，可以喂给 `GET /api/v1/media/{id}`。没落盘的（外链、失败、超上限、平台给的名字）照常给元数据，不给句柄。
 
-
 `messages[].media` 是**媒体元数据**（`{type, fileName, md5}`）：无媒体时**整个键省略**，`md5` 取不到时省略该键；它**不代表字节可取**（`fileName` 在这里是元数据名，`media=1` 时才回填实际导出名）。
 
 字段语义（`accountName` / `groupNickname` / `media` 元数据 / `type` 枚举 / `platformMessageId` /`replyToMessageId`）与拉取面完全一致，见上文的拉取面一节。
@@ -951,112 +964,6 @@ timeline/export 的条目键：`tid/id/username/nickname/avatarUrl/createTime/co
 - **变更检测**：轮询以 (主文件 mtime/size, wal mtime/size) 双指纹判断变化，仅对变化库做水位增量查询 `(create_time, sort_seq, local_id) > watermark`。
 - **密钥策略**：注册入内存、重启失效需重注册；日志、导出、响应均不打码密钥值。
 - **媒体**：图片 dat(V1/V2/XOR) 解密、语音 silk 合并、视频明文直通、wxgf(HEVC)→PNG 需 ffmpeg（环境变量 `WEFLOW_SERVER_FFMPEG` → WeFlow 内置 ffmpeg → PATH）。
-
-## 命令行子命令（`cli` feature）
-
-同一个二进制带一个子命令面。**默认 feature 是 `["server", "cli", "mcp"]`**，所以 `cargo install weflow-server` 装出来即有；`--no-default-features` 时整面消失（连 `clap` 与 SDK 都不进依赖树）。
-
-**兼容口径（重要）**：
-
-- **裸跑仍等于 `serve`**：`weflow-server --port 5033` 一个字符都不用改；
-- 以旗标开头的写法、以及 `serve` 后面的旗标，**原样交给既有参数解析器**——因此 `--help`／ `--version`／`--show-token`／配置文件加载的行为逐字不变，`serve --port 6002` 与 `--port 6002` 等价；
-- `token` 子命令 = 既有的 `--show-token`；
-- 第一个参数既不是旗标也不是已知子命令时，由 clap 报「未知子命令」并以 **2** 退出。老解析器遇到这种情况只会说「参数 bogus 缺少值」（退出 1），那是把用法错误伪装成取值错误。
-
-退出码约定（回归位置：`tests/cli.rs`）：
-
-| 码 | 含义 | 例子 |
-| --- | --- | --- |
-| `0` | 成功 | `weflow-server sessions` |
-| `1` | 运行期错误：连不上、被拒、缺密钥、缺配置文件 | 未设 `WEFLOW_TOKEN` 且本机凭据库无记录就跑查询 |
-| `2` | 用法错误：未知子命令、缺必需参数 | `weflow-server bogus`、`search` 不带 `--keyword` |
-
-- **`serve`** — 打哪个面：—；要点：起服务；等价裸跑
-- **`token`** — 打哪个面：系统凭据库；要点：打印 API token 并退出
-- **`sessions`** — 打哪个面：SDK `list_all_sessions`；要点：`page_size=10000`（服务端硬上限），一次取尽
-- **`messages`** — 打哪个面：SDK `list_messages`；要点：HTTP 形态必须给 `--talker`（服务端按会话查询）；`--since` 接受 unix 秒或 `YYYYMMDD`
-- **`search`** — 打哪个面：SDK `list_messages` 带 `keyword`；要点：`--keyword` 必填；搜不到不是错误（退出 0）
-- **`contacts`** — 打哪个面：SDK `contacts`；要点：单页；要全量请自己带 `--limit`/`--offset` 翻页
-- **`accounts`** — 打哪个面：SDK `accounts`；要点：**只有 HTTP 形态**（没有 `--embedded`）：这一面问的是「服务端此刻实际绑定了什么」，进程内索引给的是另一个答案
-- **`sync`** — 打哪个面：SDK `sync_now`；要点：**写动作**：让服务端立刻跑一次增量同步；同样没有 `--embedded`
-- **`export`** — 打哪个面：SDK `list_all_sessions` ＋ `pull_page` ＋ `chatlab_messages`；要点：**只走 HTTP**（不提供 `--embedded`）：批量导出到 ChatLab Format 文件；`--with-media` 时用同一页的时间窗调 `chatlab_messages(media=1)` 触发导出并下载字节，见下一节
-- **`mcp`** — 打哪个面：经 SDK 打 HTTP 面；要点：stdio 上的 MCP 服务端：进程不碰数据库密钥，token 走同一来源链；**必须先起服务端**。工具清单与安全提示见 [docs/mcp.md](mcp.md)
-
-环境变量：`WEFLOW_BASE_URL`（默认 `http://127.0.0.1:5033`）、`WEFLOW_TOKEN`（API token）。**token 来源链**：`WEFLOW_TOKEN`（非空）→ 本机凭据库（与 `weflow-server token` 同一份）。同机运行不必每次 export；跨机仍走环境变量。环境变量未设且凭据库无记录（或后端不可读）时，错误会分别点名这两种成因并指路 `weflow-server token`。**token 一律不经命令行传递**——命令行会落进 shell history 与进程列表，而这个值能读出整份聊天记录。
-
-`--embedded`（进程内直读本地库，不起也不打 HTTP）**只开放给只读查询类**（`sessions`／`messages`／ `search`／`contacts`）。它读与 `examples/embed.rs` **同一个**配置文件（`{"wxid":…, "db_path":…, "keys":{…}}`），路径由 `WEFLOW_EMBED_CONFIG` 给出；密钥仍只从环境变量／磁盘配置来。
-
-输出：默认是人类可读的紧凑行（每类只挑最常看的几列），`--json` 给机器可读形状。
-
-### 日志旗标（`--log` / `--log-format`）
-
-子命令面带两个 **global 旗标**（在任何子命令的位置都可用）：
-
-- **`--log`** — 取值：`error\|warn\|info\|debug`；默认：子命令 **warn**；serve **info**；说明：日志详细度。子命令默认只播失败原因，正常路径不刷屏
-- **`--log-format`** — 取值：`text\|json`；默认：`text`；说明：`json` 为**逐行一个对象**（含 `level`/`target`/`fields`），给日志采集器消费；两入口日志统一走 stderr
-
-关键口径（回归位置：`tests/cli_e2e.rs::subcommand_failures_are_logged_on_stderr` 与 `tests/cli_e2e.rs::log_json_format_emits_parseable_lines`、`tests/cli.rs::invalid_log_flags_are_usage_errors_exit_2`）：
-
-- **子命令的日志只进 stderr，stdout 永远是命令输出**。`--json` 的 stdout 可被管道直接解析，加 `--log-format json` 也不会让 JSON 日志混进 stdout（serve 的日志去向见下下条）。
-- **子命令在动手执行前就装好日志**——所以 `export` 把某个会话标记为 `skipped` 时，「**为什么**跳过」会以 `warn` 行出现在 stderr（改造前那行 `tracing::warn!` 落在没装 subscriber 的进程里，是 no-op：只剩退出码 1 与一行「跳过」，原因永远看不到）。
-- **`serve` 的 `--log` 仍走老解析器**：`serve --log debug` 与裸跑 `--log debug` 逐字等价，info 默认也不被子命令预装的 warn 劫走（dispatch 在构造 clap 之前就短路进 legacy；回归位置：`tests/cli.rs::serve_log_flag_still_goes_through_the_old_parser`）。
-- **输出去向统一 stderr**（0.10.0 破坏性变更）：子命令的日志走 stderr（stdout 留给命令输出），**serve 的日志也走 stderr**——`2>` 一处收齐服务日志与 `[init]`/`[fatal]`；此前 serve 走 stdout 的 `weflow-server > 日志文件` 类部署会拿到空 stdout，**迁移方式：改用 `2>` 收日志**。回归位置：`tests/cli.rs::serve_logs_go_to_stderr`。理由与历史代价写在 `docs/architecture.md` 的「日志：装在哪、写去哪、说什么话」。
-- 非法取值（`--log verbose`、`--log-format yaml`）是**用法错误（退出码 2）**，与 `--since` 同一契约。
-- 环境变量 `RUST_LOG` **优先于 `--log`**（EnvFilter 的既有语义）：设了它时命令行旗标被忽略。脚本与测试基座里一律 `env_remove` 它，避免级别随环境漂移。
-- 子命令日志**不带 ANSI 颜色码**（`--log-format json` 与 text 同）：stderr 是脚本与采集器的消费面，`2> 日志文件` 里出现 `\x1b[33m` 会毁掉按行解析。这条是产品保证、不依赖 `NO_COLOR` 环境变量。serve 自 0.10.0 起并入同一通道，观感一致（同为无颜色码的行）。
-
-## 批量导出（`export`）
-
-`weflow-server export --out <目录> [--format jsonl|json] [--session <id> …] [--since <t>] [--resume] [--with-media]`
-
-**只走 HTTP**：这个面不提供 `--embedded`。服务端已经把数据库密钥握在内存里，CLI 只做编排与落盘；否则一个可能跑几分钟的任务会长时间持有密钥，还得把密钥带上命令行（它会进 shell history 与进程列表）。
-
-产物布局：
-
-- **每个会话一个文件**（`<slug>.jsonl` 或 `<slug>.json`）。`<slug>` 由会话显示名经 `pathsafe::slugify` 得到；**折叠后不含任何 ASCII 字母数字时**（纯中文群名会被折成一串下划线，既不可读也极易互撞）**回落到会话 id 的 slug**；同名会话按出现顺序追加 `-2`／`-3`。文件名是确定性函数——这是 `--resume` 成立的前提。两个补充口径：
-
-  - **去重按大小写折叠**（Windows 卷默认大小写不敏感，`Team` 与 `team` 是同一个文件），而交付名保留原大小写；
-  - **编排文件名 `index` 永远留给清单**：显示名恰好是 `index` 的会话拿到 `index-2`，否则 json 形态下会话信封会被清单原地覆盖。
-
-  回归位置：`export::tests::slug_collision_gets_deterministic_suffix`。
-- **JSONL 形态**：第一行是 `_type: header`（含 `chatlab` 与 `meta`），其后是 `_type: message` 行。规范建议按时间升序，因此**页内**排序（跨页排序会把内存恒定这条承诺打破）。**不写 member 行**：流式写不出「先集齐成员再写消息」的顺序，而规范说成员行可选、缺省时由导入器从消息收集；本服务的消息行自带 `accountName` 与 `groupNickname`，信息不丢。
-- **JSON 形态**：一个会话一个完整信封（`chatlab`／`meta`／`members`／`messages`，不带行型标记）。整会话留在内存，因此大语料请用 jsonl。
-- **`index.json`**：本服务自造的编排清单（会话 → 文件 → 条数）。**它不属于 ChatLab 规范，导入请用单个 `<slug>.jsonl`／`.json`；整个目录不可导入。**
-- **`--with-media`**：把本会话用到的媒体字节下载到 `<目录>/media/`，并把导出物里的 `media.fileName` **限定为确实落盘的那些句柄**。实现是**单遍**的：每取到一页 Pull 行，就用这一页的时间窗（`(since, nextSince]` 正好对应消息面认的 `start`/`end`，两端都是闭区间的秒级戳；同秒的行必然落在同一页里，所以窗口两端不漏行）**按行分两条路**：
-
-  · **快路径**——拉取面已经给出 `messages[].mediaId` 的那些行，**直接按那个句柄取字节，一发导出请求都不发**。· **慢路径**——有 `media` 却还没有句柄的那些行，把**这些行的时间窗**交给消息面（`/chatlab/messages?media=1`，该面**每请求最多导出 200 项**，超出部分靠翻页续传）触发按需导出，再从回填的可取句柄取字节。
-
-  然后才写这一页的行；顺序不能反 —— 服务端只有在真的写出了本地副本之后，才把 `fileName` 回填成可取句柄。**为什么不能整批撤掉慢路径**：撤掉就等于「媒体句柄只能靠全历史那趟预遍历拿」，而那一趟不认 `--since`（本仓刚修掉的正是这个）。快路径让「已经导出过」的会话（`--resume`、重复导出）近乎零成本，慢路径只在真需要导出时才付出成本；两条路都不再有全历史遍历。
-
-  **`--since` 因此同时下推到导出面**：过去它是两趟独立的全历史遍历，`--since` 只管住写出来的行、媒体照样把整个会话导出并重下一遍；而两趟之间若有并发同步推进水位，第一趟没覆盖到的消息会「有行、无句柄」地静默缺件。磁盘上已有的摘要文件**不重下**（内容摘要名同名即同内容，按存在性复用是安全的）——这也是 `--resume` 能「只补下缺件」的依据。
-
-  回归位置：`cli_e2e::media_window_follows_the_pull_page`（慢路径的窗口跟着 Pull 页走：每个导出请求都带 `start`/`end`、请求条数等于 Pull 页数、两页窗口互不重叠，且 250 条句柄与 `media/` 文件集合大小相等）、`cli_e2e::media_id_from_pull_row_skips_the_export_round`（快路径：三行里只有没句柄的那一行需要导出 ⇒ 恰好一发导出请求，且窗口只覆盖那一行的时间戳）、`cli_e2e::with_media_reuses_bytes_already_on_disk`（第二次跑不得重下覆盖）。
-
-注意**两个面给的名字不必相同**：消息面回填的是导出后的内容摘要名，拉取面携带的仍是索引里的原始名，所以句柄**按消息 id 对账**（不是按名字比对），导出物里写的是实际落盘的那个名字。外链媒体与未能导出的媒体**不会**留下句柄：宁可少一个 `media` 字段，也不给一个指向不存在文件的句柄。单个媒体取不到只跳过，不升级成会话级失败。
-- **响应里的媒体名要过本地路径校验**：服务端回传的 `media.fileName` 要拿去拼 `<目录>/media/` 下的路径，`../`、盘符、ADS、Win32 设备名这类值配合 `join` 能写到导出目录之外（URL 段编码只防 HTTP 层）。因此落盘前先过 `pathsafe::safe_segment`，非法名按 404 同级跳过**并计数可见**（汇总行给出个数）。同名（含仅大小写不同，折叠口径与会话名一致）的媒体只下载一份字节，引用它的每条消息都映射到**实际落盘的那个名字**。回归位置：`export::tests::with_media_keeps_only_handles_whose_bytes_are_on_disk`、`export::tests::message_line_omits_media_without_a_handle`、`cli_e2e::with_media_rejects_unsafe_response_file_names` 与 `cli_e2e::with_media_maps_exported_names_back_to_message_ids`。
-
-三条硬约束：
-
-1. **导出物里不得出现访问令牌**。服务端的媒体是**根相对路径**（`/api/v1/media/<file>`，**不含令牌** —— 令牌只走请求头或 `?access_token=`，响应体从不嵌它）。导出仍然**不写任何 URL**（相对路径换台机器就失效），媒体只以 `{type, fileName}` 表达；并且每一行写盘前会拿调用方给的令牌做一次子串检查，**命中即整轮中止**（不是跳过该会话）并删掉半成品。回归位置：`export::tests::secret_in_output_aborts_and_removes_partial_file`。
-2. **会话级失败不静默**：取数失败的会话被记入 `skipped`，而只要 `skipped` 非空，CLI 就以退出码 1 结束。静默少导几个会话是这类工具最坏的失败方式。**`--resume` 的命中不算失败**：记入 `reused`（幂等完成），同参数续跑以退出码 0 收场。**空会话不算失败**（0.10.0 起）：`messageCount:0` 的会话在消息面是 200 空页（「存在但没有内容」与「不存在」已分离），导出它得到一个只含 header 的空产物，既不进 `skipped` 也不影响退出码；`--session` 拼错一个**不存在**的 id 仍按失败记入 `skipped` 并退 1（回归位置：`export_still_fails_on_an_unknown_session_id`、`export_completes_a_listed_session_without_messages`）。
-3. **最终名是唯一的完成标记**：会话先写 `<slug>.<格式>.part`，整个会话成功收尾后才 `rename` 成最终名。因此 `.part` 残留意味着「没写完」，续跑一律重写；失败的那一轮只删 `.part`，**不会**碰上一轮已经交付的完整产物。清单 `index.json` 同样先 `index.json.part` 再改名 —— 它是续跑唯一的「完成记录」来源，半路被杀的截断清单会让下一轮误判「没有上一轮」。
-4. **`--resume` 复用要同时满足四条**（缺一条就重写，并在日志点名原因）：上一轮清单记着该会话、且它登记的**就是本轮这个文件名**（换格式 `jsonl`／`json` 后盘上的另一扩展名文件是孤儿，不算本轮产物）、没有 `.part` 残留、本轮带 `--with-media` 时上一轮也带过媒体。「有个同名文件」单独不构成完成记录：清单被删或被截断时，那会让从没导出过的会话被静默判成已完成，而它在新清单里没有条目，既看不见也不能自愈。
-5. **媒体承诺按轮成立**：`--with-media --resume` 复用上一轮产物时，CLI 会逐个核对复用会话里的 `fileName` 在 `media/` 下确有字节；有悬空就点名该会话并以退出码 1 结束（媒体目录被清理或搬走过的交付包不该静默通过）。处理办法：对点名的会话去掉 `--resume` 重跑，或恢复 `media/`。
-6. **单个会话的起手／收尾失败只跳过该会话**（记入 `skipped`），不中止整轮 —— 整轮中止会让本轮已写出的会话留在盘上却不进清单，比留一个 `.part` 更难恢复。令牌泄漏仍是整轮中止。
-
-   回归位置：`export::tests::resume_rewrites_an_incomplete_artifact`、`export::tests::failed_rerun_keeps_the_previous_complete_artifact`、`cli_e2e::export_writes_a_file_against_a_live_service`（含续跑第二次退 0）。
-
-内存：JSONL 逐页写盘、写完即丢，**峰值常驻集与消息条数无关**；`--with-media` 的句柄映射现在**只活在这一页**（O(本页不同媒体数)，不随会话长度增长），因此媒体侧不再破坏这条承诺。同秒组的消息会被服务端扩页带出（Pull 段的「同秒扩页」），那一项仍在承诺之外。大语料的实测口径与造库工具（隐藏的 `--rows` 参数，仅 `testing` feature 下编译进二进制）见 `docs/architecture.md` 的「测试与夹具」。
-
-## 启动示例
-
-```powershell
-weflow-server.exe --port 5033 --watch-fallback-ms 5000 --log info
-weflow-server.exe serve --port 5033      # 与上一行等价
-weflow-server.exe sessions --json        # 子命令面
-```
-
-参数：`--show-token`、`--port`、`--host`、`--log`、`--log-format`、`--watch-debounce-ms`、`--watch-fallback-ms`、`--media-export-dir`、`--base-url`（全部仅命令行，无配置文件）。数据目录不可配置：Windows `%LOCALAPPDATA%\weflow-server`；媒体导出默认落在其下的 `api-media`，仅 `--media-export-dir` 可改。
 
 ## 类型化客户端（SDK）
 

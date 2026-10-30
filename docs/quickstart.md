@@ -71,7 +71,7 @@ weflow-server export --out ./export --format jsonl --with-media
 - 只导出个别会话用 `--session <id>`（可重复）；只要某时间之后用 `--since`。
 - 媒体可取性以**客户端落地**为准：新图在客户端全图落地前（数十秒到分钟级）可能仍无句柄；缺句柄时退回消息面的按需导出，不要当错误。
 
-深入：api 文档「批量导出（`export`）」（产物形状、`index.json`、失败跳过语义都在那里）。
+深入：[批量导出指南](guides/export.md)（产物形状、`index.json`、失败跳过语义都在那里）。
 
 ## 配方四：让 agent 接入（MCP）
 
