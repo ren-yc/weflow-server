@@ -116,6 +116,8 @@ GET /openapi.json
 
 **参数**：无
 
+**响应**：OpenAPI 3 JSON 文档（`application/json`）；多形状端点用 `oneOf`，描述随 DTO 变。
+
 错误响应（401/404/405 等）**不在描述里**：它们是跨端点的统一信封，见上文「错误信封」。
 
 ### GET/POST `/health`、`/api/v1/health`（免鉴权）
@@ -681,6 +683,16 @@ GET /api/v1/media/{id}?access_token=<TOKEN>
 - **无就绪门控**：导出文件已在磁盘上，其可读性与当前是否有账号绑定无关。因此注销后若未带 `purge_media=1`，此前导出的文件仍可访问；要一并清除须在注销时显式请求。
 
 **响应**
+
+```text
+200 OK
+content-type: <按扩展名推断，如 image/png>
+content-length: <字节数>
+<媒体字节流>
+
+404 Not Found
+{ "success": false, "code": 404, "message": "media not found" }
+```
 
 成功时返回媒体字节流，`content-type` 按扩展名推断（`image/jpeg` / `image/png` / `image/gif` / `image/webp` / `video/mp4` / `audio/wav` 等），带 `content-length`；找不到、被拒绝、内容冲突统一返回 404 信封 `{ "success": false, "code": 404, "message": "media not found" }`。
 
