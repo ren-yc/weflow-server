@@ -1,6 +1,8 @@
 # weflow-server
 
-无头 HTTP API + SSE 服务：实时监控、解密并提取本地 **微信 4.x** 聊天记录（`xwechat_files/<wxid>/db_storage`，WCDB/SQLCipher-4 风格加密）。独立纯 Rust 实现，架构参考同目录 `qqflow-server`，接口契约对齐 **WeFlow HTTP API**。
+无头 HTTP API + SSE 服务：实时监控、解密并提取本地 **微信 4.x** 聊天记录（`xwechat_files/<wxid>/db_storage`，WCDB/SQLCipher-4 风格加密）。
+
+独立纯 Rust 实现，架构参考同目录 `qqflow-server`，接口契约对齐 **WeFlow HTTP API**。
 
 ## 家族术语
 
@@ -66,7 +68,13 @@ curl -H "Authorization: Bearer $WEFLOW_TOKEN" \
 
 ## 重启后恢复账号
 
-密钥只存进程内存；服务重启后账号回到未注册（业务端点 503）。用 [`scripts/examples/register-accounts.ps1`](scripts/examples/register-accounts.ps1)（或 [`.sh`](scripts/examples/register-accounts.sh)）从你自备的本地配置读 key 后重新注册；完整配方见 [docs/quickstart.md](docs/quickstart.md#配方五重启后恢复账号)。脚本只读配置、不代存密钥。
+密钥只存进程内存；服务重启后账号回到未注册（业务端点 503）。
+
+用 [`scripts/examples/register-accounts.ps1`](scripts/examples/register-accounts.ps1)（或 [`.sh`](scripts/examples/register-accounts.sh)）。
+
+从你自备的本地配置读 key 后重新注册。
+
+完整配方见 [docs/quickstart.md](docs/quickstart.md#配方五重启后恢复账号)。脚本只读配置、不代存密钥。
 
 ## 去哪看细节
 
@@ -91,4 +99,6 @@ curl -H "Authorization: Bearer $WEFLOW_TOKEN" \
 
 ## 免责声明
 
-仅供个人学习、研究与本地数据备份。API 仅监听 127.0.0.1；密钥经 HTTP 传入且仅内存保存（不落盘）；鉴权 token 存 OS 凭据库（本地回环场景，非防泄密机制）；微信升级可能导致列名/消息格式解析退化（值驱动探测 + 优雅降级，天然容错）。请遵守法律法规，仅解密**自己**的微信数据。
+仅供个人学习、研究与本地数据备份。API 仅监听 127.0.0.1；密钥经 HTTP 传入且仅内存保存（不落盘）；鉴权 token 存 OS 凭据库（本地回环场景，非防泄密机制）；微信升级可能导致列名/消息格式解析退化（值驱动探测 + 优雅降级，天然容错）。
+
+请遵守法律法规，仅解密**自己**的微信数据。

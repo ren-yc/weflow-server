@@ -1,10 +1,19 @@
 # weflow-client
 
-Typed Rust client for [weflow-server](https://github.com/ren-yc/weflow-server) — a headless, read-only HTTP/SSE service over local WeChat 4.x chat databases.
+Typed Rust client for [weflow-server](https://github.com/ren-yc/weflow-server).
 
-Published in lockstep with the server crate (currently `0.9.1`); behavioral changes are recorded in the repository's [CHANGELOG.md](https://github.com/ren-yc/weflow-server/blob/master/CHANGELOG.md).
+A headless, read-only HTTP/SSE service over local WeChat 4.x chat databases.
 
-Generated from the server's OpenAPI description (types + request plumbing), with a handwritten behavior layer on top: transport failures folded into a proper error tree, readiness polling, pagination helpers, SSE streaming, and media download helpers.
+Published in lockstep with the server crate (currently `0.9.1`).
+
+Behavioral changes are recorded in the repository's [CHANGELOG.md](https://github.com/ren-yc/weflow-server/blob/master/CHANGELOG.md).
+
+Generated from the server's OpenAPI description (types + request plumbing), with a handwritten behavior layer on top:
+
+- transport failures folded into a proper error tree
+- readiness polling
+- pagination helpers
+- SSE streaming, and media download helpers
 
 ## Install
 
@@ -33,7 +42,18 @@ Requires `tokio` (`rt-multi-thread` + `macros`) as a dependency — the SDK itse
 
 ## Scope
 
-The server exposes a strictly read-only surface: accounts, sessions, messages, contacts, group members, SNS timelines, media export, and an SSE push stream. This client covers **all of it except the SNS timelines** — the server has those endpoints, the generated layer does not wrap them yet, so reach for plain HTTP if you need them (the gap is deliberate, not silent: the contract pins the surface this client is tested against). See the server repository for the API reference.
+The server exposes a strictly read-only surface:
+
+- accounts, sessions, messages, contacts, group members
+- SNS timelines, media export, and an SSE push stream
+
+This client covers **all of it except the SNS timelines** — the server has those endpoints, the generated layer does not wrap them yet.
+
+So reach for plain HTTP if you need them.
+
+The gap is deliberate, not silent: the contract pins the surface this client is tested against.
+
+See the server repository for the API reference.
 
 ## License
 

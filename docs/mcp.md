@@ -1,6 +1,8 @@
 # MCP 工具面（stdio）
 
-本服务可以作为 **MCP（Model Context Protocol）服务端**运行：把只读查询暴露成一组工具，供支持 MCP 的 agent 客户端调用。工具共 8 个：**7 个只读查询 ＋ 1 个显式写动作**（`sync_now`，见下方列表——说「只读」指的是不解密不写库的数据面，`sync_now` 会推进服务端水位并可能触发媒体导出）。传输走 stdio，由一个独立的 `weflow-server mcp` 进程承担。
+本服务可以作为 **MCP（Model Context Protocol）服务端**运行：把只读查询暴露成一组工具，供支持 MCP 的 agent 客户端调用。
+
+工具共 8 个：**7 个只读查询 ＋ 1 个显式写动作**（`sync_now`，见下方列表——说「只读」指的是不解密不写库的数据面，`sync_now` 会推进服务端水位并可能触发媒体导出）。传输走 stdio，由一个独立的 `weflow-server mcp` 进程承担。
 
 ## 数据会离开本机
 
@@ -44,7 +46,9 @@ WEFLOW_BASE_URL=http://127.0.0.1:6002 weflow-server mcp
 
 - 「取一页」类工具的 `limit` 默认 50、上限 200（超出按 200 计）。
 - 单次输出的字符预算约 32 KB：超出时**少给若干条**并置 `truncated: true`。第一条永远保留 ——否则一条长消息会得到「既无内容又无截断标记」的结果，那是 agent 场景里最坏的一种失败。
-- `get_messages` 在预算截断时**不返回整页游标** `nextSince`（它指向整页最后一条，用它续拉会跳过没给出去的那些条），但**返回 `nextOffset`**（这一面从 `offset` 起是连续切片，`start + 给出 条数` 恰指向被砍掉的第一条）与 `sinceResolved`（本轮 `since` 解析出的**排他**绝对下界）。此组合只在**截断场景**使用；未截断时响应给出整页游标 `nextSince`，按原语义续拉即可。续拉请传 `nextOffset` 且 `since` 传 `sinceResolved`——不要重发相对串（如 `7d`）：续拉发生在下一轮对话，「现在」已经前移，相对串会把窗口悄悄前移、跳过中间的消息。未提供 `since` 时 `sinceResolved` 为 null（等价于不传）。
+- `get_messages` 在预算截断时**不返回整页游标** `nextSince`（它指向整页最后一条，用它续拉会跳过没给出去的那些条），但**返回 `nextOffset`**（这一面从 `offset` 起是连续切片，`start + 给出 条数` 恰指向被砍掉的第一条）与 `sinceResolved`（本轮 `since` 解析出的**排他**绝对下界）。
+  - 此组合只在**截断场景**使用；未截断时响应给出整页游标 `nextSince`，按原语义续拉即可。续拉请传 `nextOffset` 且 `since` 传 `sinceResolved`——不要重发相对串（如 `7d`）：续拉发生在下一轮对话，「现在」已经前移，相对串会把窗口悄悄前移、跳过中间的消息。
+  - 未提供 `since` 时 `sinceResolved` 为 null（等价于不传）。
 - `search_messages` 同样按 `offset` 翻页、本页是连续切片，截断时 `nextOffset` 正好指向被砍掉的第一条（并把 `hasMore` 置真）。
 - `get_messages_raw` 例外：原生面按 offset 翻页、本页是连续切片，砍掉尾部后 `nextOffset` 正好指向被砍掉的第一条，所以它照常返回（并把 `hasMore` 置真）。
 

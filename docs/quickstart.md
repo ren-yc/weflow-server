@@ -6,7 +6,8 @@
 
 - **Release 二进制** — 入口：GitHub Releases 的最新 tag，下载对应平台归档＋`SHA256SUMS`；说明：免工具链；校验 `sha256sum -c SHA256SUMS` 后再运行
 - **`cargo install`** — 入口：`cargo install --locked weflow-server`；说明：从 crates.io 编译；仍需 C 工具链（SQLCipher/OpenSSL 源码编译）
-- **源码构建** — 入口：Windows `powershell -File scripts\build.ps1 build --release`；Linux/macOS `bash scripts/build.sh build --release`；说明：前置（MSVC/Perl/nasm、gcc/make）与命令见 [AGENTS.md](../AGENTS.md)，产物在 `target/release/`
+- **源码构建** — 入口：Windows `powershell -File scripts\build.ps1 build --release`；Linux/macOS `bash scripts/build.sh build --release`。
+  - 说明：前置（MSVC/Perl/nasm、gcc/make）与命令见 [AGENTS.md](../AGENTS.md)，产物在 `target/release/`
 
 ## 起服务与停服务
 
@@ -85,11 +86,15 @@ weflow-server mcp
 
 ## 配方五：重启后恢复账号
 
-密钥只存进程内存（见 [架构文档](architecture.md) 的「密钥不落盘」），所以**服务重启后账号回到未注册**：`/health` 的 `account` 是 `unregistered`，业务端点返回 503。恢复动作只有一步——用**与重启前相同的 key 集**重新调 `POST /api/v1/accounts`。
+密钥只存进程内存（见 [架构文档](architecture.md) 的「密钥不落盘」），所以**服务重启后账号回到未注册**：`/health` 的 `account` 是 `unregistered`，业务端点返回 503。恢复动作只有一步。
+
+用**与重启前相同的 key 集**重新调 `POST /api/v1/accounts`。
 
 ### 1. 准备 token
 
-token 的来源链是 `WEFLOW_TOKEN`（非空）→ 本机凭据库（与 `weflow-server token` 同一份）。同机可以直接从凭据库取；跨机把 `WEFLOW_TOKEN` 设成服务端实际使用的那个值。一个会踩的坑：本机凭据库不可用时，服务端生成的是**会话级 token**（不落库、随每次启动而变，只在启动日志打印一次）——此时凭据库里没有值可回落，`token` 子命令与 `--show-token` 都会落空，必须从启动日志取当前值并设进 `WEFLOW_TOKEN`。
+token 的来源链是 `WEFLOW_TOKEN`（非空）→ 本机凭据库（与 `weflow-server token` 同一份）。同机可以直接从凭据库取；跨机把 `WEFLOW_TOKEN` 设成服务端实际使用的那个值。
+
+一个会踩的坑：本机凭据库不可用时，服务端生成的是**会话级 token**（不落库、随每次启动而变，只在启动日志打印一次）——此时凭据库里没有值可回落，`token` 子命令与 `--show-token` 都会落空，必须从启动日志取当前值并设进 `WEFLOW_TOKEN`。
 
 ### 2. 准备恢复配置
 
