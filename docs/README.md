@@ -28,6 +28,8 @@
 | 我想… | 读这个 | 类型 |
 |---|---|---|
 | 逐版行为变化与迁移方式 | [CHANGELOG.md](../CHANGELOG.md) | 参考（时间序） |
-| 装 SDK 用客户端 | `clients/rust`、`clients/python`（`clients/ts` 未发布 npm，从源码取） | 操作指南 |
+| 装 SDK 用客户端 | `clients/rust`、`clients/python` | 操作指南 |
 | 贡献代码（命令、门禁、提交规范） | [AGENTS.md](../AGENTS.md) | 操作指南 |
 | 看项目门面 | [README.md](../README.md) | — |
+
+`clients/ts` 未发布 npm，从源码取。
