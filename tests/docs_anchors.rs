@@ -174,7 +174,7 @@ fn target_anchors(dir: &Path, target: &str) -> Option<HashSet<String>> {
 ///
 /// 此前这里是一张硬编码清单（README、AGENTS、architecture、mcp、quickstart + `docs/*-api.md`），
 /// 于是任何**新增或移动**的文档都落在守卫盲区：`docs/README.md`（文档地图）与
-/// `docs/guides/*.md`（从 api 拆出的 how-to）不会被检查，`docs/` 子目录里断掉的跨文件锚
+/// `docs/` 子目录里的 how-to 不会被检查，`docs/` 子目录里断掉的跨文件锚
 /// 与失配的目录项也无人发现。改成递归遍历后，新增文档自动受保护——这正是「把纪律
 /// 下沉到机器」的本意：新增文档时不需要有人记得回来改这张清单。
 ///

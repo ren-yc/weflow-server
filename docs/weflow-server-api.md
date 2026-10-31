@@ -7,7 +7,7 @@
 - 所有 `/api/v1/*` 端点需要鉴权；`/health` 与 `/api/v1/health` 不需要
 - 与 qqflow-server 的**有意差异**（SNS 仅本仓、`messageCount` 群成员面条件键、`meta.type` 推导面、默认端口、SDK/ts 状态）见 [flow-contract ADAPTATION.md](https://github.com/ren-yc/flow-contract/blob/master/ADAPTATION.md)。
 
-> 本文是**端点参考**；任务型操作见 [quickstart](quickstart.md) 与 [guides/](guides/)（命令行子命令、批量导出、启动示例）。
+> 本文是**端点参考**；任务型操作见 [quickstart](quickstart.md)（命令行子命令、批量导出、启动旗标速查）。
 
 ## 目录
 
@@ -29,8 +29,8 @@
 - **接 ChatLab 前端** — 先读这里：quickstart 配方一；再读：「ChatLab 适配面（`/chatlab/*`）」＋「通用查询参数」里的上限列表
 - **程序化取数 / 翻页** — 先读这里：本文「端点总览」→ 对应端点小节；再读：「类型化客户端（SDK）」
 - **只要增量（watcher/SSE）** — 先读这里：quickstart 配方二；再读：端点小节「SSE 事件流（免轮询推送）」
-- **批量导出（含媒体）** — 先读这里：quickstart 配方三；再读：[批量导出](guides/export.md)
-- **让 agent 接入（MCP）** — 先读这里：[mcp.md](mcp.md)；再读：[命令行子命令](guides/cli.md)
+- **批量导出（含媒体）** — 先读这里：quickstart 的「配方三：批量导出（含媒体）」
+- **让 agent 接入（MCP）** — 先读这里：[mcp.md](mcp.md)；再读：quickstart 的「命令行子命令」
 - **账号卡住 / 排障** — 先读这里：「错误信封」＋「accounts 响应的可选 `progress`」；再读：「数据获取与安全模型」与 quickstart 配方五
 
 ## 鉴权

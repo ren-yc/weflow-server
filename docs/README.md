@@ -5,9 +5,9 @@
 | 我想… | 读这个 | 类型 |
 |---|---|---|
 | 5 分钟跑通（获取 → 起服务 → 注册 → 第一个请求） | [quickstart.md](quickstart.md) | 教程 |
-| 用命令行子命令取数、看退出码与日志旗标 | [guides/cli.md](guides/cli.md) | 操作指南 |
-| 批量导出消息（含媒体、`--resume`、产物布局） | [guides/export.md](guides/export.md) | 操作指南 |
-| 复制一段可用的启动命令 | [guides/examples.md](guides/examples.md) | 操作指南 |
+| 用命令行子命令取数、看退出码与日志旗标 | [quickstart.md#命令行子命令](quickstart.md#命令行子命令) | 操作指南 |
+| 批量导出消息（含媒体、`--resume`、产物布局） | [quickstart.md#配方三批量导出含媒体](quickstart.md#配方三批量导出含媒体) | 操作指南 |
+| 复制一段可用的启动命令 | [quickstart.md#启动旗标速查](quickstart.md#启动旗标速查) | 操作指南 |
 | 让 agent 接入（stdio MCP） | [mcp.md](mcp.md) | 操作指南 |
 | 查某个端点、参数、字段、错误码 | [weflow-server-api.md](weflow-server-api.md) | 参考 |
 | 改代码前理解模块职责、数据流与陷阱 | [architecture.md](architecture.md) | 解释 |
