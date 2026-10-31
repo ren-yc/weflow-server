@@ -68,16 +68,16 @@ class CommonSection(unittest.TestCase):
         self.assertIn("pin 与契约版本不一致", out)
 
     def test_parameterized_section_and_source(self):
-        d = self.conf / "docs-common"
+        d = self.conf / "templates"
         d.mkdir()
-        (d / "release-runbook.md").write_text("发版手册正文\n", encoding="utf-8")
-        rb = self.root / "docs"
-        rb.mkdir()
-        (rb / "release-runbook.md").write_text(
-            f"本仓序言\n{BEGIN}\n发版手册正文\n{END}\n本仓附录\n", encoding="utf-8"
+        (d / "shared-section.md").write_text("共享段正文\n", encoding="utf-8")
+        docs = self.root / "docs"
+        docs.mkdir()
+        (docs / "shared-section.md").write_text(
+            f"本仓序言\n{BEGIN}\n共享段正文\n{END}\n本仓附录\n", encoding="utf-8"
         )
         rc, out = self.run_script(
-            "--section", "docs/release-runbook.md", "--source", "docs-common/release-runbook.md"
+            "--section", "docs/shared-section.md", "--source", "templates/shared-section.md"
         )
         self.assertEqual(rc, 0, out)
 

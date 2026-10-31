@@ -125,6 +125,20 @@ VS 环境脚本可用 `$env:WEFLOW_VCVARS` 覆盖。
 12. **实证纪律**：行为断言尽量带数据与回归位置（测试函数名/快照名/用例 id）；「见相关测试」不合格，必须是可搜索的具体名字。
 13. **CHANGELOG 模板**：条目含「行为变化 ＋（破坏性变更时）迁移方式 ＋ 回归位置」；并列项 3 个及以上用子弹列表；版本条目间不互相引用行号。
 
+## 发版
+
+正式上传由 CI 的 `crates` 与 `pypi` 两个作业执行（tag 触发，各自停在 `crates-io` / `pypi` 两个人工审批闸门，逐一放行）。
+
+1. **版本号五处同改**：`Cargo.toml`（根包）、`clients/rust/Cargo.toml`、`clients/python/pyproject.toml`、`clients/ts/package.json` 与 `package-lock.json`。
+   - 生成物与快照内嵌的版本号**不手改**：改完必须重跑 regen 与 golden（`UPDATE_GOLDEN=1`），否则 `regen --check` 在 push 时红——那是版本链完整性的唯一机器判据。
+2. `CHANGELOG.md` 对应段的日期回填为实际发布日，作为**独立提交**推上去；tag 必须指向这笔回填提交（CHANGELOG 会进 sdist，tag 指错会把准备日永久发出去）。
+3. **先 push master、等 check 绿、再打 tag**：`check.yml` 只在 push 到 master 触发，推 tag 不跑它；release 链的门比 check 少（不含 regen --check）。
+   - 顺序：`git push origin master` → 盯该提交的 check 绿 → `git rev-parse HEAD` 与 `git ls-remote origin refs/heads/master` 逐字一致 → `git tag v<版本>` → `git push origin v<版本>`。
+   - Windows PowerShell 5.1 不认 `&&`，两条 git 命令必须分两行写。
+4. **两个审批闸门**：`crates` 作业先发 SDK crate、确认索引可见、再发根包；放行后 `pypi` 作业再放行。两个作业对「已发布过」幂等。
+5. **发布后**：重建 sdk-dist 供应分支——`git subtree split -P clients/python/src/<sdk> -b sdk-dist` ＋ `git push origin sdk-dist --force-with-lease`；再同步下游 vendor。
+6. **失败处理**：审批前发现问题，删 tag 重来；已上架的版本不可撤销，只能 yank 并发补丁版。CI 中断重跑即可（幂等）。
+
 ## 架构指引
 
 微信 4.x 消息库的**只读** HTTP / SSE 服务（默认端口 **5033**）。活库直读 ＋ 内存索引，不落中间数据；数据库密钥由外部提供，本仓库**不做密钥提取**。

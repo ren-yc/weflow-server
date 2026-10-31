@@ -9,7 +9,7 @@
 
 默认对象是 `AGENTS.md` 的 `<!-- common:begin -->` / `<!-- common:end -->` 段，比对
 `AGENTS-common.md`。三项都可用参数替换，以便同一支脚本服务其它「公共段 + 上提模板」
-场景（如 release-runbook），而不必复制出第二份脚本——「规则与豁免只有一处」的纪律：
+场景（如任意共享模板文件），而不必复制出第二份脚本——「规则与豁免只有一处」的纪律：
 
     --section      本仓承载公共段的文件（默认 AGENTS.md）
     --marker-begin / --marker-end   段标记（默认 <!-- common:begin --> / <!-- common:end -->）
@@ -18,7 +18,7 @@
 用法：
     python scripts/check_common_section.py --conformance conformance
     python scripts/check_common_section.py --conformance conformance \
-        --section docs/release-runbook.md --source docs-common/release-runbook.md
+        --section docs/shared-section.md --source templates/shared-section.md
 
 退出码：0 一致；1 不一致；2 环境问题（读不到文件 / 缺标记）——**按拒绝放行处理**。
 """

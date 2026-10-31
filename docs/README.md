@@ -9,7 +9,6 @@
 | 批量导出消息（含媒体、`--resume`、产物布局） | [guides/export.md](guides/export.md) | 操作指南 |
 | 复制一段可用的启动命令 | [guides/examples.md](guides/examples.md) | 操作指南 |
 | 让 agent 接入（stdio MCP） | [mcp.md](mcp.md) | 操作指南 |
-| 发版、审批闸门与凭据处理 | [release-runbook.md](release-runbook.md) | 操作指南 |
 | 查某个端点、参数、字段、错误码 | [weflow-server-api.md](weflow-server-api.md) | 参考 |
 | 改代码前理解模块职责、数据流与陷阱 | [architecture.md](architecture.md) | 解释 |
 

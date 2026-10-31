@@ -87,7 +87,7 @@ curl -H "Authorization: Bearer $WEFLOW_TOKEN" \
 完整文档地图见 [docs/README.md](docs/README.md)：按 [Diátaxis](https://diataxis.fr/) 四类分工组织，另单列贡献入口；先按「我要做什么」选一份开始读。
 
 - 教程（第一次跑通）：[docs/quickstart.md](docs/quickstart.md)
-- 操作指南（按任务取数、接 MCP、发版）：[docs/guides/](docs/guides/)、[docs/mcp.md](docs/mcp.md)、[docs/release-runbook.md](docs/release-runbook.md)
+- 操作指南（按任务取数、接 MCP）：[docs/guides/](docs/guides/)、[docs/mcp.md](docs/mcp.md)
 - 参考（查端点、参数、字段、变更）：[docs/weflow-server-api.md](docs/weflow-server-api.md)、[CHANGELOG.md](CHANGELOG.md)
 - 解释（理解架构与取舍）：[docs/architecture.md](docs/architecture.md)
 - 贡献（命令、门禁、提交规范）：[AGENTS.md](AGENTS.md)
