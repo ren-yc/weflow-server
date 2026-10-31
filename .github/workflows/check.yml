@@ -173,6 +173,13 @@ jobs:
           git clone --depth 1 --branch "$pin" https://github.com/ren-yc/flow-contract.git conformance
           python3 scripts/check_common_section.py --conformance conformance
 
+      # 发布手册不漂移：docs/release-runbook.md 必须与「模板（取自所 pin 的 conformance）
+      # ＋ 本仓 vars」重新渲染的结果逐字一致。只手改一处会被这一步判红；复用上面的 conformance 克隆。
+      - name: Release runbook matches template + vars
+        if: runner.os != 'Windows'
+        shell: bash
+        run: python3 scripts/render_docs_common.py --check --template conformance/docs-common/release-runbook.tpl.md --vars docs/release-runbook.vars.toml --out docs/release-runbook.md
+
       # ── 五条数据不变量（契约用例里最硬的那几条）──────────────────────────────
       #
       # 这一条**是开着的**，因为它现在就是绿的，而且它守的是五条已定的数据不变量：

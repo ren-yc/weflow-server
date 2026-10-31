@@ -22,7 +22,9 @@ python scripts/forbidden_refs.py --tree    # 全量跟踪文件
 python scripts/forbidden_refs.py           # staged 新增内容
 ```
 
-**构建前置**（缺一即失败；包装脚本会明确指出缺哪个）：MSVC 的 `vcvars64.bat`、**Strawberry Perl**（Git 自带的 MSYS perl 会破坏 Configure 里的 Windows 路径）、`nasm`。VS 环境脚本可用 `$env:WEFLOW_VCVARS` 覆盖。
+**构建前置**（缺一即失败；包装脚本会明确指出缺哪个）：MSVC 的 `vcvars64.bat`、**Strawberry Perl**（Git 自带的 MSYS perl 会破坏 Configure 里的 Windows 路径）、`nasm`。
+
+VS 环境脚本可用 `$env:WEFLOW_VCVARS` 覆盖。
 
 **真库探针**以 `#[ignore]` ＋ 环境变量门控，CI 不跑；启用方式见对应测试文件的头部注释。
 
@@ -37,11 +39,9 @@ python scripts/forbidden_refs.py           # staged 新增内容
 - 新增功能必须补充或更新对应测试
 - **不要为了「让当前任务快速完成」而跳过上述任何一步**；门禁失败必须先修复再提交
 - **本仓库有意不设 `cargo fmt --check`**（理由见工作流内的注释）。不要以「顺手格式化」为由改动无关文件——那会让 review 淹没在噪声里
-- **`Finished` 不等于「这次改动被检查过」。** 换过 feature 组合、换过子命令（`check` / `build` /
-  `clippy` / `test` 是**不同产物**），或刚改过文件之后，输出里要能看到 `Compiling` / `Checking`，
-  才算这次真的编译并检查了。只看到 `Finished` 就当它通过，等于把**上一次**的结果当成这一次的。
-  **失败模式**：门禁「通过」而你随后换个参数再跑却报出一堆错误——那说明前一次根本没覆盖你
-  以为它覆盖的东西。**代价**：所有依赖「门禁绿了」的结论都失去依据，包括你刚写下的那些。
+- **`Finished` 不等于「这次改动被检查过」。** 换过 feature 组合、换过子命令（`check` / `build` / `clippy` / `test` 是**不同产物**），或刚改过文件之后，输出里要能看到 `Compiling` / `Checking`，才算这次真的编译并检查了。只看到 `Finished` 就当它通过，等于把**上一次**的结果当成这一次的。
+  - **失败模式**：门禁「通过」而你随后换个参数再跑却报出一堆错误——那说明前一次根本没覆盖你以为它覆盖的东西。
+  - **代价**：所有依赖「门禁绿了」的结论都失去依据，包括你刚写下的那些。
 
 ### 提交信息
 
