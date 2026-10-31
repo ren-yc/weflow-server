@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -394,18 +395,31 @@ def git(args):
     return r.stdout
 
 
+def repo_root():
+    return git(["rev-parse", "--show-toplevel"]).strip()
+
+
 def tracked_md():
-    return [p for p in git(["ls-files", "*.md"]).splitlines() if p.strip()]
+    # 路径一律取自仓库根，而非当前目录：否则从子目录运行时 ls-files 只返回该子树，
+    # 甚至为空——「扫描 0 个文件」会被读成通过，正是失败开放。
+    return [p for p in git(["-C", repo_root(), "ls-files", "*.md"]).splitlines() if p.strip()]
 
 
 def changed_md_staged():
-    out = git(["diff", "--cached", "--name-only", "--diff-filter=ACM", "--", "*.md"])
+    out = git(["-C", repo_root(), "diff", "--cached", "--name-only", "--diff-filter=ACM", "--", "*.md"])
     return [p for p in out.splitlines() if p.strip()]
 
 
 def changed_md_ref(ref):
-    out = git(["diff", "--name-only", f"{ref}...HEAD", "--", "*.md"])
+    out = git(["-C", repo_root(), "diff", "--name-only", f"{ref}...HEAD", "--", "*.md"])
     return [p for p in out.splitlines() if p.strip()]
+
+
+def require_tracked_md(files):
+    # --tree/--ref 模式扫描到 0 个文件一律拒绝放行：真正的仓库不可能没有跟踪的 .md，
+    # 出现即意味着 cwd 不对或扫描没生效。staged 模式（无 .md 改动）不算错，故不调用本函数。
+    if not files:
+        raise RuntimeError("未发现任何跟踪的 .md，拒绝以空扫描放行")
 
 
 def main(argv=None):
@@ -423,6 +437,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     try:
+        os.chdir(repo_root())
         if args.tree:
             files, target = tracked_md(), "全量跟踪 .md"
         elif args.ref:
@@ -432,6 +447,14 @@ def main(argv=None):
     except (RuntimeError, OSError) as e:
         print(f"[结构检查] 扫描未执行，拒绝放行：{e}", file=sys.stderr)
         return 2
+
+    # --tree/--ref 扫描 0 个文件 = 扫描未生效，拒绝放行（staged 模式无 .md 改动不算错）
+    if args.tree or args.ref:
+        try:
+            require_tracked_md(files)
+        except RuntimeError as e:
+            print(f"[结构检查] 扫描未执行，拒绝放行：{e}", file=sys.stderr)
+            return 2
 
     if args.stats:
         rows = []

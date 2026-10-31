@@ -10,8 +10,13 @@
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 from types import SimpleNamespace
 
@@ -227,6 +232,53 @@ class Exemptions(unittest.TestCase):
         probs = scan("- " + "字" * 400 + "\n\n" + "字" * 400 + "\n", path="CHANGELOG.md")
         self.assertFalse(any("列表项" in p for p in probs), probs)
         self.assertTrue(any("散文段" in p for p in probs), probs)
+
+class ScanSelectionFailOpen(unittest.TestCase):
+    """--tree/--ref 扫到 0 个文件必须拒绝放行（exit 2），不能静默通过；
+    从子目录运行必须仍扫到仓库根下的全部 .md；staged 无改动不算错。"""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="cds_failopen_")
+        self._cwd = os.getcwd()
+
+    def tearDown(self):
+        os.chdir(self._cwd)
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _init_repo_with_md(self):
+        subprocess.run(["git", "init", "-q", self._tmp], check=True)
+        with open(os.path.join(self._tmp, "a.md"), "w", encoding="utf-8") as fh:
+            fh.write("# 标题\n\n短段。\n")
+        subprocess.run(["git", "-C", self._tmp, "add", "-A"], check=True)
+
+    def test_tree_zero_files_refuses(self):
+        subprocess.run(["git", "init", "-q", self._tmp], check=True)  # 空仓库，无 .md
+        os.chdir(self._tmp)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(m.main(["--tree"]), 2)
+
+    def test_ref_zero_files_refuses(self):
+        subprocess.run(["git", "init", "-q", self._tmp], check=True)
+        subprocess.run(["git", "-C", self._tmp, "commit", "--allow-empty", "-qm", "x"], check=True)
+        os.chdir(self._tmp)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(m.main(["--ref", "HEAD"]), 2)
+
+    def test_tree_from_subdir_still_scans_root(self):
+        self._init_repo_with_md()
+        os.makedirs(os.path.join(self._tmp, "docs"))
+        os.chdir(os.path.join(self._tmp, "docs"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(m.main(["--tree"]), 0)
+        self.assertIn("扫描 1 个文件", out.getvalue())
+
+    def test_staged_no_change_is_ok(self):
+        self._init_repo_with_md()
+        subprocess.run(["git", "-C", self._tmp, "commit", "-qm", "init"], check=True)
+        os.chdir(self._tmp)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(m.main([]), 0)
 
 
 if __name__ == "__main__":
