@@ -245,6 +245,17 @@ class ScanSelectionFailOpen(unittest.TestCase):
         os.chdir(self._cwd)
         shutil.rmtree(self._tmp, ignore_errors=True)
 
+    @staticmethod
+    def _git(*args):
+        # CI runner 没有全局 git identity，且会把 GIT_AUTHOR_NAME 等置成空串——
+        # 空值环境变量的优先级高于 -c 配置，会压掉注入的身份，必须先剥掉。
+        env = {k: v for k, v in os.environ.items() if v or not k.startswith("GIT_")}
+        env.setdefault("GIT_AUTHOR_NAME", "docs-test")
+        env.setdefault("GIT_AUTHOR_EMAIL", "docs-test@example.invalid")
+        env.setdefault("GIT_COMMITTER_NAME", "docs-test")
+        env.setdefault("GIT_COMMITTER_EMAIL", "docs-test@example.invalid")
+        return subprocess.run(["git", *args], check=True, env=env)
+
     def _init_repo_with_md(self):
         subprocess.run(["git", "init", "-q", self._tmp], check=True)
         with open(os.path.join(self._tmp, "a.md"), "w", encoding="utf-8") as fh:
@@ -259,7 +270,7 @@ class ScanSelectionFailOpen(unittest.TestCase):
 
     def test_ref_zero_files_refuses(self):
         subprocess.run(["git", "init", "-q", self._tmp], check=True)
-        subprocess.run(["git", "-C", self._tmp, "commit", "--allow-empty", "-qm", "x"], check=True)
+        self._git("-C", self._tmp, "commit", "--allow-empty", "-qm", "x")
         os.chdir(self._tmp)
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(m.main(["--ref", "HEAD"]), 2)
@@ -275,7 +286,7 @@ class ScanSelectionFailOpen(unittest.TestCase):
 
     def test_staged_no_change_is_ok(self):
         self._init_repo_with_md()
-        subprocess.run(["git", "-C", self._tmp, "commit", "-qm", "init"], check=True)
+        self._git("-C", self._tmp, "commit", "-qm", "init")
         os.chdir(self._tmp)
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(m.main([]), 0)

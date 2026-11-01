@@ -37,7 +37,8 @@ class CommonSection(unittest.TestCase):
             [sys.executable, str(SCRIPT), "--conformance", str(self.conf), *extra],
             cwd=self.root, capture_output=True, text=True,
         )
-        return r.returncode, r.stdout + r.stderr
+        # 某些 runner 环境（如 CI 的 pwsh 包装）下子进程流可能为 None，不能假设恒为 str。
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
 
     def test_default_agents_md_happy_path(self):
         (self.conf / "AGENTS-common.md").write_text("公共正文\n", encoding="utf-8")
