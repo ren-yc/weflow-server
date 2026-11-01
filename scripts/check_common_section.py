@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""校验本仓 AGENTS.md 的公共段，与契约仓库**所 pin tag** 的内容逐字一致。
+"""校验本仓某份文档里的「公共段」，与契约仓库**所 pin tag** 的内容逐字一致。
 
 为什么比对「所 pin tag 的内容」而不是别的：
   * 比对本仓工作副本没有意义（自己跟自己比）；
@@ -7,8 +7,18 @@
     守卫就形同虚设。所以**升级 pin 是一个需要评审的动作**，而本脚本只负责
     回答「当前 pin 与当前内容是否一致」。
 
+默认对象是 `AGENTS.md` 的 `<!-- common:begin -->` / `<!-- common:end -->` 段，比对
+`AGENTS-common.md`。三项都可用参数替换，以便同一支脚本服务其它「公共段 + 上提模板」
+场景（如任意共享模板文件），而不必复制出第二份脚本——「规则与豁免只有一处」的纪律：
+
+    --section      本仓承载公共段的文件（默认 AGENTS.md）
+    --marker-begin / --marker-end   段标记（默认 <!-- common:begin --> / <!-- common:end -->）
+    --source       契约仓库里权威副本的相对路径（默认 AGENTS-common.md）
+
 用法：
     python scripts/check_common_section.py --conformance conformance
+    python scripts/check_common_section.py --conformance conformance \
+        --section docs/shared-section.md --source templates/shared-section.md
 
 退出码：0 一致；1 不一致；2 环境问题（读不到文件 / 缺标记）——**按拒绝放行处理**。
 """
@@ -37,11 +47,11 @@ def normalize(text: str) -> str:
     return text.replace("\r\n", "\n").rstrip("\n")
 
 
-def extract_common_section(agents_md: str) -> str:
-    m = re.search(re.escape(BEGIN) + r"\n(.*?)\n" + re.escape(END), agents_md, re.S)
+def extract_common_section(text: str, begin: str = BEGIN, end: str = END) -> str:
+    m = re.search(re.escape(begin) + r"\n(.*?)\n" + re.escape(end), text, re.S)
     if not m:
         raise ValueError(
-            "AGENTS.md 里找不到 " + BEGIN + " / " + END + " 标记对；"
+            f"找不到 {begin} / {end} 标记对；"
             "缺标记时无法确定比对范围，按环境问题处理（拒绝放行）"
         )
     return m.group(1)
@@ -54,13 +64,18 @@ def sha256(text: str) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description="公共段一致性校验")
     ap.add_argument("--conformance", default="conformance", help="契约仓库的检出目录")
-    ap.add_argument("--agents", default="AGENTS.md", help="本仓 AGENTS.md 路径")
+    ap.add_argument("--section", "--agents", dest="section", default="AGENTS.md",
+                    help="本仓承载公共段的文件（默认 AGENTS.md；--agents 为旧名，保留兼容）")
+    ap.add_argument("--source", default="AGENTS-common.md",
+                    help="契约仓库里权威副本的相对路径（默认 AGENTS-common.md）")
+    ap.add_argument("--marker-begin", default=BEGIN, help="段起始标记")
+    ap.add_argument("--marker-end", default=END, help="段结束标记")
     ap.add_argument("--pin", default="conformance.pin", help="记录所 pin tag 的文件")
     args = ap.parse_args()
 
     try:
-        head = Path(args.agents).read_text(encoding="utf-8")
-        want = Path(args.conformance, "AGENTS-common.md").read_text(encoding="utf-8")
+        head = Path(args.section).read_text(encoding="utf-8")
+        want = Path(args.conformance, args.source).read_text(encoding="utf-8")
         version = Path(args.conformance, "VERSION").read_text(encoding="utf-8")
         pin = Path(args.pin).read_text(encoding="utf-8").strip()
     except OSError as e:
@@ -68,9 +83,9 @@ def main() -> int:
         return 2
 
     try:
-        got = extract_common_section(head)
+        got = extract_common_section(head, args.marker_begin, args.marker_end)
     except ValueError as e:
-        print(f"[公共段] {e}", file=sys.stderr)
+        print(f"[公共段] {args.section}: {e}", file=sys.stderr)
         return 2
 
     # 版本自洽：pin 去掉前缀 v 必须等于契约仓库的 VERSION。
@@ -85,17 +100,17 @@ def main() -> int:
         return 1
 
     if normalize(got) != normalize(want):
-        print("[公共段] 与契约仓库不一致：", file=sys.stderr)
+        print(f"[公共段] {args.section} 与契约仓库 {args.source} 不一致：", file=sys.stderr)
         print(f"  本仓           {sha256(normalize(got))}", file=sys.stderr)
         print(f"  {pin}  {sha256(normalize(want))}", file=sys.stderr)
         print(
-            "  改公共段请改 flow-contract/AGENTS-common.md 并打新 tag，"
+            "  改公共段请改 flow-contract 里的权威副本并打新 tag，"
             "再在两个仓库同批升 conformance.pin。",
             file=sys.stderr,
         )
         return 1
 
-    print(f"公共段与 {pin} 一致（sha256 {sha256(normalize(got))[:16]}…）")
+    print(f"公共段与 {pin} 一致（{args.section} ↔ {args.source}，sha256 {sha256(normalize(got))[:16]}…）")
     return 0
 
 

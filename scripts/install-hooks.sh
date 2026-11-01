@@ -86,6 +86,21 @@ else
     status=1
 fi
 
+# 结构门禁（目录/段落/列表项/骨架/结论/层级）。存量已清零，正式接线（0 容忍）。
+if [ -n "$py" ]; then
+    "$py" scripts/check_docs_structure.py
+    rc=$?
+    if [ "$rc" = "2" ]; then
+        echo "[结构检查] 扫描未执行，按拒绝放行处理；提交已阻止（诊断见上）。" >&2
+        status=1
+    elif [ "$rc" != "0" ]; then
+        status=1
+    fi
+else
+    echo "[结构检查] 未找到可用的 Python 3，无法执行 scripts/check_docs_structure.py；提交已阻止。" >&2
+    status=1
+fi
+
 exit $status
 HOOK
 

@@ -1,8 +1,6 @@
 # weflow-sdk
 
-Typed Python client for [weflow-server](https://github.com/ren-yc/weflow-server) — a headless, read-only HTTP/SSE service over local WeChat 4.x chat databases.
-
-Generated from the server's OpenAPI description (types + request plumbing), with a handwritten behavior layer on top: transport failures folded into a proper error tree, readiness polling, pagination helpers, SSE streaming, and media download helpers.
+Typed Python client for [weflow-server](https://github.com/ren-yc/weflow-server), a read-only HTTP/SSE service over local WeChat 4.x databases.
 
 ## Install
 
@@ -19,32 +17,29 @@ from weflow_sdk import Client
 
 
 async def main() -> None:
-    client = Client(base_url="http://127.0.0.1:5033", token="your-token")
+    client = Client(base_url="http://127.0.0.1:5033", token="<token>")
     await client.health()
     sessions = await client.list_all_sessions()
     await client.aclose()
 
-
 asyncio.run(main())
 ```
 
-Need synchronous code? `SyncClient` mirrors `Client` method-for-method and drives its own
-private event-loop thread — it neither hijacks nor requires a loop in your thread:
+`SyncClient` mirrors `Client` method-for-method and drives its own private event-loop thread.
 
-```python
-from weflow_sdk import SyncClient
+## Generated and handwritten layers
 
-with SyncClient(base_url="http://127.0.0.1:5033", token="your-token") as client:
-    client.health()
-    sessions = client.list_all_sessions()
-```
-
-`watch_*` returns a plain iterator with the same reconnect-replay semantics as the async side.
+Types are generated; the behavior layer is handwritten. Never edit `generated/` — run `python scripts/regen.py`.
 
 ## Scope
 
-The server exposes a strictly read-only surface: accounts, sessions, messages, contacts, group members, SNS timelines, media export, and an SSE push stream. This client covers **all of it except the SNS timelines** — the server has those endpoints, the generated layer does not wrap them yet, so reach for plain HTTP if you need them (the gap is deliberate, not silent: the contract pins the surface this client is tested against). See the server repository for the API reference.
+Read-only over the user's databases; `sync` is the one state-changing call. Covers all read surfaces plus media export.
 
-## License
+SNS timelines are the one gap: the server has those endpoints, the generated layer does not wrap them yet.
 
-MIT
+## Links
+
+- [Server repository](https://github.com/ren-yc/weflow-server)
+- [API reference](https://github.com/ren-yc/weflow-server/blob/master/docs/weflow-server-api.md)
+- [CHANGELOG](https://github.com/ren-yc/weflow-server/blob/master/CHANGELOG.md)
+- [License](https://github.com/ren-yc/weflow-server/blob/master/LICENSE) — MIT
