@@ -35,7 +35,7 @@ class CommonSection(unittest.TestCase):
     def run_script(self, *extra):
         r = subprocess.run(
             [sys.executable, str(SCRIPT), "--conformance", str(self.conf), *extra],
-            cwd=self.root, capture_output=True, text=True,
+            cwd=self.root, capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
         # 某些 runner 环境（如 CI 的 pwsh 包装）下子进程流可能为 None，不能假设恒为 str。
         return r.returncode, (r.stdout or "") + (r.stderr or "")
