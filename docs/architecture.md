@@ -110,7 +110,7 @@ clients/                       # 类型化 SDK（rust / python / ts；ts 未发�
 | `testing` | 否 | 把实现面转成 `pub` | 集成测试够不着实现面 |
 | `cli` | 是 | 命令行子命令面：`clap` ＋ 复用 `weflow-client`（隐含 `server`） | 只剩「旗标」这一条老路 |
 
-依赖面的实际约束（可测，不是口号）：`--no-default-features` 的依赖树里不含 axum 与 tokio；加了 `cli`／`mcp` 之后同样不含 `clap`／`reqwest`／`rmcp`。
+依赖面的实际约束（可测，不是口号）：不开任何可选 feature 时，`--no-default-features` 的依赖树里不含 axum 与 tokio；开了 `cli` 带进 `clap`、`reqwest` 与 tokio，开了 `mcp` 再加 `rmcp`。
 
 核心面（解析、存储）因此不得依赖可选面，这条边界由 CI 的一条检查守着。
 

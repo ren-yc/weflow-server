@@ -12,7 +12,8 @@ sha256sum -c SHA256SUMS
 cargo install --locked weflow-server
 
 # 源码构建（前置工具链见 AGENTS.md 的「命令」）
-powershell -File scripts\build.ps1 build --release
+powershell -File scripts\build.ps1 build --release      # Windows
+bash scripts/build.sh build --release                   # Linux / macOS
 ```
 
 起服务：

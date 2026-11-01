@@ -481,14 +481,21 @@ def main(argv=None):
         return 0
 
     problems = []
+    scan_error = None
     for f in files:
         try:
             with open(f, encoding="utf-8", errors="replace") as fh:
                 text = fh.read()
         except OSError as e:
-            print(f"[结构检查] 跳过 {f}：{e}", file=sys.stderr)
+            # 读失败必须 fail closed：文件打不开不等于「没有违规」，静默跳过
+            # 会让全量门禁在权限/锁错误下变成空扫描放行。
+            scan_error = e
             continue
         problems.extend(scan_file(text, f, args))
+
+    if scan_error is not None:
+        print(f"[结构检查] 读取失败，按拒绝放行处理：{scan_error}", file=sys.stderr)
+        return 2
 
     if problems:
         print(f"结构门禁命中（{target}，{len(problems)} 条）：")

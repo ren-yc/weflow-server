@@ -26,8 +26,9 @@
 ```bash
 # Release 二进制：GitHub Releases 下载对应平台归档，sha256sum -c SHA256SUMS 校验后运行
 cargo install --locked weflow-server
-# 源码构建（前置工具链见 AGENTS.md 的「命令」；非 Windows 用 bash scripts/build.sh）
-powershell -File scripts\build.ps1 build --release
+# 源码构建（前置工具链见 AGENTS.md 的「命令」）
+powershell -File scripts\build.ps1 build --release      # Windows
+bash scripts/build.sh build --release                   # Linux / macOS
 ```
 
 起服务（token 首次启动生成并存入系统凭据库，`weflow-server token` 打印）：
