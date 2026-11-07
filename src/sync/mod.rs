@@ -423,6 +423,19 @@ impl AccountSync {
         // （戳与 data_version 基线）。读失败/无 key/打开失败的文件不记账，
         // 下一轮 classify 才会把它再当「已变更」重查。
         let mut read_done: Vec<String> = Vec::new();
+        // 元数据库（session/contact/fts/sns）本轮**成功刷新**的：它们的
+        // 成功读取同样进入确认集合。此前只有 Messages 会确认，一次联系人
+        // 提交之后 foreign_commit_pending 永远为真，每轮空轮询都全量重扫
+        // 并刷新 index_built_at_ms（回归：metadata_reload_confirms_once）。
+        //
+        // 版本确认采用**读取前采样**：消息库的采样在 SELECT 之前经
+        // `get_or_open_sampled` 拿到（连接与采样同一次借用，见 live.rs）；
+        // 元库的采样以「刷新成功」为准在 phase 3 补记。phase 4 确认的正是
+        // 这些采样值——SELECT 结束到确认之间落库的提交版本更大、不在集合里，
+        // 下一轮 classify 仍判「已变更」；在确认阶段重新采样当前版本会把那批
+        // 提交错误地记成「已读」，行就被永久吞掉
+        // （回归：unread_commit_between_read_and_ack_survives）。
+        let mut ack_versions: Vec<(String, i64)> = Vec::new();
 
         for w in &work {
             match w {
@@ -431,8 +444,14 @@ impl AccountSync {
                     let Some(key) = self.keys.key_for(&f.rel) else {
                         continue;
                     };
-                    let conn = match self.pool.get_or_open(f, key) {
-                        Ok(c) => c,
+                    // 连接与**读取前采样**同一次借用取得（get_or_open_sampled）：
+                    // 后面整个 SELECT 阶段都以这个版本为确认基准。
+                    // 采样值先落在局部：只有本轮**真正排空**（未触顶）才进入
+                    // 确认集合——触顶意味着还有行没读完，此时确认任何版本
+                    // 都可能把未读余量记成已读（这正是排空回归要防的形态）。
+                    let mut sampled_version: Option<i64> = None;
+                    let (conn, sampled) = match self.pool.get_or_open_sampled(f, key) {
+                        Ok(pair) => pair,
                         Err(AcquireError::WrongKey) => {
                             // 确定性失败进退避：busy_timeout 5 秒 × watch 350ms
                             // 高频触发会让坏 key 的文件拖垮整个 poll 节奏。
@@ -447,6 +466,9 @@ impl AccountSync {
                             continue;
                         }
                     };
+                    if let Some(v) = sampled {
+                        sampled_version = Some(v);
+                    }
                     let name2id = index::name2id_table(conn);
                     // 排空循环：单页读满 ⇒ 该表可能还有 ⇒ 继续读，直到不满页。只读一次就记
                     // 「本轮读过」的话，同一提交里第 5001 行之后的内容留在表里、而 phase 4 已
@@ -482,13 +504,18 @@ impl AccountSync {
                                 // latent bug that killed the parser's appmsg branch.
                                 let (base_type, _) =
                                     crate::parser::split_local_type(row.local_type);
+                                // 「记录进入索引」与「发布哪一种通知」是两件事：
+                                // 10000/10002（系统通知/撤回信令）与带撤回载荷的行
+                                // **照常入索引**——全量构建不过滤它们（index.rs 的
+                                // load_message_table），增量把它们丢掉就造成重启前后
+                                // 消息查询结果不一致（群公告、系统提示、撤回历史缺失）。
+                                // 通知类型只决定 phase 2 发哪一种事件。
                                 if matches!(base_type, 10000 | 10002)
                                     || row.parsed.revoke.is_some()
                                 {
-                                    revoke_rows.push((session_username.clone(), row));
-                                } else {
-                                    new_rows.push((session_username.clone(), row));
+                                    revoke_rows.push((session_username.clone(), row.clone()));
                                 }
+                                new_rows.push((session_username.clone(), row));
                                 new_watermarks.push((wm_key.clone(), wm));
                             }
                             if !full { break; }
@@ -501,7 +528,13 @@ impl AccountSync {
                             }
                         }
                     }
-                    if drained_all { read_done.push(f.rel.clone()); }
+                    if drained_all {
+                        read_done.push(f.rel.clone());
+                        // 排空才确认：版本集合的进入条件与戳记账一致。
+                        if let Some(v) = sampled_version {
+                            ack_versions.push((f.rel.clone(), v));
+                        }
+                    }
                 }
             }
         }
@@ -509,6 +542,8 @@ impl AccountSync {
         // phase 2: apply (single write lock) and emit events
         let mut applied_new = 0usize;
         let mut applied_revoke = 0usize;
+        // 压入 convs 的总行数（含信令行与自身发送）：updatedAt 的「索引变了吗」判据。
+        let mut applied_rows = 0usize;
         {
             let mut guard = self.store.write();
             // Deregistered while phase 1 was reading: discard the rows instead
@@ -523,6 +558,18 @@ impl AccountSync {
                 guard.watermarks.insert(wm_key, wm);
             }
             for (session, row) in new_rows {
+                // 撤回信令行入索引但不发 `message.new`：它的下游事件是 Revoke——
+                // 客户端同时收到「新消息：对方撤回了一条消息」和「撤回」两条通知
+                // 是重复告知；系统通知（10000）与撤回载荷行都只走索引 +
+                // Revoke/无事件这一条路。10000 无载荷时连 Revoke 都不发，但行在。
+                //
+                // 只按类型码判定即可：parser 只在 10000/10002 里提取撤回载荷，
+                // 「revoke.is_some() 但类型码不属于这两类」的行不存在——与
+                // phase 1 的分类条件合取形式在这里是冗余的，单条件更准确。
+                let is_signaling = matches!(
+                    crate::parser::split_local_type(row.local_type).0,
+                    10000 | 10002
+                );
                 let is_send = !row.sender_username.is_empty() && row.sender_username == my_wxid;
                 let sender_name = guard
                     .contacts
@@ -536,7 +583,8 @@ impl AccountSync {
                     is_send,
                     ..row
                 });
-                if !is_send {
+                applied_rows += 1;
+                if !is_send && !is_signaling {
                     applied_new += 1;
                     let ev = NewMessageEvent {
                         session_id: session.clone(),
@@ -585,24 +633,28 @@ impl AccountSync {
                 }
             }
             for (session, row) in revoke_rows {
-                if row.parsed.revoke.is_none() || row.create_time == 0 {
+                // 撤回**通知**只在行确实携带撤回载荷时发布。这里的 continue 只是
+                // 「不发撤回事件」——行本身已在上面随 new_rows 入索引，不再丢；
+                // create_time == 0 的行同样入索引（全量路径就是这么做的），只是
+                // 它的时间戳不能当通知时间用。
+                let Some(revoke) = row.parsed.revoke.as_ref().filter(|_| row.create_time > 0)
+                else {
                     continue;
-                }
+                };
                 let original = find_original(&guard, &session, &row);
                 let rawid = original
                     .as_ref()
                     .map(|o| o.server_id.to_string())
-                    .or_else(|| row.parsed.revoke.as_ref().and_then(|r| r.msg_id.clone()))
+                    .or_else(|| revoke.msg_id.clone())
                     .unwrap_or_default();
                 let original_content = original
                     .as_ref()
                     .map(|o| o.parsed.display.clone())
                     .unwrap_or_default();
                 let content = if original_content.is_empty() {
-                    row.parsed
-                        .revoke
-                        .as_ref()
-                        .and_then(|r| r.replace_msg.clone())
+                    revoke
+                        .replace_msg
+                        .clone()
                         .unwrap_or_else(|| "对方撤回了一条消息".to_string())
                 } else {
                     format!("对方撤回了一条消息（rawid：{rawid}） 内容为\"{original_content}\"")
@@ -632,7 +684,14 @@ impl AccountSync {
         }
 
         // phase 3: dependent section reloads over warm live connections
+        //
+        // 元库确认与消息库同一条纪律：确认的是**装载前采样**的版本。装载（全量
+        // 重载）不含装载之后落库的提交——确认「装载完成后」的版本会把那批提交
+        // 记成已读，它们要等到同库下一次提交或重启才会进索引。采样与连接在
+        // `get_or_open_sampled` 的同一次借用里取得；`load_*` 全量重载是幂等的，
+        // 装载前的版本已在 store 里充分体现。
         let keys = self.keys.clone();
+        let mut reloaded_sections = false;
         for w in &work {
             // Each arm takes its own write lock, so the flag is re-checked per
             // item rather than once for the whole loop.
@@ -642,37 +701,66 @@ impl AccountSync {
             match w {
                 Work::Sessions(f) => {
                         let Some(k) = keys.key_for(&f.rel) else { continue };
-                     if let Ok(conn) = self.pool.get_or_open(f, k) {
+                     if let Ok((conn, sampled)) = self.pool.get_or_open_sampled(f, k) {
                         let mut store = self.store.write();
-                        if let Err(e) = index::load_sessions(conn, &mut store) {
-                            tracing::warn!("sessions reload failed: {e}");
+                        match index::load_sessions(conn, &mut store) {
+                            Ok(()) => {
+                                // 刷新成功才确认：装载失败（表结构损坏等）本轮没有
+                                // 真正读过数据，版本留给下一轮。
+                                if let Some(v) = sampled {
+                                    ack_versions.push((f.rel.clone(), v));
+                                }
+                                reloaded_sections = true;
+                            }
+                            Err(e) => tracing::warn!("sessions reload failed: {e}"),
                         }
                     }
                 }
                 Work::Contacts(f) => {
                         let Some(k) = keys.key_for(&f.rel) else { continue };
-                     if let Ok(conn) = self.pool.get_or_open(f, k) {
+                     if let Ok((conn, sampled)) = self.pool.get_or_open_sampled(f, k) {
                         let mut store = self.store.write();
-                        if let Err(e) = index::load_contacts(conn, &mut store) {
-                            tracing::warn!("contacts reload failed: {e}");
-                        }
+                        let loaded = index::load_contacts(conn, &mut store);
                         // 群主与名册也住 contact.db —— 顺带一起刷，免得它们只在启动时是对的。
                         crate::store::group_meta::load_chatroom_meta(conn, &mut store);
+                        match loaded {
+                            Ok(()) => {
+                                if let Some(v) = sampled {
+                                    ack_versions.push((f.rel.clone(), v));
+                                }
+                                reloaded_sections = true;
+                            }
+                            Err(e) => tracing::warn!("contacts reload failed: {e}"),
+                        }
                     }
                 }
                 Work::GroupMeta(f) => {
                         let Some(k) = keys.key_for(&f.rel) else { continue };
-                     if let Ok(conn) = self.pool.get_or_open(f, k) {
+                     if let Ok((conn, sampled)) = self.pool.get_or_open_sampled(f, k) {
                         let mut store = self.store.write();
+                        // load_group_cards 无错误信号（尽力而为的名片加载）：
+                        // 连接打开即算装载完成——确认依据与其它元库保持同一
+                        // 粒度（「连接成功 + 装载执行过」），而不是无信号时的
+                        // 自由发挥。
                         crate::store::group_meta::load_group_cards(conn, &mut store);
+                        if let Some(v) = sampled {
+                            ack_versions.push((f.rel.clone(), v));
+                        }
+                        reloaded_sections = true;
                     }
                 }
                 Work::Sns(f) => {
                         let Some(k) = keys.key_for(&f.rel) else { continue };
-                     if let Ok(conn) = self.pool.get_or_open(f, k) {
+                     if let Ok((conn, sampled)) = self.pool.get_or_open_sampled(f, k) {
                         let mut store = self.store.write();
-                        if let Err(e) = index::load_sns(conn, &mut store) {
-                            tracing::warn!("sns reload failed: {e}");
+                        match index::load_sns(conn, &mut store) {
+                            Ok(()) => {
+                                if let Some(v) = sampled {
+                                    ack_versions.push((f.rel.clone(), v));
+                                }
+                                reloaded_sections = true;
+                            }
+                            Err(e) => tracing::warn!("sns reload failed: {e}"),
                         }
                     }
                 }
@@ -696,12 +784,19 @@ impl AccountSync {
                 f.rel.clone(),
                 DbStamps { main, wal },
             );
-            // data_version 基线同理：只在**真读过**的文件上推进。
-            self.pool.advance_data_version(&f.rel);
+        }
+        // data_version 基线只在**真读过**的文件上推进，且推进到**读取前采样**的
+        // 版本：确认之后新落库的提交（版本更大）仍被判「已变更」，下一轮照读。
+        for (rel, v) in ack_versions {
+            self.pool.set_data_version(&rel, v);
         }
 
-        // 只有这一轮确实动过索引才更新时刻：空转的一轮不该让 updatedAt 看起来更新了。
-        if applied_new > 0 || applied_revoke > 0 || !work.is_empty() {
+        // 只有这一轮确实动过索引才更新时刻。判据是**内容变化**（压入 convs 的
+        // 行数、或任一元库完成重载），不是事件数：只含自己发出的消息、或只刷了
+        // 联系人/名册的轮次同样改变了索引内容，updatedAt（group_members 的
+        // roster 就住在 contact.db）必须跟着走；空轮询（工作项非空但零行、
+        // 全部读失败）则不该让「索引时间」失去意义。
+        if applied_rows > 0 || reloaded_sections {
             self.store.write().mark_index_built();
         }
 
@@ -737,7 +832,14 @@ impl AccountSync {
 /// Locate the withdrawn original message inside a conversation.
 /// Candidates: server_id == msgid/newmsgid, else local_id == msgid,
 /// else the nearest preceding row within 5 minutes.
+///
+/// 信令行（10000/10002 系统通知与撤回信令）不作为候选：它们进索引之后
+/// （增量与全量现在一致）会出现在会话尾部，300 秒兜底会把「系统提示」
+/// 当成被撤回的原消息，RevokeEvent 的 rawid/content 随之变成系统行的。
 fn find_original(store: &Store, session: &str, revoke: &MessageRecord) -> Option<MessageRecord> {
+    let is_signaling = |m: &MessageRecord| {
+        matches!(crate::parser::split_local_type(m.local_type).0, 10000 | 10002)
+    };
     let ids: Vec<String> = [
         revoke.parsed.revoke.as_ref()?.msg_id.clone(),
         revoke.parsed.revoke.as_ref()?.new_msg_id.clone(),
@@ -747,7 +849,7 @@ fn find_original(store: &Store, session: &str, revoke: &MessageRecord) -> Option
     .collect();
     let conv = store.convs.get(session)?;
     for m in conv.iter().rev() {
-        if m.local_id == revoke.local_id {
+        if m.local_id == revoke.local_id || is_signaling(m) {
             continue;
         }
         let svr = m.server_id.to_string();
@@ -758,7 +860,7 @@ fn find_original(store: &Store, session: &str, revoke: &MessageRecord) -> Option
     // fallback: nearest previous incoming message within 300s
     let mut best: Option<&MessageRecord> = None;
     for m in conv.iter().rev() {
-        if m.local_id >= revoke.local_id {
+        if m.local_id >= revoke.local_id || is_signaling(m) {
             continue;
         }
         if revoke.create_time - m.create_time > 300 {
@@ -1035,5 +1137,192 @@ mod tests {
         assert_eq!(n2, 1, "无密钥的那一轮不得吞掉变更：恢复后必须重查");
         assert_eq!(store.read().convs[GROUP].len(), 2);
     }
+
+    /// 排空与确认之间的提交不得被吞：phase 4 只确认**读取前采样**的版本。
+    ///
+    /// 精确的读窗口交错（phase 2 持锁停驻 → 提交 → 放行）在 `poll_once` 的
+    /// 单线程接口里无法逐指令构造，本条退而验证确认原语的最小性质：
+    /// 采样值固定后，窗口内落库的提交必然让 `foreign_commit_pending` 为真。
+    /// 本条尾部还直接钉住对照形态——`advance_data_version`（确认时刻的
+    /// 当前值）会把窗口内提交记成已读，这正是它被弃用的原因。
+    #[test]
+    fn unread_commit_between_read_and_ack_survives() {
+        let dir = unique_dir("ack-window");
+        let key = crate::keystore::parse_db_key(KEY_HEX).unwrap().0;
+        let storage = build_message_account(&dir, &key);
+        let store = Arc::new(RwLock::new(Store::default()));
+        let mut sync = AccountSync::new(WXID, &storage, crate::keystore::KeyMap::from(crate::keystore::DbKey(key)), store.clone());
+        sync.full_sync().unwrap();
+        assert_eq!(store.read().convs[GROUP].len(), 1);
+
+        // 读前采样：模拟 poll_once phase 1 的动作——拿到连接即取版本。
+        let files = scan::enum_db_files(&storage);
+        let f = files.iter().find(|f| f.rel == "message/message_0.db").unwrap().clone();
+        let (sampled_v, pending_after_sample) = {
+            let (_conn, sampled) = sync
+                .pool
+                .get_or_open_sampled(&f, crate::keystore::DbKey(key))
+                .unwrap();
+            let pending = sync.pool.foreign_commit_pending(&f.rel).unwrap();
+            (sampled, pending)
+        };
+        assert!(!pending_after_sample, "采样后没有新提交：无待处理变更");
+
+        // 读取窗口内（SELECT 已完成、确认未发生）微信落库——正是要防的交错。
+        append_row(&storage, &key, 8_100_000_000_000_000_004);
+        let pending_in_window = sync.pool.foreign_commit_pending(&f.rel).unwrap();
+        assert!(pending_in_window, "窗口内提交必须被判为待处理");
+
+        // 确认动作只写**采样值**：窗口内的提交（版本更大）留在基线之后。
+        sync.pool.set_data_version(&f.rel, sampled_v.expect("正常打开必有版本"));
+        let pending_after_ack = sync.pool.foreign_commit_pending(&f.rel).unwrap();
+        assert!(
+            pending_after_ack,
+            "确认采样值后窗口内提交仍待处理——这是下一轮必读的依据"
+        );
+
+        // 对照：变异为确认当前值（advance 的错法）会把它确认掉。直接验证
+        // 当前值确认的错误性：把基线推到当前值，pending 变假——证明两种
+        // 确认的差别就是丢不丢行。
+        sync.pool.advance_data_version(&f.rel);
+        assert_eq!(
+            sync.pool.foreign_commit_pending(&f.rel),
+            Some(false),
+            "对照：确认当前值会把窗口内提交记成已读（错误形态本身的可观察性）"
+        );
+    }
+
+    /// 系统通知行（10000）在增量路径照常入索引：增量结果必须与全量重建一致。
+    /// 修复前的失败模式：10000/10002 全部只进 revoke 分支，无撤回载荷的行被
+    /// continue 丢弃 ⇒ 增量后 8 条、全量重建 9 条。
+    #[test]
+    fn system_row_reaches_the_index_incrementally() {
+        let dir = unique_dir("sys-row");
+        let key = crate::keystore::parse_db_key(KEY_HEX).unwrap().0;
+        let storage = build_message_account(&dir, &key);
+        let store = Arc::new(RwLock::new(Store::default()));
+        let mut sync = AccountSync::new(WXID, &storage, crate::keystore::KeyMap::from(crate::keystore::DbKey(key)), store.clone());
+        sync.full_sync().unwrap();
+        assert_eq!(store.read().convs[GROUP].len(), 1);
+
+        // 追加一条普通系统通知（10000、无撤回载荷）。
+        append_typed_row(&storage, &key, 8_100_000_000_000_000_007, 10000, "<sysmsg type=\"notice\"/>");
+        let (n, _) = sync.poll_once().unwrap();
+        // 信令行不进 applied_new（不发 message.new 事件——它的下游不是「新消息」语义），
+        // 但必须**入索引**：convs 里必须能看到这一行。
+        assert_eq!(n, 0, "系统通知不产生新消息事件");
+        assert_eq!(store.read().convs[GROUP].len(), 2, "系统通知照常入索引");
+
+        // 与全量重建对照：两条路径必须等价。
+        let mut pool = crate::db::live::LivePool::new();
+        let files = scan::enum_db_files(&storage);
+        let rebuilt = crate::store::index::build_all_live(
+            &mut pool,
+            &crate::keystore::KeyMap::Single(crate::keystore::DbKey(key)),
+            WXID,
+            &files,
+            &crate::store::index::IndexProgress::default(),
+        ).unwrap();
+        // 增量与全量的行数与水位必须一致——这正是「系统行入索引」的性质。
+        assert_eq!(
+            rebuilt.convs[GROUP].len(),
+            store.read().convs[GROUP].len(),
+            "增量索引与全量重建的行数必须一致"
+        );
+        assert_eq!(
+            rebuilt.convs[GROUP].last().unwrap().local_type,
+            10000,
+            "全量重建同样保留系统行"
+        );
+    }
+
+    /// 元数据库（contact）成功刷新后确认版本：一次提交只产生一次有效重载，
+    /// 随后的空轮询不再重复扫描、不再刷 index_built_at_ms。
+    ///
+    /// 夹具补上 contact.db（此前版本没有它，整条测试空转——work 恒空、
+    /// phase 0 早退，修前修后一样绿）。反向变异：把 phase 3 的确认集合
+    /// 拿掉，第二轮 foreign_commit_pending 仍为真 ⇒ reloaded 再次为真
+    /// ⇒ 时间戳第二次被推进 ⇒ 本条变红。
+    #[test]
+    fn metadata_reload_confirms_once() {
+        let dir = unique_dir("meta-ack");
+        let key = crate::keystore::parse_db_key(KEY_HEX).unwrap().0;
+        let storage = build_message_account_with_contact(&dir, &key);
+        let store = Arc::new(RwLock::new(Store::default()));
+        let mut sync = AccountSync::new(WXID, &storage, crate::keystore::KeyMap::from(crate::keystore::DbKey(key)), store.clone());
+        sync.full_sync().unwrap();
+
+        // 一次联系人提交：下一轮 poll 必须重载 contacts 并推进时间戳。
+        append_contact_row(&storage, &key, "wxid_new_friend_0001", "新朋友");
+        let t0 = store.read().index_built_at_ms;
+        sync.poll_once().unwrap();
+        let t1 = store.read().index_built_at_ms;
+        assert!(t1 > t0, "一次联系人提交应当产生一次有效重载（重载推进 updatedAt）");
+        assert!(
+            store.read().contacts.contains_key("wxid_new_friend_0001"),
+            "重载必须真的把新联系人装进索引"
+        );
+
+        // 无任何新提交：再轮询不得再次重载——时间戳不再推进，
+        // 且 classify 对 contact 库给出「已确认」。
+        sync.poll_once().unwrap();
+        assert_eq!(
+            store.read().index_built_at_ms, t1,
+            "成功重载必须确认版本：随后的空轮询不得再刷新索引时刻"
+        );
+        assert_eq!(
+            sync.pool.foreign_commit_pending("contact/contact.db"),
+            Some(false),
+            "确认集合必须包含 contact：装载前采样值已写回基线"
+        );
+    }
+
+    /// 追加一条指定 local_type 的行（系统通知/撤回载荷测试用）。
+    fn append_typed_row(storage: &Path, key: &[u8; 32], server_id: i64, local_type: i64, content: &str) {
+        let conn = Connection::open(storage.join("message/message_0.db")).unwrap();
+        let key_hex = hex::encode(key);
+        conn
+            .execute_batch(&format!(
+                "PRAGMA cipher_page_size = 4096;\n             PRAGMA key = \"x'{key_hex}'\";\n             PRAGMA journal_mode = DELETE;"
+            ))
+            .unwrap();
+        let group_md5 = md5_hex(GROUP);
+        conn.execute(
+            &format!(
+                "INSERT INTO \"Msg_{group_md5}\" (server_id, local_type, create_time, sort_seq, real_sender_id, message_content) VALUES (?1, ?2, ?3, 0, 2, ?4)"
+            ),
+            rusqlite::params![server_id, local_type, 1_700_000_300i64, content],
+        )
+        .unwrap();
+    }
+
+    /// 在 build_message_account 之上补 contact.db：元库确认与联系人重载的
+    /// 夹具（Contact 表与真库同形的最小形状）。
+    fn build_message_account_with_contact(dir: &Path, key: &[u8; 32]) -> PathBuf {
+        let storage = build_message_account(dir, key);
+        std::fs::create_dir_all(storage.join("contact")).unwrap();
+        let conn = Connection::open(storage.join("contact/contact.db")).unwrap();
+        let key_hex = hex::encode(key);
+        conn.execute_batch(&format!(
+            "PRAGMA cipher_page_size = 4096;\n             PRAGMA key = \"x'{key_hex}'\";\n             PRAGMA journal_mode = DELETE;\n             CREATE TABLE Contact (\n                userName TEXT PRIMARY KEY,\n                nickName TEXT,\n                remark TEXT\n             );"
+        ))
+        .unwrap();
+        drop(conn);
+        storage
+    }
+
+    /// 向 contact.db 追加一行联系人（新开连接提交一次，触发 data_version 变化）。
+    fn append_contact_row(storage: &Path, key: &[u8; 32], username: &str, remark: &str) {
+        let conn = Connection::open(storage.join("contact/contact.db")).unwrap();
+        let key_hex = hex::encode(key);
+        conn.execute_batch(&format!(
+            "PRAGMA cipher_page_size = 4096;\n             PRAGMA key = \"x'{key_hex}'\";\n             PRAGMA journal_mode = DELETE;"
+        ))
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO Contact (userName, nickName, remark) VALUES (?1, ?2, ?2)",
+            rusqlite::params![username, remark],
+        )
+        .unwrap();
+    }
 }
-// touch

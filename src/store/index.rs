@@ -660,34 +660,41 @@ fn build_all_live_inner(
 
     // 1) session.db
     if let Some(f) = db_files.iter().find(|f| f.kind == DbKind::Session) {
-        let Some(key) = keys.key_for(&f.rel) else {
-            tracing::warn!("no key for session.db");
-            return Ok(store);
-        };
-        match pool.get_or_open(f, key) {
-            Ok(conn) => {
-                if let Err(e) = load_sessions(conn, &mut store) {
-                    tracing::warn!("session table unreadable: {e}");
+        match keys.key_for(&f.rel) {
+            Some(key) => match pool.get_or_open(f, key) {
+                Ok(conn) => {
+                    if let Err(e) = load_sessions(conn, &mut store) {
+                        tracing::warn!("session table unreadable: {e}");
+                    }
                 }
+                Err(e) => tracing::warn!("session.db live open failed: {e}"),
+            },
+            None => {
+                // 可选库缺密钥只是**降级**：会话列表缺失，告警后继续走后面各步。
+                // 此前这里的提前 return 把「少一个可选库」放大成「消息索引整体
+                // 不建」——注册照样 ready，消息却是零条。各分支互不 return，
+                // 缺哪面只缺哪面。
+                tracing::warn!("no key for session.db —— 会话名与类型将缺失，继续构建其余库");
             }
-            Err(e) => tracing::warn!("session.db live open failed: {e}"),
         }
     }
 
     // 2) contact.db —— 联系人，以及**群主与名册**（后两者也住这个库）。
     if let Some(f) = db_files.iter().find(|f| f.kind == DbKind::Contact) {
-        let Some(key) = keys.key_for(&f.rel) else {
-            tracing::warn!("no key for contact.db");
-            return Ok(store);
-        };
-        match pool.get_or_open(f, key) {
-            Ok(conn) => {
-                if let Err(e) = load_contacts(conn, &mut store) {
-                    tracing::warn!("contact table unreadable: {e}");
+        match keys.key_for(&f.rel) {
+            Some(key) => match pool.get_or_open(f, key) {
+                Ok(conn) => {
+                    if let Err(e) = load_contacts(conn, &mut store) {
+                        tracing::warn!("contact table unreadable: {e}");
+                    }
+                    crate::store::group_meta::load_chatroom_meta(conn, &mut store);
                 }
-                crate::store::group_meta::load_chatroom_meta(conn, &mut store);
+                Err(e) => tracing::warn!("contact.db live open failed: {e}"),
+            },
+            None => {
+                // 同上：联系人名降级（显示名回退原始 id）不应连带丢掉整个消息索引。
+                tracing::warn!("no key for contact.db —— 联系人名与群主将缺失，继续构建其余库");
             }
-            Err(e) => tracing::warn!("contact.db live open failed: {e}"),
         }
     }
 
@@ -778,25 +785,34 @@ fn build_all_live_inner(
 
     // 4) sns.db — moments timeline
     if let Some(f) = db_files.iter().find(|f| f.kind == DbKind::Sns) {
-        let Some(key) = keys.key_for(&f.rel) else {
-            tracing::warn!("no key for {}", f.rel);
-            return Ok(store);
-        };
-        match pool.get_or_open(f, key) {
-            Ok(conn) => {
-                if let Err(e) = load_sns(conn, &mut store) {
-                    tracing::warn!("sns timeline unreadable: {e}");
+        match keys.key_for(&f.rel) {
+            Some(key) => match pool.get_or_open(f, key) {
+                Ok(conn) => {
+                    if let Err(e) = load_sns(conn, &mut store) {
+                        tracing::warn!("sns timeline unreadable: {e}");
+                    }
                 }
+                Err(e) => tracing::warn!("{} live open failed: {e}", f.rel),
+            },
+            None => {
+                // 同上：朋友圈时间线是可选面，缺密钥不连累消息索引与计数回填。
+                tracing::warn!("no key for {} —— 朋友圈时间线将缺失，messageCount 照常回填", f.rel);
             }
-            Err(e) => tracing::warn!("{} live open failed: {e}", f.rel),
         }
     }
 
     // 5) fill session message counts from convs
+    fill_session_message_counts(&mut store);
+    Ok(store)
+}
+
+/// 第 5 步的提取：会话消息计数从 convs 回填。缺密钥降级路径（session/contact/sns）
+/// 跳过的只是它们自己的库，这条回填在任何一条路径上都必须照常执行——各分支
+/// 现在不提前 return，函数唯一的调用点就是主路径末尾。
+fn fill_session_message_counts(store: &mut Store) {
     for (username, s) in store.sessions.iter_mut() {
         s.message_count = store.convs.get(username).map_or(0, |v| v.len());
     }
-    Ok(store)
 }
 
 /// 增量读取的单页上限。与 SQL 的 LIMIT 同值：调用方（sync 的排空循环）按
@@ -1138,5 +1154,90 @@ mod tests {
             .filter(|l| l.contains("no key for") && l.contains("DEBUG"))
             .count();
         assert!(debugs >= 1, "分母枚举步的同一事实应落 debug（至少一行）");
+    }
+
+    /// 可选元库（contact）缺密钥时消息索引照常构建：降级不得放大成整体缺失。
+    ///
+    /// 失败模式（修之前）：缺 contact 密钥的分支 `return Ok(store)`，消息扫描
+    /// 整体不跑——注册照样 ready，消息零条。
+    #[test]
+    fn missing_contact_key_still_builds_the_message_index() {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "weflow-idx-contact-key-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("message")).unwrap();
+        std::fs::create_dir_all(dir.join("contact")).unwrap();
+
+        // contact.db：文件存在、但**不提供密钥**——降级路径的精确形态。
+        let contact = dir.join("contact/contact.db");
+        {
+            let conn = rusqlite::Connection::open(&contact).unwrap();
+            conn.execute_batch(&format!(
+                "PRAGMA cipher_page_size = 4096;
+                 PRAGMA key = \"x'{}'\";
+                 PRAGMA journal_mode = DELETE;
+                 CREATE TABLE Contact (userName TEXT PRIMARY KEY, nickName TEXT);",
+                hex::encode([9u8; 32])
+            ))
+            .unwrap();
+        }
+        // 消息库：有键、含一行。它必须被读到。
+        let keyed = dir.join("message/message.db");
+        {
+            let conn = rusqlite::Connection::open(&keyed).unwrap();
+            conn.execute_batch(&format!(
+                "PRAGMA cipher_page_size = 4096;
+                 PRAGMA key = \"x'{}'\";
+                 PRAGMA journal_mode = DELETE;
+                 CREATE TABLE \"msg_2021f50af0b435101c0219d73dd2d44b\" (
+                    local_id INTEGER PRIMARY KEY,
+                    server_id INTEGER,
+                    local_type INTEGER,
+                    create_time INTEGER,
+                    sort_seq INTEGER,
+                    real_sender_id INTEGER,
+                    message_content TEXT,
+                    compress_content BLOB
+                 );
+                 INSERT INTO \"msg_2021f50af0b435101c0219d73dd2d44b\"
+                    (local_id, server_id, local_type, create_time, sort_seq, real_sender_id, message_content)
+                    VALUES (1, 100, 1, 1700000000, 0, 0, '你好');",
+                hex::encode([1u8; 32])
+            ))
+            .unwrap();
+        }
+        let files = vec![
+            crate::db::scan::DbFile {
+                rel: "contact/contact.db".into(),
+                abs: contact,
+                wal: None,
+                kind: crate::db::scan::DbKind::Contact,
+            },
+            crate::db::scan::DbFile {
+                rel: "message/message.db".into(),
+                abs: keyed,
+                wal: None,
+                kind: crate::db::scan::DbKind::Message,
+            },
+        ];
+        let keys = crate::keystore::KeyMap::Map(
+            [("message/message.db".to_string(), crate::keystore::DbKey([1; 32]))]
+                .into_iter()
+                .collect(),
+        );
+        let mut pool = crate::db::live::LivePool::new();
+        let progress = IndexProgress::default();
+        let store = build_all_live(&mut pool, &keys, "wxid_x", &files, &progress)
+            .expect("缺 contact 密钥不该让索引失败");
+        assert_eq!(
+            store.convs["2021f50af0b435101c0219d73dd2d44b"].len(),
+            1,
+            "contact 缺密钥只是降级：消息库的行必须照常进索引"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
