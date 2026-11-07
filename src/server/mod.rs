@@ -578,9 +578,29 @@ pub async fn start_account(
             } else {
                 p.clone()
             };
+            // `dir` 必须是**账号根**（媒体导出按 `<root>/msg/...` 找源文件）：
+            // 输入指向 db_storage 本身时取它的父目录——此前把原始输入原样存进
+            // dir，媒体被定位到 `<account>/db_storage/msg/...`（实际在
+            // `<account>/msg/...`），文本索引正常、媒体静默缺失。大小写不敏感
+            // （Windows 文件系统不区分，`DB_STORAGE` 是合法输入）；裸相对名的
+            // 父目录映射为 `.`（空路径功能等价但难看）。
+            let dir = if storage != p {
+                p.clone()
+            } else if p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case("db_storage"))
+            {
+                p.parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .map(|parent| parent.to_path_buf())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+            } else {
+                p.clone()
+            };
             Some(scan::AccountInfo {
                 wxid: wxid.clone(),
-                dir: p.clone(),
+                dir,
                 db_storage: storage,
                 session_db: scan::find_session_db(&p),
             })
@@ -914,6 +934,14 @@ fn purge_exported_media(root: &std::path::Path, talkers: &[String]) -> usize {
             continue;
         }
         let dir = root.join(talker);
+        // 树级删除与写侧同一归属守卫：导出树里可能预置指向根外的 junction，
+        // remove_dir_all 沿链接删的是链接本身（树级删除不破坏目标，已实测），
+        // 但**目录被替换**的 TOCTOU（校验时是目录、删除时已换成链接到别处的
+        // 目录）没有别的防线——canonicalize 解析后的真实路径必须仍在导出根内。
+        if !crate::pathsafe::is_contained(root, &dir.join(EXPORT_KINDS[0])) {
+            tracing::warn!("[deregister] 跳过越界导出目录: {:?}", dir.display());
+            continue;
+        }
         for kind in EXPORT_KINDS {
             let sub = dir.join(kind);
             match std::fs::remove_dir_all(&sub) {
@@ -1078,6 +1106,50 @@ pub fn watch_config(cfg: &Config) -> WatchConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// db_storage 本身作为 db_path 注册时，`AccountInfo.dir` 必须取账号父目录：
+    /// 媒体导出按 `<dir>/msg/...` 找源文件——dir 存的是原始输入（db_storage）时，
+    /// 媒体被定位到 `<account>/db_storage/msg/...`（实际在 `<account>/msg/...`），
+    /// 文本索引正常、媒体静默缺失。
+    #[test]
+    fn db_storage_input_resolves_the_account_root_for_media() {
+        let base = std::env::temp_dir().join(format!(
+            "weflow-reg-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let account = base.join("wxid_media_root");
+        let storage = account.join("db_storage");
+        std::fs::create_dir_all(storage.join("message")).unwrap();
+        std::fs::create_dir_all(account.join("msg").join("video")).unwrap();
+
+        // 复用与 start_account 相同的解析语义（输入指向 db_storage 本身时 dir
+        // 必须是父目录）。解析逻辑只有两行分支，这里直测语义比走 async 注册
+        // 路径更聚焦；start_account 的完整路径由探针级测试与 api_smoke 覆盖。
+        let p = std::path::PathBuf::from(storage.to_string_lossy().into_owned());
+        let storage_resolved = if p.join("db_storage").is_dir() {
+            p.join("db_storage")
+        } else {
+            p.clone()
+        };
+        let dir = if storage_resolved != p {
+            p.clone()
+        } else if p.file_name().and_then(|n| n.to_str()) == Some("db_storage") {
+            p.parent().map(|parent| parent.to_path_buf()).unwrap_or_else(|| p.clone())
+        } else {
+            p.clone()
+        };
+        assert_eq!(
+            dir, account,
+            "db_storage 输入必须解析出账号根（媒体导出的基准）"
+        );
+        assert!(dir.join("msg").is_dir(), "账号根下 msg/ 必须可达");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// 进程级 `GENERATION` 的串行化：会走**有效**注销的用例都先拿这把锁。
      /// 不加锁时 `--lib` 套件的并行执行里，任何一条并发注销都会

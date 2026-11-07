@@ -293,3 +293,70 @@ fn image_failing_md5_verification_is_not_exported() {
         "no file may be written when verification fails"
     );
 }
+
+/// 导出树里预置指向根外的 junction 时，落盘必须被归属守卫拒绝且根外内容不变。
+///
+/// 形态（Windows 特有，本服务主平台）：`<export>/<talker>/voices` 被换成指向
+/// 旁边 `outside` 目录的 junction。分量校验（`safe_segment`）管不住**已存在的
+/// 目录结构**——create_dir_all/read/write/rename 都会跟着链接走出去。修复：
+/// 落盘前 `is_contained` 校验父目录解析后的真实归属，fail-closed。
+/// （回归：junction 逃逸探针——修复前该形态下 `outside/voice_*.silk` 会被写出。）
+#[cfg(windows)]
+#[test]
+fn junctioned_voice_dir_is_rejected_and_outside_is_untouched() {
+    let dir = common::tmp_dir("mediaexport-junction");
+    let (ctx, aux) = setup(&dir);
+
+    // 在 voices 目录创建之前，先把 `<talker>` 整个目录替换为 junction：
+    // voices/videos/images/emojis 都会落在 junction 指向的根外目录里。
+    let outside = dir.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let talker_dir = ctx.export_dir.join(TALKER);
+    std::fs::create_dir_all(&talker_dir).unwrap();
+    let status = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(talker_dir.join("voices"))
+        .arg(&outside)
+        .status()
+        .unwrap();
+    assert!(status.success(), "mklink /J must succeed in the test harness");
+    // 埋一个根外哨兵文件：如果守卫失效，导出会沿 junction 在这里写出新文件。
+    std::fs::write(outside.join(".sentinel"), b"keep").unwrap();
+    let outside_before = collect_dir_state(&outside);
+
+    let jobs = vec![(
+        SVR_ID,
+        weflow_server::parser::MediaKind::Voice,
+        None,
+        SVR_ID,
+        TALKER.to_string(),
+    )];
+    let out = weflow_server::media::export::export_batch(&ctx, &aux, &jobs, 10);
+    assert!(out.is_empty(), "junctioned dir must be rejected: {out:?}");
+    assert_eq!(
+        collect_dir_state(&outside),
+        outside_before,
+        "根外目录内容不得变化——越界写入正是本守卫要拦的"
+    );
+    // 正常路径未被误伤：voices 目录恢复成真实目录后导出成功。
+    std::fs::remove_dir(talker_dir.join("voices")).unwrap();
+    let out = weflow_server::media::export::export_batch(&ctx, &aux, &jobs, 10);
+    assert!(!out.is_empty(), "removing the junction restores normal export");
+}
+
+#[cfg(windows)]
+fn collect_dir_state(p: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(p) {
+        for e in entries.flatten() {
+            if e.path().is_file() {
+                out.push((
+                    e.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(e.path()).unwrap_or_default(),
+                ));
+            }
+        }
+    }
+    out.sort();
+    out
+}

@@ -270,6 +270,20 @@ fn write_out(
     }
     let dir = export_dir.join(talker).join(kind_dir);
     std::fs::create_dir_all(&dir).ok()?;
+    // 分量校验只约束字符串形状，管不住**已存在的目录结构**：导出树里预置一个
+    // 指向根外的 junction/符号链接（Windows 上 mklink /J 人人可用），随后的
+    // read / write / rename 全都会跟着链接走出去。校验放在 create_dir_all
+    // **之后**写文件之前——目录树成形后 canonicalize 才能解析链接（放在
+    // create_dir_all 之前会因目录不存在而 fail-closed 拒绝一切）；mkdir 本身
+    // 无害（空目录），写文件才是要拦的动作。归属校验：解析后的父目录必须
+    // 仍在导出根内，fail-closed（解析不了就拒绝）。
+    if !crate::pathsafe::is_contained(export_dir, &dir.join(file_name)) {
+        tracing::warn!(
+            "[media-export] 目标目录越界（junction/symlink?）: dir={:?}",
+            dir.display()
+        );
+        return None;
+    }
     let path = dir.join(file_name);
     // idempotent: identical content already exported
     if let Ok(existing) = std::fs::read(&path)
@@ -283,8 +297,24 @@ fn write_out(
             digest_named,
         });
     }
-    let tmp = dir.join(format!(".{file_name}.tmp"));
-    std::fs::write(&tmp, bytes).ok()?;
+    // 临时文件用唯一名 + 排他创建：固定 `.name.tmp` 会让并发导出互踩——
+    // 两个写入方各自 write→rename，后写者可以把先写者刚 rename 的成品覆盖掉，
+    // 或在对方 rename 前把半成品当成对方的目标。排他创建保证只有建出这个
+    // 名字的写入方自己 rename 它。
+    let tmp = dir.join(format!(
+        ".{}.{}.tmp",
+        file_name,
+        std::process::id()
+    ));
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, bytes))
+        .is_err()
+    {
+        return None;
+    }
     std::fs::rename(&tmp, &path).ok()?;
     Some(ExportedMedia {
         file_name: file_name.to_string(),

@@ -361,6 +361,11 @@ v0.6.1 至 v0.6.6 都是纯文档 tag，v0.7.0 新增跨仓文档模板；v0.8.0
 - 所以按摘要干查（`media::export::digest_handles` 列出本会话导出目录里所有摘要派生名），命中才把实际落盘名当句柄给出。语音的 `voice_<svr>.silk` 与视频的平台名都不是摘要派生，拉取面同样不给句柄。
 - **目录扫描是阻塞 IO 且按请求算一次**（逐条 stat 会让一页变成几十次目录打开），因此走 `spawn_blocking`，并且放在取 store 读锁之前——`RwLockReadGuard` 不是 `Send`，跨 `.await` 会让 axum 的 `Handler` bound 直接编译失败。
 - 回归位置：`api_smoke::pull_advertises_media_id_only_for_exported_digest_files`；CLI 侧快路径钉在 `cli_e2e::media_id_from_pull_row_skips_the_export_round`。
+- **落盘与清理都有真实归属守卫**：路径分量校验（`safe_segment`）管不住已存在的目录结构——导出树里预置指向根外的 junction 后，读/写/rename 全都会跟着链接走出去。`write_out` 在目录树成形后、写文件前用 `is_contained` 校验父目录解析后的真实归属（fail-closed）；清理路径复用同一守卫。
+- 回归位置（归属守卫）：`media_export::junctioned_voice_dir_is_rejected_and_outside_is_untouched`。
+- **临时文件唯一名 + 排他创建**：固定 `.name.tmp` 会让两个写入方 write→rename 互踩；排他创建保证只有建出该名字的写入方自己 rename 它。
+- **续跑的媒体完整性检查是流式且三态的**：复用的 jsonl 产物按行扫描句柄，峰值内存不随文件大小增长（json 格式单行整份，不在本条承诺内）；「无悬空 / 有悬空 / 检查失败」三种结果分明，中部损坏与产物读取失败都以错误上抛并指出失败文件。
+- 回归位置（续跑检查）：`cli::reused_dangling_handles_are_detected_and_clean_rounds_pass`（中部非 UTF-8 与产物缺失两个失败分支）。
 
 ### 分页与免鉴权面
 

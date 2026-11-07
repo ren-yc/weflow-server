@@ -840,16 +840,20 @@ async fn media_for_page(
 /// 逐个核对**复用会话**产物里的媒体句柄是否在同目录 `media/` 下有字节。
 ///
 /// 返回悬空的会话名。清单只含本轮 target 与复用命中的条目，所以复用会话都能在清单里找到
-/// 自己的 `file`。句柄用子串扫描取（不解析整份 JSON）：两种形态都按 `{"fileName":"<name>"}` 无空格
-/// 序列化，而整份解析会把 jsonl 的「内存与条数无关」这条承诺在这里破掉。
+/// 自己的 `file`。句柄用**按行**子串扫描取（不解析整份 JSON、不整份读入内存）：
+/// 两种形态都按 `{"fileName":"<name>"}` 无空格序列化，行内扫描与整份扫描等价——
+/// jsonl 的每个产物行是一条完整 JSON；`read_to_string` 会把峰值内存绑到最大
+/// 会话文件上，数 GB 导出在续跑检查阶段就可能耗尽内存。
+/// 读取错误（I/O、非法 UTF-8）原样上抛——把「检查无法完成」吞成「无悬空」
+/// 等于向自动化调用方谎报媒体完整性已验证。
 fn reused_dangling_handles(
     index: &std::path::Path,
     reused: &[String],
     media_dir: &std::path::Path,
 ) -> Result<Vec<String>> {
-    let text = std::fs::read_to_string(index)
+    let index_text = std::fs::read_to_string(index)
         .with_context(|| format!("读清单失败: {}", index.display()))?;
-    let v: Value = serde_json::from_str(&text).context("清单不是合法 JSON")?;
+    let v: Value = serde_json::from_str(&index_text).context("清单不是合法 JSON")?;
     let mut dangling = Vec::new();
     for row in v.get("sessions").and_then(Value::as_array).into_iter().flatten() {
         let Some(talker) = row.get("talker").and_then(Value::as_str) else { continue };
@@ -857,16 +861,30 @@ fn reused_dangling_handles(
             continue;
         }
         let Some(file) = row.get("file").and_then(Value::as_str) else { continue };
-        let body = std::fs::read_to_string(index.with_file_name(file))
+        let artifact = index.with_file_name(file);
+        let body = std::fs::File::open(&artifact)
             .with_context(|| format!("读复用产物失败: {file}"))?;
-        for handle in body.split("\"fileName\":\"").skip(1).filter_map(|s| s.split('"').next()) {
-            if handle.is_empty() {
-                continue;
+        let reader = std::io::BufReader::new(body);
+        let mut talker_dangling = false;
+        for line in std::io::BufRead::lines(reader) {
+            // 逐行读：非法 UTF-8 与 I/O 错误在这里显式失败——两者的下游都是
+            // 「媒体完整性没有验证过」，静默通过等于谎报。
+            let line = line.with_context(|| format!("读复用产物失败（非 UTF-8 或 I/O）: {file}"))?;
+            for handle in line.split("\"fileName\":\"").skip(1).filter_map(|s| s.split('"').next()) {
+                if handle.is_empty() {
+                    continue;
+                }
+                if !media_dir.join(handle).exists() {
+                    talker_dangling = true;
+                    break;
+                }
             }
-            if !media_dir.join(handle).exists() {
-                dangling.push(talker.to_string());
+            if talker_dangling {
                 break;
             }
+        }
+        if talker_dangling {
+            dangling.push(talker.to_string());
         }
     }
     Ok(dangling)
@@ -1037,8 +1055,11 @@ fn run_export(a: &ExportArgs) -> Result<()> {
         // 复用的会话本轮一个字节都没下载，而 `--with-media` 的承诺是「导出物里出现的每个
         // fileName，字节都在 media/ 下」。上一轮之后媒体目录被清理或搬走时，句柄会悬空在交付
         // 包里而退出码仍是 0——这里按最终名逐个核对，把静默成功变成响亮失败。
-        let dangling = reused_dangling_handles(&outcome.index, &outcome.reused, &media_dir)
-            .unwrap_or_default();
+        //
+        // 三态分明：「无悬空」「有悬空」「检查无法完成」——最后一种必须以错误上抛，
+        // 把它吞成空列表等于向自动化调用方谎报媒体完整性已验证（清单中部损坏、
+        // 产物被换、非法 UTF-8 都只有这里能发现，末尾换行检查只看最后一字节）。
+        let dangling = reused_dangling_handles(&outcome.index, &outcome.reused, &media_dir)?;
         if !dangling.is_empty() {
             for t in &dangling {
                 println!("[export] 媒体句柄悬空（复用产物缺字节）: {t}");
@@ -1238,6 +1259,28 @@ mod tests {
         std::fs::write(d.join(artifact), "{\"_type\":\"header\"}\n").unwrap();
         let none = reused_dangling_handles(&index, &reused, &d.join("media")).unwrap();
         assert!(none.is_empty(), "无句柄的产物不该被报为悬空: {none:?}");
+
+        // 末尾完整但**中部非 UTF-8** → 检查必须失败而不是被当成「无悬空」：
+        // 末尾换行检查只看最后一字节，中部损坏只有这里能发现——吞掉它等于
+        // 向自动化调用方谎报媒体完整性已验证。
+        let mut corrupted = b"{\"_type\":\"header\"}\n".to_vec();
+        corrupted.extend_from_slice(&[0xFF, 0xFE, 0xC0, 0x80]);
+        std::fs::write(d.join(artifact), &corrupted).unwrap();
+        let err = reused_dangling_handles(&index, &reused, &d.join("media"))
+            .expect_err("中部损坏必须显式失败，不能静默当作无悬空");
+        assert!(
+            err.to_string().contains(artifact),
+            "错误要指出失败的文件: {err}"
+        );
+
+        // 产物读取期间失效（文件被删）→ 同样显式失败。
+        std::fs::remove_file(d.join(artifact)).unwrap();
+        let err2 = reused_dangling_handles(&index, &reused, &d.join("media"))
+            .expect_err("产物缺失必须显式失败");
+        assert!(
+            err2.to_string().contains("读复用产物失败"),
+            "错误要说明是读取失败: {err2}"
+        );
 
         let _ = std::fs::remove_dir_all(&d);
     }
