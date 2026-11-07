@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
+use axum::response::IntoResponse;
 use axum::http::{header, Request};
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -61,6 +62,28 @@ fn harness_router(
             let state = state.clone();
             async move {
                 let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                // 游标相对追加（opaqueCursor 用例）：向 cursor 表达的入库进度
+                // **之后**追加一条消息，回显新行的 platformMessageId（WeFlow 侧
+                // 即 server_id 字符串——测试夹具里它由递增序号保证唯一）。本仓库
+                // 的消息表按 (create_time, sort_seq, local_id) 排序、增量按 local_id
+                // 推进，故游标之后 = local_id 更大即可（同一秒或更晚都可）。
+                if v["action"].as_str() == Some("harness.append_message_at_cursor") {
+                    let key = weflow_server::keystore::parse_db_key(&key_hex).unwrap();
+                    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    common::append_group_message_unique(&storage, &key.0, 8100 + seq);
+                    let acct = state.accounts.lock().values().next().cloned();
+                    if let Some(a) = acct {
+                        let sync = a.sync.clone();
+                        let _ =
+                            tokio::task::spawn_blocking(move || sync.lock().poll_once()).await;
+                    }
+                    // 回显新行的 id（用例经 save 取回作为 appended_id 基准）。
+                    // append_group_message_unique 的 server_id 由序号派生，这里
+                    // 直接以同源序号构造。
+                    let id = format!("{}", 8_400_000_000_000_000_000i64 + 8100 + seq);
+                    return axum::Json(serde_json::json!({ "success": true, "id": id }))
+                        .into_response();
+                }
                 match v["action"].as_str().unwrap_or("") {
                     "harness.append_message" => {
                         // **前提恢复**：用例之间必须互相独立，而 `sse-deregister-replay` 会
@@ -128,7 +151,7 @@ fn harness_router(
                     }
                     _ => {}
                 }
-                axum::http::StatusCode::OK
+                axum::http::StatusCode::OK.into_response()
             }
         }),
     )
@@ -205,7 +228,7 @@ async fn wait_ready(app: &axum::Router) -> bool {
 
 /// 夹具声明的契约版本。**必须与 `conformance.pin` 同改** —— 见下面的
 /// `pinned_contract_version_matches_the_fixture`。
-const CONTRACT_VERSION: &str = "0.8.0";
+const CONTRACT_VERSION: &str = "0.9.0";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "由 CI 的一致性步骤显式运行：需要 FLOW_CONTRACT_DIR"]
@@ -297,6 +320,16 @@ async fn conformance_suite_passes() {
         let (n, s) = probe(client.clone(), name, r).await;
         auth_probed.insert(n, json!(s));
     }
+    // 导出根预置一条可取的媒体文件（mediaId 承诺用例）：名字由内容摘要派生
+    //（32 hex），与 mediaId 同值——按句柄取字节即取这个文件。
+    let exported_dir = dir.join("media").join(common::FAKE_GROUP).join("voices");
+    std::fs::create_dir_all(&exported_dir).unwrap();
+    std::fs::write(
+        exported_dir.join("00112233445566778899aabbccddeeff.silk"),
+        b"#!SILK_V3-fixture-bytes",
+    )
+    .unwrap();
+
     let fx = json!({
         "contractVersion": CONTRACT_VERSION,
         "platform": "wechat",
@@ -308,6 +341,9 @@ async fn conformance_suite_passes() {
             "health": "/health",
             "messages": "/api/v1/messages",
             "messages_chatlab": "/chatlab/messages",
+            // 媒体字节端点（mediaById 能力的落点，契约用例
+            // nails-media-id-fetch-succeeds 按句柄取字节）。
+            "media": "/api/v1/media/{id}",
             "harness": "/__harness",
             "group-members": "/api/v1/group-members",
             "pull": "/chatlab/sessions/{id}/messages",
@@ -320,9 +356,16 @@ async fn conformance_suite_passes() {
             "private_with_messages": { "id": common::FAKE_FRIEND, "expect": { "messages": 4 } },
             "same_second_burst": { "id": common::FAKE_GROUP, "expect": { "same_second": 4 } },
             "unknown": { "id": "wxid_does_not_exist_000000000", "expect": {} },
+            // harness 保证句柄此刻可取的媒体（mediaId 承诺用例的槽位）。
+            // harness 保证句柄此刻可取的媒体（mediaId 承诺用例的槽位）：
+            // 夹具预置一条语音导出（32 位十六进制摘要名，与 mediaId 同值）。
+            "exported_media": { "id": "00112233445566778899aabbccddeeff", "expect": {} },
         },
         "capabilities": {
             "mediaById": true,
+            // 不透明进度游标（契约 0.9.0）：sync.nextCursor + cursor 参数已实现，
+            // 排空后同秒晚入库的行可经游标续拉到达。
+            "opaqueCursor": true,
             "sns": true,
             "memberCount": true,
             // Pull 形状的发现面（`GET /chatlab/sessions`）已实现：置 true 让相关用例实跑。

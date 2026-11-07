@@ -649,12 +649,27 @@ class Client:
         # 404 copies whole files. Neither has a meaningful read budget.
         resp = await self._http_get(url, headers=auth, timeout=self._long_timeout)
         if resp.status_code == 404:
-            await self._get_json(
+            # 触发导出后**采用导出响应回填的实际文件名**重试：服务端落盘名与
+            # 元数据名不必相同，丢弃导出响应用旧名重试必然再次 404——即使目标
+            # 就在导出页内。目标不在默认导出窗口（最新 100 条）时如实报出。
+            exported = await self._get_json(
                 "/chatlab/messages",
                 {"talker": talker, "media": "1"},
                 long=True,
             )
-            resp = await self._http_get(url, headers=auth, timeout=self._long_timeout)
+            my_id = message.platform_message_id
+            exported_name = ""
+            for m in exported.get("messages", []):
+                if m.get("platformMessageId") == my_id:
+                    exported_name = (m.get("media") or {}).get("fileName") or ""
+                    break
+            if not exported_name.strip():
+                raise ShapeError(
+                    "handle 404s and the export page (latest 100) does not contain "
+                    f"message {my_id}; cannot re-export by name"
+                )
+            retry_url = self._url(f"/api/v1/media/{_encode_path_segment(exported_name)}")
+            resp = await self._http_get(retry_url, headers=auth, timeout=self._long_timeout)
         # Not-2xx (not just 4xx/5xx): a 3xx falling through to `return` hands
         # the caller an empty redirect body as media bytes with no error signal
         # - same rule as _decode / media_bytes_by_id.

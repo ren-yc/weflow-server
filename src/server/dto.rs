@@ -494,6 +494,13 @@ pub struct PullSync {
     pub has_more: bool,
     pub next_offset: usize,
     pub next_since: i64,
+        /// 不透明进度游标（契约 0.9.0 的 opaqueCursor 能力）：编码入库进度
+    /// （账号代次 + 唯一行标识 localId），客户端原样回传、不得解析。排空后
+    /// 仍在场且非空——进度游标不终结（与消息面 page.nextCursor 排空为 null
+    /// 的约定不同），它是下一次增量请求的起点。时间游标的盲区（排空后同秒
+    /// 晚入库的行永远落在 nextSince 之后）由它补上。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
     pub watermark: i64,
 }
 // ── 联系人 ────────────────────────────────────────────────

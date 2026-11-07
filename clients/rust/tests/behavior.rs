@@ -536,9 +536,18 @@ async fn media_bytes_exports_then_retries_once_after_404() {
     // the two coincide so the mistake was invisible. The mock now rejects any
     // export query whose talker is not the session id we pass.
     let display_name = "Alice DISPLAY";
+    // 导出响应携带本条消息（platformMessageId=42），media.fileName 是**导出
+    // 实际落盘名**——与元数据名不同。修复前丢弃导出响应用元数据名重试，
+    // 即使目标就在页内也必然再次 404。
     *mock.chatlab_page.lock().unwrap() = Some(serde_json::json!({
         "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
-        "count": 0, "members": [], "messages": [],
+        "count": 1, "members": [],
+        "messages": [{
+            "accountName": display_name, "content": "hello", "groupNickname": "",
+            "media": {"type": "image", "fileName": "abc123.exported.png", "md5": "abc"},
+            "platformMessageId": "42", "sender": "alice",
+            "timestamp": 1_700_000_000, "type": 1,
+        }],
         "meta": {"groupId": "", "name": "", "ownerId": "", "platform": "weflow", "type": "chat"},
         "page": {"hasMore": false, "nextCursor": null},
         "talker": talker,
@@ -553,7 +562,11 @@ async fn media_bytes_exports_then_retries_once_after_404() {
     let bytes = client.media_bytes(&message, talker).await.expect("retry must succeed");
     assert_eq!(bytes.as_ref(), b"png-bytes");
     let calls = mock.media_calls.lock().unwrap().clone();
-    assert_eq!(calls, vec!["abc123.png", "abc123.png"], "two GETs: miss then retry");
+    assert_eq!(
+        calls,
+        vec!["abc123.png", "abc123.exported.png"],
+        "two GETs: miss with the metadata name, retry with the export-backfilled name"
+    );
 }
 
 #[tokio::test]
