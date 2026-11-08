@@ -592,6 +592,47 @@ async fn media_bytes_without_a_handle_is_unexpected_body_not_a_fake_404() {
 }
 
 #[tokio::test]
+async fn media_bytes_with_ambiguous_export_rows_refuses_to_guess() {
+    // The export target is located by the (id, sender, timestamp) triple:
+    // two rows that agree on all three cannot be told apart, and retrying
+    // with either name would silently fetch the wrong file. The client must
+    // report the ambiguity (and must not fire the retry GET) instead of
+    // picking one row.
+    let mock = Mock::default();
+    let duplicated = serde_json::json!({
+        "accountName": "alice", "content": "x", "groupNickname": "",
+        "media": {"type": "image", "fileName": "dup.exported.png", "md5": "z"},
+        "platformMessageId": "42", "sender": "alice",
+        "timestamp": 1_700_000_000, "type": 1,
+    });
+    *mock.chatlab_page.lock().unwrap() = Some(serde_json::json!({
+        "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
+        "count": 2, "members": [],
+        "messages": [duplicated.clone(), duplicated],
+        "meta": {"groupId": "", "name": "", "ownerId": "", "platform": "weflow", "type": "chat"},
+        "page": {"hasMore": false, "nextCursor": null},
+        "talker": "wxid_mock",
+    }));
+    *mock.chatlab_query_talker.lock().unwrap() = Some("wxid_mock".to_string());
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+    let message: weflow_client::generated::r#gen::types::ChatlabMessage =
+        serde_json::from_value(mock_message_json("Alice DISPLAY", "abc123.png"))
+            .unwrap();
+    match client.media_bytes(&message, "wxid_mock").await {
+        Err(ClientError::UnexpectedBody { detail, .. }) => {
+            assert!(
+                detail.contains("matches 2 messages"),
+                "ambiguity error must carry the match count: {detail}"
+            );
+        }
+        other => panic!("expected UnexpectedBody, got {other:?}"),
+    }
+    // No second GET happened: the retry only fires for a unique match.
+    assert_eq!(*mock.media_calls.lock().unwrap(), vec!["abc123.png"]);
+}
+
+#[tokio::test]
 async fn media_precondition_errors_name_the_real_endpoint_not_prose() {
     // Three local preconditions (no handle, empty talker, empty file name, empty id)
     // used to put a sentence into the `url` field: a caller classifying by url prefix

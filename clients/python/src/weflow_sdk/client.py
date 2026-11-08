@@ -660,11 +660,26 @@ class Client:
                 long=True,
             )
             my_id = message.platform_message_id
+            # The target is located by the (platform message id, sender,
+            # timestamp) triple: id alone would accept an interleaved row that
+            # happens to carry the same id. No match => the target is outside
+            # the export page; multiple matches => there is no way to tell
+            # which row is this one - report, do not guess.
+            matches = [
+                m for m in exported.get("messages", [])
+                if m.get("platformMessageId") == my_id
+                and m.get("sender") == message.sender
+                and m.get("timestamp") == message.timestamp
+            ]
+            if len(matches) > 1:
+                raise ShapeError(
+                    f"export page matches {len(matches)} messages for "
+                    f"({my_id}, {message.sender}, {message.timestamp}); "
+                    "cannot pick one to re-export"
+                )
             exported_name = ""
-            for m in exported.get("messages", []):
-                if m.get("platformMessageId") == my_id:
-                    exported_name = (m.get("media") or {}).get("fileName") or ""
-                    break
+            if matches:
+                exported_name = (matches[0].get("media") or {}).get("fileName") or ""
             if not exported_name.strip():
                 raise ShapeError(
                     "handle 404s and the export page (latest 100) does not contain "

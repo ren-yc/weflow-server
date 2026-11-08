@@ -645,6 +645,7 @@ timeline / export 的条目键共 20 个：
 - 一页语义 vs 取尽语义：`pull_page` / `list_messages` / `chatlab_messages` / `contacts` 只取一页；`drain_session` / `list_all_sessions` 内部翻页到 `hasMore=false`。
 - 游标必须原样回传：`pull_page` 的 `nextSince` / `nextOffset` 叠加会二次跳过同一批行。
 - `group_members` 的计数开关关闭时不发参数（不是发 `0`）；`list_all_sessions` 的 `page_size` 上限 10000。`media_bytes` 在 404 后按「先 `media=1` 导出再取」自动重试一次；`media_bytes_by_id` 不触发导出。
+- 重试时导出行按（平台消息 id、sender、timestamp）三元组定位：恰好一行用它的落盘名重试，零行报「导出页不含目标」，多行报「无法确定哪一行才是本条」。
 - `watch()` 的游标只在帧被消费时推进；只有 `id:` 没有 `data:` 的悬空帧不推进。类型与操作客户端由 `/openapi.json` 生成（`cargo run -p weflow-regen` / `python scripts/regen.py`），生成物入库、CI 断言无 diff；不要手改生成物。
 - 行为层手写：`clients/rust/src/client.rs` 与 `clients/python/src/weflow_sdk/client.py`。Python 另有 `SyncClient`，方法面与 `Client` 一一对应，内部跑专属事件循环线程。
 - 错误按性质分派：HTTP 非 2xx → `Status`；连接/超时/重置/URL 解析失败 → `Transport`；JSON 合法但不合承诺形状 → `Shape`。超时按单次操作计时、有进展即复位，没有总时限：连接 5s、普通 JSON 请求 30s、成本由数据量决定的一族 90s。

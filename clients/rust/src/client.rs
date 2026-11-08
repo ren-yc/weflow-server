@@ -761,19 +761,41 @@ impl Client {
             q.insert("talker", talker.to_string());
             q.insert("media", "1".to_string());
             let exported: gen_types::ChatlabMessages = self.get_json("/chatlab/messages", &q).await?;
-            let my_id = &message.platform_message_id;
-            let exported_name = exported
+            // 导出页里的目标是按「平台消息 id + 发送者 + 时间戳」三元组定位的，
+            // 单看 platform_message_id 会把同 id 的干扰行当成目标（id 并不保证
+            // 全局唯一）。都不匹配 ⇒ 目标不在导出页；匹配到多行 ⇒ 无法确定
+            // 哪一行才是本条，两者都如实报错而不是猜一个名字重试。
+            let matches: Vec<&gen_types::ChatlabMessage> = exported
                 .messages
                 .iter()
-                .find(|m| &m.platform_message_id == my_id)
-                .and_then(|m| m.media.as_ref())
-                .map(|m| m.file_name.clone())
-                .unwrap_or_default();
+                .filter(|m| {
+                    m.platform_message_id == message.platform_message_id
+                        && m.sender == message.sender
+                        && m.timestamp == message.timestamp
+                })
+                .collect();
+            let exported_name = match matches.as_slice() {
+                [one] => one.media.as_ref().map(|m| m.file_name.clone()).unwrap_or_default(),
+                [] => String::new(),
+                _ => {
+                    return Err(ClientError::UnexpectedBody {
+                        url: url.clone(),
+                        detail: format!(
+                            "export page matches {} messages for ({}, {}, {}); cannot pick one to re-export",
+                            matches.len(),
+                            message.platform_message_id,
+                            message.sender,
+                            message.timestamp
+                        ),
+                    });
+                }
+            };
             if exported_name.trim().is_empty() {
                 return Err(ClientError::UnexpectedBody {
                     url: url.clone(),
                     detail: format!(
-                        "handle 404s and the export page (latest 100) does not contain message {my_id}; cannot re-export by name"
+                        "handle 404s and the export page (latest 100) does not contain message {}; cannot re-export by name",
+                        message.platform_message_id
                     ),
                 });
             }

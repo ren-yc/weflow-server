@@ -453,6 +453,46 @@ async def test_media_bytes_exports_then_retries() -> None:
     await client.aclose()
 
 
+async def test_media_bytes_with_ambiguous_export_rows_refuses_to_guess() -> None:
+    """The export target is located by the (id, sender, timestamp) triple.
+
+    Two rows that agree on all three cannot be told apart, and retrying with
+    either name would silently fetch the wrong file. The client must report
+    the ambiguity (and must not fire the retry GET) instead of picking one.
+    """
+    duplicated = {
+        "accountName": "alice", "content": "x", "groupNickname": "",
+        "media": {"type": "image", "fileName": "dup.exported.png", "md5": "z"},
+        "platformMessageId": "1", "sender": "alice", "timestamp": 1, "type": 1,
+    }
+    mock = Mock()
+    mock.chatlab_page = {
+        "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
+        "count": 2, "members": [],
+        "messages": [duplicated, dict(duplicated)],
+        "meta": {"groupId": "", "name": "", "ownerId": "",
+                 "platform": "weflow", "type": "chat"},
+        "page": {"hasMore": False, "nextCursor": None},
+        "talker": "alice",
+    }
+    mock.chatlab_query_talker = "wxid_alice"
+    client = make_client(mock)
+    message = gen.ChatlabMessage.model_validate({
+        "accountName": "Alice DISPLAY", "content": "x", "groupNickname": "",
+        "media": {"type": "image", "fileName": "abc.png", "md5": "z"},
+        "platformMessageId": "1", "sender": "alice", "timestamp": 1, "type": 1,
+    })
+    with pytest.raises(sdkmod.ShapeError) as exc_info:
+        await client.media_bytes(message, "wxid_alice")
+    assert "matches 2 messages" in str(exc_info.value), (
+        "ambiguity error must carry the match count"
+    )
+    assert mock.media_calls == ["abc.png"], (
+        "no retry GET fires: the retry only happens for a unique match"
+    )
+    await client.aclose()
+
+
 async def test_media_bytes_rejects_redirect_like_statuses() -> None:
     """The bytes check must be "not 2xx", not "4xx/5xx".
 
