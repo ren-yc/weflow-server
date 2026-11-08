@@ -340,7 +340,8 @@ v0.6.1 至 v0.6.6 都是纯文档 tag，v0.7.0 新增跨仓文档模板；v0.8.0
 - **WAL 预分配 4 MiB ⇒ 文件大小恒定，指纹只能看 mtime**：库是 WAL 模式且预分配固定大小的日志，写入不会改变文件大小，所以「靠 size 判断有没有新消息」永远为假。反过来说 mtime 变了不代表真有新消息，水位线才是权威。
 - **增量检测是两级**：已打开的库用 SQLite `PRAGMA data_version` 探测外部提交——它是连接本地属性，只在同一连接的两个时点之间比较才有意义，且别的连接提交后必然不同但不保证递增（比较用不等，不用大小）。文件 mtime/size 戳退为未打开文件的前置门。Windows 高负载下元数据回读可能滞后，只靠文件戳会把一次写入误判成「未变」。
 - **记账规则**：只有真正读到数据的文件才记账（记文件戳 ＋ 确认 data_version 基线）——无密钥、打开失败的文件不记账，下一轮才不会把它判成「未变」而把变更永久吞掉。qqflow 侧语义天然如此，无需同构。
-- **确认的是读取前采样值，且只有排空才确认**：消息库在 SELECT 之前采样 `data_version`，本轮完全排空（未触顶）才把采样值写回基线。SELECT 结束到确认之间落库的提交版本更大、留在基线之后，下一轮必读；确认时刻重读「当前值」会把那批提交错误记成已读。回归见 `unread_commit_between_read_and_ack_survives`。
+- **确认的是读取前采样值，且只有排空才确认**：消息库在 SELECT 之前采样 `data_version`，本轮完全排空（未触顶）才把采样值写回基线。SELECT 结束到确认之间落库的提交版本更大、留在基线之后，下一轮必读；确认时刻重读「当前值」会把那批提交错误记成已读。
+- 回归位置分两层：采样与排空判据的原语级单元回归见 `unread_commit_between_read_and_ack_survives`；`poll_once` 全路径只能观察到结果（`incremental_poll_picks_up_new_rows_after_watermark`），确认窗口本身无法逐指令构造。
 - **元库重载与消息库同一确认纪律**：session/contact/fts/sns 成功重载后按**装载前采样值**确认，一次提交只产生一次有效重载。回归见 `metadata_reload_confirms_once`。
 - **updatedAt 只随索引内容变化推进**：判据是本轮压入会话的行数或任一元库完成重载，不是事件数——只含自身发送消息、或只刷了名册的轮次同样改变索引内容；空轮询不推进。
 - 回归见 `stamp_unchanged_but_committed_row_is_still_polled` 与 `failed_open_does_not_swallow_the_next_poll`。
