@@ -40,6 +40,8 @@ from weflow_sdk.generated.weflow_sdk.models.health import Health
 from weflow_sdk.generated.weflow_sdk.models.index_progress_dto import IndexProgressDto
 from weflow_sdk.generated.weflow_sdk.models.media_brief import MediaBrief
 from weflow_sdk.generated.weflow_sdk.models.media_envelope import MediaEnvelope
+from weflow_sdk.generated.weflow_sdk.models.media_export_request import MediaExportRequest
+from weflow_sdk.generated.weflow_sdk.models.media_export_result import MediaExportResult
 from weflow_sdk.generated.weflow_sdk.models.media_object import MediaObject
 from weflow_sdk.generated.weflow_sdk.models.message_native import MessageNative
 from weflow_sdk.generated.weflow_sdk.models.messages_native import MessagesNative
