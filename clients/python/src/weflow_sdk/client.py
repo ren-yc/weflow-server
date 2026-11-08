@@ -649,9 +649,11 @@ class Client:
         # 404 copies whole files. Neither has a meaningful read budget.
         resp = await self._http_get(url, headers=auth, timeout=self._long_timeout)
         if resp.status_code == 404:
-            # 触发导出后**采用导出响应回填的实际文件名**重试：服务端落盘名与
-            # 元数据名不必相同，丢弃导出响应用旧名重试必然再次 404——即使目标
-            # 就在导出页内。目标不在默认导出窗口（最新 100 条）时如实报出。
+            # Retry with the name the export response backfilled: the on-disk
+            # name need not match the metadata name, so discarding the export
+            # response and retrying with the old name would 404 again even
+            # when the target sits inside the export page. When the target is
+            # outside the default export window (latest 100), say so.
             exported = await self._get_json(
                 "/chatlab/messages",
                 {"talker": talker, "media": "1"},
