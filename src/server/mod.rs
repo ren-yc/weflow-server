@@ -573,31 +573,7 @@ pub async fn start_account(
             // the storage dir itself. A path that is neither passes through
             // unchanged so the `is_dir` check below reports it against the
             // value the client actually sent.
-            let storage = if p.join("db_storage").is_dir() {
-                p.join("db_storage")
-            } else {
-                p.clone()
-            };
-            // `dir` 必须是**账号根**（媒体导出按 `<root>/msg/...` 找源文件）：
-            // 输入指向 db_storage 本身时取它的父目录——此前把原始输入原样存进
-            // dir，媒体被定位到 `<account>/db_storage/msg/...`（实际在
-            // `<account>/msg/...`），文本索引正常、媒体静默缺失。大小写不敏感
-            // （Windows 文件系统不区分，`DB_STORAGE` 是合法输入）；裸相对名的
-            // 父目录映射为 `.`（空路径功能等价但难看）。
-            let dir = if storage != p {
-                p.clone()
-            } else if p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.eq_ignore_ascii_case("db_storage"))
-            {
-                p.parent()
-                    .filter(|parent| !parent.as_os_str().is_empty())
-                    .map(|parent| parent.to_path_buf())
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-            } else {
-                p.clone()
-            };
+            let (dir, storage) = resolve_account_dir(&p);
             Some(scan::AccountInfo {
                 wxid: wxid.clone(),
                 dir,
@@ -934,6 +910,11 @@ fn purge_exported_media(root: &std::path::Path, talkers: &[String]) -> usize {
             continue;
         }
         let dir = root.join(talker);
+        // 目录不存在时直接跳过：is_contained 会 canonicalize——不存在的路径
+        // canonicalize 失败，把「账号没导出过媒体」误报成「越界导出目录」。
+        if !dir.is_dir() {
+            continue;
+        }
         // 树级删除与写侧同一归属守卫：导出树里可能预置指向根外的 junction，
         // remove_dir_all 沿链接删的是链接本身（树级删除不破坏目标，已实测），
         // 但**目录被替换**的 TOCTOU（校验时是目录、删除时已换成链接到别处的
@@ -954,6 +935,38 @@ fn purge_exported_media(root: &std::path::Path, talkers: &[String]) -> usize {
         let _ = std::fs::remove_dir(&dir);
     }
     removed
+}
+
+/// Resolve the **account root** from a `db_storage` user input.
+///
+/// 接受账号根（内含 `db_storage` 子目录）或 storage 目录本身两种输入；`dir`
+/// 必须是账号根（媒体导出按 `<root>/msg/...` 找源文件）——输入指向 db_storage
+/// 本身时取它的父目录，否则媒体被定位到 `<account>/db_storage/msg/...`（实际
+/// 在 `<account>/msg/...`），文本索引正常、媒体静默缺失。大小写不敏感（Windows
+/// 文件系统不区分，`DB_STORAGE` 是合法输入）；裸相对名的父目录映射为 `.`。
+/// 返回 `(account_root, storage_dir)`。两处调用（start_account 与它的测试镜像）
+/// 各写一遍时，改一处忘另一处，媒体定位就会分叉。
+fn resolve_account_dir(p: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let storage = if p.join("db_storage").is_dir() {
+        p.join("db_storage")
+    } else {
+        p.to_path_buf()
+    };
+    let dir = if storage != p {
+        p.to_path_buf()
+    } else if p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("db_storage"))
+    {
+        p.parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(|parent| parent.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+    } else {
+        p.to_path_buf()
+    };
+    (dir, storage)
 }
 
 /// Undo one account's registration: stop its sync, drop its index, and return
@@ -1127,28 +1140,54 @@ mod tests {
         std::fs::create_dir_all(storage.join("message")).unwrap();
         std::fs::create_dir_all(account.join("msg").join("video")).unwrap();
 
-        // 复用与 start_account 相同的解析语义（输入指向 db_storage 本身时 dir
-        // 必须是父目录）。解析逻辑只有两行分支，这里直测语义比走 async 注册
-        // 路径更聚焦；start_account 的完整路径由探针级测试与 api_smoke 覆盖。
+        // 直接调与 start_account 共用的 helper（解析语义只有一处出处）：输入
+        // 指向 db_storage 本身时 dir 必须是父目录。start_account 的完整路径由
+        // 探针级测试与 api_smoke 覆盖。
         let p = std::path::PathBuf::from(storage.to_string_lossy().into_owned());
-        let storage_resolved = if p.join("db_storage").is_dir() {
-            p.join("db_storage")
-        } else {
-            p.clone()
-        };
-        let dir = if storage_resolved != p {
-            p.clone()
-        } else if p.file_name().and_then(|n| n.to_str()) == Some("db_storage") {
-            p.parent().map(|parent| parent.to_path_buf()).unwrap_or_else(|| p.clone())
-        } else {
-            p.clone()
-        };
+        let (dir, storage_resolved) = resolve_account_dir(&p);
         assert_eq!(
             dir, account,
             "db_storage 输入必须解析出账号根（媒体导出的基准）"
         );
+        assert_eq!(storage_resolved, storage, "storage 目录必须原样返回");
         assert!(dir.join("msg").is_dir(), "账号根下 msg/ 必须可达");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 大小写不敏感（`DB_STORAGE`）与裸相对名的解析：Windows 文件系统不区分
+    /// 大小写，合法输入不得被拒；裸相对名（无父目录）映射为 `.` 而不是空路径。
+    #[test]
+    fn db_storage_input_is_case_insensitive_and_bare_relative_name_maps_to_dot() {
+        let (dir, storage) = resolve_account_dir(std::path::Path::new("DB_STORAGE"));
+        assert_eq!(dir, std::path::Path::new("."), "裸相对名的父目录映射为 .");
+        assert_eq!(storage, std::path::Path::new("DB_STORAGE"), "storage 原样返回");
+        let account = std::env::temp_dir().join(format!(
+            "weflow-reg-case-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&account);
+        std::fs::create_dir_all(account.join("DB_STORAGE")).unwrap();
+        let (dir2, storage2) = resolve_account_dir(&account);
+        // 大小写语义是**文件系统**的属性：大小写不敏感的平台（Windows）上
+        // `join("db_storage").is_dir()` 命中大写目录 → storage=小写拼出的
+        // 子目录（同一位置，须等价比较）；大小写敏感的平台（Linux）上不命中
+        // → 输入被当作 storage 目录本身 → storage=account。
+        if cfg!(windows) {
+            assert_eq!(dir2, account, "含 DB_STORAGE 子目录的输入按账号根解析");
+            assert_eq!(
+                storage2.to_string_lossy().to_ascii_lowercase(),
+                account.join("DB_STORAGE").to_string_lossy().to_ascii_lowercase(),
+                "storage 必须指向（大小写等价的）DB_STORAGE 子目录"
+            );
+        } else {
+            assert_eq!(dir2, account, "Linux 不折叠大小写：输入按 storage 目录本身解析");
+            assert_eq!(storage2, account, "storage 原样返回");
+        }
+        let _ = std::fs::remove_dir_all(&account);
     }
 
     /// 进程级 `GENERATION` 的串行化：会走**有效**注销的用例都先拿这把锁。
