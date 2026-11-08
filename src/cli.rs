@@ -868,8 +868,13 @@ fn reused_dangling_handles(
         let mut talker_dangling = false;
         for line in std::io::BufRead::lines(reader) {
             // 逐行读：非法 UTF-8 与 I/O 错误在这里显式失败——两者的下游都是
-            // 「媒体完整性没有验证过」，静默通过等于谎报。
+            // 「媒体完整性没有验证过」，静默通过等于谎报。悬空已判定时也要把
+            // 文件读完：读到一半就停会把尾部的读错误吞成「无错误」，三态里的
+            // 「读失败」就再也报不出来了。
             let line = line.with_context(|| format!("读复用产物失败（非 UTF-8 或 I/O）: {file}"))?;
+            if talker_dangling {
+                continue;
+            }
             for handle in line.split("\"fileName\":\"").skip(1).filter_map(|s| s.split('"').next()) {
                 if handle.is_empty() {
                     continue;
@@ -878,9 +883,6 @@ fn reused_dangling_handles(
                     talker_dangling = true;
                     break;
                 }
-            }
-            if talker_dangling {
-                break;
             }
         }
         if talker_dangling {
@@ -1259,6 +1261,22 @@ mod tests {
         std::fs::write(d.join(artifact), "{\"_type\":\"header\"}\n").unwrap();
         let none = reused_dangling_handles(&index, &reused, &d.join("media")).unwrap();
         assert!(none.is_empty(), "无句柄的产物不该被报为悬空: {none:?}");
+
+        // 悬空判定**之后**的尾部读错误必须仍然上抛：读到一半就停会把尾部
+        // 的损坏吞成「无错误」，三态里的「读失败」就再也报不出来——正是本次
+        // 修复的交错，必须有回归钉住。
+        let mut dangling_then_bad = b"{\"_type\":\"header\"}\n".to_vec();
+        dangling_then_bad.extend_from_slice(
+            b"{\"_type\":\"message\",\"media\":{\"type\":\"image\",\"fileName\":\"gone2.png\"}}\n",
+        );
+        dangling_then_bad.extend_from_slice(&[0xFF, 0xFE, 0xC0, 0x80]);
+        std::fs::write(d.join(artifact), &dangling_then_bad).unwrap();
+        let err_dangling = reused_dangling_handles(&index, &reused, &d.join("media"))
+            .expect_err("悬空后尾部的坏字节必须仍然让检查失败");
+        assert!(
+            err_dangling.to_string().contains(artifact),
+            "错误要指出失败的文件: {err_dangling}"
+        );
 
         // 末尾完整但**中部非 UTF-8** → 检查必须失败而不是被当成「无悬空」：
         // 末尾换行检查只看最后一字节，中部损坏只有这里能发现——吞掉它等于
