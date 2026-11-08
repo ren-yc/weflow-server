@@ -17,8 +17,8 @@ import pprint
 import re  # noqa: F401
 import json
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
-from typing import Any, ClassVar, Dict, List
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
+from typing import Any, ClassVar, Dict, List, Optional
 from typing_extensions import Annotated
 from typing import Optional, Set
 from typing_extensions import Self
@@ -29,10 +29,11 @@ class PullSync(BaseModel):
     翻页与水位。**两个游标都要原样回传**：`nextSince` 是排他下界、`nextOffset` 只用于 时间戳没能前进的退化情形，客户端自行推导会跳行。
     """ # noqa: E501
     has_more: StrictBool = Field(alias="hasMore")
+    next_cursor: Optional[StrictStr] = Field(default=None, description="不透明进度游标（契约 0.9.0 的 opaqueCursor 能力）：编码入库进度 （账号代次 + 唯一行标识 localId），客户端原样回传、不得解析。排空后 仍在场且非空——进度游标不终结（与消息面 page.nextCursor 排空为 null 的约定不同），它是下一次增量请求的起点。时间游标的盲区（排空后同秒 晚入库的行永远落在 nextSince 之后）由它补上。", alias="nextCursor")
     next_offset: Annotated[int, Field(strict=True, ge=0)] = Field(alias="nextOffset")
     next_since: StrictInt = Field(alias="nextSince")
     watermark: StrictInt
-    __properties: ClassVar[List[str]] = ["hasMore", "nextOffset", "nextSince", "watermark"]
+    __properties: ClassVar[List[str]] = ["hasMore", "nextCursor", "nextOffset", "nextSince", "watermark"]
 
     model_config = ConfigDict(
         validate_by_name=True,
@@ -73,6 +74,11 @@ class PullSync(BaseModel):
             exclude=excluded_fields,
             exclude_none=True,
         )
+        # set to None if next_cursor (nullable) is None
+        # and model_fields_set contains the field
+        if self.next_cursor is None and "next_cursor" in self.model_fields_set:
+            _dict['nextCursor'] = None
+
         return _dict
 
     @classmethod
@@ -86,6 +92,7 @@ class PullSync(BaseModel):
 
         _obj = cls.model_validate({
             "hasMore": obj.get("hasMore"),
+            "nextCursor": obj.get("nextCursor"),
             "nextOffset": obj.get("nextOffset"),
             "nextSince": obj.get("nextSince"),
             "watermark": obj.get("watermark")
