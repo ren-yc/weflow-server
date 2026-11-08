@@ -7,7 +7,7 @@
 
 
 use anyhow::Result;
-use rusqlite::{Connection, Row};
+use rusqlite::{Connection, OptionalExtension, Row};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{Contact, MessageRecord, Session, SessionKind, Store, Watermark};
@@ -172,7 +172,7 @@ fn load_sessions_from(conn: &Connection, table: &str, store: &mut Store) -> Resu
 
 /// Parse the `contact` table of `contact.db`.
 pub fn load_contacts(conn: &Connection, store: &mut Store) -> Result<()> {
-    let cols = open::table_columns(conn, "contact");
+    let cols = open::table_columns_checked(conn, "contact")?;
     let c_username = pick(&cols, CONTACT_COLUMNS[0]);
     let c_remark = pick(&cols, CONTACT_COLUMNS[1]);
     let c_nick = pick(&cols, CONTACT_COLUMNS[2]);
@@ -180,6 +180,7 @@ pub fn load_contacts(conn: &Connection, store: &mut Store) -> Result<()> {
     let c_avatar = pick(&cols, CONTACT_COLUMNS[4]);
     let c_type = pick(&cols, CONTACT_COLUMNS[5]);
     let Some(c_username) = c_username else {
+        store.contacts.clear();
         return Ok(());
     };
     let selected: Vec<&str> = [
@@ -198,23 +199,27 @@ pub fn load_contacts(conn: &Connection, store: &mut Store) -> Result<()> {
     let has = [c_remark.is_some(), c_nick.is_some(), c_alias.is_some(), c_avatar.is_some(), c_type.is_some()];
     let pos = |n: usize| -> usize { 1 + has[..n].iter().filter(|b| **b).count() };
     let mut rows = stmt.query([])?;
+    let mut contacts = std::collections::HashMap::new();
     while let Some(row) = rows.next()? {
-        let username = get_opt_str(row, 0).unwrap_or_default();
+        let text = |idx| -> rusqlite::Result<Option<String>> {
+            Ok(row.get::<_, Option<String>>(idx)?.map(|s| s.trim().to_string()))
+        };
+        let username = text(0)?.unwrap_or_default();
         if username.is_empty() {
             continue;
         }
-        let remark = if c_remark.is_some() { get_opt_str(row, pos(0)).filter(|s| !s.is_empty()) } else { None };
-        let nickname = if c_nick.is_some() { get_opt_str(row, pos(1)).filter(|s| !s.is_empty()) } else { None };
-        let alias = if c_alias.is_some() { get_opt_str(row, pos(2)).filter(|s| !s.is_empty()) } else { None };
-        let avatar_url = if c_avatar.is_some() { get_opt_str(row, pos(3)).filter(|s| !s.is_empty()) } else { None };
-        let type_raw = if c_type.is_some() { get_i64(row, pos(4)) } else { 0 };
+        let remark = if c_remark.is_some() { text(pos(0))?.filter(|s| !s.is_empty()) } else { None };
+        let nickname = if c_nick.is_some() { text(pos(1))?.filter(|s| !s.is_empty()) } else { None };
+        let alias = if c_alias.is_some() { text(pos(2))?.filter(|s| !s.is_empty()) } else { None };
+        let avatar_url = if c_avatar.is_some() { text(pos(3))?.filter(|s| !s.is_empty()) } else { None };
+        let type_raw = if c_type.is_some() { row.get::<_, Option<i64>>(pos(4))?.unwrap_or_default() } else { 0 };
         let kind = match type_raw {
             1 => SessionKind::Private,
             2 => SessionKind::Group,
             3 => SessionKind::Official,
             _ => SessionKind::classify(&username),
         };
-        store.contacts.insert(
+        contacts.insert(
             username.clone(),
             Contact {
                 username,
@@ -226,6 +231,7 @@ pub fn load_contacts(conn: &Connection, store: &mut Store) -> Result<()> {
             },
         );
     }
+    store.contacts = contacts;
     Ok(())
 }
 
@@ -468,40 +474,30 @@ pub fn load_sns(conn: &Connection, store: &mut Store) -> Result<()> {
 ///
 /// 便捷入口存在的理由：两个库的 id 空间**互相独立**，调用方若拿错库的表名就会解析到**错误的
 /// 人**（而不是解析失败）—— 那是最难查的一类错。让调用方只传连接，就少一个拿错的机会。
-pub fn uid_map(conn: &Connection) -> std::collections::HashMap<i64, String> {
-    load_uid_map(conn, name2id_table(conn).as_deref())
+pub fn uid_map(conn: &Connection) -> Result<std::collections::HashMap<i64, String>> {
+    let table: Option<String> = conn.query_row(
+        "SELECT name FROM sqlite_master WHERE type='table' AND lower(name) LIKE 'name2id%' ORDER BY name DESC LIMIT 1",
+        [], |row| row.get(0),
+    ).optional()?;
+    load_uid_map(conn, table.as_deref())
 }
 
-/// Load the `Name2Id` uid map: rowid -> user_name.
-fn load_uid_map(conn: &Connection, name2id: Option<&str>) -> std::collections::HashMap<i64, String> {
+/// Load this database's rowid-to-username map; optional schema may be absent,
+/// but a partial read must not be acknowledged as a complete mapping.
+fn load_uid_map(conn: &Connection, name2id: Option<&str>) -> Result<std::collections::HashMap<i64, String>> {
     let mut map = std::collections::HashMap::new();
-    let Some(t) = name2id else { return map };
-    // **列名要探测，不能二选一硬编码。** 真库实测：`contact.db` 与 `contact_fts.db` 的
-    // `name2id` 列叫 `username`（没有下划线），而消息库的 `Name2Id` 叫 `user_name`。
-    // 硬编码其中一个，另一个库的 SELECT 就会失败 —— 而它是**静默**返回空表的，于是症状是
-    // 「发送者全是空串」或「群主/名册一个都解析不出来」，不是报错。夹具若恰好写成另一个拼法，
-    // 夹具路径永远发现不了这个分歧（实测就是这样：夹具写 `user_name` 一路绿灯，真库全 0）。
-    let cols = crate::db::open::table_columns(conn, t);
-    let Some(col) = ["user_name", "username"]
-        .into_iter()
-        .find(|c| cols.iter().any(|x| x == c))
-    else {
-        tracing::warn!("{t} 里没有 user_name/username 列，发送者名将为空");
-        return map;
+    let Some(t) = name2id else { return Ok(map) };
+    let cols = open::table_columns_checked(conn, t)?;
+    let Some(col) = pick(&cols, &["user_name", "username"]) else {
+        return Ok(map);
     };
-    let Ok(mut stmt) = conn.prepare(&format!("SELECT rowid, \"{col}\" FROM \"{t}\"")) else {
-        return map;
-    };
-    let mut rows = match stmt.query([]) {
-        Ok(r) => r,
-        Err(_) => return map,
-    };
-    while let Ok(Some(row)) = rows.next() {
-        if let (Ok(id), Ok(name)) = (row.get::<_, i64>(0), row.get::<_, String>(1)) {
-            map.insert(id, name);
-        }
+    let table = t.replace('"', "\"\"");
+    let mut stmt = conn.prepare(&format!("SELECT rowid, \"{col}\" FROM \"{table}\""))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        map.insert(row.get::<_, i64>(0)?, row.get::<_, String>(1)?);
     }
-    map
+    Ok(map)
 }
 
 /// Read all rows of one message table (in order), returning owned records and
@@ -684,10 +680,10 @@ fn build_all_live_inner(
         match keys.key_for(&f.rel) {
             Some(key) => match pool.get_or_open(f, key) {
                 Ok(conn) => {
-                    if let Err(e) = load_contacts(conn, &mut store) {
-                        tracing::warn!("contact table unreadable: {e}");
+                    match crate::store::group_meta::read_contact_metadata(conn) {
+                        Ok(metadata) => metadata.apply(&mut store),
+                        Err(e) => tracing::warn!("contact metadata unreadable: {e}"),
                     }
-                    crate::store::group_meta::load_chatroom_meta(conn, &mut store);
                 }
                 Err(e) => tracing::warn!("contact.db live open failed: {e}"),
             },
@@ -705,7 +701,10 @@ fn build_all_live_inner(
     if let Some(f) = db_files.iter().find(|f| f.kind == DbKind::ContactFts) {
         match keys.key_for(&f.rel) {
             Some(key) => match pool.get_or_open(f, key) {
-                Ok(conn) => crate::store::group_meta::load_group_cards(conn, &mut store),
+                Ok(conn) => match crate::store::group_meta::read_group_cards(conn) {
+                    Ok(cards) => store.group_cards = cards,
+                    Err(e) => tracing::warn!("group cards unreadable: {e}"),
+                },
                 Err(e) => tracing::warn!("contact_fts.db live open failed: {e}"),
             },
             None => tracing::debug!("no key for contact_fts.db —— 群名片将为空"),
@@ -758,7 +757,13 @@ fn build_all_live_inner(
                 continue;
             }
         };
-        let uid_map = load_uid_map(conn, name2id_table(conn).as_deref());
+        let uid_map = match uid_map(conn) {
+            Ok(map) => map,
+            Err(e) => {
+                tracing::warn!("{} sender map unreadable: {e}", f.rel);
+                std::collections::HashMap::new()
+            }
+        };
         for (table, md5_suffix) in message_tables(conn) {
             match load_message_table(conn, &table, &uid_map, &contacts, my_wxid, progress) {
                 Ok((records, watermark)) => {
@@ -844,7 +849,7 @@ pub fn read_new(
             "message table {table} has no time column: incremental read cannot be ordered"
         ));
     };
-    let uid_map = load_uid_map(conn, name2id);
+    let uid_map = load_uid_map(conn, name2id)?;
     let order = [time, cols.seq.as_deref().unwrap_or(&cols.local), &cols.local];
     let query = format!(
         "SELECT {sel} FROM \"{table}\" WHERE ({ts}, {seq}, {lid}) > (?1, ?2, ?3) ORDER BY {ord} LIMIT {page}",

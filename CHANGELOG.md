@@ -2,6 +2,13 @@
 
 本文件从 0.5.0 起维护。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased]
+
+### 修复
+
+- 联系人、群主和名册完整读取后整体替换；读取失败不确认版本并保留旧数据。回归：`metadata_failure_preserves_snapshot_and_pending_version`。
+- 群名片读取错误保留失败语义，恢复后重试；成功的空结果清除删除项。回归：`group_cards_failure_retries_and_empty_snapshot_clears_deleted_cards`。
+
 ## [0.10.0] - 2026-10-24
 
 ### 破坏性变更

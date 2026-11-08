@@ -373,6 +373,7 @@ curl -H "Authorization: Bearer <token>" \
 
 - 成员标识键为 `wxid`（非 `username`）。成员集合是「名册 ∪ 发言人」：潜水成员也会出现，其 `messageCount` 为 `0`；发过言但已不在名册里的照旧保留。
 - 名册里的成员可能连联系人档案都没有：那时 `displayName` 回落 `wxid`。排序按 `messageCount` 降序、`wxid` 升序。`messageCount` 仅在 `includeMessageCounts=1` 时为真实值。
+- 元数据刷新失败时保留上一份完整联系人、群主、名册或群名片，并在后续同步重试；成功刷新后移除已删除的元数据项。
 - `isOwner` 由 `chat_room.owner` 解析；群主不在本页时全为 `false`。`fromCache` 恒为 `false`：本请求既不读盘、也不触发同步。`updatedAt` 是索引构建/更新完成时刻，毫秒。
 
 ### GET `/api/v1/media/{id}` — 按文件名取字节（唯一的字节面）

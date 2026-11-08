@@ -717,17 +717,17 @@ impl AccountSync {
                     }
                 }
                 Work::Contacts(f) => {
-                        let Some(k) = keys.key_for(&f.rel) else { continue };
-                     if let Ok((conn, sampled)) = self.pool.get_or_open_sampled(f, k) {
-                        let mut store = self.store.write();
-                        let loaded = index::load_contacts(conn, &mut store);
-                        // 群主与名册也住 contact.db —— 顺带一起刷，免得它们只在启动时是对的。
-                        crate::store::group_meta::load_chatroom_meta(conn, &mut store);
-                        match loaded {
-                            Ok(()) => {
+                    let Some(k) = keys.key_for(&f.rel) else { continue };
+                    if let Ok((conn, sampled)) = self.pool.get_or_open_sampled(f, k) {
+                        match crate::store::group_meta::read_contact_metadata(conn) {
+                            Ok(metadata) => {
+                                let mut store = self.store.write();
+                                if self.is_stopped() { return Ok((applied_new, applied_revoke)); }
+                                metadata.apply(&mut store);
                                 if let Some(v) = sampled {
                                     ack_versions.push((f.rel.clone(), v));
                                 }
+                                read_done.push(f.rel.clone());
                                 reloaded_sections = true;
                             }
                             Err(e) => tracing::warn!("contacts reload failed: {e}"),
@@ -735,18 +735,21 @@ impl AccountSync {
                     }
                 }
                 Work::GroupMeta(f) => {
-                        let Some(k) = keys.key_for(&f.rel) else { continue };
-                     if let Ok((conn, sampled)) = self.pool.get_or_open_sampled(f, k) {
-                        let mut store = self.store.write();
-                        // load_group_cards 无错误信号（尽力而为的名片加载）：
-                        // 连接打开即算装载完成——确认依据与其它元库保持同一
-                        // 粒度（「连接成功 + 装载执行过」），而不是无信号时的
-                        // 自由发挥。
-                        crate::store::group_meta::load_group_cards(conn, &mut store);
-                        if let Some(v) = sampled {
-                            ack_versions.push((f.rel.clone(), v));
+                    let Some(k) = keys.key_for(&f.rel) else { continue };
+                    if let Ok((conn, sampled)) = self.pool.get_or_open_sampled(f, k) {
+                        match crate::store::group_meta::read_group_cards(conn) {
+                            Ok(cards) => {
+                                let mut store = self.store.write();
+                                if self.is_stopped() { return Ok((applied_new, applied_revoke)); }
+                                store.group_cards = cards;
+                                if let Some(v) = sampled {
+                                    ack_versions.push((f.rel.clone(), v));
+                                }
+                                read_done.push(f.rel.clone());
+                                reloaded_sections = true;
+                            }
+                            Err(e) => tracing::warn!("group cards reload failed: {e}"),
                         }
-                        reloaded_sections = true;
                     }
                 }
                 Work::Sns(f) => {
@@ -1325,4 +1328,96 @@ mod tests {
         )
         .unwrap();
     }
+
+    fn metadata_writer(storage: &Path, key: &[u8; 32], file: &str) -> Connection {
+        let conn = Connection::open(storage.join("contact").join(file)).unwrap();
+        let key_hex = hex::encode(key);
+        conn.execute_batch(&format!(
+            "PRAGMA cipher_page_size = 4096; PRAGMA key = \"x'{key_hex}'\"; PRAGMA journal_mode = DELETE;"
+        )).unwrap();
+        conn
+    }
+
+    #[test]
+    fn metadata_failure_preserves_snapshot_and_pending_version() {
+        let dir = unique_dir("meta-failed-read");
+        let key = crate::keystore::parse_db_key(KEY_HEX).unwrap().0;
+        let storage = build_message_account_with_contact(&dir, &key);
+        let writer = metadata_writer(&storage, &key, "contact.db");
+        writer.execute_batch(
+            "INSERT INTO Contact VALUES ('member', 'before', 'before');
+             CREATE TABLE name2id (username TEXT);
+             INSERT INTO name2id VALUES ('room'), ('member');
+             CREATE TABLE chat_room (username TEXT, owner TEXT);
+             INSERT INTO chat_room VALUES ('room', 'member');
+             CREATE TABLE chatroom_member (room_id INTEGER, member_id INTEGER);
+             INSERT INTO chatroom_member VALUES (1, 2);"
+        ).unwrap();
+        let store = Arc::new(RwLock::new(Store::default()));
+        let mut sync = AccountSync::new(WXID, &storage, KeyMap::Single(crate::keystore::DbKey(key)), store.clone());
+        sync.full_sync().unwrap();
+        let built = store.read().index_built_at_ms;
+
+        // The contact read succeeds; the later roster read yields one good row
+        // and then an invalid numeric ID. Nothing from this snapshot may apply.
+        writer.execute_batch(
+            "UPDATE Contact SET remark = 'after';
+             DELETE FROM chat_room;
+             INSERT INTO chatroom_member VALUES (1, 'broken');"
+        ).unwrap();
+        for _ in 0..2 {
+            sync.poll_once().unwrap();
+            let snapshot = store.read();
+            assert_eq!(snapshot.contacts["member"].remark.as_deref(), Some("before"));
+            assert_eq!(snapshot.chatroom_owner["room"], "member");
+            assert_eq!(snapshot.chatroom_roster["room"], vec!["member"]);
+            assert_eq!(snapshot.index_built_at_ms, built);
+            assert_eq!(sync.pool.foreign_commit_pending("contact/contact.db"), Some(true));
+        }
+        writer.execute_batch("DELETE FROM chatroom_member;").unwrap();
+        sync.poll_once().unwrap();
+        assert_eq!(store.read().contacts["member"].remark.as_deref(), Some("after"));
+        assert!(store.read().chatroom_owner.is_empty());
+        assert!(store.read().chatroom_roster.is_empty());
+        assert_eq!(sync.pool.foreign_commit_pending("contact/contact.db"), Some(false));
+        let accepted = store.read().index_built_at_ms;
+        sync.poll_once().unwrap();
+        assert_eq!(store.read().index_built_at_ms, accepted);
+    }
+
+    #[test]
+    fn group_cards_failure_retries_and_empty_snapshot_clears_deleted_cards() {
+        let dir = unique_dir("cards-failed-read");
+        let key = crate::keystore::parse_db_key(KEY_HEX).unwrap().0;
+        let storage = build_message_account_with_contact(&dir, &key);
+        let writer = metadata_writer(&storage, &key, "contact_fts.db");
+        writer.execute_batch(
+            "CREATE TABLE name2id (username TEXT);
+             INSERT INTO name2id VALUES ('room'), ('member');
+             CREATE TABLE chatroom_member_fts_v3_aux (room_id INTEGER, member_id INTEGER);
+             CREATE TABLE chatroom_member_fts_v3_content (c0 TEXT);
+             INSERT INTO chatroom_member_fts_v3_aux VALUES (1, 2);
+             INSERT INTO chatroom_member_fts_v3_content VALUES ('before');"
+        ).unwrap();
+        let store = Arc::new(RwLock::new(Store::default()));
+        let mut sync = AccountSync::new(WXID, &storage, KeyMap::Single(crate::keystore::DbKey(key)), store.clone());
+        sync.full_sync().unwrap();
+        assert_eq!(store.read().group_cards["room"]["member"], "before");
+        // The mapping itself must propagate a decode failure after valid rows.
+        writer.execute_batch(
+            "UPDATE chatroom_member_fts_v3_content SET c0 = 'after';
+             INSERT INTO name2id VALUES (x'80');"
+        ).unwrap();
+        sync.poll_once().unwrap();
+        assert_eq!(store.read().group_cards["room"]["member"], "before");
+        assert_eq!(sync.pool.foreign_commit_pending("contact/contact_fts.db"), Some(true));
+        writer.execute_batch("DELETE FROM name2id WHERE rowid = 3;").unwrap();
+        sync.poll_once().unwrap();
+        assert_eq!(store.read().group_cards["room"]["member"], "after");
+        writer.execute_batch("DELETE FROM chatroom_member_fts_v3_content;").unwrap();
+        sync.poll_once().unwrap();
+        assert!(store.read().group_cards.is_empty());
+        assert_eq!(sync.pool.foreign_commit_pending("contact/contact_fts.db"), Some(false));
+    }
+
 }

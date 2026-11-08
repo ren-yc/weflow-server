@@ -343,6 +343,9 @@ v0.6.1 至 v0.6.6 都是纯文档 tag，v0.7.0 新增跨仓文档模板；v0.8.0
 - **确认的是读取前采样值，且只有排空才确认**：消息库在 SELECT 之前采样 `data_version`，本轮完全排空（未触顶）才把采样值写回基线。SELECT 结束到确认之间落库的提交版本更大、留在基线之后，下一轮必读；确认时刻重读「当前值」会把那批提交错误记成已读。
 - 回归位置分两层：采样与排空判据的原语级单元回归见 `unread_commit_between_read_and_ack_survives`；`poll_once` 全路径只能观察到结果（`incremental_poll_picks_up_new_rows_after_watermark`），确认窗口本身无法逐指令构造。
 - **元库重载与消息库同一确认纪律**：session/contact/fts/sns 成功重载后按**装载前采样值**确认，一次提交只产生一次有效重载。回归见 `metadata_reload_confirms_once`。
+- 联系人、群主与名册在同一读取事务中暂存，全部成功后才整体替换并确认版本；失败保留上一份完整数据。回归：`metadata_failure_preserves_snapshot_and_pending_version`。
+- 群名片和本库名字映射也须完整读取；成功的空快照清除已删除名片。回归：`group_cards_failure_retries_and_empty_snapshot_clears_deleted_cards`。
+- 可选表或列缺失可降级；查询、锁冲突与行解码错误须重试。回归：`optional_schema_is_empty_but_query_and_decode_failures_are_errors`、`metadata_lock_error_is_not_an_absent_optional_table`。
 - **updatedAt 只随索引内容变化推进**：判据是本轮压入会话的行数或任一元库完成重载，不是事件数——只含自身发送消息、或只刷了名册的轮次同样改变索引内容；空轮询不推进。
 - 回归见 `stamp_unchanged_but_committed_row_is_still_polled` 与 `failed_open_does_not_swallow_the_next_poll`。
 - **增量读遇到「没有时间列」的表：报错，不能返回空增量**：空 Vec 与「真的没有新行」在调用方完全不可区分，于是这张表的增量永久静默为空。同函数里「无 `local_id` 列」本来就是 `Err`，两者行为不一致本身就是线索。

@@ -34,6 +34,14 @@ pub fn quick_check(conn: &Connection) -> Result<()> {
 }
 
 /// List the columns of a table (empty if the table is missing).
+/// Query failures remain distinguishable from an absent optional schema.
+pub fn table_columns_checked(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {
+    let table = table.replace('"', "\"\"");
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info(\"{table}\")"))?;
+    stmt.query_map([], |r| r.get::<_, String>(1))?.collect()
+}
+
+/// Best-effort schema probe for legacy callers.
 pub fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
     let mut stmt = match conn.prepare(&format!("PRAGMA table_info({table})")) {
         Ok(s) => s,
