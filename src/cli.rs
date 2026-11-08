@@ -672,7 +672,7 @@ fn row_from_pull(m: &weflow_client::generated::r#gen::types::PullMessage) -> exp
         msg_type: m.type_,
         content: m.content.clone(),
         reply_to_message_id: m.reply_to_message_id.clone(),
-        // 媒体先按拉取面给的原始名落行；--with-media 时 retain_downloaded_media 会按消息 id
+        // 媒体先按拉取面给的原始名落行；--with-media 时 retain_downloaded_media 按消息身份
         // 把它改写成实际落盘的内容摘要名。不带 --with-media 时 fileName 只是元数据，不是可取
         // 承诺（服务的媒体链接也刻意不写进导出物——导出文件会被拷进聊天工具、传上网盘）。
         media_file_name: m.media.as_ref().map(|x| x.file_name.clone()).filter(|s| !s.is_empty()),
@@ -709,36 +709,17 @@ async fn fetch_one_handle(
     Ok(Some(name.to_string()))
 }
 
-/// 给**一页 Pull 行**配齐媒体，返回「消息 id → 确实落盘的文件名」映射与被拒的非法名字数。
-///
-/// **两条路按行分派**：
-///
-/// · 快路径 —— Pull 行自带 `mediaId` 的那些（服务端已保证「出现即可取」）。**直接按句柄取
-///   字节，一次导出请求都不发**。
-/// · 慢路径 —— 有 `media` 却没有可用 `mediaId` 的那些：本面不执行导出，服务端不会凭空给出
-///   句柄，所以把**这些行的时间窗**交给消息面（`/chatlab/messages?media=1`）触发按需导出，
-///   再从回填的可取句柄取字节。
-///
-/// **为什么不能整批撤掉慢路径**：撤掉就等于「媒体句柄只能靠全历史那趟预遍历拿」，而那一趟不认
-/// `--since`（本仓刚修掉的正是这个）。快路径让「已经导出过」的会话（`--resume`、重复导出）近乎
-/// 零成本，慢路径只在真需要导出时才付出成本；两条路都不再有全历史遍历。
-/// 回归位置：`media_window_follows_the_pull_page`（慢路径窗口仍跟着页走）与
-/// `media_id_from_pull_row_skips_the_export_round`（快路径零导出请求）。
-///
-/// 映射按**消息 id**：消息面回填的是内容摘要名、拉取面 `media.fileName` 给的是索引里的原始名，
-/// 两者不必相同，只有 id 能把两边对上（`retain_downloaded_media` 按 id 改写句柄）。
-///
-/// 句柄与名字都来自 HTTP 响应、却要拿去拼本地路径：`../`、盘符、设备名配合 `join` 能写到导出
-/// 目录之外。`media_bytes_by_id` 会做 URL 段编码，那防的是 HTTP 层、替代不了写盘前的这一道。
-/// 非法名不进下载也不计数为媒体，按**去重后的名字**计数（同一个非法名在两个面上各出现一次时
-/// 只该报一次）；静默少下载而整体退 0，是不可发现的失败。
+/// 配齐本页媒体，以消息 ID、发送者和时间关联实际句柄。
+/// 已知 mediaId 优先直接取字节；缺失或过期时只导出唯一目标。
+/// 回归：`targeted_media_restores_each_missing_message_once` 与
+/// `media_id_from_pull_row_skips_the_export_round`。
 async fn media_for_page(
     client: &Client,
     talker: &str,
     media_dir: &std::path::Path,
     page: &[weflow_client::generated::r#gen::types::PullMessage],
-) -> Result<(std::collections::BTreeMap<String, String>, usize)> {
-    let mut by_message: std::collections::BTreeMap<String, String> =
+) -> Result<(std::collections::BTreeMap<(String, String, i64), String>, usize)> {
+    let mut by_message: std::collections::BTreeMap<(String, String, i64), String> =
         std::collections::BTreeMap::new();
     // 折叠名 → 实际落盘名：同一份字节被多条消息引用（或仅大小写不同）时，一律指到同一个
     // 物理文件，不重下也不另开一份。折叠口径与会话名去重一致（Windows 卷大小写不敏感）。
@@ -765,74 +746,41 @@ async fn media_for_page(
         };
         let folded = handle.to_lowercase();
         if let Some(known) = landed.get(&folded) {
-            by_message.insert(m.platform_message_id.clone(), known.clone());
+            by_message.insert((m.platform_message_id.clone(), m.sender.clone(), m.timestamp), known.clone());
             continue;
         }
         match fetch_one_handle(client, media_dir, handle).await? {
             Some(name) => {
                 landed.insert(folded, name.clone());
-                by_message.insert(m.platform_message_id.clone(), name);
+                by_message.insert((m.platform_message_id.clone(), m.sender.clone(), m.timestamp), name);
             }
-            // 服务端说过「出现即可取」而我们拿到 404：句柄已过期（缓存被清理之类）。按取不到
-            // 处理 —— 宁可少一个 media 字段，也不给一个指向不存在文件的句柄。
+            // 已知句柄过期时按完整消息身份恢复；不可恢复的错误由调用方报告。
             None => {
-                tracing::debug!("跳过 Pull 行句柄 {handle}: 404（服务端已不再可取）");
+                need_export.push(m);
             }
         }
     }
     if need_export.is_empty() {
         return Ok((by_message, rejected_names.len()));
     }
-    // 慢路径：只给「还没有句柄的那些行」配窗。窗口取这些行的时间跨度 —— 它正是消息面认的
-    // start/end（两端闭区间的秒级戳；同秒的行必然落在同一页，所以两端不漏行）。
-    let lo = need_export.iter().map(|m| m.timestamp).min().unwrap_or(0);
-    let hi = need_export.iter().map(|m| m.timestamp).max().unwrap_or(0);
-    let mut q = MessageQuery::new(talker.to_string());
-    q.media = true;
-    q.start = Some(lo.to_string());
-    q.end = Some(hi.to_string());
-    q.limit = Some(200);
-    let mut offset = 0u64;
-    loop {
-        let resp = client.chatlab_messages(&q).await?;
-        let count = resp.messages.len();
-        for m in &resp.messages {
-            let Some(media) = &m.media else { continue };
-            // 已经拿到句柄的消息不再重取：同一份字节在两个面上的**名字形态**可以不同
-            // （拉取面句柄 vs 导出回填名），只按折叠名去重会漏掉「同一消息、两个名字」。
-            // 与 qqflow 侧同一条守卫。
-            if by_message.contains_key(&m.platform_message_id) {
-                continue;
-            }
-            let name = media.file_name.clone();
-            if name.is_empty() {
-                continue;
-            }
-            if !crate::pathsafe::safe_segment(&name) {
-                rejected_names.insert(name.to_lowercase());
-                tracing::warn!("媒体文件名不是安全的单路径分量，跳过: {name}");
-                continue;
-            }
-            let folded = name.to_lowercase();
-            if let Some(known) = landed.get(&folded) {
-                by_message.insert(m.platform_message_id.clone(), known.clone());
-                continue;
-            }
-            match fetch_one_handle(client, media_dir, &name).await? {
-                Some(landed_name) => {
-                    landed.insert(folded, landed_name.clone());
-                    by_message.insert(m.platform_message_id.clone(), landed_name);
-                }
-                None => {
-                    tracing::debug!("跳过不可取句柄 {name}: 404（外链或未落盘）");
-                }
-            }
+    for m in need_export {
+        let result = client.export_media_by_message(talker, &m.platform_message_id, &m.sender, m.timestamp).await?;
+        let name = result.media_id;
+        if !crate::pathsafe::safe_segment(&name) {
+            rejected_names.insert(name.to_lowercase());
+            tracing::warn!("媒体文件名不是安全的单路径分量，跳过: {name}");
+            continue;
         }
-        if !resp.page.has_more || count == 0 {
-            break;
+        let key = (m.platform_message_id.clone(), m.sender.clone(), m.timestamp);
+        let folded = name.to_lowercase();
+        if let Some(known) = landed.get(&folded) {
+            by_message.insert(key, known.clone());
+            continue;
         }
-        offset += count as u64;
-        q.offset = Some(offset);
+        let landed_name = fetch_one_handle(client, media_dir, &name).await?
+            .ok_or_else(|| anyhow::anyhow!("定向媒体导出成功但字节不可取"))?;
+        landed.insert(folded, landed_name.clone());
+        by_message.insert(key, landed_name);
     }
     Ok((by_message, rejected_names.len()))
 }

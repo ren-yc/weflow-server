@@ -2629,3 +2629,157 @@ async fn media_kind_whitelist_serves_only_requested_kinds() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+
+fn targeted_media_fixture(dir: &std::path::Path, duplicate: bool) -> (Arc<server::AppState>, std::path::PathBuf) {
+    use md5::Digest;
+    let bytes = b"\x89PNG\r\n\x1a\nactual bytes";
+    let digest = format!("{:x}", md5::Md5::digest(bytes));
+    let room = format!("{:x}", md5::Md5::digest(common::FAKE_GROUP.as_bytes()));
+    let source = dir.join("msg/attach").join(&room).join("fixture/Img").join(format!("{digest}.dat"));
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, bytes).unwrap();
+    let state = test_state_with(dir, |storage, key| {
+        let writer = common::wx_conn(&storage.join("message/message_0.db"), key, false);
+        let table = format!("Msg_{room}");
+        let sql = format!("INSERT INTO \"{table}\" (server_id,local_type,create_time,sort_seq,real_sender_id,message_content) VALUES (?1,?2,?3,0,?4,?5)");
+        writer.execute_batch("BEGIN").unwrap();
+        for i in 0..180 {
+            writer.execute(&sql, rusqlite::params![1000+i, 1, 1_700_000_000+i, 2, "later"]).unwrap();
+        }
+        let xml = format!("<msg><img md5=\"{digest}\"/></msg>");
+        writer.execute(&sql, rusqlite::params![99, 3, 1_500_000_000, 2, xml]).unwrap();
+        writer.execute(&sql, rusqlite::params![99, 3, 1_500_000_000, 1, xml]).unwrap();
+        if duplicate { writer.execute(&sql, rusqlite::params![99, 3, 1_500_000_000, 2, xml]).unwrap(); }
+        writer.execute_batch("COMMIT").unwrap();
+    });
+    (state, source)
+}
+
+fn targeted_media_request() -> Value {
+    serde_json::json!({"talker": common::FAKE_GROUP, "platformMessageId":"99",
+        "sender":"wxid_member_b", "timestamp":1_500_000_000i64})
+}
+
+async fn export_targeted(app: axum::Router, target: Value) -> (StatusCode, Value) {
+    let mut req = request("POST", "/api/v1/media/export", Some(TOKEN));
+    req.headers_mut().insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+    *req.body_mut() = Body::from(target.to_string());
+    json_body(app.oneshot(req).await.unwrap()).await
+}
+
+#[tokio::test]
+async fn targeted_media_restores_old_image_and_actual_handle() {
+    let dir = common::tmp_dir("targeted-media-old");
+    let (state, _source) = targeted_media_fixture(&dir, false);
+    let app = server::build_router(state);
+    let (_, latest) = json_body(app.clone().oneshot(request("GET",
+        &format!("/chatlab/messages?talker={}", common::FAKE_GROUP), Some(TOKEN))).await.unwrap()).await;
+    assert!(!latest["messages"].as_array().unwrap().iter().any(|m| m["platformMessageId"] == "99"));
+    let (status, result) = export_targeted(app.clone(), targeted_media_request()).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let id = result["mediaId"].as_str().unwrap();
+    assert!(id.ends_with(".png"));
+    assert_eq!(result["fileName"], id);
+    assert_eq!(result["mediaUrl"], format!("/api/v1/media/{id}"));
+    let response = app.clone().oneshot(request("GET", &format!("/api/v1/media/{id}"), Some(TOKEN))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(axum::body::to_bytes(response.into_body(), 1024).await.unwrap().as_ref(), b"\x89PNG\r\n\x1a\nactual bytes");
+    std::fs::remove_file(dir.join("api-media").join(common::FAKE_GROUP).join("images").join(id)).unwrap();
+    assert_eq!(export_targeted(app, targeted_media_request()).await, (StatusCode::OK, result));
+}
+
+#[tokio::test]
+async fn targeted_media_reports_ambiguity_missing_and_decode_errors() {
+    let dir = common::tmp_dir("targeted-media-ambiguous");
+    let (state, _) = targeted_media_fixture(&dir, true);
+    assert_eq!(export_targeted(server::build_router(state), targeted_media_request()).await.0, StatusCode::CONFLICT);
+    let dir = common::tmp_dir("targeted-media-errors");
+    let (state, source) = targeted_media_fixture(&dir, false);
+    let app = server::build_router(state);
+    std::fs::write(&source, b"\x89PNG corrupt bytes").unwrap();
+    assert_eq!(export_targeted(app.clone(), targeted_media_request()).await.0, StatusCode::INTERNAL_SERVER_ERROR);
+    std::fs::remove_file(source).unwrap();
+    assert_eq!(export_targeted(app.clone(), targeted_media_request()).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(export_targeted(app.clone(), serde_json::json!({})).await.0, StatusCode::BAD_REQUEST);
+    let mut missing = targeted_media_request(); missing["platformMessageId"] = serde_json::json!("missing");
+    assert_eq!(export_targeted(app, missing).await.0, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn targeted_media_cancels_staged_bytes_after_account_switch() {
+    let dir = common::tmp_dir("targeted-media-switch");
+    let (state, _) = targeted_media_fixture(&dir, false);
+    let current = state.clone();
+    let error = server::handlers::media_export::restore_before_publish(
+        state, serde_json::from_value(targeted_media_request()).unwrap(), move || {
+            server::deregister_account(&current, common::FAKE_WXID, false);
+        },
+    ).await.unwrap_err();
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert_eq!(std::fs::read_dir(dir.join("api-media").join(common::FAKE_GROUP).join("images")).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(dir.join("api-media/.pending")).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn targeted_media_concurrent_retries_share_complete_bytes() {
+    let dir = common::tmp_dir("targeted-media-concurrent");
+    let (state, _) = targeted_media_fixture(&dir, false);
+    let app = server::build_router(state);
+    let (a, b) = tokio::join!(export_targeted(app.clone(), targeted_media_request()), export_targeted(app.clone(), targeted_media_request()));
+    assert_eq!(a.0, StatusCode::OK, "{a:?}");
+    assert_eq!(a, b);
+    assert_eq!(export_targeted(app, targeted_media_request()).await, a);
+}
+
+#[tokio::test]
+async fn targeted_media_reuses_a_valid_export_after_source_removal() {
+    let dir = common::tmp_dir("targeted-media-reuse");
+    let (state, source) = targeted_media_fixture(&dir, false);
+    let app = server::build_router(state);
+    let uri = format!("/chatlab/messages?talker={}&media=1&start=1500000000&end=1500000000", common::FAKE_GROUP);
+    let (status, exported) = json_body(app.clone().oneshot(request("GET", &uri, Some(TOKEN))).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    let previous = exported["messages"].as_array().unwrap().iter().find(|m| m["sender"] == "wxid_member_b").unwrap()["media"]["fileName"].as_str().unwrap();
+    assert!(previous.ends_with(".png"));
+    std::fs::remove_file(source).unwrap();
+    let (status, restored) = export_targeted(app, targeted_media_request()).await;
+    assert_eq!(status, StatusCode::OK, "{restored}");
+    assert_eq!(restored["mediaId"], previous);
+}
+
+#[tokio::test]
+async fn page_media_backfill_keeps_equal_local_ids_in_separate_shards() {
+    use md5::Digest;
+    let dir = common::tmp_dir("media-shard-backfill");
+    let bodies = [b"\x89PNG first".as_slice(), b"\x89PNG second".as_slice()];
+    let digests = bodies.map(|body| format!("{:x}", md5::Md5::digest(body)));
+    let room = format!("{:x}", md5::Md5::digest(common::FAKE_GROUP.as_bytes()));
+    let source = dir.join("msg/attach").join(&room).join("fixture/Img");
+    std::fs::create_dir_all(&source).unwrap();
+    for (digest, body) in digests.iter().zip(bodies) { std::fs::write(source.join(format!("{digest}.dat")), body).unwrap(); }
+    let state = test_state_with(&dir, |storage, key| {
+        for (n, digest) in digests.iter().enumerate() {
+            let writer = common::wx_conn(&storage.join(format!("message/message_{}.db", n + 1)), key, false);
+            let table = format!("Msg_{room}");
+            writer.execute_batch(&format!("CREATE TABLE \"{table}\" (local_id INTEGER PRIMARY KEY AUTOINCREMENT, server_id INTEGER, local_type INTEGER, create_time INTEGER, sort_seq INTEGER, sender_username TEXT, message_content TEXT)")).unwrap();
+            writer.execute(&format!("INSERT INTO \"{table}\" VALUES (999, ?1, 3, 1800000000, 0, 'wxid_member_b', ?2)"),
+                rusqlite::params![90 + n as i64, format!("<msg><img md5=\"{digest}\"/></msg>")]).unwrap();
+        }
+    });
+    let app = server::build_router(state);
+    for endpoint in ["/api/v1/messages", "/chatlab/messages"] {
+        let uri = format!("{endpoint}?talker={}&media=1&start=1800000000&end=1800000000", common::FAKE_GROUP);
+        let (status, body) = json_body(app.clone().oneshot(request("GET", &uri, Some(TOKEN))).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let rows = body["messages"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        for (n, digest) in digests.iter().enumerate() {
+            let expected_id = (90 + n).to_string();
+            let row = rows.iter().find(|m| m["platformMessageId"].as_str() == Some(expected_id.as_str()) || m["serverId"].as_str() == Some(expected_id.as_str())).unwrap();
+            let media = &row["media"];
+            let name = if endpoint == "/api/v1/messages" { &media["mediaId"] } else { &media["fileName"] };
+            assert_eq!(name.as_str().unwrap(), format!("{digest}.png"), "{row}");
+        }
+    }
+}

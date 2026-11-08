@@ -249,6 +249,20 @@ async fn conformance_suite_passes() {
     // 用更晚的会让水位线越过 200，于是 harness 追加的那条被判成「旧的」，
     // `poll_once` 返回 0、SSE 上永远等不到 `message.new`（我第一版就是这么写的）。
     common::append_same_second_burst(&storage, &key.0, 4, 1_700_000_150);
+    // The existing group image gets a real matching local source before indexing.
+    {
+        use md5::Digest;
+        let bytes = b"\x89PNG\r\n\x1a\ncontract image";
+        let digest = format!("{:x}", md5::Md5::digest(bytes));
+        let room = format!("{:x}", md5::Md5::digest(common::FAKE_GROUP.as_bytes()));
+        let source = dir.join("msg/attach").join(&room).join("fixture/Img");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join(format!("{digest}.dat")), bytes).unwrap();
+        let writer = common::wx_conn(&storage.join("message/message_0.db"), &key.0, false);
+        writer.execute(&format!("UPDATE \"Msg_{room}\" SET message_content=?1 WHERE local_type=3"),
+            [format!("<msg><img md5=\"{digest}\"/></msg>")]).unwrap();
+    }
+
 
     // 零账号启动，随后走真实注册路径。
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
@@ -344,6 +358,7 @@ async fn conformance_suite_passes() {
             // 媒体字节端点（mediaById 能力的落点，契约用例
             // nails-media-id-fetch-succeeds 按句柄取字节）。
             "media": "/api/v1/media/{id}",
+            "media_export": "/api/v1/media/export",
             "harness": "/__harness",
             "group-members": "/api/v1/group-members",
             "pull": "/chatlab/sessions/{id}/messages",
@@ -361,9 +376,13 @@ async fn conformance_suite_passes() {
             // 夹具预置一条语音导出。**id 是导出文件名**（本面按名解析的形状：
             // <md5>.<ext>），与文件系统里预置的文件同名。
             "exported_media": { "id": "00112233445566778899aabbccddeeff.silk", "expect": {} },
+            "targeted_media": {"id":common::FAKE_GROUP, "expect":{
+                "platformMessageId": 8_200_000_000_000_000_002i64.to_string(),
+                "sender":"wxid_member_b", "timestamp":1_700_000_102i64}},
         },
         "capabilities": {
             "mediaById": true,
+            "mediaExportByMessage": true,
             // 不透明进度游标（契约 0.9.0）：sync.nextCursor + cursor 参数已实现，
             // 排空后同秒晚入库的行可经游标续拉到达。
             "opaqueCursor": true,

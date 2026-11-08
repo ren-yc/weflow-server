@@ -521,6 +521,27 @@ coarser [`AccountPhase`] instead, which has no `AwaitingKey` variant.*/
         #[serde(rename = "exportPath")]
         pub export_path: ::std::string::String,
     }
+    ///Locate exactly one media-bearing message in the bound account.
+    #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+    #[serde(deny_unknown_fields)]
+    pub struct MediaExportRequest {
+        #[serde(rename = "platformMessageId")]
+        pub platform_message_id: ::std::string::String,
+        pub sender: ::std::string::String,
+        pub talker: ::std::string::String,
+        pub timestamp: i64,
+    }
+    ///A local export whose actual filename is also its credential-free handle.
+    #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+    pub struct MediaExportResult {
+        #[serde(rename = "fileName")]
+        pub file_name: ::std::string::String,
+        #[serde(rename = "mediaId")]
+        pub media_id: ::std::string::String,
+        #[serde(rename = "mediaUrl")]
+        pub media_url: ::std::string::String,
+        pub success: bool,
+    }
     /**消息的媒体元数据 —— **原生面专用**（拉取面与消息面用 `MediaBrief`，SSE 用 `EventMedia`）。
 
 - 未导出：`url` / `localPath` / `mediaId` **都不出现**，`exported` 也不出现；
@@ -1208,6 +1229,52 @@ Sends a `GET` request to `/api/v1/group-members`
         let response = result?;
         match response.status().as_u16() {
             200u16 => ResponseValue::from_response(response).await,
+            _ => Err(Error::UnexpectedResponse(response)),
+        }
+    }
+    /**按会话、消息 ID、发送者及时间唯一定位并导出本地媒体。
+
+Sends a `POST` request to `/api/v1/media/export`
+
+*/
+    pub async fn post_api_v1_media_export<'a>(
+        &'a self,
+        body: &'a types::MediaExportRequest,
+    ) -> Result<ResponseValue<types::MediaExportResult>, Error<()>> {
+        let url = format!("{}/api/v1/media/export", self.baseurl,);
+        let mut header_map = ::reqwest::header::HeaderMap::with_capacity(1usize);
+        header_map
+            .append(
+                ::reqwest::header::HeaderName::from_static("api-version"),
+                ::reqwest::header::HeaderValue::from_static(Self::api_version()),
+            );
+        #[allow(unused_mut)]
+        let mut request = self
+            .client
+            .post(url)
+            .header(
+                ::reqwest::header::ACCEPT,
+                ::reqwest::header::HeaderValue::from_static("application/json"),
+            )
+            .json(&body)
+            .headers(header_map)
+            .build()?;
+        let info = OperationInfo {
+            operation_id: "post_api_v1_media_export",
+        };
+        self.pre(&mut request, &info).await?;
+        let result = self.exec(request, &info).await;
+        self.post(&result, &info).await?;
+        let response = result?;
+        match response.status().as_u16() {
+            200u16 => ResponseValue::from_response(response).await,
+            400u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            401u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            404u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            409u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            422u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            500u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            503u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
             _ => Err(Error::UnexpectedResponse(response)),
         }
     }

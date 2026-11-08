@@ -4,12 +4,20 @@
 
 ## [Unreleased]
 
+### 新增
+
+- 新增 `POST /api/v1/media/export`，按完整消息身份恢复窗口外的本地媒体，返回实际摘要句柄；歧义、源缺失和导出失败保留不同错误状态。回归：`targeted_media_restores_old_image_and_actual_handle`。
+- Rust 和 Python SDK 新增 `export_media_by_message`；媒体恢复最多触发一次定向导出。CLI 采用同一接口并按消息身份回填。回归：`media_bytes_exports_then_retries_once_after_404`、`targeted_media_restores_each_missing_message_once`。
+
 ### 破坏性变更
 
+- 自动媒体恢复改用定向接口；旧服务缺少该能力时显式报错，源不可恢复时 CLI 导出返回失败。迁移：服务与 SDK/CLI 同步升级，调用方处理 404、409 和 422。回归：`targeted_export_reports_missing_server_capability`、`with_media_reports_an_unrecoverable_source`。
 - 嵌入数据类型 `MessageRecord` 新增 `source_shard`，同会话跨分片的本地行号可重复。使用结构体字面量的调用方须补充该字段；去重键改为源分片与本地号。回归：`new_shard_reuses_local_and_platform_ids_without_losing_rows`。
 
 ### 修复
 
+- 定向媒体在临时文件写完后复查注册，再发布产物；取消清理临时文件，已有有效副本可在源缓存清理后复用。回归：`targeted_media_cancels_staged_bytes_after_account_switch`。
+- 明文图片先识别格式再尝试 DAT 解密，跨分片重复本地行号按请求内位置回填媒体。回归：`page_media_backfill_keeps_equal_local_ids_in_separate_shards`。
 - 消息入库按每张表的本地行号推进，新增旧时间消息不再被时间水位跳过；初次构建也记录独立扫描位置。回归：`backdated_append_is_indexed_without_replaying_the_initial_snapshot`。
 - 联系人、群主和名册完整读取后整体替换；读取失败不确认版本并保留旧数据。回归：`metadata_failure_preserves_snapshot_and_pending_version`。
 - 群名片读取错误保留失败语义，恢复后重试；成功的空结果清除删除项。回归：`group_cards_failure_retries_and_empty_snapshot_clears_deleted_cards`。

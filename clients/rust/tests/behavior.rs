@@ -22,6 +22,8 @@ struct Mock {
     pull_pages: Arc<StdMutex<Vec<serde_json::Value>>>,
     pull_queries: Arc<StdMutex<Vec<String>>>,
     media_calls: Arc<StdMutex<Vec<String>>>,
+    export_calls: Arc<StdMutex<Vec<serde_json::Value>>>,
+    export_response: Arc<StdMutex<Option<(u16, serde_json::Value)>>>,
     media_bytes: Arc<StdMutex<Option<Vec<u8>>>>,
     // When set, the media route answers 302 with this Location once (then
     // clears itself) — the "first hit is a redirect" fixture: a proxy or
@@ -97,6 +99,7 @@ async fn spawn_mock(mock: Mock) -> String {
         .route("/api/v1/sessions/{id}/messages", get(pull_route))
         .route("/chatlab/messages", get(chatlab_route))
         .route("/api/v1/media/{id}", get(media_route))
+        .route("/api/v1/media/export", post(target_export_route))
         .route("/api/v1/messages", get(messages_route))
         .route("/api/v1/contacts", get(contacts_route))
         .route("/api/v1/group-members", get(group_members_route))
@@ -228,6 +231,14 @@ async fn chatlab_route(
         Some(p) => Json(p).into_response(),
         None => (StatusCode::NOT_FOUND, "fixture missing").into_response(),
     }
+}
+
+async fn target_export_route(State(mock): State<Mock>, headers: HeaderMap, Json(body): Json<serde_json::Value>) -> Response {
+    assert_bearer(&headers);
+    mock.export_calls.lock().unwrap().push(body);
+    let (status, response) = mock.export_response.lock().unwrap().clone()
+        .unwrap_or((405, serde_json::json!({"success":false})));
+    (StatusCode::from_u16(status).unwrap(), Json(response)).into_response()
 }
 
 async fn media_route(
@@ -530,43 +541,20 @@ async fn pull_page_omits_defaulted_cursors_instead_of_sending_zero() {
 #[tokio::test]
 async fn media_bytes_exports_then_retries_once_after_404() {
     let mock = Mock::default();
-    let talker = "wxid_mock";
-    // The display name and the session id must DIFFER here: the old retry
-    // used `message.account_name` as the export `talker`, and the fixture let
-    // the two coincide so the mistake was invisible. The mock now rejects any
-    // export query whose talker is not the session id we pass.
-    let display_name = "Alice DISPLAY";
-    // 导出响应携带本条消息（platformMessageId=42），media.fileName 是**导出
-    // 实际落盘名**——与元数据名不同。修复前丢弃导出响应用元数据名重试，
-    // 即使目标就在页内也必然再次 404。
-    *mock.chatlab_page.lock().unwrap() = Some(serde_json::json!({
-        "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
-        "count": 1, "members": [],
-        "messages": [{
-            "accountName": display_name, "content": "hello", "groupNickname": "",
-            "media": {"type": "image", "fileName": "abc123.exported.png", "md5": "abc"},
-            "platformMessageId": "42", "sender": "alice",
-            "timestamp": 1_700_000_000, "type": 1,
-        }],
-        "meta": {"groupId": "", "name": "", "ownerId": "", "platform": "weflow", "type": "chat"},
-        "page": {"hasMore": false, "nextCursor": null},
-        "talker": talker,
-    }));
-    *mock.chatlab_query_talker.lock().unwrap() = Some(talker.to_string());
+    *mock.export_response.lock().unwrap() = Some((200, serde_json::json!({
+        "success":true, "mediaId":"abc123.exported.png", "fileName":"abc123.exported.png",
+        "mediaUrl":"/api/v1/media/abc123.exported.png"
+    })));
     let base = spawn_mock(mock.clone()).await;
     let client = Client::new(&base, TOKEN);
     let message: weflow_client::generated::r#gen::types::ChatlabMessage =
-        serde_json::from_value(mock_message_json(display_name, "abc123.png"))
-            .unwrap();
-    assert_eq!(message.account_name, display_name, "fixture: display name differs from session id");
-    let bytes = client.media_bytes(&message, talker).await.expect("retry must succeed");
-    assert_eq!(bytes.as_ref(), b"png-bytes");
-    let calls = mock.media_calls.lock().unwrap().clone();
-    assert_eq!(
-        calls,
-        vec!["abc123.png", "abc123.exported.png"],
-        "two GETs: miss with the metadata name, retry with the export-backfilled name"
-    );
+        serde_json::from_value(mock_message_json("Alice DISPLAY", "abc123.png")).unwrap();
+    assert_eq!(client.media_bytes(&message, "actual-session").await.unwrap().as_ref(), b"png-bytes");
+    assert_eq!(*mock.media_calls.lock().unwrap(), vec!["abc123.png", "abc123.exported.png"]);
+    assert_eq!(*mock.export_calls.lock().unwrap(), vec![serde_json::json!({
+        "talker":"actual-session", "platformMessageId":message.platform_message_id,
+        "sender":message.sender, "timestamp":message.timestamp
+    })]);
 }
 
 #[tokio::test]
@@ -593,43 +581,26 @@ async fn media_bytes_without_a_handle_is_unexpected_body_not_a_fake_404() {
 
 #[tokio::test]
 async fn media_bytes_with_ambiguous_export_rows_refuses_to_guess() {
-    // The export target is located by the (id, sender, timestamp) triple:
-    // two rows that agree on all three cannot be told apart, and retrying
-    // with either name would silently fetch the wrong file. The client must
-    // report the ambiguity (and must not fire the retry GET) instead of
-    // picking one row.
     let mock = Mock::default();
-    let duplicated = serde_json::json!({
-        "accountName": "alice", "content": "x", "groupNickname": "",
-        "media": {"type": "image", "fileName": "dup.exported.png", "md5": "z"},
-        "platformMessageId": "42", "sender": "alice",
-        "timestamp": 1_700_000_000, "type": 1,
-    });
-    *mock.chatlab_page.lock().unwrap() = Some(serde_json::json!({
-        "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
-        "count": 2, "members": [],
-        "messages": [duplicated.clone(), duplicated],
-        "meta": {"groupId": "", "name": "", "ownerId": "", "platform": "weflow", "type": "chat"},
-        "page": {"hasMore": false, "nextCursor": null},
-        "talker": "wxid_mock",
-    }));
-    *mock.chatlab_query_talker.lock().unwrap() = Some("wxid_mock".to_string());
+    *mock.export_response.lock().unwrap() = Some((409, serde_json::json!({"success":false})));
     let base = spawn_mock(mock.clone()).await;
     let client = Client::new(&base, TOKEN);
     let message: weflow_client::generated::r#gen::types::ChatlabMessage =
-        serde_json::from_value(mock_message_json("Alice DISPLAY", "abc123.png"))
-            .unwrap();
-    match client.media_bytes(&message, "wxid_mock").await {
-        Err(ClientError::UnexpectedBody { detail, .. }) => {
-            assert!(
-                detail.contains("matches 2 messages"),
-                "ambiguity error must carry the match count: {detail}"
-            );
-        }
-        other => panic!("expected UnexpectedBody, got {other:?}"),
-    }
-    // No second GET happened: the retry only fires for a unique match.
+        serde_json::from_value(mock_message_json("Alice DISPLAY", "abc123.png")).unwrap();
+    assert!(matches!(client.media_bytes(&message, "actual-session").await,
+        Err(ClientError::Status { status:409, .. })));
     assert_eq!(*mock.media_calls.lock().unwrap(), vec!["abc123.png"]);
+    assert_eq!(mock.export_calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn targeted_export_reports_missing_server_capability() {
+    let mock = Mock::default();
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+    assert!(matches!(client.export_media_by_message("session", "old-id", "sender", 1).await,
+        Err(ClientError::UnexpectedBody { detail, .. }) if detail.contains("mediaExportByMessage")));
+    assert_eq!(mock.export_calls.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -1352,4 +1323,22 @@ async fn no_polling_path_triggers_a_sync() {
         0,
         "readiness probing must never sync"
     );
+}
+
+#[tokio::test]
+async fn targeted_export_preserves_missing_source_and_rejects_bad_handle_shape() {
+    let mock = Mock::default();
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+    *mock.export_response.lock().unwrap() = Some((404, serde_json::json!({"success":false,"code":404,"message":"missing source"})));
+    assert!(matches!(client.export_media_by_message("session", "old-id", "sender", 1).await, Err(ClientError::Status { status:404, .. })));
+    let valid = serde_json::json!({"success":true,"mediaId":"digest.png","fileName":"digest.png","mediaUrl":"/api/v1/media/digest.png"});
+    for (key, value) in [("success", serde_json::json!(false)), ("mediaId", serde_json::json!("")),
+        ("fileName", serde_json::json!("different.png")), ("mediaUrl", serde_json::json!("https://example.test/media?token=secret"))] {
+        let mut body = valid.clone();
+        body[key] = value;
+        *mock.export_response.lock().unwrap() = Some((200, body));
+        assert!(matches!(client.export_media_by_message("session", "old-id", "sender", 1).await, Err(ClientError::UnexpectedBody { .. })));
+    }
+    assert_eq!(mock.export_calls.lock().unwrap().len(), 5);
 }

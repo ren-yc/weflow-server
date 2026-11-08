@@ -842,6 +842,14 @@ impl AccountSync {
             max_items,
         )
     }
+
+    pub fn export_media_targeted(
+        &self,
+        context: &crate::media::export::ExportCtx,
+        target: crate::media::target::Target<'_>,
+    ) -> Result<crate::media::export::PreparedExport, crate::media::target::ExportError> {
+        crate::media::target::export_live(&self.storage, &self.keys, context, target)
+    }
 }
 
 /// Locate the withdrawn original message inside a conversation.

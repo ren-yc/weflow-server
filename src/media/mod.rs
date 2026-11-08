@@ -28,6 +28,7 @@
 //! byte-for-byte, including the large `rawSize > 0` shape.
 
 pub mod export;
+pub mod target;
 
 use aes::cipher::{BlockDecrypt, KeyInit};
 

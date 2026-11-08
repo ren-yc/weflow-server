@@ -9,6 +9,7 @@ pub mod contacts;
 pub mod group_members;
 pub mod health;
 pub mod media;
+pub mod media_export;
 pub mod messages;
 pub mod push_events;
 pub mod sessions;

@@ -62,6 +62,8 @@ pub enum Kind {
     GroupMembers,
     /// 按导出文件名取字节（**唯一**的字节面）。
     MediaById,
+    /// Export one uniquely identified message's local media.
+    MediaExport,
     /// 老面的 SSE 推送。
     PushMessages,
     /// ChatLab 通知面（只发元信息）。
@@ -121,6 +123,7 @@ pub const ROUTES: &[Route] = &[
     Route { path: "/api/v1/contacts", kind: Kind::Contacts, methods: GET_ONLY },
     Route { path: "/api/v1/group-members", kind: Kind::GroupMembers, methods: GET_ONLY },
     Route { path: "/api/v1/media/{id}", kind: Kind::MediaById, methods: GET_ONLY },
+    Route { path: "/api/v1/media/export", kind: Kind::MediaExport, methods: &[Method::Post] },
     Route { path: "/api/v1/push/messages", kind: Kind::PushMessages, methods: GET_ONLY },
     // ── ChatLab 适配面 ─────────────────────────────────────────────────
     //
@@ -177,6 +180,7 @@ pub fn method_router(kind: Kind) -> MethodRouter<Arc<AppState>> {
         Kind::Contacts => get(contacts::handler),
         Kind::GroupMembers => get(group_members::handler),
         Kind::MediaById => get(media::handler_by_id),
+        Kind::MediaExport => axum::routing::post(media_export::handler),
         Kind::PushMessages => get(push_events::handler),
         Kind::ChatlabPush => get(chatlab_push::handler),
         Kind::ChatlabSessions => get(chatlab_sessions::handler),

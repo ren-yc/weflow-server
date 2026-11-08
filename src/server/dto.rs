@@ -22,6 +22,28 @@
 
 use serde::Serialize;
 
+/// Locate exactly one media-bearing message in the bound account.
+#[derive(Debug, serde::Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MediaExportRequest {
+    pub platform_message_id: String,
+    pub sender: String,
+    pub talker: String,
+    pub timestamp: i64,
+}
+
+/// A local export whose actual filename is also its credential-free handle.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaExportResult {
+    pub file_name: String,
+    pub media_id: String,
+    pub media_url: String,
+    pub success: bool,
+}
+
+
+
 // ── 账号面 ────────────────────────────────────────────────
 
 /// `GET /api/v1/accounts`。

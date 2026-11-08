@@ -615,6 +615,27 @@ class Client:
                 return out
             offset += count
 
+    async def export_media_by_message(
+        self, talker: str, platform_message_id: str, sender: str, timestamp: int
+    ) -> gen.MediaExportResult:
+        """Restore one uniquely identified message's media across the full history."""
+        if not talker.strip() or not platform_message_id.strip() or not sender.strip():
+            raise ValueError("message identity fields must not be empty")
+        url = self._url("/api/v1/media/export")
+        response = await self._http_post(
+            url, headers={"Authorization": f"Bearer {self._token}"},
+            json={"talker": talker, "platformMessageId": platform_message_id,
+                  "sender": sender, "timestamp": timestamp}, timeout=self._long_timeout,
+        )
+        if response.status_code in (405, 501):
+            raise ShapeError("server does not support mediaExportByMessage")
+        exported = self._validate(gen.MediaExportResult, await self._decode(response, url))
+        if (not exported.success or not exported.media_id.strip()
+                or exported.file_name != exported.media_id
+                or exported.media_url != "/api/v1/media/" + exported.media_id):
+            raise ShapeError("export did not return a valid media handle")
+        return exported
+
     # ---- media_bytes ----------------------------------------------------
 
     async def media_bytes(self, message: gen.ChatlabMessage, talker: str) -> bytes:
@@ -627,9 +648,8 @@ class Client:
         the value).
 
         One automatic retry after a 404: the caller may have serialized the
-        handle before the export finished, and the ``media=1`` re-export is
-        what mints the file. A second 404 means the handle was never
-        exportable and the error propagates.
+        handle before the export finished. A targeted export returns the actual
+        handle; export failures propagate and a second fetch is not retried.
         """
         if message.media is None:
             raise ShapeError("(no media on message): nothing to fetch")
@@ -649,42 +669,10 @@ class Client:
         # 404 copies whole files. Neither has a meaningful read budget.
         resp = await self._http_get(url, headers=auth, timeout=self._long_timeout)
         if resp.status_code == 404:
-            # Retry with the name the export response backfilled: the on-disk
-            # name need not match the metadata name, so discarding the export
-            # response and retrying with the old name would 404 again even
-            # when the target sits inside the export page. When the target is
-            # outside the default export window (latest 100), say so.
-            exported = await self._get_json(
-                "/chatlab/messages",
-                {"talker": talker, "media": "1"},
-                long=True,
+            exported = await self.export_media_by_message(
+                talker, message.platform_message_id, message.sender, message.timestamp
             )
-            my_id = message.platform_message_id
-            # The target is located by the (platform message id, sender,
-            # timestamp) triple: id alone would accept an interleaved row that
-            # happens to carry the same id. No match => the target is outside
-            # the export page; multiple matches => there is no way to tell
-            # which row is this one - report, do not guess.
-            matches = [
-                m for m in exported.get("messages", [])
-                if m.get("platformMessageId") == my_id
-                and m.get("sender") == message.sender
-                and m.get("timestamp") == message.timestamp
-            ]
-            if len(matches) > 1:
-                raise ShapeError(
-                    f"export page matches {len(matches)} messages for "
-                    f"({my_id}, {message.sender}, {message.timestamp}); "
-                    "cannot pick one to re-export"
-                )
-            exported_name = ""
-            if matches:
-                exported_name = (matches[0].get("media") or {}).get("fileName") or ""
-            if not exported_name.strip():
-                raise ShapeError(
-                    "handle 404s and the export page (latest 100) does not contain "
-                    f"message {my_id}; cannot re-export by name"
-                )
+            exported_name = exported.media_id
             retry_url = self._url(f"/api/v1/media/{_encode_path_segment(exported_name)}")
             resp = await self._http_get(retry_url, headers=auth, timeout=self._long_timeout)
             # The retry replaced the response, so a failure must name the URL
@@ -717,7 +705,7 @@ class Client:
         Descending by time, offset-paged: advance ``offset`` by the page size
         until ``has_more`` is false. This is the face that carries what the
         ChatLab shape drops - ``raw_content``, ``is_send``, ``local_type`` - and
-        the only one that can export media (``media=True``).
+        supports page media export (``media=True``).
 
         Prefer :meth:`drain_session` when both faces would do: the Pull cursor
         is stable across a live database, while offset paging over a growing
@@ -1178,6 +1166,12 @@ class SyncClient:
         keyword: str | None = None,
     ) -> list[gen.SessionNative]:
         return self._call(self._client.list_all_sessions(page_size=page_size, keyword=keyword))
+
+    def export_media_by_message(
+        self, talker: str, platform_message_id: str, sender: str, timestamp: int
+    ) -> gen.MediaExportResult:
+        """Synchronous counterpart of targeted media export."""
+        return self._call(self._client.export_media_by_message(talker, platform_message_id, sender, timestamp))
 
     def media_bytes(self, message: gen.ChatlabMessage, talker: str) -> bytes:
         return self._call(self._client.media_bytes(message, talker))

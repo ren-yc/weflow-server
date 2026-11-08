@@ -706,15 +706,38 @@ impl Client {
         }
     }
 
+    /// Export one uniquely identified message, including messages outside the
+    /// default page. The returned handle describes bytes actually written.
+    pub async fn export_media_by_message(
+        &self, talker: &str, platform_message_id: &str, sender: &str, timestamp: i64,
+    ) -> Result<gen_types::MediaExportResult> {
+        let url = self.url("/api/v1/media/export");
+        if talker.trim().is_empty() || platform_message_id.trim().is_empty() || sender.trim().is_empty() {
+            return Err(ClientError::UnexpectedBody { url, detail: "message identity fields must not be empty".into() });
+        }
+        let response = self.http_long.post(&url).bearer_auth(&self.token).json(&gen_types::MediaExportRequest {
+            talker: talker.into(), platform_message_id: platform_message_id.into(), sender: sender.into(), timestamp,
+        }).send().await?;
+        if matches!(response.status().as_u16(), 405 | 501) {
+            return Err(ClientError::UnexpectedBody { url, detail: "server does not support mediaExportByMessage".into() });
+        }
+        let exported: gen_types::MediaExportResult = Self::decode(response, &url).await?;
+        if !exported.success || exported.media_id.trim().is_empty()
+            || exported.file_name != exported.media_id
+            || exported.media_url != format!("/api/v1/media/{}", exported.media_id) {
+            return Err(ClientError::UnexpectedBody { url, detail: "export did not return a valid media handle".into() });
+        }
+        Ok(exported)
+    }
+
     // ---- media_bytes -------------------------------------------------------
 
     /// Fetch media bytes for a handle that names content uniquely
     /// (content-digest-derived names only; the server 404s anything else).
     ///
     /// One automatic retry after a 404: the caller may have serialized the
-    /// handle before the export finished, and `media=1` re-export is what
-    /// mints the file. If the retry also 404s, the handle was not
-    /// exportable to begin with and the error is returned as-is.
+    /// handle before the export finished. A targeted export locates the exact
+    /// message and returns the actual handle; its failures are propagated.
     /// `talker` is the **session id** the export side door needs; it is NOT
     /// `message.account_name` (that is the sender's display name, which only
     /// coincides with the session id for 1:1 chats where the display name was
@@ -752,53 +775,9 @@ impl Client {
         let url = self.url(&url_path);
         let resp = self.http_long.get(&url).bearer_auth(&self.token).send().await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            // 触发导出后**采用导出响应回填的实际文件名**重试：服务端落盘名与
-            // 元数据名不必相同（图片落盘扩展名由内容嗅探定），丢弃导出响应用
-            // 旧名重试必然再次 404——即使目标就在导出页内。目标不在默认导出
-            // 窗口（最新 100 条）时如实报出，而不是让调用方对着必 404 的句柄
-            // 反复重试。
-            let mut q = BTreeMap::new();
-            q.insert("talker", talker.to_string());
-            q.insert("media", "1".to_string());
-            let exported: gen_types::ChatlabMessages = self.get_json("/chatlab/messages", &q).await?;
-            // 导出页里的目标是按「平台消息 id + 发送者 + 时间戳」三元组定位的，
-            // 单看 platform_message_id 会把同 id 的干扰行当成目标（id 并不保证
-            // 全局唯一）。都不匹配 ⇒ 目标不在导出页；匹配到多行 ⇒ 无法确定
-            // 哪一行才是本条，两者都如实报错而不是猜一个名字重试。
-            let matches: Vec<&gen_types::ChatlabMessage> = exported
-                .messages
-                .iter()
-                .filter(|m| {
-                    m.platform_message_id == message.platform_message_id
-                        && m.sender == message.sender
-                        && m.timestamp == message.timestamp
-                })
-                .collect();
-            let exported_name = match matches.as_slice() {
-                [one] => one.media.as_ref().map(|m| m.file_name.clone()).unwrap_or_default(),
-                [] => String::new(),
-                _ => {
-                    return Err(ClientError::UnexpectedBody {
-                        url: url.clone(),
-                        detail: format!(
-                            "export page matches {} messages for ({}, {}, {}); cannot pick one to re-export",
-                            matches.len(),
-                            message.platform_message_id,
-                            message.sender,
-                            message.timestamp
-                        ),
-                    });
-                }
-            };
-            if exported_name.trim().is_empty() {
-                return Err(ClientError::UnexpectedBody {
-                    url: url.clone(),
-                    detail: format!(
-                        "handle 404s and the export page (latest 100) does not contain message {}; cannot re-export by name",
-                        message.platform_message_id
-                    ),
-                });
-            }
+            let exported = self.export_media_by_message(talker, &message.platform_message_id,
+                &message.sender, message.timestamp).await?;
+            let exported_name = exported.media_id;
             let retry_url_path = format!("/api/v1/media/{}", encode_path_segment(&exported_name));
             let retry_url = self.url(&retry_url_path);
             let retry = self.http_long.get(&retry_url).bearer_auth(&self.token).send().await?;

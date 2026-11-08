@@ -851,6 +851,56 @@
           ],
           "type": "object"
         },
+        "MediaExportRequest": {
+          "additionalProperties": false,
+          "description": "Locate exactly one media-bearing message in the bound account.",
+          "properties": {
+            "platformMessageId": {
+              "type": "string"
+            },
+            "sender": {
+              "type": "string"
+            },
+            "talker": {
+              "type": "string"
+            },
+            "timestamp": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "platformMessageId",
+            "sender",
+            "talker",
+            "timestamp"
+          ],
+          "type": "object"
+        },
+        "MediaExportResult": {
+          "description": "A local export whose actual filename is also its credential-free handle.",
+          "properties": {
+            "fileName": {
+              "type": "string"
+            },
+            "mediaId": {
+              "type": "string"
+            },
+            "mediaUrl": {
+              "type": "string"
+            },
+            "success": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "fileName",
+            "mediaId",
+            "mediaUrl",
+            "success"
+          ],
+          "type": "object"
+        },
         "MediaObject": {
           "description": "消息的媒体元数据 —— **原生面专用**（拉取面与消息面用 `MediaBrief`，SSE 用 `EventMedia`）。\n\n- 未导出：`url` / `localPath` / `mediaId` **都不出现**，`exported` 也不出现；\n- 导出成功：`url` 是根相对路径、`localPath` 是绝对路径，且多出 `exported: true`；\n  其中**名字由内容摘要派生**的那些再多一个 `mediaId`（可直接喂给按名取字节的路由）；\n  名字来自平台（视频的 DB 名回落）的那些**不给** `mediaId` —— 按名取字节是跨会话解析的，\n  同名可能是别的会话的另一个文件。\n\n`exported` 是**条件键**：不导出时它**不出现**而不是 `false`。客户端靠「键在不在」\n判断字节可不可取 —— 改成恒出现会让这个判据失效。",
           "properties": {
@@ -1639,6 +1689,55 @@
           }
         }
       },
+      "/api/v1/media/export": {
+        "post": {
+          "description": "按会话、消息 ID、发送者及时间唯一定位并导出本地媒体。",
+          "operationId": "post__api_v1_media_export",
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MediaExportRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/MediaExportResult"
+                  }
+                }
+              },
+              "description": "成功"
+            },
+            "400": {
+              "description": "请求字段缺失或非法"
+            },
+            "401": {
+              "description": "未鉴权"
+            },
+            "404": {
+              "description": "目标或原始媒体不存在"
+            },
+            "409": {
+              "description": "目标不唯一或数据源切换"
+            },
+            "422": {
+              "description": "没有可导出的本地媒体"
+            },
+            "500": {
+              "description": "实际读取或导出失败"
+            },
+            "503": {
+              "description": "账号尚未就绪"
+            }
+          }
+        }
+      },
       "/api/v1/media/{id}": {
         "get": {
           "description": "字节面（唯一入口）：只服务导出根下**摘要派生**的文件名；未导出的先经 `media=1`（每请求上限 200 项）导出。同名多命中时内容一致才服务、不一致给 404。",
@@ -2384,6 +2483,34 @@
     "type",
     "required",
     "type",
+    "MediaExportRequest",
+    "additionalProperties",
+    "description",
+    "properties",
+    "platformMessageId",
+    "type",
+    "sender",
+    "type",
+    "talker",
+    "type",
+    "timestamp",
+    "format",
+    "type",
+    "required",
+    "type",
+    "MediaExportResult",
+    "description",
+    "properties",
+    "fileName",
+    "type",
+    "mediaId",
+    "type",
+    "mediaUrl",
+    "type",
+    "success",
+    "type",
+    "required",
+    "type",
     "MediaObject",
     "description",
     "properties",
@@ -2822,6 +2949,37 @@
     "application/json",
     "schema",
     "$ref",
+    "description",
+    "/api/v1/media/export",
+    "post",
+    "description",
+    "operationId",
+    "requestBody",
+    "content",
+    "application/json",
+    "schema",
+    "$ref",
+    "required",
+    "responses",
+    "200",
+    "content",
+    "application/json",
+    "schema",
+    "$ref",
+    "description",
+    "400",
+    "description",
+    "401",
+    "description",
+    "404",
+    "description",
+    "409",
+    "description",
+    "422",
+    "description",
+    "500",
+    "description",
+    "503",
     "description",
     "/api/v1/media/{id}",
     "get",
