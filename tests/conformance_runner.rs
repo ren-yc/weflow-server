@@ -358,8 +358,9 @@ async fn conformance_suite_passes() {
             "unknown": { "id": "wxid_does_not_exist_000000000", "expect": {} },
             // harness 保证句柄此刻可取的媒体（mediaId 承诺用例的槽位）。
             // harness 保证句柄此刻可取的媒体（mediaId 承诺用例的槽位）：
-            // 夹具预置一条语音导出（32 位十六进制摘要名，与 mediaId 同值）。
-            "exported_media": { "id": "00112233445566778899aabbccddeeff", "expect": {} },
+            // 夹具预置一条语音导出。**id 是导出文件名**（本面按名解析的形状：
+            // <md5>.<ext>），与文件系统里预置的文件同名。
+            "exported_media": { "id": "00112233445566778899aabbccddeeff.silk", "expect": {} },
         },
         "capabilities": {
             "mediaById": true,

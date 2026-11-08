@@ -71,7 +71,7 @@
     },
     "sync": {
       "hasMore": false,
-      "nextCursor": "djEuMS40",
+      "nextCursor": "<volatile>",
       "nextOffset": 0,
       "nextSince": "<volatile>",
       "watermark": "<volatile>"

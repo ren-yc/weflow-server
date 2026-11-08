@@ -1840,6 +1840,10 @@ mod golden {
         // 由 `chrono::Utc::now()` 派生：每次运行都不同
         "watermark",
         "nextSince",
+        // 不透明进度游标（pull 面 0.9.0）：base64(generation + localId)，
+        // generation 随进程内注销计数变化 —— 值不确定，键必须留下。
+        // （消息面的 page.nextCursor 是偏移数，确定性的，不在清单里。）
+        "nextCursor",
         // 索引构建时刻（毫秒）：每次运行都不同，但键必须留下 ——
         // 掩掉的是值，不是「这个字段还在不在」。
         "updatedAt",
