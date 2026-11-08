@@ -128,11 +128,12 @@ pub async fn handler(
     let generation = crate::server::current_generation();
     let cursor_local_id = cursor_param.as_deref().and_then(|c| decode_cursor(c, generation));
 
-    // Chronological messages within (since, end] — `since` is EXCLUSIVE, so a
-    // client resuming with `nextSince` never re-fetches the boundary second
-    // and can neither loop nor see duplicates (qqflow-server parity).
-    // 进度游标是权威起点：给出时忽略 since/offset（时间只是元数据，入库进度
-    // 才是增量判据）。排空后同秒晚入库的行由 localId 排他性覆盖。
+    // 进度游标模式（cursor 给出）下整个分页只用行标识（local_id）：过滤用
+    // 「local_id > 游标值」的排他下界，排序与页推进都按 local_id 单调——
+    // 入库序与时间序在乱序行上分叉时，续拉严格无重放、无跳行；乱序行的
+    // messages 顺序不再是时间升序，这是「排空判据=入库进度」的直接后果。
+    // 无 cursor 的时间模式保持规范原行为：(create_time, sort_seq, local_id)
+    // 复合键升序、页不跨秒推进（nextSince 语义依赖它），契约不要求与游标同键。
     let mut ascending: Vec<&crate::store::MessageRecord> = conv
         .iter()
         .filter(|m| {
@@ -142,9 +143,13 @@ pub async fn handler(
             since.is_none_or(|s| m.create_time > s) && end.is_none_or(|e| m.create_time <= e)
         })
         .collect();
-    ascending.sort_by(|a, b| {
-        (a.create_time, a.sort_seq, a.local_id).cmp(&(b.create_time, b.sort_seq, b.local_id))
-    });
+    if cursor_local_id.is_some() {
+        ascending.sort_by_key(|m| m.local_id);
+    } else {
+        ascending.sort_by(|a, b| {
+            (a.create_time, a.sort_seq, a.local_id).cmp(&(b.create_time, b.sort_seq, b.local_id))
+        });
+    }
 
     let total = ascending.len();
     // Page from `offset`, extending to the end of the last second's ts group:
@@ -152,24 +157,62 @@ pub async fn handler(
     // last timestamp) advance without dropping the rest of that second.
     let start = if cursor_local_id.is_some() { 0 } else { offset.min(total) };
     let mut page_end = start;
-    let mut prev_ts = None;
-    while page_end < total {
-        let ts = ascending[page_end].create_time;
-        if prev_ts.is_some_and(|p| p != ts) && page_end - start >= limit {
-            break;
+    if cursor_local_id.is_some() {
+        // 游标模式：页推进按 local_id 组——与排序键一致，页边界不切断单调序，
+        // 页末 localId 是严格的「已交付上界」。
+        let mut prev_lid = None;
+        while page_end < total {
+            let lid = ascending[page_end].local_id;
+            if prev_lid.is_some_and(|p| p != lid) && page_end - start >= limit {
+                break;
+            }
+            prev_lid = Some(lid);
+            page_end += 1;
         }
-        prev_ts = Some(ts);
-        page_end += 1;
+    } else {
+        // 时间模式：页不跨秒推进——`nextSince`（页末时间戳）要能无损续页。
+        let mut prev_ts = None;
+        while page_end < total {
+            let ts = ascending[page_end].create_time;
+            if prev_ts.is_some_and(|p| p != ts) && page_end - start >= limit {
+                break;
+            }
+            prev_ts = Some(ts);
+            page_end += 1;
+        }
     }
     let page: Vec<&crate::store::MessageRecord> = ascending[start..page_end].to_vec();
     let has_more = page_end < total;
     // The page's OWN last timestamp. Using the whole set's maximum here would
     // tell the client to resume past everything it has not seen yet.
     let next_since = page.last().map(|m| m.create_time).unwrap_or(since.unwrap_or(0));
-    // 进度游标恒编码**页末行**（排空时=最后交付行）的 localId：下一次增量的
-    // 排他起点，排空后仍在场。排空后同秒晚入库的行 localId 更大，续拉必然
-    // 可达——这正是时间游标补不上的盲区。
-    let last_local_id = page.last().map(|m| m.local_id).unwrap_or(cursor_local_id.unwrap_or(0));
+    // 进度游标编码「**已交付集合**」的进度上界——不是页末行：
+    //
+    // - cursor 模式：排序按 local_id 单调，页末行就是已交付集合的最大 local_id，
+    //   两者重合；空页时以本次游标值为准（进度不回退）。
+    // - 时间模式非空页：排序按时间复合键，页末行 local_id **可能不是已交付集合
+    //   里最大的**（回溯入库的行：时间早、行标识大）。编码页末行会让后续游标链
+    //   重放它；必须编码「本次响应已交付的行里最大的 local_id」。
+    // - 时间模式空页：本响应没有交付任何行，但请求窗口 (since, end] 为空本身
+    //   就是进度陈述——窗口内无行，则一切 create_time ≤ end 的行都已确立。
+    //   游标编码「end 界内已确立的最大 local_id」（end 缺省时水位线=now 覆盖
+    //   全部行）。编码 0 是「从头拉取」，周期轮询的客户端采纳它再丢掉时间过滤
+    //   就会重放全历史。
+    let last_local_id = if cursor_local_id.is_some() {
+        page.iter()
+            .map(|m| m.local_id)
+            .max()
+            .or(cursor_local_id)
+            .unwrap_or(0)
+    } else if page.is_empty() {
+        conv.iter()
+            .filter(|m| m.create_time <= watermark)
+            .map(|m| m.local_id)
+            .max()
+            .unwrap_or(0)
+    } else {
+        page.iter().map(|m| m.local_id).max().unwrap_or(0)
+    };
     let next_cursor = encode_cursor(generation, last_local_id);
 
     // `groupNickname` is the sender's per-chatroom card, which lives in

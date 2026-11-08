@@ -332,6 +332,35 @@ pub fn append_group_message_unique(storage: &Path, key: &Key, seq: i64) {
     drop(conn);
 }
 
+/// Add one group message whose business timestamp is **earlier** than existing
+/// rows while its row identity (local_id) is larger.
+///
+/// Why the fixture needs this: cursor continuation pages by row identity while
+/// the no-cursor time mode pages by timestamp. When the two orders diverge, a
+/// continuation that mixed the two keys would replay rows it already served
+/// (page-end row is not the largest local_id under time order) — this fixture
+/// is the divergence itself, so the out-of-order regression can pin the
+/// row-identity ordering.
+pub fn append_group_message_backdated(storage: &Path, key: &Key, seq: i64, create_time: i64) {
+    let path = storage.join("message/message_0.db");
+    let conn = wx_conn(&path, key, false);
+    let group_md5 = md5_hex(FAKE_GROUP);
+    conn.execute(
+        &format!(
+            "INSERT INTO \"Msg_{md5}\" (server_id, local_type, create_time, sort_seq, real_sender_id, message_content) \
+             VALUES (?1, 1, ?2, 0, 2, ?3)",
+            md5 = group_md5
+        ),
+        rusqlite::params![
+            8_450_000_000_000_000_000i64 + seq,
+            create_time,
+            format!("回溯入库-{seq}")
+        ],
+    )
+    .unwrap();
+    drop(conn);
+}
+
 pub fn append_group_reply(storage: &Path, key: &Key, quoted_server_id: i64) {
     let path = storage.join("message/message_0.db");
     let conn = wx_conn(&path, key, false);

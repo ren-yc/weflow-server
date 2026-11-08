@@ -423,3 +423,262 @@ async fn conformance_suite_passes() {
     serve.abort();
     assert!(out.status.success(), "一致性套件未通过（见上面的报告）");
 }
+
+/// 游标续拉的**行标识单调性**回归：入库序与业务时间序在乱序行上分叉时，
+/// cursor 模式的过滤、排序、页推进与游标编码必须全部只用行标识。
+///
+/// 修复前会踩中其中一段：
+///
+/// - **重放**（「单页排空 + 续拉」段）：排空按时间序一页交付全部行时，页末行的 localId
+///   不是已交付集合的最大值（回溯入库的行时间早、行标识大，排序在最前、
+///   页末也轮不到它）。旧代码编码页末行 → 回传续拉用 `localId > 页末值`
+///   过滤 → 该行被**再次交付**。
+/// - **空页进度重置**（「空页游标语义」段）：空页旧代码编码 0 —— 那是
+///   「从头拉取」，带 `end` 过滤的续拉把全历史重放一遍。
+/// - **页推进**（「同秒组续接」段）：cursor 模式按时间组扩展页边界，同秒行 + 乱序行的组合
+///   会把页边界切在行标识序中间，「已交付上界」不严格。
+///
+/// 健全域说明：混合链（时间模式多页 → 游标续接）在乱序行存在时**单点游标
+/// 本质上不可健全**——页 1 已交付大行标识的回溯行，小行标识的未交付行永远
+/// 无法经游标到达。游标链只在「采纳游标前已交付集合是行标识前缀」时健全，
+/// 单页全量排空保证这一点（契约用例 cursor-boundary-append-reachable 正是
+/// 此形态）。本测试钉住健全域内的全部判别性场景。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "真实索引链路回归：随一致性步骤显式运行（cargo test --test conformance_runner -- --ignored）"]
+async fn cursor_continuation_is_monotonic_when_row_order_diverges_from_time_order() {
+    let dir = common::tmp_dir("cursor-ooo");
+    let key = keystore::parse_db_key(common::FAKE_KEY_HEX).unwrap();
+    let storage = common::build_wechat_account(&dir, &key.0);
+
+    // 回溯入库在**注册之前**：业务时间早于夹具全部群行（…100–103 → …050），
+    // 行标识更大（AUTOINCREMENT 排在最后）。注册后的全量索引把它一并收进来。
+    // （注册后追加不可行：增量扫描按时间水位线推进，回溯行会永远落在
+    // 水位线之后被跳过，索引里根本没有它——第一版编排就是这么失败的。）
+    common::append_group_message_backdated(&storage, &key.0, 990, 1_700_000_050);
+
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let state = Arc::new(server::AppState::new(
+        cfg_for(&dir),
+        TOKEN.to_string(),
+        shutdown_tx,
+    ));
+    let app = server::build_router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = app.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let body = json!({
+        "wxid": common::FAKE_WXID,
+        "key": common::FAKE_KEY_HEX,
+        "db_path": dir.to_string_lossy(),
+    });
+    let mut r = req("POST", "/api/v1/accounts");
+    r.headers_mut().insert(
+        header::CONTENT_TYPE,
+        "application/json".parse().unwrap(),
+    );
+    *r.body_mut() = Body::from(body.to_string());
+    let reg = json_of(&client, r).await;
+    assert_eq!(reg["success"], json!(true), "注册失败：{reg}");
+    assert!(wait_ready(&client).await, "索引没能在 30 秒内到 ready");
+
+    let pull_url = format!("/chatlab/sessions/{}/messages", common::FAKE_GROUP);
+    let backdated = format!("{}", 8_450_000_000_000_000_000i64 + 990);
+
+    // 段一：单页排空 + 一次续拉——无重放。
+    // limit 放大到能一页装下全部 5 行（4 行常规 + 回溯行）。时间序把回溯行
+    // 排在最前、页末轮不到它——旧代码编码页末行，续拉把回溯行再交付一次。
+    let v = json_of(&client, req("GET", &format!("{pull_url}?limit=5000"))).await;
+    let first_page: Vec<String> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(v["sync"]["hasMore"], json!(false), "必须单页排空");
+    assert!(first_page.contains(&backdated), "回溯行必须在排空页里");
+    assert_eq!(first_page.len(), 5, "排空页必须交付全部 5 行");
+
+    let c0 = v["sync"]["nextCursor"].as_str().unwrap();
+    let v = json_of(
+        &client,
+        req("GET", &format!("{pull_url}?limit=5000&cursor={c0}")),
+    )
+    .await;
+    let got: Vec<String> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        got.is_empty(),
+        "排空后按游标续拉必须为空（重放判据），实际交付：{got:?}"
+    );
+
+    // 段二：空页游标语义。
+    //  - 带 cursor 的空页：进度保持（游标值不变，不回退为从头拉取）；
+    //  - 无 cursor 的空 time-filtered 页：游标编码「end 界内已确立的最大行
+    //    标识」——不是 0（从头拉取）。周期轮询的客户端（end=now）采纳空页
+    //    游标再丢掉时间过滤，必须不重放全历史。
+    let v = json_of(
+        &client,
+        req("GET", &format!("{pull_url}?limit=5000&cursor={c0}&end=1700000000")),
+    )
+    .await;
+    let got: Vec<String> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
+        .collect();
+    assert!(got.is_empty(), "end 过滤必须让本页为空");
+    let c1 = v["sync"]["nextCursor"].as_str().unwrap();
+    assert_eq!(c1, c0, "带 cursor 的空页必须保持进度（游标不变）");
+
+    // 无 cursor 的空 time-filtered 页：窗口 (1700000060, 1700000099] 内
+    // 无行，但「ts ≤ end 的行都已确立」——游标必须编码回溯行（ts=…050、行标识
+    // 最大），而不是 0（从头拉取）。周期轮询的客户端（end=now）采纳空页游标
+    // 再丢掉时间过滤，必须不重放全历史。
+    let v = json_of(
+        &client,
+        req("GET", &format!("{pull_url}?limit=5000&since=1700000060&end=1700000099")),
+    )
+    .await;
+    let got: Vec<String> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
+        .collect();
+    assert!(got.is_empty(), "end 过滤必须让本页为空");
+    let c_empty = v["sync"]["nextCursor"].as_str().unwrap();
+    // 游标形状 `v1.<generation>.<localId>`（base64）：行标识 0 即「从头拉取」。
+    use base64::Engine as _;
+    let decoded = String::from_utf8(
+        base64::engine::general_purpose::STANDARD
+            .decode(c_empty)
+            .unwrap(),
+    )
+    .unwrap();
+    let lid: i64 = decoded
+        .split('.')
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(-1);
+    assert_ne!(
+        lid, 0,
+        "空页游标不得编码行标识 0（从头拉取）：{decoded}"
+    );
+    // 采纳空页游标续拉（不带时间过滤）：不得重放全历史。
+    let v = json_of(
+        &client,
+        req("GET", &format!("{pull_url}?limit=5000&cursor={c_empty}")),
+    )
+    .await;
+    let got: Vec<String> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        got.is_empty(),
+        "空页游标（end 界内已确立进度）续拉不得重放全历史，实际交付：{got:?}"
+    );
+
+    // 段三：排空后追加（同秒、行标识更大）→ 游标续拉可达。
+    // 基准游标是段一的排空游标 c0（全量排空线，全部行在链内）；段二的空页
+    // 游标属于「end=99 的时间过滤线」，它确立的进度只覆盖 ts ≤ 99 的行，
+    // 拿它接无过滤链会跳过时间更晚的常规行——那不是缺陷，是线语义。
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    common::append_group_message_unique(&storage, &key.0, 8_100 + seq);
+    let acct = state.accounts.lock().values().next().cloned();
+    if let Some(a) = acct {
+        let sync = a.sync.clone();
+        let _ = tokio::task::spawn_blocking(move || sync.lock().poll_once()).await;
+    }
+    let v = json_of(
+        &client,
+        req("GET", &format!("{pull_url}?limit=5000&cursor={c0}")),
+    )
+    .await;
+    let got: Vec<String> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        got,
+        vec![format!("{}", 8_400_000_000_000_000_000i64 + 8_100 + seq)],
+        "排空后追加的行必须经排空游标可达（且只交付它）"
+    );
+
+    // 段四：同秒组 + 游标续接——页推进按行标识组。从段三的游标线继续（cursor
+    // 模式全链），limit=2 强制分页：验证「页边界按行标识组扩展」而不是按
+    // 时间组，且链上无重放无跳行。
+    common::append_same_second_burst(&storage, &key.0, 2, 1_700_000_200);
+    let acct = state.accounts.lock().values().next().cloned();
+    if let Some(a) = acct {
+        let sync = a.sync.clone();
+        let _ = tokio::task::spawn_blocking(move || sync.lock().poll_once()).await;
+    }
+    let mut cursor: Option<String> = Some(c0.to_string());
+    let mut pages: Vec<Vec<String>> = Vec::new();
+    loop {
+        let q = match &cursor {
+            Some(c) => format!("?limit=2&cursor={c}"),
+            None => unreachable!("cursor 模式排空链游标必须恒在场"),
+        };
+        let v = json_of(&client, req("GET", &format!("{pull_url}{q}"))).await;
+        let page_ids: Vec<String> = v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
+            .collect();
+        let more = v["sync"]["hasMore"].as_bool().unwrap();
+        pages.push(page_ids);
+        cursor = Some(
+            v["sync"]["nextCursor"]
+                .as_str()
+                .expect("cursor 模式排空链上 nextCursor 必须在场")
+                .to_string(),
+        );
+        if !more {
+            break;
+        }
+    }
+    let all: Vec<String> = pages.iter().flatten().cloned().collect();
+    let mut sorted = all.clone();
+    sorted.sort();
+    let mut expected = [
+        // 段四从排空游标 c0 续接：本次循环交付的是 local_id 更大的三行——段三的
+        // 追加行（同秒 …200）与 burst 两行（同秒 …200）。limit=2 下 cursor 模式
+        // 页推进按行标识（每行即一组）：同秒三行被切成 2+1 两页——游标线的
+        // 「已交付上界」优先于时间分组，这与时间模式「页不跨秒」是两套规则。
+        8_400_000_000_000_000_000i64 + 8_100 + seq,
+        8_300_000_000_000_000_000i64,
+        8_300_000_000_000_000_001i64,
+    ]
+    .iter()
+    .map(|v| v.to_string())
+    .collect::<Vec<_>>();
+    expected.sort();
+    // 页推进判别：修复前页推进按时间组——同秒三行整体一页（页数=1）；修复后
+    // 按行标识推进，limit=2 切成两页（2+1）。
+    assert_eq!(
+        pages.len(),
+        2,
+        "cursor 模式页推进必须按行标识（limit=2 把同秒三行切成两页），实际页数：{}",
+        pages.len()
+    );
+    assert_eq!(sorted, expected, "游标链（limit=2）交付集合必须与剩余行逐条相等");
+    let mut dedup = all;
+    dedup.sort();
+    dedup.dedup();
+    assert_eq!(dedup.len(), sorted.len(), "游标链不得重复交付（重放判据）");
+}

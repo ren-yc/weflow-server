@@ -98,6 +98,9 @@ required-features = ["server"]
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+# 游标回归测试解码 sync.nextCursor（opaqueCursor，v1.<代次>.<行标识> 的 base64）
+# 以断言行标识非 0；与根包 dependencies 同版本，无新增 vendored 依赖。
+base64 = "0.22"
 
 [profile.dev]
 debug = "line-tables-only"
