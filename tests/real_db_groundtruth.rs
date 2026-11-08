@@ -44,6 +44,156 @@ fn real_env() -> Option<(PathBuf, keystore::KeyMap)> {
     }
 }
 
+/// Aggregate-only evidence for per-table scan keys and conversation shards.
+/// Explicit execution requires WEFLOW_TEST_DB_ROOT and a key source above.
+#[test]
+#[ignore = "requires a real WeChat account; reports aggregate counts only"]
+fn real_message_source_identity_aggregate() {
+    let (root, keys) = real_env().expect("real source environment is required");
+    let storage = if root.join("db_storage").is_dir() { root.join("db_storage") } else { root };
+    let files = scan::enum_db_files(&storage);
+    let mut pool = LivePool::new();
+    let mut shards = std::collections::HashMap::<String, usize>::new();
+    let mut identities = std::collections::HashSet::<(String, i64)>::new();
+    let (mut databases, mut tables, mut rows, mut collisions, mut stable, mut skipped) = (0, 0, 0, 0, 0, 0);
+    for file in files.iter().filter(|f| f.kind == scan::DbKind::Message) {
+        let Some(key) = keys.key_for(&file.rel) else { skipped += 1; continue };
+        let conn = pool.get_or_open(file, key).unwrap_or_else(|_| panic!("source open failed"));
+        databases += 1;
+        for (table, suffix) in index::message_tables(conn) {
+            tables += 1;
+            *shards.entry(suffix.clone()).or_default() += 1;
+            let quoted = table.replace('"', "\"\"");
+            let mut stmt = conn.prepare(&format!("PRAGMA table_info(\"{quoted}\")")).unwrap();
+            let columns: Vec<(String, String, i64)> = stmt.query_map([], |r| {
+                Ok((r.get(1)?, r.get(2)?, r.get(5)?))
+            }).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+            let column = columns.iter().find(|(name, _, _)| {
+                ["local_id", "localId", "id"].iter().any(|c| name.eq_ignore_ascii_case(c))
+            }).expect("message table must have a local row key");
+            let sql: String = conn.query_row("SELECT sql FROM sqlite_master WHERE name=?1", [&table], |r| r.get(0)).unwrap();
+            if column.1.eq_ignore_ascii_case("integer") && column.2 == 1
+                && columns.iter().filter(|(_, _, pk)| *pk > 0).count() == 1
+                && sql.to_ascii_uppercase().contains("AUTOINCREMENT")
+            {
+                stable += 1;
+            }
+            let column = column.0.replace('"', "\"\"");
+            let mut stmt = conn.prepare(&format!("SELECT \"{column}\" FROM \"{quoted}\"")).unwrap();
+            let mut source_rows = stmt.query([]).unwrap();
+            while let Some(row) = source_rows.next().unwrap_or_else(|_| panic!("source iteration failed")) {
+                let id: i64 = row.get(0).unwrap_or_else(|_| panic!("local key decode failed"));
+                rows += 1;
+                if !identities.insert((suffix.clone(), id)) { collisions += 1; }
+            }
+        }
+    }
+    assert!(tables > 0, "probe must read message tables");
+    eprintln!("source_identity: databases={databases} tables={tables} rows={rows} autoincrement_integer_keys={stable} multi_shard_conversations={} colliding_conversation_local_keys={collisions} skipped_without_key={skipped}",
+        shards.values().filter(|count| **count > 1).count());
+    assert_eq!(stable, tables, "some source tables lack an integer autoincrement key");
+}
+
+/// Read/hash all logical fields without retaining bodies or emitting digests.
+/// This measures a conservative continuity-check baseline, not an index build.
+#[test]
+#[ignore = "requires real source environment; aggregate continuity cost only"]
+fn real_source_continuity_scan_cost() {
+    use sha2::{Digest, Sha256};
+    let (root, keys) = real_env().expect("real source environment is required");
+    let storage = if root.join("db_storage").is_dir() { root.join("db_storage") } else { root };
+    let files = scan::enum_db_files(&storage);
+    let mut pool = LivePool::new();
+    for round in 0..3 {
+        let started = std::time::Instant::now();
+        let (mut rows, mut bytes, mut tables, mut databases) = (0u64, 0u64, 0u64, 0u64);
+        let mut slowest_ms = 0u128;
+        for file in files.iter().filter(|f| f.kind == scan::DbKind::Message) {
+            let Some(key) = keys.key_for(&file.rel) else { continue };
+            let conn = pool.get_or_open(file, key).unwrap_or_else(|_| panic!("source open failed"));
+            let tx = conn.unchecked_transaction().unwrap();
+            let db_started = std::time::Instant::now();
+            databases += 1;
+            for (table, _) in index::message_tables(&tx) {
+                let quoted = table.replace('"', "\"\"");
+                let columns = weflow_server::db::open::table_columns_checked(&tx, &table).unwrap();
+                let local = columns.iter().find(|c| c.eq_ignore_ascii_case("local_id"))
+                    .expect("local_id column required for this probe").replace('"', "\"\"");
+                let mut stmt = tx.prepare(&format!("SELECT * FROM \"{quoted}\" ORDER BY \"{local}\"")).unwrap();
+                let count = stmt.column_count();
+                let mut values = stmt.query([]).unwrap();
+                let mut digest = Sha256::new();
+                while let Some(row) = values.next().unwrap_or_else(|_| panic!("source scan failed")) {
+                    rows += 1;
+                    digest.update([255]);
+                    for i in 0..count {
+                        use rusqlite::types::ValueRef;
+                        match row.get_ref(i).unwrap() {
+                            ValueRef::Null => digest.update([0]),
+                            ValueRef::Integer(v) => { digest.update([1]); digest.update(v.to_le_bytes()); bytes += 8; }
+                            ValueRef::Real(v) => { digest.update([2]); digest.update(v.to_bits().to_le_bytes()); bytes += 8; }
+                            ValueRef::Text(v) | ValueRef::Blob(v) => {
+                                digest.update([if matches!(row.get_ref(i).unwrap(), ValueRef::Text(_)) { 3 } else { 4 }]);
+                                digest.update((v.len() as u64).to_le_bytes());
+                                digest.update(v);
+                                bytes += v.len() as u64;
+                            }
+                        }
+                    }
+                }
+                std::hint::black_box(digest.finalize());
+                tables += 1;
+            }
+            tx.commit().unwrap();
+            slowest_ms = slowest_ms.max(db_started.elapsed().as_millis());
+        }
+        assert!(rows > 0);
+        eprintln!("continuity_cost: round={round} databases={databases} tables={tables} rows={rows} logical_bytes={bytes} elapsed_ms={} slowest_database_ms={slowest_ms}", started.elapsed().as_millis());
+        report_process_cost();
+    }
+}
+
+#[cfg(windows)]
+fn report_process_cost() {
+    // Windows retains peak working set and transfer counters for the current
+    // process; reading them once per round requires no monitoring/poll loop.
+    #[repr(C)]
+    #[derive(Default)]
+    struct Memory {
+        size: u32, faults: u32, peak_working_set: usize, working_set: usize,
+        peak_paged: usize, paged: usize, peak_nonpaged: usize, nonpaged: usize,
+        pagefile: usize, peak_pagefile: usize,
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct Io { read_ops: u64, write_ops: u64, other_ops: u64, read: u64, write: u64, other: u64 }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn GetProcessIoCounters(process: *mut std::ffi::c_void, counters: *mut Io) -> i32;
+    }
+    #[link(name = "psapi")]
+    unsafe extern "system" {
+        fn GetProcessMemoryInfo(process: *mut std::ffi::c_void, memory: *mut Memory, size: u32) -> i32;
+    }
+    let mut memory = Memory { size: std::mem::size_of::<Memory>() as u32, ..Memory::default() };
+    let mut io = Io::default();
+    // SAFETY: buffers have the documented C layouts and sizes, and the pseudo
+    // handle describes this process for the duration of both calls.
+    unsafe {
+        let process = GetCurrentProcess();
+        assert_ne!(GetProcessMemoryInfo(process, &mut memory, std::mem::size_of::<Memory>() as u32), 0);
+        assert_ne!(GetProcessIoCounters(process, &mut io), 0);
+    }
+    eprintln!("continuity_process: peak_working_set_bytes={} read_transfer_bytes={} read_operations={}",
+        memory.peak_working_set, io.read, io.read_ops);
+}
+
+#[cfg(not(windows))]
+fn report_process_cost() {
+    eprintln!("continuity_process: peak memory and I/O counters unavailable on this platform");
+}
+
 #[test]
 #[ignore = "requires a real WeChat 4.0 account"]
 fn real_session_db_roundtrips() {

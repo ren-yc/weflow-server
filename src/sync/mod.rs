@@ -417,7 +417,8 @@ impl AccountSync {
 
         // phase 1: incremental reads (read-only wrt the store)
         let mut new_rows: Vec<(String, MessageRecord)> = Vec::new();
-        let mut new_watermarks: Vec<(String, Watermark)> = Vec::new();
+        let mut new_watermarks = std::collections::HashMap::<String, Watermark>::new();
+        let mut scan_positions = std::collections::HashMap::<String, i64>::new();
         let mut revoke_rows: Vec<(String, MessageRecord)> = Vec::new();
         // 本轮**真正读过数据**的文件：只有它们才允许在 phase 4 记账
         // （戳与 data_version 基线）。读失败/无 key/打开失败的文件不记账，
@@ -479,14 +480,19 @@ impl AccountSync {
                         let wm_key = format!("{}:{table}", f.rel);
                         let mut wm = {
                             let guard = self.store.read();
-                            guard.watermarks.get(&wm_key).copied().unwrap_or_default()
+                            Watermark {
+                                local_id: guard.scan_positions.get(&wm_key).copied().unwrap_or(0),
+                                ..Watermark::default()
+                            }
                         };
+                        let source: Arc<str> = wm_key.clone().into();
                         let mut pages = 0usize;
                         loop {
                             pages += 1;
                             let rows = read_new(conn, &table, &wm, name2id.as_deref())?;
                             let full = rows.len() >= index::READ_PAGE;
-                            for row in rows {
+                            for mut row in rows {
+                                row.source_shard = source.clone();
                                 let session_username = {
                                     let guard = self.store.read();
                                     index::resolve_table_session(&guard, &md5_suffix)
@@ -516,7 +522,9 @@ impl AccountSync {
                                     revoke_rows.push((session_username.clone(), row.clone()));
                                 }
                                 new_rows.push((session_username.clone(), row));
-                                new_watermarks.push((wm_key.clone(), wm));
+                                let previous = new_watermarks.entry(wm_key.clone()).or_default();
+                                *previous = (*previous).max(wm);
+                                scan_positions.insert(wm_key.clone(), wm.local_id);
                             }
                             if !full { break; }
                             if pages >= READ_MAX_PAGES {
@@ -554,8 +562,12 @@ impl AccountSync {
                 return Ok((0, 0));
             }
             let my_wxid = guard.my_wxid.clone();
+            for (wm_key, position) in scan_positions {
+                guard.scan_positions.insert(wm_key, position);
+            }
             for (wm_key, wm) in new_watermarks {
-                guard.watermarks.insert(wm_key, wm);
+                let previous = guard.watermarks.entry(wm_key).or_default();
+                *previous = (*previous).max(wm);
             }
             for (session, row) in new_rows {
                 // 撤回信令行入索引但不发 `message.new`：它的下游事件是 Revoke——
@@ -889,6 +901,7 @@ mod tests {
         };
         let conv = store.convs.entry("sess".into()).or_default();
         conv.push(MessageRecord {
+            source_shard: Arc::from("fixture"),
             local_id: 1,
             server_id: 100,
             local_type: 1,
@@ -900,6 +913,7 @@ mod tests {
             parsed: crate::parser::parse_message(1, 100, 1, "你好"),
         });
         conv.push(MessageRecord {
+            source_shard: Arc::from("fixture"),
             local_id: 2,
             server_id: 101,
             local_type: 10002,

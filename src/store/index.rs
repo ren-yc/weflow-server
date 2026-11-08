@@ -431,6 +431,7 @@ fn row_to_record(row: OwnedMsgRow, my_wxid: &str, contacts: &std::collections::H
         .filter(|s| !s.is_empty() && s != &row.sender_username)
         .unwrap_or_else(|| row.sender_username.clone());
     MessageRecord {
+        source_shard: std::sync::Arc::from(""),
         local_id: row.local_id,
         server_id: row.server_id,
         local_type: row.local_type,
@@ -766,7 +767,12 @@ fn build_all_live_inner(
         };
         for (table, md5_suffix) in message_tables(conn) {
             match load_message_table(conn, &table, &uid_map, &contacts, my_wxid, progress) {
-                Ok((records, watermark)) => {
+                Ok((mut records, watermark)) => {
+                    let source: std::sync::Arc<str> = format!("{}:{table}", f.rel).into();
+                    if let Some(last_id) = records.iter().map(|r| r.local_id).max() {
+                        store.scan_positions.insert(source.to_string(), last_id);
+                    }
+                    for record in &mut records { record.source_shard = source.clone(); }
                     let session = table_session(&md5_suffix, &store);
                     let conv = store.convs.entry(session).or_default();
                     conv.extend(records);
@@ -831,7 +837,8 @@ pub const READ_PAGE: usize = 5000;
 #[cfg(test)]
 pub const READ_PAGE: usize = 5;
 
-/// Incremental read: rows of one table after the watermark, in order.
+/// Incremental read after the shard's local-ID scan position. Time fields in
+/// the argument are descriptive only; late rows may have older timestamps.
 pub fn read_new(
     conn: &Connection,
     table: &str,
@@ -840,7 +847,7 @@ pub fn read_new(
 ) -> Result<Vec<MessageRecord>> {
     let cols =
         MsgCols::probe(conn, table).ok_or_else(|| anyhow::anyhow!("no local_id column"))?;
-    let Some(time) = cols.time.as_deref() else {
+    let Some(_time) = cols.time.as_deref() else {
         // 与「无 local_id 列」同口径报 Err，而不是返回空 Vec：空 Vec 与「真的没有新行」
         // 在调用方完全不可区分，于是这张表的增量**永久静默为空**——水位照记、页面照答，
         // 谁也不会再回头看它。真库里出现过这种列形态时，唯一能发现它的就是这个错误串。
@@ -850,32 +857,25 @@ pub fn read_new(
         ));
     };
     let uid_map = load_uid_map(conn, name2id)?;
-    let order = [time, cols.seq.as_deref().unwrap_or(&cols.local), &cols.local];
     let query = format!(
-        "SELECT {sel} FROM \"{table}\" WHERE ({ts}, {seq}, {lid}) > (?1, ?2, ?3) ORDER BY {ord} LIMIT {page}",
+        "SELECT {sel} FROM \"{table}\" WHERE {lid} > ?1 ORDER BY {lid} LIMIT {page}",
         sel = cols.selected.join(", "),
-        ord = order.join(", "),
-        ts = time,
-        seq = cols.seq.as_deref().unwrap_or(&cols.local),
         lid = cols.local,
         page = READ_PAGE,
     );
     let mut stmt = conn.prepare(&query)?;
-    let mut rows = stmt.query(rusqlite::params![
-        watermark.create_time,
-        watermark.sort_seq,
-        watermark.local_id
-    ])?;
+    let mut rows = stmt.query([watermark.local_id])?;
     let mut out = Vec::new();
-    // sender display resolution needs contacts, which we do not have here;
-    // caller (sync engine) re-resolves names after applying
-    let empty: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+    // Sender display names are resolved by the applying sync engine.
     let no_contacts: std::collections::HashMap<String, Contact> = std::collections::HashMap::new();
     while let Some(row) = rows.next()? {
+        // A malformed local ID cannot silently become zero and stall/replay
+        // the drain loop. Its decode must fail before any progress is applied.
+        let local_id: i64 = row.get(0)?;
+        anyhow::ensure!(local_id > watermark.local_id, "message scan position did not advance");
         let owned = cols.extract(row, &uid_map);
         out.push(row_to_record(owned, "", &no_contacts));
     }
-    let _ = empty;
     Ok(out)
 }
 

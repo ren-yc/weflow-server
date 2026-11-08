@@ -337,6 +337,10 @@ v0.6.1 至 v0.6.6 都是纯文档 tag，v0.7.0 新增跨仓文档模板；v0.8.0
 
 ### 增量同步
 
+- 消息扫描按每库每表的 `local_id` 推进；源分片与行号共同标识一行，业务时间不参与入库判定。初次扫描以最大行号建立位置，避免重放已收录的旧时间行。
+- 内部扫描位置独立于 SSE 的时间三元组；晚到行可以早于既有时间水位。回归：`backdated_append_is_indexed_without_replaying_the_initial_snapshot`。
+- 新分片从自己的行号起点扫描，同会话同本地号或平台 ID 不互相覆盖。回归：`new_shard_reuses_local_and_platform_ids_without_losing_rows`。真实源聚合探针为 `real_message_source_identity_aggregate`。
+
 - **WAL 预分配 4 MiB ⇒ 文件大小恒定，指纹只能看 mtime**：库是 WAL 模式且预分配固定大小的日志，写入不会改变文件大小，所以「靠 size 判断有没有新消息」永远为假。反过来说 mtime 变了不代表真有新消息，水位线才是权威。
 - **增量检测是两级**：已打开的库用 SQLite `PRAGMA data_version` 探测外部提交——它是连接本地属性，只在同一连接的两个时点之间比较才有意义，且别的连接提交后必然不同但不保证递增（比较用不等，不用大小）。文件 mtime/size 戳退为未打开文件的前置门。Windows 高负载下元数据回读可能滞后，只靠文件戳会把一次写入误判成「未变」。
 - **记账规则**：只有真正读到数据的文件才记账（记文件戳 ＋ 确认 data_version 基线）——无密钥、打开失败的文件不记账，下一轮才不会把它判成「未变」而把变更永久吞掉。qqflow 侧语义天然如此，无需同构。

@@ -448,7 +448,7 @@ curl -X POST -H "Authorization: Bearer <token>" http://127.0.0.1:5033/api/v1/syn
 { "success": true, "newMessages": 3, "revokeMessages": 0 }
 ```
 
-立即跑一次水位增量同步。正常情况下由文件监视自动触发，此端点用于强制对账。
+立即跑一次入库进度增量同步。新增行即使携带较早的发送时间也会进入索引；每个数据库分片独立推进。正常情况下由文件监视自动触发，此端点用于强制对账。
 
 - 撤回计数键为 `revokeMessages`，不计入 `newMessages`。新消息同时会通过 SSE 推给已订阅的客户端。这是一个触发器，不返回消息体。
 

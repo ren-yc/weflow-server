@@ -4,8 +4,13 @@
 
 ## [Unreleased]
 
+### 破坏性变更
+
+- 嵌入数据类型 `MessageRecord` 新增 `source_shard`，同会话跨分片的本地行号可重复。使用结构体字面量的调用方须补充该字段；去重键改为源分片与本地号。回归：`new_shard_reuses_local_and_platform_ids_without_losing_rows`。
+
 ### 修复
 
+- 消息入库按每张表的本地行号推进，新增旧时间消息不再被时间水位跳过；初次构建也记录独立扫描位置。回归：`backdated_append_is_indexed_without_replaying_the_initial_snapshot`。
 - 联系人、群主和名册完整读取后整体替换；读取失败不确认版本并保留旧数据。回归：`metadata_failure_preserves_snapshot_and_pending_version`。
 - 群名片读取错误保留失败语义，恢复后重试；成功的空结果清除删除项。回归：`group_cards_failure_retries_and_empty_snapshot_clears_deleted_cards`。
 

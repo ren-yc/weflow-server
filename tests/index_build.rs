@@ -140,6 +140,77 @@ fn incremental_poll_picks_up_new_rows_after_watermark() {
 }
 
 #[test]
+fn backdated_append_is_indexed_without_replaying_the_initial_snapshot() {
+    let dir = common::tmp_dir("livebackdated");
+    let key = fake_key();
+    let storage = common::build_wechat_account(&dir, &key);
+    // The largest ID is deliberately not the newest timestamp at build time.
+    common::append_group_message_backdated(&storage, &key, 1, 1_600_000_000);
+    let store = Arc::new(RwLock::new(Store::default()));
+    let mut sync = AccountSync::new(common::FAKE_WXID, &storage, km(key), store.clone());
+    sync.full_sync().unwrap();
+    let before = store.read().convs[common::FAKE_GROUP].len();
+    common::append_group_message_backdated(&storage, &key, 2, 1_500_000_000);
+    assert_eq!(sync.poll_once().unwrap(), (1, 0));
+    assert_eq!(store.read().convs[common::FAKE_GROUP].len(), before + 1);
+    assert_eq!(sync.poll_once().unwrap(), (0, 0));
+    let rebuilt = Arc::new(RwLock::new(Store::default()));
+    let mut rebuild = AccountSync::new(common::FAKE_WXID, &storage, km(key), rebuilt.clone());
+    rebuild.full_sync().unwrap();
+    let snapshot = |store: &Arc<RwLock<Store>>| {
+        let mut rows: Vec<_> = store.read().convs[common::FAKE_GROUP].iter()
+            .map(|m| (m.local_id, m.server_id, m.create_time)).collect();
+        rows.sort();
+        rows
+    };
+    assert_eq!(snapshot(&store), snapshot(&rebuilt));
+}
+
+#[test]
+fn new_shard_reuses_local_and_platform_ids_without_losing_rows() {
+    let dir = common::tmp_dir("livenewshard");
+    let key = fake_key();
+    let storage = common::build_wechat_account(&dir, &key);
+    let store = Arc::new(RwLock::new(Store::default()));
+    let mut sync = AccountSync::new(common::FAKE_WXID, &storage, km(key), store.clone());
+    sync.full_sync().unwrap();
+    let original = store.read().convs[common::FAKE_GROUP][0].clone();
+    use md5::Digest;
+    let table = format!("Msg_{:x}", md5::Md5::digest(common::FAKE_GROUP.as_bytes()));
+    let writer = common::wx_conn(&storage.join("message/message_1.db"), &key, false);
+    writer.execute_batch(&format!(
+        "CREATE TABLE \"{table}\" (local_id INTEGER PRIMARY KEY AUTOINCREMENT,
+         server_id INTEGER, local_type INTEGER, create_time INTEGER,
+         sort_seq INTEGER, sender_username TEXT, message_content TEXT);"
+    )).unwrap();
+    // A separate shard legitimately starts from the same local ID and may
+    // repeat a platform ID. Neither is a global progress/deduplication key.
+    writer.execute(&format!("INSERT INTO \"{table}\" VALUES (?1, ?2, 1, ?3, 0, 'member', 'late')"),
+        rusqlite::params![original.local_id, original.server_id, original.create_time - 1]).unwrap();
+    assert_eq!(sync.poll_once().unwrap(), (1, 0));
+    let duplicates: Vec<_> = store.read().convs[common::FAKE_GROUP].iter()
+        .filter(|m| m.local_id == original.local_id && m.server_id == original.server_id)
+        .map(|m| m.source_shard.clone()).collect();
+    assert_eq!(duplicates.len(), 2);
+    assert_ne!(duplicates[0], duplicates[1]);
+    // Append independently to both files, including another backwards time.
+    writer.execute(&format!("INSERT INTO \"{table}\" (server_id,local_type,create_time,sort_seq,sender_username,message_content) VALUES (?1,1,?2,0,'member','later')"),
+        rusqlite::params![original.server_id, original.create_time - 2]).unwrap();
+    common::append_group_message_backdated(&storage, &key, 3, original.create_time - 3);
+    assert_eq!(sync.poll_once().unwrap(), (2, 0));
+    assert_eq!(sync.poll_once().unwrap(), (0, 0));
+    let expected: std::collections::BTreeSet<_> = store.read().convs[common::FAKE_GROUP].iter()
+        .map(|m| (m.source_shard.clone(), m.local_id, m.server_id, m.create_time)).collect();
+    let rebuilt = Arc::new(RwLock::new(Store::default()));
+    let mut rebuild = AccountSync::new(common::FAKE_WXID, &storage, km(key), rebuilt.clone());
+    rebuild.full_sync().unwrap();
+    let actual: std::collections::BTreeSet<_> = rebuilt.read().convs[common::FAKE_GROUP].iter()
+        .map(|m| (m.source_shard.clone(), m.local_id, m.server_id, m.create_time)).collect();
+    assert_eq!(actual, expected);
+    assert_eq!(actual.len(), store.read().convs[common::FAKE_GROUP].len());
+}
+
+#[test]
 fn missing_tables_degrade_gracefully() {
     let dir = common::tmp_dir("livedegrade");
     let key = fake_key();
