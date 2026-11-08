@@ -299,23 +299,33 @@ fn write_out(
     }
     // 临时文件用唯一名 + 排他创建：固定 `.name.tmp` 会让并发导出互踩——
     // 两个写入方各自 write→rename，后写者可以把先写者刚 rename 的成品覆盖掉，
-    // 或在对方 rename 前把半成品当成对方的目标。排他创建保证只有建出这个
-    // 名字的写入方自己 rename 它。
+    // 或在对方 rename 前把半成品当成对方的目标。排他创建保证只有**建出这个
+    // 名字的写入方**处置它：open 撞名（并发同名导出）时那份 tmp 是别人的
+    // 半成品，直接退出、绝不 remove——失败清理只针对自己创建的 tmp（半成品
+    // 留在导出目录里会被目录扫描当成可取句柄通告出去，取到的是截断字节）。
     let tmp = dir.join(format!(
         ".{}.{}.tmp",
         file_name,
         std::process::id()
     ));
-    if std::fs::OpenOptions::new()
+    let mut f = match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&tmp)
-        .and_then(|mut f| std::io::Write::write_all(&mut f, bytes))
-        .is_err()
     {
+        Ok(f) => f,
+        Err(_open_err) => return None,
+    };
+    if std::io::Write::write_all(&mut f, bytes).is_err() {
+        drop(f);
+        let _ = std::fs::remove_file(&tmp);
         return None;
     }
-    std::fs::rename(&tmp, &path).ok()?;
+    drop(f);
+    if std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return None;
+    }
     Some(ExportedMedia {
         file_name: file_name.to_string(),
         kind_dir,
@@ -749,6 +759,25 @@ mod tests {
         // 正向对照：合法分量照常写入。
         assert!(write_out(&root, "wxid_a", "images", "ok.jpg", b"x", false).is_some());
         assert!(root.join("wxid_a/images/ok.jpg").exists());
+
+        // rename 失败（目标位置被一个**目录**占用）→ 清理自己创建的 tmp：
+        // 半成品留在导出目录里会被目录扫描当成可取句柄通告出去，取到的是
+        // 截断字节。目标位置预置目录让 rename 必然失败（文件不能覆盖目录）。
+        std::fs::create_dir_all(root.join("wxid_a/images/blocked.jpg")).unwrap();
+        assert!(
+            write_out(&root, "wxid_a", "images", "blocked.jpg", b"x", false).is_none(),
+            "目标被目录占用时写入必须失败"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(root.join("wxid_a/images"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "失败后不得残留临时文件: {:?}",
+            leftovers.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
