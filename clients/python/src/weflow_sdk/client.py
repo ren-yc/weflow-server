@@ -672,6 +672,10 @@ class Client:
                 )
             retry_url = self._url(f"/api/v1/media/{_encode_path_segment(exported_name)}")
             resp = await self._http_get(retry_url, headers=auth, timeout=self._long_timeout)
+            # The retry replaced the response, so a failure must name the URL
+            # that actually failed - not the metadata-name URL that only
+            # triggered the export.
+            url = retry_url
         # Not-2xx (not just 4xx/5xx): a 3xx falling through to `return` hands
         # the caller an empty redirect body as media bytes with no error signal
         # - same rule as _decode / media_bytes_by_id.

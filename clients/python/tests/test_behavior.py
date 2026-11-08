@@ -467,7 +467,7 @@ async def test_media_bytes_rejects_redirect_like_statuses() -> None:
             "count": 1, "members": [],
             "messages": [{
                 "accountName": "alice", "content": "x", "groupNickname": "",
-                "media": {"type": "image", "fileName": "abc.png", "md5": "z"},
+                "media": {"type": "image", "fileName": "abc.exported.png", "md5": "z"},
                 "platformMessageId": "1", "sender": "alice", "timestamp": 1, "type": 1,
             }],
             "meta": {"groupId": "", "name": "", "ownerId": "",
@@ -485,6 +485,10 @@ async def test_media_bytes_rejects_redirect_like_statuses() -> None:
         with pytest.raises(sdkmod.StatusError) as exc_info:
             await client.media_bytes(message, "wxid_alice")
         assert exc_info.value.status == status
+        assert exc_info.value.url.endswith("/api/v1/media/abc.exported.png"), (
+            "the failure names the retry URL that actually 404s-or-3xx's, "
+            "not the metadata-name URL that only triggered the export"
+        )
         await client.aclose()
 
 
