@@ -101,6 +101,8 @@ struct GetMessagesArgs {
     limit: Option<usize>,
     /// 同一时间组内的游标：翻页时原样回传上一次的 nextOffset
     offset: Option<u64>,
+    /// 不透明进度游标：原样回传上一次的 nextCursor。给出时它取代 since/offset
+    cursor: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -157,12 +159,16 @@ struct GroupMembersArgs {
 
 // ---- 纯函数 ------------------------------------------------------------------
 
-/// 把 SDK 错误分流到两条通道：404 是「工具跑成了、但没有这个东西」，其余是服务端不可用。
+/// 把 SDK 错误分流到两条通道：404（没有这个东西）与游标失效（入参已过期）都是「工具
+/// 跑成了，但结果取决于调用方下一步动作」，用工具级错误把动作说清楚；其余才是服务端
+/// 不可用。游标失效归到这里而不是内部错误：它是**可自愈**的，而内部错误没有处置动作。
 fn sdk_outcome(e: ClientError) -> Result<CallToolResult, McpError> {
-    if let ClientError::Status { status: 404, .. } = e {
-        Ok(tool_error(format!("{e}")))
-    } else {
-        Err(McpError::internal_error(format!("{e}"), None))
+    match &e {
+        ClientError::Status { status: 404, .. } => Ok(tool_error(format!("{e}"))),
+        ClientError::CursorReset { .. } => Ok(tool_error(format!(
+            "{e}；重新调用时不要带 cursor（从 since 重新开始），不要重试同一条游标"
+        ))),
+        _ => Err(McpError::internal_error(format!("{e}"), None)),
     }
 }
 
@@ -286,11 +292,17 @@ impl WeflowMcp {
             Ok(v) => v,
             Err(e) => return Ok(tool_error(e)),
         };
-        let page = match self
-            .client
-            .pull_page(&a.talker, since, a.offset.unwrap_or(0), Some(limit as u32))
-            .await
-        {
+        // 两条路径并存：给了游标就走路标模式（游标原样回传，服务端权威）；没给就仍按
+        // offset 取，老调用方手里的 nextOffset 继续有效。
+        let fetched = match a.cursor.as_deref() {
+            Some(c) => {
+                self.client
+                    .pull_page_cursor(&a.talker, Some(c), since, Some(limit as u32))
+                    .await
+            }
+            None => self.client.pull_page(&a.talker, since, a.offset.unwrap_or(0), Some(limit as u32)).await,
+        };
+        let page = match fetched {
             Ok(p) => p,
             Err(e) => return sdk_outcome(e),
         };
@@ -308,6 +320,10 @@ impl WeflowMcp {
         // Option<String>，回填数字会被反序列化拒绝，而 MCP 协议错误只渲染成一句
         // 笼统的内部错误 —— 指引本身不能制造不可读失败。
         let since_resolved = since.map(|v| v.to_string());
+        let cursor_mode = a.cursor.is_some();
+        // 预算截断时**不**交整页游标：它指向本页之后，调用方会永远跳过被砍掉的条。
+        // 原样回传入参游标等于「本页还没读完」，用更小的 limit 重取本页即可。
+        let next_cursor = if cut { a.cursor.clone() } else { page.sync.next_cursor.clone() };
         Ok(CallToolResult::structured(json!({
             "talker": a.talker,
             "count": proj.items.len(),
@@ -320,23 +336,29 @@ impl WeflowMcp {
             // 这一面从 `offset` 起是连续切片，所以 `start + 给出条数` 恰指向被砍掉的第一条 —— 否则
             // 一个纯按字段续拉的调用方会永远重取同一页。
             "nextSince": if cut { Value::Null } else { json!(page.sync.next_since) },
-            "nextOffset": if cut {
+            // 不透明进度游标：原样回传。游标模式下的 offset 没有意义（它不是同一时间组内的
+            // 位置，而是服务端编码的进度），所以那时给 null，免得调用方把它套回 offset 续拉。
+            "nextCursor": next_cursor,
+            "nextOffset": if cursor_mode {
+                Value::Null
+            } else if cut {
                 json!(start + proj.items.len() as u64)
             } else {
                 json!(page.sync.next_offset)
             },
             // 绝对下界：续拉时传它而不是原始 since 串（下一轮 now 已前移，相对串会挪窗）。
             "sinceResolved": since_resolved,
-            // hint 只在确实有下界可回填时指路：since 未提供时 sinceResolved 为 null，
-            // 教调用方「传响应里的 sinceResolved」会得到 null/反序列化失败。
-            "hint": if cut {
-                if since_resolved.is_some() {
-                    json!("本页超过字符预算，已少给若干条：用 nextOffset 且 since 传响应里的 sinceResolved（绝对下界，不要重发相对串——下一轮 now 已前移会挪窗）续拉；也可用更小的 limit 重取本页，此时按 platformMessageId 去重")
-                } else {
-                    json!("本页超过字符预算，已少给若干条：用 nextOffset 续拉（本次调用未提供 since，无绝对下界可回填）；也可用更小的 limit 重取本页，此时按 platformMessageId 去重")
-                }
-            } else {
+            // hint 只在真被截断时出现；`since` 未提供时 sinceResolved 为 null，此时教调用方
+            // 「传响应里的 sinceResolved」会得到 null/反序列化失败（见最后一个分支）。
+            "hint": if !cut {
                 Value::Null
+            } else if cursor_mode {
+                // 游标模式下 nextCursor 已原样回传入参游标：拿它配更小的 limit 重取本页。
+                json!("本页超过字符预算，已少给若干条：把响应里的 nextCursor 原样回传（它等于本次入参游标，表示本页还没读完）并减小 limit 重取本页，按 platformMessageId 去重")
+            } else if since_resolved.is_some() {
+                json!("本页超过字符预算，已少给若干条：用 nextCursor 原样回传续拉，或改用 nextOffset 且 since 传响应里的 sinceResolved（绝对下界，不要重发相对串——下一轮 now 已前移会挪窗）续拉；也可用更小的 limit 重取本页，此时按 platformMessageId 去重")
+            } else {
+                json!("本页超过字符预算，已少给若干条：用 nextCursor 原样回传续拉，或用 nextOffset 续拉（本次调用未提供 since，无绝对下界可回填）；也可用更小的 limit 重取本页，此时按 platformMessageId 去重")
             },
             "messages": proj.items,
         })))

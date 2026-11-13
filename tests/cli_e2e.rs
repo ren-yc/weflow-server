@@ -160,6 +160,40 @@ async fn pull(
         }))
         .into_response();
     }
+    if id == "cursor-talker" {
+        // 两页各三条：小到不会撞上字符预算，于是「有没有截断」不会混进游标断言。
+        let raw = q.as_deref().unwrap_or_default();
+        let second = raw.split('&').any(|kv| kv == "cursor=ct1");
+        if raw.split('&').any(|kv| kv == "cursor=ct2") {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(json!({
+                    "success": false, "code": 400,
+                    "message": "stub: hasMore=false 之后不应再翻页"
+                })),
+            )
+                .into_response();
+        }
+        let messages: Vec<Value> = (0..3)
+            .map(|k| {
+                let mut m = pull_message();
+                m["platformMessageId"] = json!(format!("c-{}-{k}", usize::from(second)));
+                m["timestamp"] = json!(1_700_000_000 + k as i64);
+                m
+            })
+            .collect();
+        return Json(json!({
+            "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
+            "members": [], "messages": messages,
+            "meta": {"groupId": "", "name": "演示会话", "ownerId": "", "platform": "wechat", "type": "private"},
+            "sync": {
+                "hasMore": !second,
+                "nextCursor": if second { "ct2" } else { "ct1" },
+                "nextSince": 1_700_000_002, "nextOffset": 0, "watermark": 1_700_000_002,
+            },
+        }))
+        .into_response();
+    }
     if id == "reset-talker" {
         // 游标在导出途中失效：服务端回 409 + 机器可读的 `reason`（客户端不得去匹配中文
         // `message`）。第一页故意留 hasMore=true 且给出游标，失效就发生在第二页。
@@ -916,6 +950,51 @@ async fn mcp_three_step_demo_lists_searches_and_fetches() {
 
     child.kill().ok();
     let _ = child.wait();
+}
+
+/// 取消息工具的游标必须原样回传：给出去的是服务端那串，拿回来照发，不改写也不解析。
+///
+/// 同时钉住两个字段的分工：游标模式不再给 `nextOffset`（它表示同一时间组内的位置，
+/// 套在游标流上等于把服务端编码的进度当偏移量用）。失效时给的是工具级错误并指名
+/// 「不要带 cursor 重来」——内部错误没有处置动作，agent 只会原地重试。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mcp_get_messages_echoes_the_opaque_cursor_and_says_what_to_do_when_it_expires() {
+    let base = spawn_stub().await;
+    let json_of = |r: &Value| -> Value {
+        let text = r["content"][0]["text"].as_str().unwrap_or_default();
+        serde_json::from_str(text).unwrap_or_else(|e| panic!("工具输出应是 JSON: {e} / {text}"))
+    };
+
+    let first = mcp_call(&base, "get_messages", json!({"talker": "cursor-talker"})).await;
+    assert_ne!(first["isError"], json!(true), "不该是工具级错误: {first}");
+    let first = json_of(&first);
+    assert_eq!(first["truncated"], json!(false), "三条消息不该被截断: {first}");
+    assert_eq!(first["hasMore"], json!(true), "第一页应报还有更多: {first}");
+    assert_eq!(first["nextCursor"], json!("ct1"), "游标要原样交出去: {first}");
+
+    let second = mcp_call(
+        &base,
+        "get_messages",
+        json!({"talker": "cursor-talker", "cursor": "ct1"}),
+    )
+    .await;
+    assert_ne!(second["isError"], json!(true), "不该是工具级错误: {second}");
+    let second = json_of(&second);
+    assert_eq!(second["count"], json!(3), "第二页取到剩下的三条: {second}");
+    assert_eq!(second["hasMore"], json!(false), "第二页已排空: {second}");
+    assert_eq!(second["nextCursor"], json!("ct2"), "排空后游标仍在场: {second}");
+    assert_eq!(second["nextOffset"], Value::Null, "游标模式不给 nextOffset: {second}");
+
+    let expired = mcp_call(
+        &base,
+        "get_messages",
+        json!({"talker": "reset-talker", "cursor": "r1"}),
+    )
+    .await;
+    assert_eq!(expired["isError"], json!(true), "失效游标应是工具级错误: {expired}");
+    let text = expired["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(text.contains("cursor"), "错误文本要指名字段: {expired}");
+    assert!(text.contains("不要带 cursor"), "错误文本要给出处置动作: {expired}");
 }
 
 /// 起一个 `mcp` 子进程、握手、调一次工具，返回 `result` 对象后杀掉进程。
