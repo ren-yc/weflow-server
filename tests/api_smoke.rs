@@ -2680,7 +2680,10 @@ async fn targeted_media_restores_old_image_and_actual_handle() {
     assert_eq!(status, StatusCode::OK, "{result}");
     let id = result["mediaId"].as_str().unwrap();
     assert!(id.ends_with(".png"));
-    assert_eq!(result["fileName"], id);
+    let display = result["fileName"].as_str().unwrap();
+    assert!(!display.is_empty() && display.ends_with(".jpg"),
+        "fileName 是消息元数据里的展示名（本夹具是原文件摘要 + 扩展名）：{result}");
+    assert_ne!(display, id, "fileName 是展示名、mediaId 才是句柄：{result}");
     assert_eq!(result["mediaUrl"], format!("/api/v1/media/{id}"));
     let response = app.clone().oneshot(request("GET", &format!("/api/v1/media/{id}"), Some(TOKEN))).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);

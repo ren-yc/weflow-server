@@ -9,8 +9,13 @@
 - 新增 `POST /api/v1/media/export`，按完整消息身份恢复窗口外的本地媒体，返回实际摘要句柄；歧义、源缺失和导出失败保留不同错误状态。回归：`targeted_media_restores_old_image_and_actual_handle`。
 - Rust 和 Python SDK 新增 `export_media_by_message`；媒体恢复最多触发一次定向导出。CLI 采用同一接口并按消息身份回填。回归：`media_bytes_exports_then_retries_once_after_404`、`targeted_media_restores_each_missing_message_once`。
 
+### 变更
+
+- 接口契约 pin 由 `v0.9.0` 升 `v0.10.0`：新增 `mediaExportByMessage` 能力与 `media_export` 端点，共享用例 `targeted-media-export-fetch` 随一致性套件执行。
+
 ### 破坏性变更
 
+- 定向导出响应的 `fileName` 改为消息自带的展示名（取不到时为空串），`mediaId` 才是可取句柄，两者通常不相等。迁移：取字节一律用 `mediaId`，不要拿 `fileName` 拼地址。回归：`targeted_media_restores_old_image_and_actual_handle`。
 - 自动媒体恢复改用定向接口；旧服务缺少该能力时显式报错，源不可恢复时 CLI 导出返回失败。迁移：服务与 SDK/CLI 同步升级，调用方处理 404、409 和 422。回归：`targeted_export_reports_missing_server_capability`、`with_media_reports_an_unrecoverable_source`。
 - 嵌入数据类型 `MessageRecord` 新增 `source_shard`，同会话跨分片的本地行号可重复。使用结构体字面量的调用方须补充该字段；去重键改为源分片与本地号。回归：`new_shard_reuses_local_and_platform_ids_without_losing_rows`。
 

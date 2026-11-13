@@ -25,11 +25,11 @@ from pydantic_core import to_jsonable_python
 
 class MediaExportResult(BaseModel):
     """
-    A local export whose actual filename is also its credential-free handle.
+    定向导出的结果：`mediaId` 是可按名取字节的句柄，`fileName` 只是展示名。  两者分工与消息层的 `media.fileName` / `mediaId` 一致：名字说这条媒体叫什么， 句柄说这份字节现在取得到。它们通常不相等 —— 展示名来自消息元数据（原文件摘要或 平台原名），句柄由落盘字节的摘要派生。
     """ # noqa: E501
-    file_name: StrictStr = Field(alias="fileName")
-    media_id: StrictStr = Field(alias="mediaId")
-    media_url: StrictStr = Field(alias="mediaUrl")
+    file_name: StrictStr = Field(description="展示名（消息自带的元数据名）。**不是句柄**，不能拿它取字节。", alias="fileName")
+    media_id: StrictStr = Field(description="可按名取字节的句柄：URL 安全单段 token，末段直接拼进 `mediaUrl`。", alias="mediaId")
+    media_url: StrictStr = Field(description="根相对的字节地址，末段就是 `mediaId`；不带凭据与查询串。", alias="mediaUrl")
     success: StrictBool
     __properties: ClassVar[List[str]] = ["fileName", "mediaId", "mediaUrl", "success"]
 

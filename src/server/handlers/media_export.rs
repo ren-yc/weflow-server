@@ -59,7 +59,7 @@ async fn restore(
             return Err(ApiError { status: StatusCode::CONFLICT, message: "导出期间账号注册发生切换".into() });
         }
         let result = result.map_err(failure)?.publish().map_err(|_| failure(ExportError::Failed))?;
-        Ok(MediaExportResult { file_name: result.file_name.clone(), media_id: result.file_name.clone(),
+        Ok(MediaExportResult { file_name: hint.file_name.clone(), media_id: result.file_name.clone(),
             media_url: format!("/api/v1/media/{}", result.file_name), success: true })
     }).await.map_err(|_| ApiError::internal("媒体导出任务异常"))?
 
