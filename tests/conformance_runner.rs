@@ -386,6 +386,10 @@ async fn conformance_suite_passes() {
             // 不透明进度游标（契约 0.9.0）：sync.nextCursor + cursor 参数已实现，
             // 排空后同秒晚入库的行可经游标续拉到达。
             "opaqueCursor": true,
+            // 游标失效语义（契约 0.11.0）：语法坏 400、身份不符 409 +
+            // reason: cursor_reset_required（server::cursor::CursorError，
+            // pull_cursor_rejects_foreign_or_stale_tokens）。
+            "cursorReset": true,
             "sns": true,
             "memberCount": true,
             // Pull 形状的发现面（`GET /chatlab/sessions`）已实现：置 true 让相关用例实跑。
