@@ -722,8 +722,8 @@ impl Client {
             return Err(ClientError::UnexpectedBody { url, detail: "server does not support mediaExportByMessage".into() });
         }
         let exported: gen_types::MediaExportResult = Self::decode(response, &url).await?;
+        // `fileName` 是展示名，`mediaId` 才是句柄：两者通常不相等，不能要求相等。
         if !exported.success || exported.media_id.trim().is_empty()
-            || exported.file_name != exported.media_id
             || exported.media_url != format!("/api/v1/media/{}", exported.media_id) {
             return Err(ClientError::UnexpectedBody { url, detail: "export did not return a valid media handle".into() });
         }

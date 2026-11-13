@@ -48,7 +48,7 @@ class Mock:
         self.export_calls: list[dict] = []
         self.export_status = 200
         self.export_response = {"success": True, "mediaId": "abc.exported.png",
-                                "fileName": "abc.exported.png", "mediaUrl": "/api/v1/media/abc.exported.png"}
+                                "fileName": "orig-name.jpg", "mediaUrl": "/api/v1/media/abc.exported.png"}
         self.media_hit_first = True
         # Status the media route answers with once the first miss is done.
         self.media_status: int = 200
@@ -1725,7 +1725,7 @@ async def test_targeted_retry_is_bounded_and_preserves_source_missing() -> None:
 
 
 @pytest.mark.parametrize("patch", [
-    {"success": False}, {"mediaId": ""}, {"fileName": "wrong.png"},
+    {"success": False}, {"mediaId": ""},
     {"mediaUrl": "https://example.test/media?token=secret"},
 ])
 async def test_targeted_export_rejects_inconsistent_response(patch) -> None:

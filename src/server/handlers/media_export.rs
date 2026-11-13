@@ -44,9 +44,13 @@ async fn restore(
     };
     let context = ExportCtx { account_dir: account.info.dir.clone(),
         export_dir: state.cfg.media_export_dir.clone(), media_keys: account.media_keys };
-    // 记下请求开始时的数据源世代：发布前若变了，这次导出的字节属于旧源，
-    // 不能当成新源的数据发布出去。
+    // 记下请求开始时的数据源世代与身份指纹。
+    //
+    // 只比 `generation` 不够：它只在同步路径的 `sample_source` 里推进，而导出的整个
+    // 阻塞任务都持有 `sync` 锁——这期间轮询根本跑不了，计数器必然不动。所以这里
+    // 自己采一次指纹（路径 + 创建时间 + salt），发布前再采一次比对。
     let generation = account.generation.load(std::sync::atomic::Ordering::SeqCst);
+    let fingerprint = crate::db::source_identity::fingerprint(&account.info.db_storage).ok();
     let sync = account.sync.clone();
     tokio::task::spawn_blocking(move || {
         let result = {
@@ -63,6 +67,15 @@ async fn restore(
         }
         if account.generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
             return Err(ApiError { status: StatusCode::CONFLICT, message: "导出期间数据源发生变化".into() });
+        }
+        // 指纹比对是这条复查真正起作用的那一半：换库/分片增删都会改变它。
+        // 起始采样失败时退回到世代比较（尽力检测，边界写进文档）；起始采到了、
+        // 现在采不到，按「无法证明」处理——不发布也不赌。
+        if let Some(before) = fingerprint {
+            let current = crate::db::source_identity::fingerprint(&account.info.db_storage).ok();
+            if current.as_ref() != Some(&before) {
+                return Err(ApiError { status: StatusCode::CONFLICT, message: "导出期间数据源发生变化".into() });
+            }
         }
         let result = result.map_err(failure)?.publish().map_err(|_| failure(ExportError::Failed))?;
         Ok(MediaExportResult { file_name: hint.file_name.clone(), media_id: result.file_name.clone(),

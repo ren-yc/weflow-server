@@ -112,7 +112,12 @@ fn locate(root: &Path, name: &str, depth: usize) -> Result<Vec<PathBuf>, ExportE
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        let resolved = path.canonicalize()?;
+        let resolved = match path.canonicalize() {
+            Ok(resolved) => resolved,
+            // 悬空链接不是候选：跳过它，别让一个无关的坏链接把整个查找判死。
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
         if !resolved.starts_with(&canonical) { continue; }
         if entry.file_type()?.is_dir() {
             found.extend(locate(&path, name, depth - 1)?);

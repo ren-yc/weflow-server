@@ -542,7 +542,7 @@ async fn pull_page_omits_defaulted_cursors_instead_of_sending_zero() {
 async fn media_bytes_exports_then_retries_once_after_404() {
     let mock = Mock::default();
     *mock.export_response.lock().unwrap() = Some((200, serde_json::json!({
-        "success":true, "mediaId":"abc123.exported.png", "fileName":"abc123.exported.png",
+        "success":true, "mediaId":"abc123.exported.png", "fileName":"orig-name.jpg",
         "mediaUrl":"/api/v1/media/abc123.exported.png"
     })));
     let base = spawn_mock(mock.clone()).await;
@@ -1334,11 +1334,11 @@ async fn targeted_export_preserves_missing_source_and_rejects_bad_handle_shape()
     assert!(matches!(client.export_media_by_message("session", "old-id", "sender", 1).await, Err(ClientError::Status { status:404, .. })));
     let valid = serde_json::json!({"success":true,"mediaId":"digest.png","fileName":"digest.png","mediaUrl":"/api/v1/media/digest.png"});
     for (key, value) in [("success", serde_json::json!(false)), ("mediaId", serde_json::json!("")),
-        ("fileName", serde_json::json!("different.png")), ("mediaUrl", serde_json::json!("https://example.test/media?token=secret"))] {
+        ("mediaUrl", serde_json::json!("https://example.test/media?token=secret"))] {
         let mut body = valid.clone();
         body[key] = value;
         *mock.export_response.lock().unwrap() = Some((200, body));
         assert!(matches!(client.export_media_by_message("session", "old-id", "sender", 1).await, Err(ClientError::UnexpectedBody { .. })));
     }
-    assert_eq!(mock.export_calls.lock().unwrap().len(), 5);
+    assert_eq!(mock.export_calls.lock().unwrap().len(), 4);
 }

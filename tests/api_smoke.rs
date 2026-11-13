@@ -2727,6 +2727,22 @@ async fn targeted_media_cancels_staged_bytes_after_account_switch() {
 }
 
 #[tokio::test]
+async fn targeted_media_cancels_when_the_source_identity_changes_midway() {
+    let dir = common::tmp_dir("targeted-media-identity");
+    let (state, _) = targeted_media_fixture(&dir, false);
+    let storage = dir.join("db_storage");
+    let error = server::handlers::media_export::restore_before_publish(
+        state, serde_json::from_value(targeted_media_request()).unwrap(), move || {
+            // 新增一个分片文件：身份指纹随之改变（不动正在被读的库，避免共享冲突）。
+            std::fs::write(storage.join("message/message_99.db"), b"x").unwrap();
+        },
+    ).await.unwrap_err();
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert_eq!(std::fs::read_dir(dir.join("api-media").join(common::FAKE_GROUP).join("images")).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(dir.join("api-media/.pending")).unwrap().count(), 0);
+}
+
+#[tokio::test]
 async fn targeted_media_cancels_when_the_source_generation_changes() {
     let dir = common::tmp_dir("targeted-media-generation");
     let (state, _) = targeted_media_fixture(&dir, false);

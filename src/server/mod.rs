@@ -923,6 +923,11 @@ fn purge_exported_media(root: &std::path::Path, talkers: &[String]) -> usize {
         // remove_dir_all 沿链接删的是链接本身（树级删除不破坏目标，已实测），
         // 但**目录被替换**的 TOCTOU（校验时是目录、删除时已换成链接到别处的
         // 目录）没有别的防线——canonicalize 解析后的真实路径必须仍在导出根内。
+        // 从没导出过媒体的会话在这里没有子目录。`is_contained` 对不存在的路径必然
+        // fail-closed，但那不是越界——先跳过，别为每个 talker 打一条「越界」警告。
+        if !dir.join(EXPORT_KINDS[0]).exists() {
+            continue;
+        }
         if !crate::pathsafe::is_contained(root, &dir.join(EXPORT_KINDS[0])) {
             tracing::warn!("[deregister] 跳过越界导出目录: {:?}", dir.display());
             continue;
