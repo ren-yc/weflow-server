@@ -239,6 +239,11 @@ pub struct SnsMedia {
 #[derive(Debug, Clone, Default)]
 pub struct Store {
     pub my_wxid: String,
+    /// 全量构建时因**发送者映射读不出来**而整库推迟的库（相对路径）。
+    ///
+    /// 这些库一条位置都没记，靠 `data_version` 基线永远等不到重试——构建期间
+    /// 没有任何新提交。增量轮询据此把它们强制重查，读成功后移除。
+    pub deferred_sender_maps: std::collections::BTreeSet<String>,
     /// username -> session summary
     pub sessions: HashMap<String, Session>,
     /// username -> messages (append-only; sorted lazily by the query layer)

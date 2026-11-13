@@ -270,6 +270,15 @@ fn clear_sender_map_failure(failures: &SenderMapFailures, rel: &str) {
     guard.remove(rel);
 }
 
+/// 这一轮要不要读这个库。
+///
+/// `deferred` 是「发送者映射还没读成功、欠着一批行」：这类库必须无视
+/// `data_version` 基线的「未变化」结论——全量构建跳过它时**没有**任何新提交，
+/// 只靠基线永远等不到重试，那批消息会一直缺失。
+fn reread_needed(changed: bool, deferred: bool) -> bool {
+    changed || deferred
+}
+
 impl AccountSync {
     pub fn new(wxid: &str, storage: &Path, keys: KeyMap, store: Arc<RwLock<Store>>) -> Self {
         let bus = EventBus::new(1024);
@@ -425,6 +434,23 @@ impl AccountSync {
             *guard = store;
             guard.mark_index_built();
         }
+        // 把「构建期欠账」的库登记进待处理集合：`classify_changed` 会因此无视
+        // `data_version` 基线强制重查。构建期间没有任何新提交，只靠基线永远等
+        // 不到重试，那批消息会一直缺失。
+        let deferred: Vec<String> = self
+            .store
+            .read()
+            .deferred_sender_maps
+            .iter()
+            .cloned()
+            .collect();
+        {
+            let mut guard = self.sender_map_failures.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.clear();
+            for rel in deferred {
+                guard.insert(rel, 0);
+            }
+        }
         // seed stamps so the next poll starts from a clean baseline
         // 只给**成功打开过**的文件记基线：构建期间打不开的库（缺 key / busy）
         // 若也被记上戳，poll 会把它的存量数据判成「未变」—— 存量就被卡死到
@@ -462,28 +488,32 @@ impl AccountSync {
         let files = self.rescan();
         let mut work: Vec<Work> = Vec::new();
         for f in &files {
+            // 发送者映射欠着账的库强制重查：全量构建跳过它时**没有**新提交，
+            // 只靠 `data_version` 基线永远等不到重试。
+            let deferred = self
+                .sender_map_failures
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&f.rel);
             // 两级检测：**已打开**的文件走 `data_version`（别的连接提交后必然
             // 变化，与文件系统时间戳无关 —— Windows 高负载下 mtime/size 回读
             // 滞后不会再把一次写入误判成「未变」）；**未打开**的文件没有连接，
             // 只能继续用 mtime/size 戳做前置门。无基线（首见文件）一律判变。
-            if self.pool.is_open(&f.rel) {
+            let changed = if self.pool.is_open(&f.rel) {
                 // 只**窥探**不推进基线：这一轮若因无 key / 打开失败而读不到数据，
                 // 基线必须保持原样，否则变更同样会被吞掉（换了个机制的同一 bug）。
-                let changed = self.pool.foreign_commit_pending(&f.rel).unwrap_or(true);
-                if !changed {
-                    continue;
-                }
+                self.pool.foreign_commit_pending(&f.rel).unwrap_or(true)
             } else {
                 let main = src_stamp(&f.abs);
                 let wal = f.wal.as_deref().and_then(src_stamp);
                 let cur = DbStamps { main, wal };
-                let unchanged = self
+                !self
                     .stamps
                     .get(&f.rel)
-                    .is_some_and(|prev| *prev == cur);
-                if unchanged {
-                    continue;
-                }
+                    .is_some_and(|prev| *prev == cur)
+            };
+            if !reread_needed(changed, deferred) {
+                continue;
             }
             match f.kind {
                 DbKind::Message => work.push(Work::Messages(f.clone())),
@@ -598,6 +628,9 @@ impl AccountSync {
                                         "{} sender map still unreadable ({e}) after {attempt} attempts; indexing with empty senders",
                                         f.rel
                                     );
+                                    // 降级只做一次：位置与行都照常落库，再把欠账销掉，
+                                    // 否则每轮都会重新尝试读那张坏表并重复告警。
+                                    clear_sender_map_failure(&sender_failures, &f.rel);
                                     std::collections::HashMap::new()
                                 }
                             }
@@ -1045,6 +1078,18 @@ mod tests {
         assert_eq!(sender_map_action(2), SenderMapAction::Defer);
         assert_eq!(sender_map_action(3), SenderMapAction::DegradeWithEmptyMap);
         assert_eq!(sender_map_action(99), SenderMapAction::DegradeWithEmptyMap);
+    }
+
+    /// 欠账的库必须无视「未变更」结论被重查。
+    ///
+    /// 全量构建跳过它时**没有**任何新提交，`data_version` 基线的结论是「没变」；
+    /// 只看那一个判据，这张库会永久停在「一条消息都没有」的状态。
+    #[test]
+    fn deferred_database_is_reread_even_when_unchanged() {
+        assert!(reread_needed(true, false), "变了当然要读");
+        assert!(reread_needed(false, true), "欠账的库即使判「未变更」也要读");
+        assert!(reread_needed(true, true));
+        assert!(!reread_needed(false, false), "既没变也不欠账才跳过");
     }
 
     #[test]

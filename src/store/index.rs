@@ -765,6 +765,10 @@ fn build_all_live_inner(
             Ok(map) => map,
             Err(e) => {
                 tracing::warn!("{} sender map unreadable: {e}; postponed to the next incremental pass", f.rel);
+                // 位置一条都不记，同时登记「欠账」：增量轮询据此无视 data_version
+                // 基线强制重查。只跳过不登记的话，构建期间没有新提交，那批消息
+                // 会一直缺失。
+                store.deferred_sender_maps.insert(f.rel.clone());
                 continue;
             }
         };
