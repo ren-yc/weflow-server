@@ -87,6 +87,7 @@ fn test_state_inner(
     sync.lock().full_sync().unwrap();
 
     let stopped = sync.lock().stop_flag();
+    let generation = sync.lock().generation_handle();
     // `indexing` 变体用独立计数器：夹具构建时真实计数器已经跑完一整遍（`done == total`），
     // 沿用它会得到与 `indexing` 自相矛盾的数。`ready` 变体则沿用同步引擎那一份，与线上路径一致。
     let progress = if indexing {
@@ -110,6 +111,7 @@ fn test_state_inner(
         watcher: Mutex::new(None),
         stopped,
         progress,
+        generation,
     });
     state
         .accounts
@@ -2717,6 +2719,22 @@ async fn targeted_media_cancels_staged_bytes_after_account_switch() {
     let error = server::handlers::media_export::restore_before_publish(
         state, serde_json::from_value(targeted_media_request()).unwrap(), move || {
             server::deregister_account(&current, common::FAKE_WXID, false);
+        },
+    ).await.unwrap_err();
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert_eq!(std::fs::read_dir(dir.join("api-media").join(common::FAKE_GROUP).join("images")).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(dir.join("api-media/.pending")).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn targeted_media_cancels_when_the_source_generation_changes() {
+    let dir = common::tmp_dir("targeted-media-generation");
+    let (state, _) = targeted_media_fixture(&dir, false);
+    let account = state.accounts.lock().values().next().cloned().expect("已注册账号");
+    let error = server::handlers::media_export::restore_before_publish(
+        state, serde_json::from_value(targeted_media_request()).unwrap(), move || {
+            // 模拟导出期间数据源被换掉：世代前进一格。
+            account.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         },
     ).await.unwrap_err();
     assert_eq!(error.status, StatusCode::CONFLICT);

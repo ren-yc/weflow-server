@@ -23,7 +23,7 @@ pub mod history;
 pub mod watch;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -211,6 +211,11 @@ pub struct AccountSync {
     /// 与 `stopped` 同族的理由：它必须能在 `full_sync` 持锁期间被 HTTP 侧读到，
     /// 所以复制的是 `Arc`，不是值；读侧永远不碰这把锁。
     progress: Arc<index::IndexProgress>,
+    /// 上一次采到的数据源指纹；`None` 表示还没建立基线。
+    source_digest: Option<[u8; 32]>,
+    /// 数据源世代：身份类线索变化时前进一格。与 `stopped`／`progress` 同族，
+    /// 以 `Arc<AtomicU32>` 交出去，HTTP 侧判断「导出期间源是否换了」不必拿这把锁。
+    generation: Arc<AtomicU32>,
 }
 
 /// 单轮排空的页数上限：防坏数据（水位推不动的表）把一轮 poll 拖死。
@@ -239,6 +244,8 @@ impl AccountSync {
             stamps: std::collections::HashMap::new(),
             stopped: Arc::new(AtomicBool::new(false)),
             progress: Arc::new(index::IndexProgress::default()),
+            source_digest: None,
+            generation: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -262,6 +269,8 @@ impl AccountSync {
             stamps: std::collections::HashMap::new(),
             stopped: Arc::new(AtomicBool::new(false)),
             progress: Arc::new(index::IndexProgress::default()),
+            source_digest: None,
+            generation: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -306,6 +315,44 @@ impl AccountSync {
         self.progress.clone()
     }
 
+    /// 数据源世代的共享句柄，给拥有它的 `AccountHandle`。
+    ///
+    /// 与 `stop_flag`／`progress_handle` 同一条理由：HTTP 侧判断「导出期间数据源是否换了」
+    /// 时不能去拿这把锁，而 `full_sync` 可能正持有它数分钟。
+    pub fn generation_handle(&self) -> Arc<AtomicU32> {
+        self.generation.clone()
+    }
+
+    /// 采一次数据源指纹；身份类线索变化时推进世代并返回 `true`。
+    ///
+    /// 只比对相对路径、创建时间与每个库的 salt——**追加写入不会改变它们**，所以正常的
+    /// 新消息入库不会让游标失效。采样失败时**不推进**世代：一次读失败不能把所有在用
+    /// 游标判死，下一轮重试即可；失败本身会记一条警告，不静默吞掉。
+    fn sample_source(&mut self) -> bool {
+        match crate::db::source_identity::fingerprint(&self.storage) {
+            Ok(fp) => match self.source_digest {
+                None => {
+                    self.source_digest = Some(fp.digest);
+                    false
+                }
+                Some(previous) if previous != fp.digest => {
+                    self.source_digest = Some(fp.digest);
+                    self.generation.fetch_add(1, Ordering::SeqCst);
+                    tracing::warn!(
+                        files = fp.files,
+                        "数据源身份发生变化：旧游标与进行中的导出将失效"
+                    );
+                    true
+                }
+                Some(_) => false,
+            },
+            Err(err) => {
+                tracing::warn!(error = %err, "数据源指纹采样失败，本轮不推进世代");
+                false
+            }
+        }
+    }
+
     pub fn is_stopped(&self) -> bool {
         self.stopped.load(Ordering::SeqCst)
     }
@@ -313,6 +360,8 @@ impl AccountSync {
     /// Full build: read every database through the live pool and rebuild the
     /// index from scratch. Returns the number of databases processed.
     pub fn full_sync(&mut self) -> Result<usize> {
+        // 建索引前先建立（或刷新）数据源身份基线：换了库就从这里开始算新世代。
+        self.sample_source();
         let files = self.rescan();
         let keys = self.keys.clone();
         let store = index::build_all_live(&mut self.pool, &keys, &self.wxid, &files, &self.progress)?;
@@ -410,6 +459,8 @@ impl AccountSync {
         if self.is_stopped() {
             return Ok((0, 0));
         }
+        // 每轮扫描前采一次身份指纹：换库要尽快被发现，而增量本身不会被误判。
+        self.sample_source();
         let work = self.classify_changed();
         if work.is_empty() {
             return Ok((0, 0));
@@ -1052,6 +1103,39 @@ mod tests {
         ));
         std::fs::create_dir_all(&base).unwrap();
         base
+    }
+
+    /// 世代只认身份类线索：真实追加不推进，整份换库才推进。
+    ///
+    /// 失败模式（修复前／写错时）：把大小或 mtime 也算进指纹，则每次入库都推进世代，
+    /// 所有在用游标每秒失效一次——游标等于不可用。
+    #[test]
+    fn source_generation_advances_only_when_the_database_is_replaced() {
+        let dir = unique_dir("source-generation");
+        let key = [0x3du8; 32];
+        let storage = build_message_account(&dir, &key);
+        let mut sync = AccountSync::new(
+            WXID,
+            &storage,
+            KeyMap::from(crate::keystore::DbKey(key)),
+            Arc::new(RwLock::new(Store::default())),
+        );
+        let generation = sync.generation_handle();
+        assert!(!sync.sample_source(), "第一次采样只建立基线");
+        assert_eq!(generation.load(Ordering::SeqCst), 0);
+
+        // 真实追加一行：文件大小变了，但身份没变。
+        append_row(&storage, &key, 8_100_000_000_000_000_002);
+        assert!(!sync.sample_source(), "追加不是身份变化");
+        assert_eq!(generation.load(Ordering::SeqCst), 0);
+
+        // 换库：整份替换成另一份库文件（salt 不同）。
+        let other_dir = unique_dir("source-generation-other");
+        let other = build_message_account(&other_dir, &key);
+        std::fs::copy(other.join("message/message_0.db"), storage.join("message/message_0.db"))
+            .unwrap();
+        assert!(sync.sample_source(), "换了库必须推进世代");
+        assert_eq!(generation.load(Ordering::SeqCst), 1);
     }
 
     /// 候选 1 路：**mtime/size 戳与基线相同**（模拟 Windows 高负载下元数据回读滞后）

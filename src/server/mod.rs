@@ -170,6 +170,9 @@ pub struct AccountHandle {
     /// 建索引进度。`Arc` 的理由与 `stopped` 相同：`full_sync` 持锁数分钟，HTTP 侧
     /// 必须能在锁外读进度，否则「问一句到哪了」会阻塞到建索引结束。
     pub progress: Arc<crate::store::index::IndexProgress>,
+    /// 数据源世代：身份类线索变化时前进一格。`Arc` 的理由同上——导出发布前要复查
+    /// 「源是不是在这期间换了」，而那时可能正有一轮扫描占着 sync 锁。
+    pub generation: Arc<std::sync::atomic::AtomicU32>,
 }
 
 pub use crate::sync::history::{HistoryBuf, HistoryItem};
@@ -795,9 +798,9 @@ pub fn register_account(
     // `Arc`s out of the sync engine: `stopped` lets deregistration skip in-flight
     // writes, `progress` lets HTTP read the build's position — neither may take
     // this mutex, which `full_sync` holds for minutes.
-    let (stopped, progress) = {
+    let (stopped, progress, generation) = {
         let guard = sync.lock();
-        (guard.stop_flag(), guard.progress_handle())
+        (guard.stop_flag(), guard.progress_handle(), guard.generation_handle())
     };
     let handle = Arc::new(AccountHandle {
         info,
@@ -809,6 +812,7 @@ pub fn register_account(
         watcher: Mutex::new(None),
         stopped,
         progress,
+        generation,
     });
 
     let mut accounts = state.accounts.lock();

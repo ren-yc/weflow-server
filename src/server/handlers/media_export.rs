@@ -44,6 +44,9 @@ async fn restore(
     };
     let context = ExportCtx { account_dir: account.info.dir.clone(),
         export_dir: state.cfg.media_export_dir.clone(), media_keys: account.media_keys };
+    // 记下请求开始时的数据源世代：发布前若变了，这次导出的字节属于旧源，
+    // 不能当成新源的数据发布出去。
+    let generation = account.generation.load(std::sync::atomic::Ordering::SeqCst);
     let sync = account.sync.clone();
     tokio::task::spawn_blocking(move || {
         let result = {
@@ -57,6 +60,9 @@ async fn restore(
         let accounts = state.accounts.lock();
         if account.is_stopped() || !accounts.values().any(|current| Arc::ptr_eq(current, &account)) {
             return Err(ApiError { status: StatusCode::CONFLICT, message: "导出期间账号注册发生切换".into() });
+        }
+        if account.generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
+            return Err(ApiError { status: StatusCode::CONFLICT, message: "导出期间数据源发生变化".into() });
         }
         let result = result.map_err(failure)?.publish().map_err(|_| failure(ExportError::Failed))?;
         Ok(MediaExportResult { file_name: hint.file_name.clone(), media_id: result.file_name.clone(),
