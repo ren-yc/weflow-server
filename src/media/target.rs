@@ -179,16 +179,29 @@ pub fn export_with(ctx: &ExportCtx, aux: &HashMap<String, Connection>, target: T
             for conn in aux.values() {
                 let columns = crate::db::open::table_columns_checked(conn, "VoiceInfo")?;
                 if !["voice_data", "svr_id", "data_index"].iter().all(|c| columns.iter().any(|s| s.eq_ignore_ascii_case(c))) { continue; }
-                let mut stmt = conn.prepare("SELECT voice_data, data_index FROM VoiceInfo WHERE svr_id=?1 ORDER BY data_index")?;
+                let mut stmt = conn.prepare("SELECT voice_data, data_index FROM VoiceInfo WHERE svr_id=?1")?;
                 let mut rows = stmt.query([target.server_id])?;
-                let mut bytes = Vec::new();
-                let mut previous = None;
+                // `data_index` 在真实库里是 TEXT，`ORDER BY data_index` 会得到
+                // `0, 1, 10, 2, …`——拼出来的文件仍以 `#!SILK_V3` 开头、仍能播放，
+                // 只是片段顺序错了，下游无法发现。所以按数值严格排序：索引不是
+                // 整数就当作损坏（`Failed`），排序靠猜等于制造静默错序。
+                let mut chunks: Vec<(i64, Option<Vec<u8>>)> = Vec::new();
                 while let Some(row) = rows.next()? {
                     let index = row.get::<_, rusqlite::types::Value>(1)?;
-                    if !matches!(index, rusqlite::types::Value::Integer(_) | rusqlite::types::Value::Text(_)) { return Err(ExportError::Failed); }
-                    if previous.as_ref() == Some(&index) { return Err(ExportError::Ambiguous); }
-                    previous = Some(index);
-                    if let Some(fragment) = row.get::<_, Option<Vec<u8>>>(0)? {
+                    let order = match index {
+                        rusqlite::types::Value::Integer(v) => v,
+                        rusqlite::types::Value::Text(t) => t.trim().parse::<i64>().map_err(|_| ExportError::Failed)?,
+                        _ => return Err(ExportError::Failed),
+                    };
+                    chunks.push((order, row.get::<_, Option<Vec<u8>>>(0)?));
+                }
+                chunks.sort_by_key(|(order, _)| *order);
+                let mut bytes = Vec::new();
+                let mut previous: Option<i64> = None;
+                for (order, fragment) in chunks {
+                    if previous == Some(order) { return Err(ExportError::Ambiguous); }
+                    previous = Some(order);
+                    if let Some(fragment) = fragment {
                         let start = fragment.windows(6).position(|w| w == b"#!SILK").unwrap_or(0);
                         bytes.extend_from_slice(&fragment[start..]);
                     }
@@ -251,6 +264,30 @@ mod tests {
         assert!(matches!(export_with(&ctx, &aux, target()), Err(ExportError::Ambiguous)));
         aux.get("second").unwrap().execute("UPDATE VoiceInfo SET voice_data=?1", [b"invalid".as_slice()]).unwrap();
         assert!(matches!(export_with(&ctx, &aux, target()), Err(ExportError::Failed)));
+        std::fs::remove_dir_all(ctx.export_dir.parent().unwrap()).unwrap();
+    }
+
+    /// `data_index` is TEXT in the real schema, so ordering by it sorts "10"
+    /// before "2". The concatenation still starts with `#!SILK_V3` and still
+    /// plays — nothing downstream can tell the fragments are out of order.
+    /// Order numerically instead, and treat a non-integer index as damaged
+    /// rather than guessing where it belongs.
+    #[test]
+    fn voice_chunks_are_ordered_numerically_not_lexically() {
+        let ctx = context();
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE VoiceInfo(svr_id INTEGER, data_index TEXT, voice_data BLOB)").unwrap();
+        // Inserted out of order on purpose: text ordering would give 0,1,10,2.
+        for (index, piece) in [("10", "ten"), ("2", "two"), ("0", "#!SILK_V3zero"), ("1", "one")] {
+            c.execute("INSERT INTO VoiceInfo VALUES (7, ?1, ?2)", rusqlite::params![index, piece.as_bytes()]).unwrap();
+        }
+        let aux = HashMap::from([("only".into(), c)]);
+        let target = || Target { talker: "room", kind: MediaKind::Voice, md5: None, server_id: 7 };
+        let result = export_with(&ctx, &aux, target()).unwrap().publish().unwrap();
+        assert_eq!(std::fs::read(result.local_path).unwrap(), b"#!SILK_V3zeroonetwoten");
+
+        aux.get("only").unwrap().execute("INSERT INTO VoiceInfo VALUES (7, 'x', ?1)", [b"x".as_slice()]).unwrap();
+        assert!(matches!(export_with(&ctx, &aux, target()), Err(ExportError::Failed)), "非整数索引不得猜顺序");
         std::fs::remove_dir_all(ctx.export_dir.parent().unwrap()).unwrap();
     }
 
