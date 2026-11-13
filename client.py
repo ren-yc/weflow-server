@@ -98,6 +98,18 @@ class StatusError(ClientError):
         self.detail = detail
 
 
+class CursorReset(StatusError):
+    """The progress cursor is no longer valid (409 + ``reason``).
+
+    Disposition is to **drop the cursor and restart the pull once**, not to
+    retry the same token: retrying keeps returning 409. Subclasses
+    :class:`StatusError`, so callers that only branch on the status code still
+    catch it.
+    """
+
+    reason = "cursor_reset_required"
+
+
 class ShapeError(ClientError):
     """The body did not match the documented shape."""
 
@@ -326,6 +338,16 @@ class Client:
         # 200..300 as an error, and a surfaced 3xx would otherwise fall into
         # `resp.json()` and come out as a shape error instead of a status error.
         if not 200 <= resp.status_code < 300:
+            # 409 + ``reason`` is an actionable conflict: read the body once so
+            # the caller does not have to guess from the status code alone. A
+            # body that will not parse falls through to the plain StatusError.
+            if resp.status_code == 409:
+                try:
+                    body = resp.json()
+                except ValueError:
+                    body = None
+                if isinstance(body, dict) and body.get("reason") == CursorReset.reason:
+                    raise CursorReset(resp.status_code, url, body.get("message"))
             raise StatusError(resp.status_code, url)
         try:
             return resp.json()
@@ -542,6 +564,69 @@ class Client:
             f"/api/v1/sessions/{_encode_path_segment(talker)}/messages", query
         )
         )
+
+    async def pull_page_cursor(
+        self,
+        talker: str,
+        cursor: str | None,
+        since: int | None = None,
+        limit: int | None = None,
+    ) -> gen.PullEnvelope:
+        """Fetch one page through the **opaque progress cursor**.
+
+        When ``cursor`` is given the server ignores ``since`` / ``offset``. The
+        token must be echoed verbatim: parsing it copies the server-side
+        progress model into the client, and that copy goes stale the moment the
+        server changes its cursor generation.
+        """
+        query: dict[str, str] = {}
+        if cursor is not None:
+            query["cursor"] = cursor
+        elif since is not None:
+            query["since"] = str(since)
+        if limit is not None:
+            query["limit"] = str(limit)
+        return self._validate(gen.PullEnvelope,
+            await self._get_json(
+            f"/api/v1/sessions/{_encode_path_segment(talker)}/messages", query
+        )
+        )
+
+    async def drain_session_cursor(
+        self,
+        talker: str,
+        since: int | None,
+        on_page: Callable[[list[gen.PullMessage]], None],
+    ) -> int:
+        """Drain one session through the opaque cursor, echoing it verbatim.
+
+        On :class:`CursorReset`: if the current request carried a server-issued
+        cursor, drop it and restart **once**. A second reset is raised - looping
+        forever would trap the caller, and repeated resets mean the source or
+        the registration is churning.
+        """
+        cursor: str | None = None
+        restarted = False
+        total = 0
+        while True:
+            try:
+                page = await self.pull_page_cursor(talker, cursor, since)
+            except CursorReset:
+                if cursor is not None and not restarted:
+                    restarted = True
+                    cursor = None
+                    continue
+                raise
+            total += len(page.messages)
+            on_page(page.messages)
+            if not page.sync.has_more:
+                return total
+            cursor = page.sync.next_cursor
+            if cursor is None:
+                raise ShapeError(
+                    "sync.hasMore=true but sync.nextCursor is absent: "
+                    "echoing the previous cursor would loop forever"
+                )
 
     async def drain_session(
         self,
