@@ -919,26 +919,37 @@ fn purge_exported_media(root: &std::path::Path, talkers: &[String]) -> usize {
         if !dir.is_dir() {
             continue;
         }
+        // 逐个 kind 判定，不拿某个固定 kind 当「这里有没有导出」的前置条件：
+        // 只导出过语音或视频的会话没有 images 目录，以 images 为闸门会把
+        // voices / videos 永久留在盘上——注销后仍能导出，正是清理要防的。
+        //
         // 树级删除与写侧同一归属守卫：导出树里可能预置指向根外的 junction，
         // remove_dir_all 沿链接删的是链接本身（树级删除不破坏目标，已实测），
         // 但**目录被替换**的 TOCTOU（校验时是目录、删除时已换成链接到别处的
         // 目录）没有别的防线——canonicalize 解析后的真实路径必须仍在导出根内。
-        // 从没导出过媒体的会话在这里没有子目录。`is_contained` 对不存在的路径必然
-        // fail-closed，但那不是越界——先跳过，别为每个 talker 打一条「越界」警告。
-        if !dir.join(EXPORT_KINDS[0]).exists() {
-            continue;
-        }
-        if !crate::pathsafe::is_contained(root, &dir.join(EXPORT_KINDS[0])) {
-            tracing::warn!("[deregister] 跳过越界导出目录: {:?}", dir.display());
-            continue;
-        }
+        let mut saw_kind = false;
         for kind in EXPORT_KINDS {
             let sub = dir.join(kind);
+            // 不存在的 kind 不参与判定：is_contained 对不存在的路径必然
+            // fail-closed，别为没导出过这类媒体的会话打「越界」警告。
+            if !sub.exists() {
+                continue;
+            }
+            saw_kind = true;
+            if !crate::pathsafe::is_contained(root, &sub) {
+                tracing::warn!("[deregister] 跳过越界导出目录: {:?}", dir.display());
+                continue;
+            }
             match std::fs::remove_dir_all(&sub) {
                 Ok(()) => removed += 1,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => tracing::warn!("[deregister] 清理导出媒体失败 {}: {e}", sub.display()),
             }
+        }
+        // 一个导出目录都没有：这个会话从没导出过媒体，别去碰它的目录
+        // （空目录也可能不是我们建的）。
+        if !saw_kind {
+            continue;
         }
         // Empty-only: anything the server did not put there survives.
         let _ = std::fs::remove_dir(&dir);
@@ -1645,6 +1656,23 @@ mod tests {
         assert!(!root.join("talker_b").exists());
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&victim);
+    }
+
+    /// A talker that only ever exported voices has no `images` directory:
+    /// treating `images` as the "did this account export anything" gate leaves
+    /// `voices` / `videos` on disk, and they stay exportable after the account
+    /// is deregistered — exactly what the purge exists to prevent.
+    #[test]
+    fn purge_reaches_a_talker_that_only_exported_voices() {
+        let root = std::path::PathBuf::from("target/test-tmp/purge-voices-only");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("talker_voice/voices")).unwrap();
+        std::fs::write(root.join("talker_voice/voices/1.silk"), b"x").unwrap();
+
+        assert_eq!(purge_exported_media(&root, &["talker_voice".into()]), 1);
+        assert!(!root.join("talker_voice/voices").exists());
+        assert!(!root.join("talker_voice").exists(), "只剩导出目录时整目录一起消失");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
