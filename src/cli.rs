@@ -927,16 +927,30 @@ fn run_export(a: &ExportArgs) -> Result<()> {
             .enable_all()
             .build()
             .context("建 tokio 运行时失败")?;
-        let mut next_since = since_pull;
-        let mut next_offset = 0u64;
+        // 进度游标**原样回传**，一个字都不自己算：服务端的进度模型（v2 起绑定进程、
+        // 账号、会话、注册代次与数据源世代）在客户端抄一份，随后必然与它漂移，而漂移
+        // 的表现是「少了几页」——产物看起来完整，缺口无从发现。
+        let mut cursor: Option<String> = None;
         // SDK 的回调要求它自己的错误类型，而这里真正会失败的是**写盘**：把写失败硬塞成
         // ClientError 会丢信息，所以错误先存起来、循环后立即上抛，后续页只跳过不再写
         // （半途而废的会话由 run 删掉，交给 --resume 重来）。
         let mut write_err: Option<anyhow::Error> = None;
         loop {
-            let page = rt
-                .block_on(client.pull_page(&talker, next_since, next_offset, None))
-                .map_err(anyhow::Error::new)?;
+            let page = match rt.block_on(client.pull_page_cursor(
+                &talker,
+                cursor.as_deref(),
+                since_pull,
+                None,
+            )) {
+                Ok(page) => page,
+                // 游标失效说明导出途中数据源被换掉或服务端重启过：这一页取不到，也不能
+                // 退回时间模式「接着拉」——那会把已经写进 .part 的行再写一遍，产物里出现
+                // 重复消息。半成品由 run 删掉、会话记 skipped，--resume 从头重建。
+                Err(ClientError::CursorReset { .. }) => anyhow::bail!(
+                    "会话 {talker} 的进度游标在导出途中失效（数据源被替换或服务端重启），请用 --resume 重跑"
+                ),
+                Err(e) => return Err(anyhow::Error::new(e)),
+            };
             if page.messages.is_empty() {
                 break;
             }
@@ -978,8 +992,14 @@ fn run_export(a: &ExportArgs) -> Result<()> {
             if !page.sync.has_more {
                 break;
             }
-            next_since = Some(page.sync.next_since);
-            next_offset = page.sync.next_offset;
+            // hasMore 却没有游标是本端形状判断的问题：继续用旧游标会原地打转，当作排空
+            // 又会静默丢数据——两种都不能算成功。
+            match page.sync.next_cursor.clone() {
+                Some(next) => cursor = Some(next),
+                None => anyhow::bail!(
+                    "会话 {talker} 的拉取面在 hasMore=true 时没有给出 nextCursor"
+                ),
+            }
         }
         match write_err {
             Some(e) => Err(e),

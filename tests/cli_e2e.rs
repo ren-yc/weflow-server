@@ -160,20 +160,65 @@ async fn pull(
         }))
         .into_response();
     }
+    if id == "reset-talker" {
+        // 游标在导出途中失效：服务端回 409 + 机器可读的 `reason`（客户端不得去匹配中文
+        // `message`）。第一页故意留 hasMore=true 且给出游标，失效就发生在第二页。
+        let raw = q.as_deref().unwrap_or_default();
+        if raw.split('&').any(|kv| kv == "cursor=r1") {
+            return (
+                axum::http::StatusCode::CONFLICT,
+                axum::Json(json!({
+                    "success": false, "code": 409,
+                    "message": "cursor is no longer valid; restart the pull without a cursor",
+                    "reason": "cursor_reset_required",
+                })),
+            )
+                .into_response();
+        }
+        return Json(json!({
+            "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
+            "members": [], "messages": [pull_message()],
+            "meta": {"groupId": "", "name": "演示会话", "ownerId": "", "platform": "wechat", "type": "private"},
+            "sync": {"hasMore": true, "nextCursor": "r1", "nextSince": 1_700_000_000, "nextOffset": 0, "watermark": 1_700_000_000},
+        }))
+        .into_response();
+    }
     if id == "win-talker" {
         let raw = q.unwrap_or_default();
-        let offset: usize = raw
-            .split('&')
-            .find_map(|kv| kv.strip_prefix("offset="))
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        let second = offset > 0;
+        // 拉取面的进度游标必须**原样回传**。客户端若自己按 offset/since 续拉，这里直接
+        // 拒绝：少了几页在产物里看不出来，只有让旧的续拉方式响亮失败，回归才有信号。
+        if raw.split('&').any(|kv| kv.starts_with("offset=")) {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(json!({
+                    "success": false, "code": 400,
+                    "message": "stub: 拉取面不接受 offset，客户端必须原样回传 nextCursor"
+                })),
+            )
+                .into_response();
+        }
+        let second = raw.split('&').any(|kv| kv == "cursor=c1");
+        // 排空后游标**仍在场**（服务端的契约如此：它是下一次增量的起点，不终结）。客户
+        // 端必须按 hasMore 停，而不是按「游标没了」停；真按 c2 再翻一次就是错的。
+        if raw.split('&').any(|kv| kv == "cursor=c2") {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(json!({
+                    "success": false, "code": 400,
+                    "message": "stub: hasMore=false 之后不应再翻页"
+                })),
+            )
+                .into_response();
+        }
         let n = if second { 100 } else { 150 };
+        // 号的**段基**跟着页走（0 段 + 150 段），这样两条消息的句柄必然不同：句柄一旦
+        // 撞名，产物里少掉的那一条就只能靠「250 条都各有句柄」这条断言发现。
+        let base_id = if second { 150 } else { 0 };
         let base = if second { 1_700_001_000 } else { 1_700_000_000 };
         let messages: Vec<Value> = (0..n)
             .map(|k| {
                 let mut m = pull_message();
-                m["platformMessageId"] = json!(format!("w{offset}-{k}"));
+                m["platformMessageId"] = json!(format!("w{}-{k}", base_id));
                 m["timestamp"] = json!(base + (k as i64 / 50));
                 m["media"] = json!({"fileName": format!("{:032x}.png", k), "type": "image"});
                 m
@@ -184,7 +229,12 @@ async fn pull(
             "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
             "members": [], "messages": messages,
             "meta": {"groupId": "", "name": "演示会话", "ownerId": "", "platform": "wechat", "type": "private"},
-            "sync": {"hasMore": !second, "nextSince": next_ts, "nextOffset": if second { 0 } else { 150 }, "watermark": next_ts},
+            "sync": {
+                "hasMore": !second,
+                // 排空后仍给一条游标：与「hasMore 决定是否继续」的约定一起钉住。
+                "nextCursor": if second { "c2" } else { "c1" },
+                "nextSince": next_ts, "nextOffset": 0, "watermark": next_ts,
+            },
         }))
         .into_response();
     }
@@ -1056,6 +1106,33 @@ async fn targeted_media_restores_each_missing_message_once() {
     for h in &handles {
         assert!(dir.join("media").join(h).is_file(), "句柄 {h} 没有落盘字节");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 游标在导出途中失效时整个会话判失败，而不是「退回时间游标接着拉」。
+///
+/// 后者看起来更友好，实际会把已经写进 `.part` 的行再写一遍：产物里出现重复消息，而
+/// 重复的行不会让任何断言变红。失败后由 `--resume` 从头重建，错误文本必须点名它。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_expired_cursor_fails_the_session_instead_of_splicing_a_new_one() {
+    let base = spawn_stub().await;
+    let dir = std::env::temp_dir().join(format!("weflow-e2e-reset-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (code, stdout, stderr) = run(
+        &base,
+        &["export", "--out", dir.to_str().unwrap(), "--format", "jsonl", "--session", "reset-talker"],
+    );
+    assert_eq!(code, 1, "游标失效必须退 1（该会话记 skipped）: stdout: {stdout} stderr: {stderr}");
+    assert!(stderr.contains("--resume"), "错误文本要指名恢复手段: {stderr}");
+    assert!(stderr.contains("reset-talker"), "错误文本要指名是哪个会话: {stderr}");
+    let left: Vec<String> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".jsonl"))
+        .collect();
+    assert!(left.is_empty(), "半途而废的产物必须被删掉，不能留在交付包里: {left:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
