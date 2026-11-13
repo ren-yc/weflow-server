@@ -112,16 +112,24 @@ fn locate(root: &Path, name: &str, depth: usize) -> Result<Vec<PathBuf>, ExportE
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        let resolved = match path.canonicalize() {
-            Ok(resolved) => resolved,
-            // 悬空链接不是候选：跳过它，别让一个无关的坏链接把整个查找判死。
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e.into()),
-        };
-        if !resolved.starts_with(&canonical) { continue; }
-        if entry.file_type()?.is_dir() {
-            found.extend(locate(&path, name, depth - 1)?);
-        } else if entry.file_name() == name && entry.file_type()?.is_file() { found.push(resolved); }
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            // 目录要先解析再判归属（可能是指到别处的链接/junction）。解析不出来
+            // 就等于不是候选：悬空、自指（ELOOP）都只跳过这一条——一个无关的坏
+            // 链接不该让整个查找判死，哪怕目标文件就在旁边。
+            match path.canonicalize() {
+                Ok(resolved) if resolved.starts_with(&canonical) => {
+                    found.extend(locate(&path, name, depth - 1)?);
+                }
+                Ok(_) => {}
+                Err(e) => tracing::debug!("跳过无法解析的目录 {}: {e}", path.display()),
+            }
+        } else if entry.file_name() == name && file_type.is_file() {
+            // 普通文件：路径本身就在 root 内（`read_unique` 落盘前还会复核归属），
+            // 不需要为它再做一次 canonicalize——无关条目连解析都不做，才不会因为
+            // 旁边一个坏链接把整次查找判死。链接形态的媒体文件与旧实现一致地忽略。
+            found.push(path);
+        }
     }
     found.sort();
     found.dedup();
@@ -288,6 +296,35 @@ mod tests {
 
         aux.get("only").unwrap().execute("INSERT INTO VoiceInfo VALUES (7, 'x', ?1)", [b"x".as_slice()]).unwrap();
         assert!(matches!(export_with(&ctx, &aux, target()), Err(ExportError::Failed)), "非整数索引不得猜顺序");
+        std::fs::remove_dir_all(ctx.export_dir.parent().unwrap()).unwrap();
+    }
+
+    /// 一个指向自己的链接会让 `canonicalize()` 返回 ELOOP。它和目标文件毫无关系，
+    /// 但「先解析每个条目」的实现会因此把整次查找判死、返回 500——目标明明就在
+    /// 旁边。回归位置：本用例。
+    #[test]
+    fn unrelated_self_referential_symlink_does_not_break_the_lookup() {
+        let ctx = context();
+        let dir = ctx.account_dir.join("msg/video");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bytes = b"\x00\x00\x00\x18ftypisomvideo";
+        let digest = format!("{:x}", md5::Md5::digest(bytes));
+        std::fs::write(dir.join(format!("{digest}.mp4")), bytes).unwrap();
+
+        // 自指链接只在能建链接的环境里造：Windows 上非特权进程建不了符号链接，
+        // 那种情况下这条用例退化为「普通文件能导出」的冒烟，不假装验证了 ELOOP。
+        let loop_link = dir.join("self-loop");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("self-loop", &loop_link).unwrap();
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_file("self-loop", &loop_link).is_err() {
+            let _ = std::fs::remove_dir_all(ctx.export_dir.parent().unwrap());
+            return;
+        }
+
+        let target = Target { talker: "room", kind: MediaKind::Video, md5: Some(&digest), server_id: 7 };
+        let result = export_with(&ctx, &HashMap::new(), target).unwrap().publish().unwrap();
+        assert_eq!(std::fs::read(result.local_path).unwrap(), bytes);
         std::fs::remove_dir_all(ctx.export_dir.parent().unwrap()).unwrap();
     }
 
