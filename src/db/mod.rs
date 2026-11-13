@@ -10,4 +10,5 @@
 pub mod live;
 pub mod open;
 pub mod scan;
+pub mod source_identity;
 pub mod wcdb;
