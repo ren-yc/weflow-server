@@ -1828,15 +1828,14 @@ async fn both_pull_paths_are_byte_identical() {
         let start = raw.find(key).expect("响应必须带 sync.nextCursor") + key.len();
         let cursor = raw[start..].split('"').next().expect("游标是字符串").to_string();
         assert!(!cursor.is_empty(), "sync.nextCursor 不得为空");
-        let decoded = base64::engine::general_purpose::STANDARD
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(&cursor)
-            .expect("游标必须是 base64");
+            .expect("游标必须是 URL-safe base64");
         let text = String::from_utf8(decoded).expect("游标必须是 UTF-8");
-        let mut parts = text.splitn(3, '.');
-        let version = parts.next().unwrap_or_default().to_string();
-        let _generation = parts.next();
-        let local = parts.next().unwrap_or_default().to_string();
-        format!("{version}.{local}")
+        // v2.<nonce>.<账号摘要>.<注册代次>.<数据源世代>.<会话摘要>.<localId>
+        let parts: Vec<&str> = text.split('.').collect();
+        assert_eq!(parts.len(), 7, "游标字段数固定，实际 {text}");
+        format!("{}.{}", parts[0], parts[6])
     }
 
     let a = raw_body(
@@ -1859,6 +1858,54 @@ async fn both_pull_paths_are_byte_identical() {
         mask_next_cursor(&mask_exported_at(&b)),
         "两条拉取路径必须是同一份响应（只有 exportedAt 与游标代号允许不同）"
     );
+}
+
+/// 游标的失效必须被**区分**：语法坏是 400，版本/身份/代次不符是 409 +
+/// `reason: cursor_reset_required`。最坏的实现是静默退回时间模式——客户端以为
+/// 续上了，实际从头重放一遍。
+#[tokio::test]
+async fn pull_cursor_rejects_foreign_or_stale_tokens() {
+    let dir = common::tmp_dir("cursor-invalidate");
+    let state = test_state(&dir);
+    let app = server::build_router(state);
+    let pull = |session: &str, cursor: &str| {
+        format!(
+            "/chatlab/sessions/{session}/messages?limit=1&cursor={cursor}&access_token={TOKEN}"
+        )
+    };
+    let call = |uri: String| {
+        let app = app.clone();
+        async move { json_body(app.oneshot(request("GET", &uri, None)).await.unwrap()).await }
+    };
+
+    // 1) 语法坏：400，且不带「重拉」信号（重试同样的请求也不会好）。
+    let (status, body) = call(pull(common::FAKE_GROUP, "not-a-cursor")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.get("reason").is_none(), "语法错不是重拉信号：{body}");
+
+    // 2) 旧版本游标：409 + reason。
+    use base64::Engine as _;
+    let v1 = base64::engine::general_purpose::STANDARD.encode("v1.1.3");
+    let (status, body) = call(pull(common::FAKE_GROUP, &v1)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["reason"], "cursor_reset_required", "{body}");
+
+    // 3) 跨会话：拿 A 的游标去拉 B。
+    let (status, body) = call(format!(
+        "/chatlab/sessions/{}/messages?limit=1&access_token={TOKEN}",
+        common::FAKE_GROUP
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let foreign = body["sync"]["nextCursor"].as_str().expect("必须有游标").to_string();
+    let (status, body) = call(pull(common::FAKE_FRIEND, &foreign)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "跨会话游标必须被拒：{body}");
+    assert_eq!(body["reason"], "cursor_reset_required", "{body}");
+
+    // 4) 自家游标照常可用（不是把所有游标都拒掉）。
+    let (status, body) = call(pull(common::FAKE_GROUP, &foreign)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["sync"]["nextCursor"].as_str().is_some(), "{body}");
 }
 
 mod golden {

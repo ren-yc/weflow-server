@@ -6,6 +6,7 @@
 //! qqflow-server 5032).
 
 pub mod auth;
+pub mod cursor;
 pub mod dto;
 pub mod error;
 pub mod openapi;
@@ -195,6 +196,20 @@ pub fn current_generation() -> u64 {
 /// 推进基线代号（注销时调用）。
 pub fn bump_generation() -> u64 {
     GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+}
+
+/// 进程级 nonce：游标里带上它，重启后旧游标一律按「需要重拉」处理。
+///
+/// 内存索引的行标识只在**本进程**内连续；跨进程沿用等于按一张新表的位置去读
+/// 旧表。用随机值而不是 pid + 启动时间：后者在同一秒内重启会撞。
+pub fn process_nonce() -> &'static str {
+    static NONCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NONCE.get_or_init(|| {
+        use rand::RngCore;
+        let mut raw = [0u8; 8];
+        rand::thread_rng().fill_bytes(&mut raw);
+        hex::encode(raw)
+    })
 }
 
 
@@ -448,6 +463,7 @@ async fn method_not_allowed() -> crate::server::error::ApiError {
     crate::server::error::ApiError {
         status: axum::http::StatusCode::METHOD_NOT_ALLOWED,
         message: "方法不允许".into(),
+        reason: None,
     }
 }
 

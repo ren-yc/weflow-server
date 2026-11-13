@@ -12,77 +12,8 @@ use crate::server::error::{ApiError, ApiResult};
 use crate::server::handlers::{require_auth, ready_account};
 use crate::server::AppState;
 
-/// 编码不透明进度游标：`v1.<generation>.<localId>` 的 base64。内容对客户端
-/// 不透明；排他性由 localId 保证（比它小的行已全部交付），账号代次保证跨代次
-/// 的旧游标被识别为「从头拉取」而不是「错误续页」。
-fn encode_cursor(generation: u64, local_id: i64) -> String {
-    use std::io::Write;
-    let mut buf = Vec::new();
-    let _ = write!(buf, "v1.{}.{}", generation, local_id);
-    base64_simply(&buf)
-}
-
-/// 解码本端点编出的游标；无法识别返回 None，调用方退回时间模式——不是错误，
-/// 兼容期客户端可能仍用 nextSince。代次不匹配按「从头拉取」处理（localId 0）。
-fn decode_cursor(cursor: &str, generation: u64) -> Option<i64> {
-    let raw = decode_base64_simply(cursor)?;
-    let text = String::from_utf8(raw).ok()?;
-    let rest = text.strip_prefix("v1.")?;
-    let mut parts = rest.splitn(2, '.');
-    let token_gen: u64 = parts.next()?.parse().ok()?;
-    let local_id: i64 = parts.next()?.parse().ok()?;
-    if token_gen != generation {
-        return Some(0);
-    }
-    Some(local_id)
-}
-
-fn base64_simply(data: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
-        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-        out.push(TABLE[(n >> 18) as usize & 63] as char);
-        out.push(TABLE[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { TABLE[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
-    }
-    out
-}
-
-fn decode_base64_simply(text: &str) -> Option<Vec<u8>> {
-    let rev = |c: u8| -> Option<u32> {
-        match c {
-            b'A'..=b'Z' => Some((c - b'A') as u32),
-            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
-            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    };
-    let bytes: Vec<u8> = text.bytes().filter(|b| *b != b'=').collect();
-    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    for chunk in bytes.chunks(4) {
-        if chunk.len() == 1 {
-            return None;
-        }
-        let mut n: u32 = 0;
-        for (i, c) in chunk.iter().enumerate() {
-            n |= rev(*c)? << (18 - 6 * i);
-        }
-        out.push((n >> 16) as u8);
-        if chunk.len() > 2 {
-            out.push((n >> 8) as u8);
-        }
-        if chunk.len() > 3 {
-            out.push(n as u8);
-        }
-    }
-    Some(out)
-}
-
+// 游标编解码一律走 `crate::server::cursor`：它把「进程 / 账号 / 会话 / 注册代次 /
+// 数据源世代」绑进载荷，失效时返回 409 + `reason`，而不是静默退回时间模式。
 pub async fn handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -123,10 +54,22 @@ pub async fn handler(
     // drained the session resumes from here. It is a TIME BOUND, not the
     // newest message's timestamp, so an idle session still reports progress.
     let watermark = end.unwrap_or_else(|| chrono::Utc::now().timestamp());
-    // 进度游标模式：给出 cursor 时它取代 since/offset 成为权威起点。代次与
-    // 本端不匹配时按「从头拉取」处理（旧账号的进度线在新账号上不存在）。
-    let generation = crate::server::current_generation();
-    let cursor_local_id = cursor_param.as_deref().and_then(|c| decode_cursor(c, generation));
+    // 进度游标模式：给出 cursor 时它取代 since/offset 成为权威起点。
+    // 游标上下文：本进程 + 本账号 + 本会话 + (注册代次, 数据源世代)。解码失败
+    // 分两种——语法坏是 400，身份/代次不符是 409 + `reason: cursor_reset_required`；
+    // 两者都不退回时间模式：静默退回等于让客户端以为续上了、实际从头重放。
+    let registration = crate::server::current_generation();
+    let source_generation = account.generation.load(std::sync::atomic::Ordering::SeqCst);
+    let cursor_ctx = crate::server::cursor::CursorContext::for_session(
+        &store.my_wxid,
+        &id,
+        registration,
+        source_generation,
+    );
+    let cursor_local_id = match cursor_param.as_deref() {
+        Some(raw) => Some(cursor_ctx.decode(raw).map_err(|e| e.into_api_error())?),
+        None => None,
+    };
 
     // 进度游标模式（cursor 给出）下整个分页只用行标识（local_id）：过滤用
     // 「local_id > 游标值」的排他下界，排序与页推进都按 local_id 单调——
@@ -213,7 +156,7 @@ pub async fn handler(
     } else {
         page.iter().map(|m| m.local_id).max().unwrap_or(0)
     };
-    let next_cursor = encode_cursor(generation, last_local_id);
+    let next_cursor = cursor_ctx.encode(last_local_id);
 
     // `groupNickname` is the sender's per-chatroom card, which lives in
     // `group_cards` — NOT the contact's 备注. The two are different things and

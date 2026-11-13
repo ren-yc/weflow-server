@@ -63,10 +63,10 @@ async fn restore(
         before_publish();
         let accounts = state.accounts.lock();
         if account.is_stopped() || !accounts.values().any(|current| Arc::ptr_eq(current, &account)) {
-            return Err(ApiError { status: StatusCode::CONFLICT, message: "导出期间账号注册发生切换".into() });
+            return Err(ApiError::conflict("导出期间账号注册发生切换"));
         }
         if account.generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
-            return Err(ApiError { status: StatusCode::CONFLICT, message: "导出期间数据源发生变化".into() });
+            return Err(ApiError::conflict("导出期间数据源发生变化"));
         }
         // 指纹比对是这条复查真正起作用的那一半：换库/分片增删都会改变它。
         // 起始采样失败时退回到世代比较（尽力检测，边界写进文档）；起始采到了、
@@ -74,7 +74,7 @@ async fn restore(
         if let Some(before) = fingerprint {
             let current = crate::db::source_identity::fingerprint(&account.info.db_storage).ok();
             if current.as_ref() != Some(&before) {
-                return Err(ApiError { status: StatusCode::CONFLICT, message: "导出期间数据源发生变化".into() });
+                return Err(ApiError::conflict("导出期间数据源发生变化"));
             }
         }
         let result = result.map_err(failure)?.publish().map_err(|_| failure(ExportError::Failed))?;
@@ -91,5 +91,5 @@ fn failure(error: ExportError) -> ApiError {
         ExportError::Ambiguous => (StatusCode::CONFLICT, "目标或媒体来源不唯一"),
         ExportError::Failed => (StatusCode::INTERNAL_SERVER_ERROR, "媒体读取、解码或导出失败"),
     };
-    ApiError { status, message: message.into() }
+    ApiError { status, message: message.into(), reason: None }
 }

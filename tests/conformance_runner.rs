@@ -574,17 +574,18 @@ async fn cursor_continuation_is_monotonic_when_row_order_diverges_from_time_orde
         .collect();
     assert!(got.is_empty(), "end 过滤必须让本页为空");
     let c_empty = v["sync"]["nextCursor"].as_str().unwrap();
-    // 游标形状 `v1.<generation>.<localId>`（base64）：行标识 0 即「从头拉取」。
+    // 游标形状 `v2.<nonce>.<账号>.<注册代次>.<数据源世代>.<会话>.<localId>`，
+    // 整段 URL-safe base64（无填充）：标准字母表的 `+` 会在 query 里被解成空格。
     use base64::Engine as _;
     let decoded = String::from_utf8(
-        base64::engine::general_purpose::STANDARD
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(c_empty)
             .unwrap(),
     )
     .unwrap();
     let lid: i64 = decoded
         .split('.')
-        .nth(2)
+        .next_back()
         .and_then(|s| s.parse().ok())
         .unwrap_or(-1);
     assert_ne!(
