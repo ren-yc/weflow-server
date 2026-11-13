@@ -21,6 +21,9 @@ struct Mock {
     states: Arc<StdMutex<Vec<String>>>,
     pull_pages: Arc<StdMutex<Vec<serde_json::Value>>>,
     pull_queries: Arc<StdMutex<Vec<String>>>,
+    /// FIFO (status, body) served by the pull route **before** its pages: 失效
+    /// 游标的 409 + `reason` 只能这样造——正常形态是 200。
+    pull_errors: Arc<StdMutex<Vec<Option<(u16, serde_json::Value)>>>>,
     media_calls: Arc<StdMutex<Vec<String>>>,
     export_calls: Arc<StdMutex<Vec<serde_json::Value>>>,
     export_response: Arc<StdMutex<Option<(u16, serde_json::Value)>>>,
@@ -199,6 +202,14 @@ async fn pull_route(
 ) -> Response {
     assert_bearer(&headers);
     mock.pull_queries.lock().unwrap().push(format!("{id}?{}", query.unwrap_or_default()));
+    // 失效游标先答：409 + `reason` 是客户端唯一该据以「重拉」的信号。
+    let slot = {
+        let mut q = mock.pull_errors.lock().unwrap();
+        if q.is_empty() { None } else { Some(q.remove(0)) }
+    };
+    if let Some(Some((status, body))) = slot {
+        return (StatusCode::from_u16(status).unwrap(), Json(body)).into_response();
+    }
     // FIFO: pages are listed in request order, so take from the front.
     let page = {
         let mut q = mock.pull_pages.lock().unwrap();
@@ -534,6 +545,95 @@ async fn pull_page_omits_defaulted_cursors_instead_of_sending_zero() {
         assert!(!queries[0].contains(key),
             "{key} must be absent, not defaulted on the wire: {}", queries[0]);
     }
+}
+
+// ---- 不透明进度游标（v2）---------------------------------------------------
+
+/// 游标必须**原样**上车：解析它等于把服务端的进度模型抄一份到客户端。
+#[tokio::test]
+async fn pull_cursor_page_sends_the_token_verbatim_and_drops_since() {
+    let mock = Mock::default();
+    *mock.pull_pages.lock().unwrap() = vec![serde_json::json!({
+        "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
+        "members": [],
+        "messages": [],
+        "meta": {"groupId": "", "name": "", "ownerId": "", "platform": "weflow", "type": "chat"},
+        "sync": {"hasMore": false, "nextSince": 0, "nextOffset": 0, "nextCursor": "tok+/=", "watermark": 0},
+    })];
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+
+    client.pull_page_cursor("alice", Some("djIudG9r"), Some(1700000000), None).await.unwrap();
+    let queries = mock.pull_queries.lock().unwrap().clone();
+    assert_eq!(queries.len(), 1);
+    assert!(queries[0].contains("cursor=djIudG9r"), "游标必须逐字上车：{}", queries[0]);
+    // 游标在场时 since/offset 会被服务端忽略：一起发只会让日志看不出谁才是权威。
+    assert!(!queries[0].contains("since="), "有游标就不该再发 since：{}", queries[0]);
+}
+
+/// 失效游标只重来**一次**：无限重来会把调用方拖进死循环。
+#[tokio::test]
+async fn drain_session_cursor_restarts_once_after_a_reset() {
+    let mock = Mock::default();
+    // 请求序列：第一页（给游标）→ 409（该游标失效）→ 重来后的最后一页。
+    *mock.pull_errors.lock().unwrap() = vec![
+        None,
+        Some((409, serde_json::json!({
+            "success": false, "code": 409, "message": "游标已失效", "reason": "cursor_reset_required"
+        }))),
+        None,
+    ];
+    *mock.pull_pages.lock().unwrap() = vec![
+        serde_json::json!({
+            "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
+            "members": [],
+            "messages": [{"accountName":"","content":"one","groupNickname":"","platformMessageId":"1",
+                          "sender":"alice","timestamp":1700000000,"type":0}],
+            "meta": {"groupId": "", "name": "", "ownerId": "", "platform": "weflow", "type": "chat"},
+            "sync": {"hasMore": true, "nextSince": 1700000000, "nextOffset": 0, "nextCursor": "c1", "watermark": 1700000000},
+        }),
+        serde_json::json!({
+            "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
+            "members": [],
+            "messages": [{"accountName":"","content":"two","groupNickname":"","platformMessageId":"2",
+                          "sender":"alice","timestamp":1700000001,"type":0}],
+            "meta": {"groupId": "", "name": "", "ownerId": "", "platform": "weflow", "type": "chat"},
+            "sync": {"hasMore": false, "nextSince": 1700000001, "nextOffset": 0, "nextCursor": "c2", "watermark": 1700000001},
+        }),
+    ];
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+
+    let mut seen = 0u64;
+    let total = client
+        .drain_session_cursor("alice", None, |page| {
+            seen += page.len() as u64;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(total, 2, "重来后要把剩下的那页也算上");
+    assert_eq!(seen, 2);
+    let queries = mock.pull_queries.lock().unwrap().clone();
+    assert_eq!(queries.len(), 3, "被拒一次后应重来一次，实际 {queries:?}");
+    assert!(queries[1].contains("cursor=c1"), "第二次必须带上服务端给的游标：{}", queries[1]);
+    assert!(!queries[2].contains("cursor="), "重来必须不带游标：{}", queries[2]);
+}
+
+/// 没有 `reason` 的 409 不是「重拉」信号：照旧当错误上抛，别把真冲突吞成重试。
+#[tokio::test]
+async fn plain_409_without_the_reason_stays_a_status_error() {
+    let mock = Mock::default();
+    *mock.pull_errors.lock().unwrap() = vec![Some((409, serde_json::json!({
+        "success": false, "code": 409, "message": "目标不唯一"
+    })))];
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+    let err = client
+        .pull_page_cursor("alice", Some("djIudG9r"), None, None)
+        .await
+        .expect_err("没有 reason 的 409 必须当普通错误");
+    assert!(matches!(err, weflow_client::client::ClientError::Status { status: 409, .. }), "{err}");
 }
 
 // ---- media_bytes ---------------------------------------------------------

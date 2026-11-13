@@ -20,6 +20,7 @@ from weflow_sdk import (
     STALL_TIMEOUT,
     Client,
     ClientError,
+    CursorReset,
     NotReady,
     ShapeError,
     StatusError,
@@ -44,6 +45,10 @@ class Mock:
         self.states: list[str] = []
         self.pull_pages: list[dict] = []
         self.pull_queries: list[dict] = []
+        #: Consulted per request before the page queue: None = serve a page,
+        #: (status, body) = answer that error instead. A cursor reset is a 409
+        #: with ``reason``, which the normal 200-shaped fixtures cannot express.
+        self.pull_errors: list[tuple[int, dict] | None] = []
         self.media_calls: list[str] = []
         self.export_calls: list[dict] = []
         self.export_status = 200
@@ -150,6 +155,13 @@ class Mock:
                     body = {"success": True, "accounts": [entry]}
             elif path.endswith("/messages") and path.startswith("/api/v1/sessions/"):
                 mock.pull_queries.append(query)
+                slot = mock.pull_errors.pop(0) if mock.pull_errors else None
+                if slot is not None:
+                    await send({"type": "http.response.start", "status": slot[0],
+                                "headers": [(b"content-type", b"application/json")]})
+                    await send({"type": "http.response.body",
+                                "body": json.dumps(slot[1]).encode()})
+                    return
                 if mock.pull_pages:
                     body = mock.pull_pages.pop(0)
                 else:
@@ -277,7 +289,8 @@ def make_sync_client(mock: Mock, monkeypatch) -> SyncClient:
     return SyncClient("http://mock", TOKEN)
 
 
-def pull_page(msgs: list[dict], has_more: bool, next_since: int, next_offset: int) -> dict:
+def pull_page(msgs: list[dict], has_more: bool, next_since: int, next_offset: int,
+              next_cursor: str | None = None) -> dict:
     return {
         "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
         "members": [],
@@ -285,7 +298,7 @@ def pull_page(msgs: list[dict], has_more: bool, next_since: int, next_offset: in
         "meta": {"groupId": "", "name": "", "ownerId": "",
                  "platform": "weflow", "type": "chat"},
         "sync": {"hasMore": has_more, "nextSince": next_since,
-                 "nextOffset": next_offset, "watermark": 2000},
+                 "nextOffset": next_offset, "nextCursor": next_cursor, "watermark": 2000},
     }
 
 
@@ -428,6 +441,60 @@ async def test_pull_page_omits_defaulted_cursors_instead_of_sending_zero() -> No
     client = make_client(mock)
     await client.pull_page("alice", None)
     assert mock.pull_queries[0] == {}
+    await client.aclose()
+
+
+# ---- opaque progress cursor (v2) -----------------------------------------
+
+
+async def test_pull_cursor_page_sends_the_token_verbatim() -> None:
+    """The token must ride the wire verbatim: parsing it copies the server model."""
+    mock = Mock()
+    mock.pull_pages = [pull_page([], False, 0, 0, next_cursor="c1")]
+    client = make_client(mock)
+    await client.pull_page_cursor("alice", "djIudG9r", since=1700000000)
+    assert mock.pull_queries[0] == {"cursor": "djIudG9r"}
+    await client.aclose()
+
+
+async def test_drain_session_cursor_restarts_once_after_a_reset() -> None:
+    """A reset restarts **once**; looping forever would trap the caller."""
+    mock = Mock()
+    mock.pull_errors = [
+        None,
+        (409, {"success": False, "code": 409, "message": "游标已失效",
+               "reason": "cursor_reset_required"}),
+        None,
+    ]
+    mock.pull_pages = [
+        pull_page([msg(1, 1000)], True, 1000, 0, next_cursor="c1"),
+        pull_page([msg(2, 1001)], False, 1001, 0, next_cursor="c2"),
+    ]
+    client = make_client(mock)
+    pages: list[list[int]] = []
+    total = await client.drain_session_cursor(
+        "alice", None,
+        lambda batch: pages.append([int(m.platform_message_id) for m in batch]),
+    )
+    assert total == 2, "the restarted pull must still count the remaining page"
+    assert pages == [[1], [2]]
+    assert len(mock.pull_queries) == 3, mock.pull_queries
+    assert mock.pull_queries[1] == {"cursor": "c1"}
+    assert "cursor" not in mock.pull_queries[2], "the restart must drop the cursor"
+    await client.aclose()
+
+
+async def test_plain_409_without_the_reason_is_not_a_cursor_reset() -> None:
+    """A 409 without ``reason`` is not a restart signal: raise it as-is."""
+    import pytest
+
+    mock = Mock()
+    mock.pull_errors = [(409, {"success": False, "code": 409, "message": "目标不唯一"})]
+    client = make_client(mock)
+    with pytest.raises(StatusError) as caught:
+        await client.pull_page_cursor("alice", "djIudG9r")
+    assert not isinstance(caught.value, CursorReset)
+    assert caught.value.status == 409
     await client.aclose()
 
 

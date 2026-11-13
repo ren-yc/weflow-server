@@ -56,6 +56,16 @@ pub enum ClientError {
         /// What was expected, and what arrived instead.
         detail: String,
     },
+    /// 服务端说这条进度游标已经失效（409 + `reason: "cursor_reset_required"`）。
+    ///
+    /// 处置是**丢弃游标、从头拉一次**，不是重试同一条游标——重试会一直 409。
+    /// 单列一个变体而不是并进 [`ClientError::Status`]：上层若只能看到状态码，
+    /// 就只能靠猜来决定「重拉」还是「报错」。
+    #[error("{url}: cursor is no longer valid; restart the pull without a cursor")]
+    CursorReset {
+        /// Request URL.
+        url: String,
+    },
     /// The server answered 200 with a **business refusal** state.
     ///
     /// Waiting for `ready` after a refusal can only time out and hide the
@@ -402,6 +412,17 @@ impl Client {
     async fn decode<T: DeserializeOwned>(resp: reqwest::Response, url: &str) -> Result<T> {
         let status = resp.status();
         if !status.is_success() {
+            // 409 + `reason` 是**可处置**的冲突：读一次体把原因认出来，别让上层
+            // 只能按状态码猜。体读失败就按普通 Status 处理。
+            let body = resp.bytes().await.unwrap_or_default();
+            if status.as_u16() == 409 {
+                let reason = serde_json::from_slice::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_string));
+                if reason.as_deref() == Some("cursor_reset_required") {
+                    return Err(ClientError::CursorReset { url: url.to_string() });
+                }
+            }
             return Err(ClientError::Status { status: status.as_u16(), url: url.to_string() });
         }
         // 先拿字节、再单独解码：`resp.json::<T>()` 把**解码失败**也包成 reqwest::Error，
@@ -622,6 +643,79 @@ impl Client {
         }
         self.get_json(&format!("/api/v1/sessions/{}/messages", encode_path_segment(talker)), &q)
             .await
+    }
+
+    /// 用**不透明进度游标**取一页（`cursor` 给出时服务端忽略 `since`/`offset`）。
+    ///
+    /// 游标必须原样回传：解析它等于把服务端的进度模型抄一份到客户端，服务端
+    /// 换代（v2 起绑定进程/账号/会话/数据源世代）后那份实现就错了。
+    pub async fn pull_page_cursor(
+        &self,
+        talker: &str,
+        cursor: Option<&str>,
+        since: Option<i64>,
+        limit: Option<u32>,
+    ) -> Result<gen_types::PullEnvelope> {
+        let mut q = BTreeMap::new();
+        match cursor {
+            Some(c) => {
+                q.insert("cursor", c.to_string());
+            }
+            None => {
+                if let Some(s) = since {
+                    q.insert("since", s.to_string());
+                }
+            }
+        }
+        if let Some(l) = limit {
+            q.insert("limit", l.to_string());
+        }
+        self.get_json(&format!("/api/v1/sessions/{}/messages", encode_path_segment(talker)), &q)
+            .await
+    }
+
+    /// 用不透明游标把一个会话排空；游标**原样**回传（`sync.nextCursor`）。
+    ///
+    /// 收到 [`ClientError::CursorReset`] 时：本轮若用的是服务端给的游标，就丢弃它
+    /// 从头重来**一次**；再遇到就上抛——无限重来会把调用方拖进死循环，而反复失效
+    /// 本身说明数据源或注册在动荡，继续拉没有意义。
+    pub async fn drain_session_cursor<F>(
+        &self,
+        talker: &str,
+        since: Option<i64>,
+        mut on_page: F,
+    ) -> Result<u64>
+    where
+        F: FnMut(&[gen_types::PullMessage]) -> Result<()>,
+    {
+        let mut cursor: Option<String> = None;
+        let mut restarted = false;
+        let mut total = 0u64;
+        loop {
+            let page = match self.pull_page_cursor(talker, cursor.as_deref(), since, None).await {
+                Ok(page) => page,
+                Err(ClientError::CursorReset { .. }) if cursor.is_some() && !restarted => {
+                    restarted = true;
+                    cursor = None;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            total += page.messages.len() as u64;
+            on_page(&page.messages)?;
+            if !page.sync.has_more {
+                return Ok(total);
+            }
+            cursor = page.sync.next_cursor.clone();
+            if cursor.is_none() {
+                // 服务端在没有排空的情况下不给游标，是本端形状判断的问题：
+                // 继续用旧游标会原地打转，静默退出又会丢数据。
+                return Err(ClientError::UnexpectedBody {
+                    url: format!("/api/v1/sessions/{}/messages", encode_path_segment(talker)),
+                    detail: "sync.hasMore=true but sync.nextCursor is absent".to_string(),
+                });
+            }
+        }
     }
 
     /// Drain one session through the ChatLab Pull cursor loop, calling
