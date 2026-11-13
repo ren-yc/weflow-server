@@ -72,7 +72,7 @@
     },
     "page": {
       "hasMore": false,
-      "nextCursor": "<volatile>"
+      "nextCursor": null
     },
     "talker": "wxid_fake_group@chatroom"
   },

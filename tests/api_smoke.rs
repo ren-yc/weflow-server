@@ -1805,6 +1805,39 @@ async fn both_pull_paths_are_byte_identical() {
         out.push_str(rest);
         out
     }
+    /// `nextCursor` 里嵌着**进程级**代号（注销会推进它），并发跑别的用例时两次请求
+    /// 之间就可能不同。逐字节比对前把它掩掉，位置另用解码后的 `(版本, localId)`
+    /// 比——代号属于进程状态，不属于「两条路是否一致」的判据。
+    fn mask_next_cursor(raw: &str) -> String {
+        let key = "\"nextCursor\":\"";
+        let mut out = String::with_capacity(raw.len());
+        let mut rest = raw;
+        while let Some(i) = rest.find(key) {
+            let (head, tail) = rest.split_at(i + key.len());
+            out.push_str(head);
+            let end = tail.find('"').unwrap_or(tail.len());
+            out.push_str("<cursor>");
+            rest = &tail[end..];
+        }
+        out.push_str(rest);
+        out
+    }
+    fn cursor_position(raw: &str) -> String {
+        use base64::Engine as _;
+        let key = "\"nextCursor\":\"";
+        let start = raw.find(key).expect("响应必须带 sync.nextCursor") + key.len();
+        let cursor = raw[start..].split('"').next().expect("游标是字符串").to_string();
+        assert!(!cursor.is_empty(), "sync.nextCursor 不得为空");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&cursor)
+            .expect("游标必须是 base64");
+        let text = String::from_utf8(decoded).expect("游标必须是 UTF-8");
+        let mut parts = text.splitn(3, '.');
+        let version = parts.next().unwrap_or_default().to_string();
+        let _generation = parts.next();
+        let local = parts.next().unwrap_or_default().to_string();
+        format!("{version}.{local}")
+    }
 
     let a = raw_body(
         app.clone(),
@@ -1817,9 +1850,14 @@ async fn both_pull_paths_are_byte_identical() {
     )
     .await;
     assert_eq!(
-        mask_exported_at(&a),
-        mask_exported_at(&b),
-        "两条拉取路径必须是同一份响应（只有 exportedAt 允许不同）"
+        cursor_position(&a),
+        cursor_position(&b),
+        "两条路的进度游标必须指向同一位置"
+    );
+    assert_eq!(
+        mask_next_cursor(&mask_exported_at(&a)),
+        mask_next_cursor(&mask_exported_at(&b)),
+        "两条拉取路径必须是同一份响应（只有 exportedAt 与游标代号允许不同）"
     );
 }
 
@@ -1828,6 +1866,11 @@ mod golden {
 
     /// 值易变、但键必须留下的字段。按**键名**匹配：同一个字段换个端点仍叫这个名字，
     /// 所以清单不随端点增长。
+    ///
+    /// `nextCursor` **不在**这里：同名键装的是两种东西——`sync.nextCursor` 是不透明的
+    /// 进度游标（base64(generation + localId)，generation 随注销计数变），`page.nextCursor`
+    /// 是确定的偏移量字符串。整名掩掉会把「排空后从 `null` 变成数字或字符串」这种回归
+    /// 一起吃掉，所以按父键区分，见 `mask`。
     const VOLATILE_KEYS: &[&str] = &[
         // 每次请求都不同
         "exportedAt",
@@ -1842,10 +1885,6 @@ mod golden {
         // 由 `chrono::Utc::now()` 派生：每次运行都不同
         "watermark",
         "nextSince",
-        // 不透明进度游标（pull 面 0.9.0）：base64(generation + localId)，
-        // generation 随进程内注销计数变化 —— 值不确定，键必须留下。
-        // （消息面的 page.nextCursor 是偏移数，确定性的，不在清单里。）
-        "nextCursor",
         // 索引构建时刻（毫秒）：每次运行都不同，但键必须留下 ——
         // 掩掉的是值，不是「这个字段还在不在」。
         "updatedAt",
@@ -1860,26 +1899,46 @@ mod golden {
     /// 那条断言是这套快照的关键：漏掩盖一个易变字段时，测试会**响亮地失败**，
     /// 而不是每次运行都产生一份新快照——后者会让人习惯性地点「更新快照」，
     /// 护栏于是名存实亡。
-    fn mask(value: &mut serde_json::Value, tmp: &str) {
+    fn mask(value: &mut serde_json::Value, tmp: &str, parent: &str) {
         match value {
             serde_json::Value::Object(map) => {
                 for (key, val) in map.iter_mut() {
-                    if VOLATILE_KEYS.contains(&key.as_str()) {
+                    // `sync.nextCursor` 是每次运行都可能不同的进度游标：掩值之前先证明
+                    // 它确实是非空字符串，否则「游标返回 null / 数字」的回归会被掩码
+                    // 顺手盖掉，快照照样绿。`page.nextCursor` 是确定的偏移量，不掩，
+                    // 让它以真实值参与比对。
+                    let volatile = if key == "nextCursor" {
+                        match val {
+                            // 对象/数组位置上是 schema 形状，不是取值。
+                            serde_json::Value::Object(_) | serde_json::Value::Array(_) => false,
+                            _ if parent == "sync" => {
+                                assert!(
+                                    val.as_str().is_some_and(|s| !s.is_empty()),
+                                    "sync.nextCursor 必须是非空字符串，实际是 {val}"
+                                );
+                                true
+                            }
+                            _ => false,
+                        }
+                    } else {
+                        VOLATILE_KEYS.contains(&key.as_str())
+                    };
+                    if volatile {
                         // 只掩**标量**。对象/数组位置上的同名键装的是形状而非取值：
                         // /openapi.json 里 `updatedAt` 的值就是整个 schema，整值替换会把
                         // description 与类型一起从比对里抹掉——字段语义写红也不会红。
                         match val {
-                            serde_json::Value::Object(_) | serde_json::Value::Array(_) => mask(val, tmp),
+                            serde_json::Value::Object(_) | serde_json::Value::Array(_) => mask(val, tmp, key),
                             _ => *val = serde_json::Value::String("<volatile>".into()),
                         }
                     } else {
-                        mask(val, tmp);
+                        mask(val, tmp, key);
                     }
                 }
             }
             serde_json::Value::Array(items) => {
                 for it in items.iter_mut() {
-                    mask(it, tmp);
+                    mask(it, tmp, parent);
                 }
             }
             serde_json::Value::String(s) => {
@@ -2084,7 +2143,7 @@ mod golden {
             "keys": keys,
             "body": body,
         });
-        mask(&mut snapshot, tmp);
+        mask(&mut snapshot, tmp, "");
         assert_no_wall_clock(&snapshot, name);
         let actual = serde_json::to_string_pretty(&snapshot).unwrap() + "\n";
 
