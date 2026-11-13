@@ -216,6 +216,16 @@ pub struct AccountSync {
     /// 数据源世代：身份类线索变化时前进一格。与 `stopped`／`progress` 同族，
     /// 以 `Arc<AtomicU32>` 交出去，HTTP 侧判断「导出期间源是否换了」不必拿这把锁。
     generation: Arc<AtomicU32>,
+    /// 每个库「发送者映射连续读失败了几轮」。
+    ///
+    /// 映射读不出来时**不能**推进扫描位置：那会把空发送者与错的 `is_send` 固化
+    /// 下来（增量只读更大的 `local_id`，事后修好映射也不会回补）。但也不能无限
+    /// 等待——损坏的映射表永远读不出来，那张库会永久停在原地。折中是连续失败
+    /// 达到 `SENDER_MAP_MAX_ATTEMPTS` 轮后按空映射入库并告警。
+    ///
+    /// 以 `Arc<Mutex<…>>` 持有：`poll_once` 里 `conn` 借走 `self.pool` 的可变借用，
+    /// 之后再调 `&self` 方法会撞借用检查——所以先把这张表 clone 出来，用自由函数记账。
+    sender_map_failures: SenderMapFailures,
 }
 
 /// 单轮排空的页数上限：防坏数据（水位推不动的表）把一轮 poll 拖死。
@@ -227,6 +237,38 @@ pub struct AccountSync {
 const READ_MAX_PAGES: usize = 64;
 #[cfg(test)]
 const READ_MAX_PAGES: usize = 2;
+
+/// 发送者映射读不出来时的处置。
+#[derive(Debug, PartialEq, Eq)]
+enum SenderMapAction {
+    /// 还没到上限：这张库这一轮**不读**，扫描位置也不推进。
+    Defer,
+    /// 到上限了：按空映射入库（发送者与 `is_send` 降级），并告警。
+    DegradeWithEmptyMap,
+}
+
+fn sender_map_action(attempt: u32) -> SenderMapAction {
+    if attempt < AccountSync::SENDER_MAP_MAX_ATTEMPTS {
+        SenderMapAction::Defer
+    } else {
+        SenderMapAction::DegradeWithEmptyMap
+    }
+}
+
+/// 每个库「发送者映射连续读失败了几轮」。以 `Arc` 持有，见字段注释。
+type SenderMapFailures = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u32>>>;
+
+fn note_sender_map_failure(failures: &SenderMapFailures, rel: &str) -> u32 {
+    let mut guard = failures.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let counter = guard.entry(rel.to_string()).or_insert(0);
+    *counter = counter.saturating_add(1);
+    *counter
+}
+
+fn clear_sender_map_failure(failures: &SenderMapFailures, rel: &str) {
+    let mut guard = failures.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.remove(rel);
+}
 
 impl AccountSync {
     pub fn new(wxid: &str, storage: &Path, keys: KeyMap, store: Arc<RwLock<Store>>) -> Self {
@@ -246,6 +288,7 @@ impl AccountSync {
             progress: Arc::new(index::IndexProgress::default()),
             source_digest: None,
             generation: Arc::new(AtomicU32::new(0)),
+            sender_map_failures: SenderMapFailures::default(),
         }
     }
 
@@ -271,8 +314,13 @@ impl AccountSync {
             progress: Arc::new(index::IndexProgress::default()),
             source_digest: None,
             generation: Arc::new(AtomicU32::new(0)),
+            sender_map_failures: SenderMapFailures::default(),
         }
     }
+
+    /// 发送者映射连续失败多少轮后放弃等待。达到上限按空映射入库：损坏的映射表
+    /// 永远读不出来，无限等待等于让这张库永久停止入库。
+    const SENDER_MAP_MAX_ATTEMPTS: u32 = 3;
 
     /// 取走自上次调用以来积压的事件（按发生顺序）。
     ///
@@ -467,6 +515,9 @@ impl AccountSync {
         }
 
         // phase 1: incremental reads (read-only wrt the store)
+        // 失败计数先 clone 出来：下面 `conn` 会借走 `self.pool` 的可变借用，
+        // 之后再碰 `&self` 会撞借用检查。
+        let sender_failures = self.sender_map_failures.clone();
         let mut new_rows: Vec<(String, MessageRecord)> = Vec::new();
         let mut new_watermarks = std::collections::HashMap::<String, Watermark>::new();
         let mut scan_positions = std::collections::HashMap::<String, i64>::new();
@@ -521,7 +572,37 @@ impl AccountSync {
                     if let Some(v) = sampled {
                         sampled_version = Some(v);
                     }
-                    let name2id = index::name2id_table(conn);
+                    // 发送者映射读不出来时**不读这张库**：读进来的是空发送者与错的
+                    // `is_send`，而扫描位置会随行一起推进——增量只读更大的 `local_id`，
+                    // 事后把映射修好也不会回补这批行。所以先欠着，下一轮再试；连续失败
+                    // 达到上限才按空映射降级（损坏的表永远读不出来，无限等待等于让这张
+                    // 库永久停止入库）。
+                    let uid_map = match index::uid_map(conn) {
+                        Ok(map) => {
+                            clear_sender_map_failure(&sender_failures, &f.rel);
+                            map
+                        }
+                        Err(e) => {
+                            let attempt = note_sender_map_failure(&sender_failures, &f.rel);
+                            match sender_map_action(attempt) {
+                                SenderMapAction::Defer => {
+                                    tracing::warn!(
+                                        "{} sender map unreadable ({e}); deferring this database, attempt {attempt}/{}",
+                                        f.rel,
+                                        Self::SENDER_MAP_MAX_ATTEMPTS
+                                    );
+                                    continue;
+                                }
+                                SenderMapAction::DegradeWithEmptyMap => {
+                                    tracing::warn!(
+                                        "{} sender map still unreadable ({e}) after {attempt} attempts; indexing with empty senders",
+                                        f.rel
+                                    );
+                                    std::collections::HashMap::new()
+                                }
+                            }
+                        }
+                    };
                     // 排空循环：单页读满 ⇒ 该表可能还有 ⇒ 继续读，直到不满页。只读一次就记
                     // 「本轮读过」的话，同一提交里第 5001 行之后的内容留在表里、而 phase 4 已
                     // 给该文件记了戳与 data_version 基线 —— 下一轮判「未变」，余量被永久吞掉。
@@ -540,7 +621,7 @@ impl AccountSync {
                         let mut pages = 0usize;
                         loop {
                             pages += 1;
-                            let rows = read_new(conn, &table, &wm, name2id.as_deref())?;
+                            let rows = read_new(conn, &table, &wm, &uid_map)?;
                             let full = rows.len() >= index::READ_PAGE;
                             for mut row in rows {
                                 row.source_shard = source.clone();
@@ -951,6 +1032,20 @@ fn find_original(store: &Store, session: &str, revoke: &MessageRecord) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 发送者映射读不出来时先欠账、到上限才降级。
+    ///
+    /// 欠账期**必须**不读这张库：读进来的是空发送者与错的 `is_send`，而扫描
+    /// 位置会随行推进——增量只读更大的 `local_id`，事后把映射修好也不回补。
+    /// 到上限仍失败则按空映射入库并告警：损坏的映射表永远读不出来，无限等待
+    /// 等于让这张库永久停止入库。
+    #[test]
+    fn sender_map_failures_defer_then_degrade() {
+        assert_eq!(sender_map_action(1), SenderMapAction::Defer);
+        assert_eq!(sender_map_action(2), SenderMapAction::Defer);
+        assert_eq!(sender_map_action(3), SenderMapAction::DegradeWithEmptyMap);
+        assert_eq!(sender_map_action(99), SenderMapAction::DegradeWithEmptyMap);
+    }
 
     #[test]
     fn find_original_by_server_id_matches_memory_rows() {

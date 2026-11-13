@@ -758,11 +758,14 @@ fn build_all_live_inner(
                 continue;
             }
         };
+        // 映射读不出来就**先不读这张库**：带着空映射建索引会把空发送者与错的
+        // `is_send` 写进库，同时记下扫描位置——之后映射修好也不会回补这些行。
+        // 留空位，由增量轮询重试（连续失败到上限才按空映射降级）。
         let uid_map = match uid_map(conn) {
             Ok(map) => map,
             Err(e) => {
-                tracing::warn!("{} sender map unreadable: {e}", f.rel);
-                std::collections::HashMap::new()
+                tracing::warn!("{} sender map unreadable: {e}; postponed to the next incremental pass", f.rel);
+                continue;
             }
         };
         for (table, md5_suffix) in message_tables(conn) {
@@ -843,7 +846,7 @@ pub fn read_new(
     conn: &Connection,
     table: &str,
     watermark: &Watermark,
-    name2id: Option<&str>,
+    uid_map: &std::collections::HashMap<i64, String>,
 ) -> Result<Vec<MessageRecord>> {
     let cols =
         MsgCols::probe(conn, table).ok_or_else(|| anyhow::anyhow!("no local_id column"))?;
@@ -856,7 +859,6 @@ pub fn read_new(
             "message table {table} has no time column: incremental read cannot be ordered"
         ));
     };
-    let uid_map = load_uid_map(conn, name2id)?;
     let query = format!(
         "SELECT {sel} FROM \"{table}\" WHERE {lid} > ?1 ORDER BY {lid} LIMIT {page}",
         sel = cols.selected.join(", "),
@@ -873,7 +875,7 @@ pub fn read_new(
         // the drain loop. Its decode must fail before any progress is applied.
         let local_id: i64 = row.get(0)?;
         anyhow::ensure!(local_id > watermark.local_id, "message scan position did not advance");
-        let owned = cols.extract(row, &uid_map);
+        let owned = cols.extract(row, uid_map);
         out.push(row_to_record(owned, "", &no_contacts));
     }
     Ok(out)
@@ -916,7 +918,7 @@ mod tests {
             1,
             "夹具表必须落在 message_tables 的谓词里: {tables:?}"
         );
-        let err = read_new(&conn, "msg_2021f50af0b435101c0219d73dd2d44b", &Watermark::default(), None)
+        let err = read_new(&conn, "msg_2021f50af0b435101c0219d73dd2d44b", &Watermark::default(), &std::collections::HashMap::new())
             .expect_err("无 time 列必须报错，不能静默返回空增量");
         let text = format!("{err}");
         assert!(
@@ -945,7 +947,7 @@ mod tests {
         "
         )
         .unwrap();
-        let rows = read_new(&conn, "msg_2021f50af0b435101c0219d73dd2d44b", &Watermark::default(), None)
+        let rows = read_new(&conn, "msg_2021f50af0b435101c0219d73dd2d44b", &Watermark::default(), &std::collections::HashMap::new())
             .expect("补上时间列后同一张表必须可读");
         // 不只数条数：一个「无论有没有时间列都吐 1 行」的实现会骗过 len 断言。
         // 内容断言把它钉死——上一测试要红，这条要绿，两个方向才都成立。
