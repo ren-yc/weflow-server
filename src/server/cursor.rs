@@ -9,13 +9,18 @@
 //! 整段再做 URL-safe base64（无填充）。**不能用标准字母表**：`+` 在 query 里会被
 //! 解成空格，客户端原样回传时就变成另一条游标。
 //!
-//! 末段 `progress` 编码**各分片的已交付上界**：`local_id` 只在 `source_shard`
+//! 末段 `progress` 编码**各分片的行标识排除**：`local_id` 只在 `source_shard`
 //! （库文件:表名）内唯一，而同一会话的行可以来自多个分片表（真实库里 16 与 32
 //! 位 md5 表共存；不同文件也可能各有一张同名 md5 表）。只编码会话最大
 //! `local_id` 会把低分片的新追加行永远滤在「`local_id > 上界`」之外——且普通
-//! 追加不推进数据源世代，客户端拿不到任何重置信号。形态：分片用其全名的
-//! SHA-256 前 8 字节作紧凑代号，段与段之间 `~` 分隔，空进度（从头拉取）编 `0`；
-//! 游标不跨进程存活（nonce 绑定本进程），不存在需要兼容的旧形态。
+//! 追加不推进数据源世代，客户端拿不到任何重置信号。每分片两个量：**水位线**
+//! （已交付最大行标识）与**历史高水位**（排除线界内历史最大行标识）；另有全局
+//! 的**排除线**（初始 `since`）。排除线段 `t<since>` 与高水位后缀 `-<n>` 中的
+//! `t` 取自十六进制字母表之外，分片代号（十六进制开头）不会与之混淆。段间
+//! `~` 分隔，空进度（从头拉取）编 `0`。编码容量与 [`CursorContext::decode`]
+//! 的总长上限**同源**（同一 [`MAX_LEN`] 换算预算）：放不下的进度拒绝签发，
+//! 服务端签出的游标必然能解回来。游标不跨进程存活（nonce 绑定本进程），不存
+//! 在需要兼容的旧形态。
 //!
 //! 失效语义见 [`CursorError`]：语法坏 400；版本不认识、跨进程、跨账号、跨会话、
 //! 代次不符一律 409 + `reason: cursor_reset_required`。**不静默退回时间模式**——
@@ -23,8 +28,12 @@
 
 use crate::server::error::ApiError;
 
-/// 游标总长上限：正常载荷不到 120 字节，超过这个数一定是垃圾或攻击。
-const MAX_LEN: usize = 512;
+/// 游标总长上限（解码接受的最大字节数）。真实载荷不到 500 字节；余量留给
+/// 分片极多的会话（每分片一段约 25–35 字节）。上限与编码端
+/// （[`CursorProgress::encode`]）同源：编码按同一常数换算预算并**拒签**
+/// 放不下的进度——上限与签发若不同源，多分片会话会拿到一条服务端自己都解不
+/// 回的游标，续拉永远 400。
+const MAX_LEN: usize = 2048;
 const VERSION: &str = "v2";
 /// 机器可读的失效原因：客户端据此**从头重拉**，而不是重试同一条游标。
 pub const REASON_CURSOR_RESET: &str = "cursor_reset_required";
@@ -33,6 +42,9 @@ pub const REASON_CURSOR_RESET: &str = "cursor_reset_required";
 pub enum CursorError {
     /// 语法坏：解不出来、字段数不对、数字或十六进制解析失败。这是**请求错误**（400）。
     Malformed,
+    /// 进度放不进长度预算：这条游标**没有签出来**（500）。同会话的多分片排空
+    /// 会线性增长进度段，超过预算时不能签出一条自己都解不回的游标。
+    Overflow,
     /// 语法没问题，但这条游标对当前请求已经失效（409）；字符串是给人看的原因。
     Reset(&'static str),
 }
@@ -43,6 +55,9 @@ impl CursorError {
             CursorError::Malformed => {
                 ApiError::bad_request("cursor 无法解析：期望服务端签发的原样游标")
             }
+            CursorError::Overflow => ApiError::internal(
+                "游标进度超出单条上限：会话分片过多，请先合并分片或缩短会话",
+            ),
             CursorError::Reset(why) => ApiError::conflict_with_reason(REASON_CURSOR_RESET, why),
         }
     }
@@ -80,7 +95,10 @@ impl CursorContext {
         }
     }
 
-    pub fn encode(&self, progress: &CursorProgress) -> String {
+    /// 签发一条游标。进度放不进长度预算时返回 [`CursorError::Overflow`]——
+    /// 服务端签出的每一条游标都必须能被自己的 [`Self::decode`] 解回。
+    pub fn encode(&self, progress: &CursorProgress) -> Result<String, CursorError> {
+        let progress = progress.encode(MAX_LEN).ok_or(CursorError::Overflow)?;
         let payload = format!(
             "{VERSION}.{}.{}.{}.{}.{}.{}",
             self.nonce,
@@ -88,10 +106,10 @@ impl CursorContext {
             self.registration,
             self.generation,
             hex::encode(self.session),
-            progress.encode(),
+            progress,
         );
         use base64::Engine as _;
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
+        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload))
     }
 
     pub fn decode(&self, cursor: &str) -> Result<CursorProgress, CursorError> {
@@ -150,112 +168,175 @@ impl CursorContext {
     }
 }
 
-/// 游标末段的进度：会话内每个分片各自的已交付上界（排他下界，严格大于才算新行），
-/// 以及**未覆盖分片的时间排除线**。
+/// 游标末段的进度：会话内每个分片的**水位线**（已交付最大行标识）与**历史高
+/// 水位**（排除线界内历史最大行标识），加上全局**排除线**（初始 `since`）。
 ///
-/// 时间排除线解决「首次响应只覆盖部分分片」的泄漏：请求带 `since=20` 时，
-/// 窗口外的分片 B（历史行时间 10）不在本次交付里，游标线上也就没有它的进度——
-/// 续拉若对它从 0 起算，它的历史行会冒出来。排除线把「初始窗口对未覆盖分片的
-/// 排除」钉进游标：续拉对线上没有进度线的分片仍按排除线过滤，带不带 since
-/// 都不会重放窗口外历史。分片一旦被任何响应覆盖，排除线即被进度线取代
-/// （进度线是更强的上界）。
+/// 「定局」= 行要么已被交付，要么属于排除线界内的历史且此后也不会进入任何
+/// 窗口。排除判据按行标识而不是时间：时间序与行标识序在回溯行上分叉（时间
+/// 更早、入库更晚的行 local_id 更大），按时间排除的续拉会把同分片的历史回溯
+/// 行放进来；行标识排除对它们成立。单标量下界不够——历史行可能插在未交付
+/// 窗口行之后（lid 更大），把历史 lid 并进水位线会把那条未交付窗口行永久滤掉；
+/// 两个量各管一类行：
+///
+/// - `local_id ≤ 水位线` ⇒ 已交付，不得重放；
+/// - `create_time ≤ 排除线 且 local_id ≤ 历史高水位` ⇒ 签发时刻已在库的窗口外
+///   历史，不得冒出；
+/// - 其余行（含排除线确立之后入库的回溯行：local_id 按分片内 AUTOINCREMENT
+///   单调，必然大于签发时刻的全部行标识）照常可达。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CursorProgress {
-    /// `(分片代号, 该分片已交付的最大 local_id)`，按代号升序。
-    shards: Vec<(u64, i64)>,
-    /// 本游标的**排除线**：初始请求的 since（不排除历史 = `i64::MIN`）。
-    /// 对 `shards` 里没有进度线的分片，续拉按它过滤 `create_time`。
-    /// 排除线只收紧不放松：续拉携带新的 since（更晚）时取两者较大值。
-    excluded_until: i64,
+    /// `(分片代号, 水位线, 历史高水位)`，按代号升序。高水位 `None` = 排除线
+    /// 界内该分片没有历史行（任何时间早于排除线的行都是其后入库的回溯行，
+    /// 可交付）。游标线上没有的分片视为从头拉取——排除线确立时它不存在，
+    /// 此后出现的新分片必然推进数据源世代、触发游标重置。
+    shards: Vec<(u64, i64, Option<i64>)>,
+    /// 全局排除线：初始请求的 since（不排除历史 = `i64::MIN`）。它是**全局**
+    /// 的，不随分片被覆盖而取消——「分片已有进度」不等于「这个分片的所有大
+    /// 行标识都在窗口内」（同分片的历史回溯行正是反例）。
+    excluded_since: i64,
 }
 
 impl CursorProgress {
-    /// 从会话里各分片的已交付上界构造。调用方只传「本次响应真正覆盖到的分片」；
-    /// 游标线上没有的分片视为下界 0（首次拉取）——续拉请求携带旧进度，
-    /// 未覆盖分片的进度由 [`CursorProgress::merged`] 保留。
+    /// 从会话里各分片的已交付上界构造（无排除线——纯增量链、无 since 请求，
+    /// 或游标模式本页覆盖的分片）。调用方只传「本次响应真正覆盖到的分片」；
+    /// 游标线上没有的分片进度由 [`CursorProgress::merged`] 保留。
     pub fn from_bounds(bounds: impl IntoIterator<Item = (u64, i64)>) -> Self {
-        let mut shards: Vec<(u64, i64)> = bounds.into_iter().collect();
-        shards.sort_unstable_by_key(|(s, _)| *s);
-        shards.dedup_by(|a, b| a.0 == b.0);
-        Self { shards, excluded_until: i64::MIN }
+        Self {
+            shards: bounds.into_iter().map(|(s, b)| (s, b, None)).collect(),
+            excluded_since: i64::MIN,
+        }
+        .normalized()
     }
 
-    /// 带排除线的构造（初始请求带 since 时）。
+    /// 带排除线的构造（初始请求带 since 的时间模式）：`delivered` 是各分片
+    /// **已交付**的最大行标识（空页为空），`history` 是各分片**排除线界内**
+    /// （`create_time ≤ since`）历史行的最大行标识。界内无历史行的分片高水位
+    /// 为 `None`——其时间早于排除线的行都是其后入库的回溯行，照常可达。
     pub fn with_exclusion(
-        bounds: impl IntoIterator<Item = (u64, i64)>,
+        delivered: impl IntoIterator<Item = (u64, i64)>,
+        history: impl IntoIterator<Item = (u64, i64)>,
         since: i64,
     ) -> Self {
-        let mut out = Self::from_bounds(bounds);
-        out.excluded_until = since;
-        out
+        let mut shards: Vec<(u64, i64, Option<i64>)> = delivered
+            .into_iter()
+            .map(|(s, b)| (s, b, None))
+            .chain(history.into_iter().map(|(s, b)| (s, 0, Some(b))))
+            .collect();
+        shards.sort_unstable_by_key(|(s, _, _)| *s);
+        Self { shards, excluded_since: since }.normalized()
     }
 
     /// 空进度：全部行从 0 起算（「从头拉取」的语义位）。
     pub fn empty() -> Self {
-        Self { shards: Vec::new(), excluded_until: i64::MIN }
+        Self { shards: Vec::new(), excluded_since: i64::MIN }
     }
 
-    /// 请求携带的旧进度与本页覆盖的分片合并：本页没覆盖到的分片保留旧值
-    /// （进度不回退），覆盖到的取新值；排除线只收紧（取较大 since）。
+    /// 排序去重（同分片取最大值；高水位「有则取最大」）。
+    fn normalized(mut self) -> Self {
+        self.shards.sort_unstable_by_key(|(s, _, _)| *s);
+        self.shards.dedup_by(|a, b| {
+            if a.0 == b.0 {
+                b.1 = b.1.max(a.1);
+                b.2 = match (b.2, a.2) {
+                    (Some(x), Some(y)) => Some(x.max(y)),
+                    (Some(x), None) | (None, Some(x)) => Some(x),
+                    (None, None) => None,
+                };
+                true
+            } else {
+                false
+            }
+        });
+        self
+    }
+
+    /// 请求携带的旧进度与本页覆盖的分片合并：本页没覆盖到的分片保留旧值；
+    /// 覆盖到的分片水位线取「旧值与本页已交付最大值的较大者」（只前进不回退）。
+    /// **历史高水位与排除线只由旧值承载**：排除线在签发时刻确立，此后入库的
+    /// 回溯行必须可达，续拉不得把高水位抬高（否则新回溯行被误判为历史）。
     pub fn merged(self, fresh: &CursorProgress) -> CursorProgress {
         let mut out = self.shards.clone();
-        for (shard, bound) in &fresh.shards {
-            match out.iter_mut().find(|(s, _)| s == shard) {
-                Some(slot) => slot.1 = *bound,
-                None => out.push((*shard, *bound)),
+        for (shard, bound, _) in &fresh.shards {
+            match out.iter_mut().find(|(s, _, _)| s == shard) {
+                Some(slot) => slot.1 = slot.1.max(*bound),
+                None => out.push((*shard, *bound, None)),
             }
         }
-        out.sort_unstable_by_key(|(s, _)| *s);
-        let excluded_until = self.excluded_until.max(fresh.excluded_until);
-        Self { shards: out, excluded_until }
+        out.sort_unstable_by_key(|(s, _, _)| *s);
+        Self { shards: out, excluded_since: self.excluded_since }
     }
 
-    /// 某分片当前的**时间下界**：进度线上的分片已无时间排除（None）；
-    /// 线上没有的分片按排除线（`excluded_until`；`i64::MIN` = 不排除）。
-    pub fn time_bound_for(&self, shard: u64) -> Option<i64> {
-        let covered = self.shards.iter().any(|(s, _)| *s == shard);
-        let excluded = self.excluded_until != i64::MIN;
-        (excluded && !covered).then_some(self.excluded_until)
-    }
-
-    /// 一行是否已越过该行所在分片的进度线：严格大于（上界是「已交付集合的
-    /// 最大值」，排他下界保证续拉无重放）。
-    pub fn admits(&self, shard: u64, local_id: i64) -> bool {
+    /// 一行在游标续拉里是否可交付。判据按行标识与排除线的组合：
+    ///
+    /// - `local_id > 水位线`：未交付（水位线是「已交付集合的最大值」，排他保证
+    ///   续拉无重放）；
+    /// - 且**不是**「排除线界内的历史行」：`create_time ≤ 排除线` 且
+    ///   `local_id ≤ 历史高水位` 的行在签发时刻已在库、已被窗口排除，不得冒出。
+    ///   高水位为 `None` 时该分片签发时刻没有界内历史，时间早于排除线的行都是
+    ///   其后入库的回溯行，照常可达。
+    pub fn admits(&self, shard: u64, local_id: i64, create_time: i64) -> bool {
+        if create_time <= self.excluded_since {
+            let past = self
+                .shards
+                .iter()
+                .find(|(s, _, _)| *s == shard)
+                .and_then(|(_, _, h)| *h);
+            match past {
+                Some(high) if local_id <= high => return false,
+                _ => {}
+            }
+        }
         local_id > self.bound_of(shard)
     }
 
-    /// 某分片当前的下界（游标线上没有 = 0）。
+    /// 某分片当前的水位线（游标线上没有 = 0）。
     pub fn bound_of(&self, shard: u64) -> i64 {
         self.shards
             .iter()
-            .find(|(s, _)| *s == shard)
-            .map(|(_, b)| *b)
+            .find(|(s, _, _)| *s == shard)
+            .map(|(_, b, _)| *b)
             .unwrap_or(0)
     }
 
-    fn encode(&self) -> String {
-        // 排除线用 `e<since>` 后缀段表达（`i64::MIN` = 无排除，整段省略）；
-        // 其余与分片进度线相同。空进度（无分片、无排除）仍编码 "0"——「从头拉取」
-        // 的语义位，空串解不出来。
+    /// 编码末段进度：各分片段 `<hex16><水位线>[-<高水位>]`（无排除线时高水位
+    /// 恒缺席、不出 `-`），全局排除线段 `t<since>`（`i64::MIN` = 无排除，整段
+    /// 省略）。`t` 取自十六进制字母表之外：分片段的前 16 字符必为十六进制，
+    /// 以 `e` 等十六进制字符开头的分片代号不会误入排除线分支。空进度（无分片、
+    /// 无排除）编 "0"。放不进 `max_len` 换算出的预算时返回 `None`——调用方
+    /// （`CursorContext::encode`）升格为拒签，服务端不签发解不回的游标。
+    fn encode(&self, max_len: usize) -> Option<String> {
+        // 容量模型（与 decode 的 MAX_LEN 同源）：末段预算 = 总长上限减去
+        // `v2.<nonce16>.<account16>.<registration≤20>.<generation≤10>.<session16>`
+        // 的最大固定开销（6 个点分隔符已计入），再按 base64 的 4/3 膨胀折算
+        // （向下取整，宁可少签不超签）。
+        const IDENTITY_LEN: usize = 2 + 6 + 16 + 16 + 20 + 10 + 16;
+        let budget = max_len
+            .checked_sub(IDENTITY_LEN)?
+            .checked_mul(3)?
+            .checked_div(4)?;
         let mut out = String::new();
-        for (i, (shard, bound)) in self.shards.iter().enumerate() {
+        for (i, (shard, watermark, high)) in self.shards.iter().enumerate() {
             if i > 0 {
                 out.push('~');
             }
             out.push_str(&format!("{shard:016x}"));
-            out.push_str(&bound.to_string());
+            out.push_str(&watermark.to_string());
+            if let Some(h) = high {
+                out.push('-');
+                out.push_str(&h.to_string());
+            }
         }
-        if self.excluded_until != i64::MIN {
+        if self.excluded_since != i64::MIN {
             if !out.is_empty() {
                 out.push('~');
             }
-            out.push('e');
-            out.push_str(&self.excluded_until.to_string());
+            out.push('t');
+            out.push_str(&self.excluded_since.to_string());
         }
         if out.is_empty() {
-            return "0".to_string();
+            return Some("0".to_string());
         }
-        out
+        (out.len() <= budget).then_some(out)
     }
 
     /// 解析末段进度。返回 `None` = 语法坏（400）。
@@ -264,23 +345,30 @@ impl CursorProgress {
             return Some(Self::empty());
         }
         let mut shards = Vec::new();
-        let mut excluded_until = i64::MIN;
+        let mut excluded_since = i64::MIN;
         for seg in text.split('~') {
-            if let Some(rest) = seg.strip_prefix('e') {
+            // 先按标记分流：排除线段以 `t` 开头（十六进制字母表之外），分片段
+            // 前 16 字符必为十六进制——两者形态正交。
+            if let Some(rest) = seg.strip_prefix('t') {
                 if rest.is_empty() {
                     return None;
                 }
-                excluded_until = rest.parse().ok()?;
+                excluded_since = rest.parse().ok()?;
                 continue;
             }
             if seg.len() <= SHARD_HEX || !seg.bytes().take(SHARD_HEX).all(|b| b.is_ascii_hexdigit()) {
                 return None;
             }
             let shard = u64::from_str_radix(&seg[..SHARD_HEX], 16).ok()?;
-            let bound: i64 = seg[SHARD_HEX..].parse().ok()?;
-            shards.push((shard, bound));
+            let rest = &seg[SHARD_HEX..];
+            // 高水位后缀 `-<n>`：十进制数字里没有 `-`，首次出现即分界。
+            let (bound, high) = match rest.split_once('-') {
+                Some((b, h)) => (b.parse().ok()?, Some(h.parse().ok()?)),
+                None => (rest.parse().ok()?, None),
+            };
+            shards.push((shard, bound, high));
         }
-        Some(Self { shards, excluded_until })
+        Some(Self { shards, excluded_since })
     }
 }
 
@@ -301,11 +389,13 @@ mod tests {
 
     #[test]
     fn round_trip_and_url_safety() {
-        let encoded = ctx().encode(&CursorProgress::from_bounds([(shard_code("message/message_0.db:Msg_abc"), 42)]));
-        assert_eq!(
-            ctx().decode(&encoded),
-            Ok(CursorProgress::from_bounds([(shard_code("message/message_0.db:Msg_abc"), 42)]))
+        let progress = CursorProgress::with_exclusion(
+            [(shard_code("message/message_0.db:Msg_abc"), 42)],
+            [(shard_code("message/message_1.db:Msg_abc"), 7)],
+            20,
         );
+        let encoded = ctx().encode(&progress).unwrap();
+        assert_eq!(ctx().decode(&encoded), Ok(progress));
         // 标准字母表的 `+` / `/` 在 query 里会被改写，URL-safe 必须一个都不出现。
         assert!(!encoded.contains('+') && !encoded.contains('/'), "游标必须 URL-safe：{encoded}");
         assert!(!encoded.contains('='), "不留 padding，省一次转义：{encoded}");
@@ -313,7 +403,7 @@ mod tests {
 
     #[test]
     fn empty_progress_round_trips_as_zero() {
-        let encoded = ctx().encode(&CursorProgress::empty());
+        let encoded = ctx().encode(&CursorProgress::empty()).unwrap();
         assert_eq!(ctx().decode(&encoded), Ok(CursorProgress::empty()));
     }
 
@@ -323,36 +413,97 @@ mod tests {
         let b = shard_code("message/message_1.db:Msg_aaaa");
         assert_ne!(a, b, "不同库的同名表必须拿到不同代号");
         let progress = CursorProgress::from_bounds([(a, 100), (b, 10)]);
-        let encoded = ctx().encode(&progress);
+        let encoded = ctx().encode(&progress).unwrap();
         let decoded = ctx().decode(&encoded).unwrap();
         assert_eq!(decoded, progress);
         // 低分片的新追加行必须可达：这正是只编会话最大 local_id 会丢掉的行。
-        assert!(decoded.admits(b, 11), "低分片新行 11 必须越过下界 10");
-        assert!(!decoded.admits(b, 10), "已交付行不得重放");
-        assert!(decoded.admits(a, 101));
+        assert!(decoded.admits(b, 11, 1_700_000_100), "低分片新行 11 必须越过下界 10");
+        assert!(!decoded.admits(b, 10, 1_700_000_100), "已交付行不得重放");
+        assert!(decoded.admits(a, 101, 1_700_000_100));
     }
 
     #[test]
-    fn exclusion_line_survives_round_trip_and_merges_forward() {
+    fn same_shard_history_is_excluded_while_window_and_backfill_reach() {
+        // 同分片的回溯泄漏形态（回归 `cursor_continuation_excludes_same_shard_history_but_reaches_later_backfill`
+        // 钉端到端链路，这里钉判据本身）：分片 A 已交付 (lid=1, ts=30)，历史行
+        // (lid=2, ts=10) 在初始窗口（since=20）之外。续拉必须排除历史行，同时
+        // 不妨碍窗口内未交付行（lid 更小也可能）与其后入库的回溯行。
+        let a = shard_code("db0:Msg_a");
+        let progress = CursorProgress::with_exclusion([(a, 1)], [(a, 2)], 20);
+        // 历史行：时间在排除线界内、行标识不高于高水位 ⇒ 定局。
+        assert!(!progress.admits(a, 2, 10), "窗口外历史行不得经续拉冒出");
+        // 已交付行不得重放。
+        assert!(!progress.admits(a, 1, 30));
+        // 单标量下界会永久滤掉的形态：历史行 lid=4 插在未交付窗口行 lid=2 之后。
+        let progress = CursorProgress::with_exclusion([(a, 1)], [(a, 4)], 20);
+        assert!(progress.admits(a, 2, 25), "未交付窗口行不得被历史高水位滤掉");
+        assert!(!progress.admits(a, 4, 10), "历史行仍定局");
+        // 排除线确立之后入库的回溯行（时间更早、行标识更大）照常可达。
+        assert!(progress.admits(a, 5, 5), "其后入库的回溯行必须可达");
+        // 无排除线的进度（纯增量链）不做历史排除。
+        let plain = CursorProgress::from_bounds([(a, 1)]);
+        assert!(plain.admits(a, 2, 10), "无排除线时不按时间排除");
+    }
+
+    #[test]
+    fn exclusion_line_is_global_and_survives_merge() {
         let a = shard_code("db0:Msg_a");
         let b = shard_code("db1:Msg_b");
-        // 首次响应只覆盖 a（b 在 since 窗口外没有行）：排除线记下 since。
-        let first = CursorProgress::with_exclusion([(a, 1)], 20);
-        let encoded = ctx().encode(&first);
+        // 首次 since=20 只覆盖 a；b 的历史行（ts=10）经历史高水位定局。
+        let first = CursorProgress::with_exclusion([(a, 1)], [(b, 5)], 20);
+        let encoded = ctx().encode(&first).unwrap();
         assert_eq!(ctx().decode(&encoded), Ok(first.clone()));
-        assert_eq!(first.time_bound_for(b), Some(20), "未覆盖分片按排除线过滤");
-        assert_eq!(first.time_bound_for(a), None, "已覆盖分片由进度线接管");
-        // 续拉覆盖到 b：排除线仍在（只收紧不放松），但 b 已被进度线接管。
-        let next = first.merged(&CursorProgress::with_exclusion([(b, 1)], 30));
-        assert_eq!(next.time_bound_for(b), None);
-        assert_eq!(next.time_bound_for(a), None);
-        // 无排除线的游标编码后不带 e 段（与旧载荷逐字节兼容）。
-        let plain = CursorProgress::from_bounds([(a, 1)]);
-        assert!(!ctx().encode(&plain).contains('e'), "无排除线不得引入 e 段");
+        assert!(!first.admits(b, 5, 10), "未覆盖分片的历史行定局");
+        // 续拉覆盖 b：排除线保持（不随覆盖取消），b 的历史行仍定局。
+        let next = first.merged(&CursorProgress::from_bounds([(b, 8)]));
+        assert!(!next.admits(b, 5, 10), "覆盖不得取消历史排除");
+        assert!(!next.admits(b, 8, 30), "已交付行（水位线本身）不得重放");
+        assert!(next.admits(b, 9, 30), "水位线之后的行可达");
+        assert!(next.admits(b, 9, 10), "排除线之后入库的回溯行可达");
+        // 合并不抬高历史高水位：排除线确立后的新回溯行不得被误判为历史。
+        let next = next.merged(&CursorProgress::from_bounds([(b, 9)]));
+        assert!(next.admits(b, 10, 10), "合并后新回溯行仍可达");
     }
 
     #[test]
-    fn merged_keeps_uncovered_shards_and_never_regresses() {        let a = shard_code("db0:Msg_a");
+    fn e_prefixed_shard_codes_round_trip() {
+        // 分片代号以十六进制 `e` 开头：排除线段用 `t` 标记（字母表之外），
+        // 两者形态正交，往返必须无损。
+        let code = 0xe123_4567_89ab_cdefu64;
+        let progress = CursorProgress::with_exclusion([(code, 1)], [(code, 2)], 20);
+        let encoded = ctx().encode(&progress).unwrap();
+        assert_eq!(ctx().decode(&encoded), Ok(progress));
+    }
+
+    #[test]
+    fn eighteen_shards_with_epoch_bounds_round_trip_within_the_limit() {
+        // 多分片 + 十位时间戳曾是「签出即解不回」的形态：编码预算与解码上限
+        // 同源后，这类游标必须仍能完整往返。
+        let delivered: Vec<(u64, i64)> = (1..=18).map(|c| (c, 1_700_000_000)).collect();
+        let history: Vec<(u64, i64)> = (1..=18).map(|c| (c, 1_690_000_000)).collect();
+        let progress = CursorProgress::with_exclusion(delivered, history, 1_700_000_000);
+        let encoded = ctx().encode(&progress).unwrap();
+        assert!(
+            encoded.len() <= MAX_LEN,
+            "签出的游标必须能被解码上限容纳：{} > {MAX_LEN}",
+            encoded.len()
+        );
+        assert_eq!(ctx().decode(&encoded), Ok(progress));
+    }
+
+    #[test]
+    fn progress_beyond_the_budget_is_refused_not_issued() {
+        // 分片多到超出预算：拒签（Overflow）而不是签出一条解码必 400 的游标。
+        let bounds: Vec<(u64, i64)> = (0..200).map(|c| (c, 1_700_000_000)).collect();
+        assert_eq!(
+            ctx().encode(&CursorProgress::from_bounds(bounds)),
+            Err(CursorError::Overflow)
+        );
+    }
+
+    #[test]
+    fn merged_keeps_uncovered_shards_and_never_regresses() {
+        let a = shard_code("db0:Msg_a");
         let b = shard_code("db1:Msg_b");
         let old = CursorProgress::from_bounds([(a, 100), (b, 10)]);
         // 本页只覆盖 a：b 的进度原样保留。
@@ -364,6 +515,9 @@ mod tests {
         let next = next.merged(&CursorProgress::from_bounds([(c, 3)]));
         assert_eq!(next.bound_of(c), 3);
         assert_eq!(next.bound_of(a), 150, "合并不得回退已覆盖分片的进度");
+        // 覆盖值小于旧值（理论上不该发生）时也不得回退。
+        let next = next.merged(&CursorProgress::from_bounds([(a, 40)]));
+        assert_eq!(next.bound_of(a), 150, "定局下界只前进不回退");
     }
 
     #[test]

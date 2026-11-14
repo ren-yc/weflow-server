@@ -387,10 +387,15 @@ v0.6.1 至 v0.6.6 都是纯文档 tag，v0.7.0 新增跨仓文档模板；v0.8.0
 
 - 载荷是本进程 nonce、账号摘要、注册代次、数据源世代、会话摘要与**各分片的进度线**。
   - 进度线按分片（`source_shard`）记账而不是整个会话：`local_id` 只在分片内唯一，同一会话的行可以来自多个分片表。只编码会话最大值会把低分片的新追加行永远滤在续拉之外且拿不到任何重置信号。
+  - 每分片两个量：**水位线**（已交付最大行标识）与**历史高水位**（初始 since 界内历史行的最大行标识），外加全局**排除线**（初始 since）。
+  - 排除按行标识而不是时间：时间序与行标识序在回溯行上分叉，按时间排除的续拉会把同分片的历史回溯行放出来。排除线确立之后入库的回溯行（lid 必然更大）照常可达。回归 `cursor_continuation_excludes_same_shard_history_but_reaches_later_backfill`。
   - 字段多到没有「解析一下再用」的价值，是刻意的：任何客户端解析实现都绑定当版服务端，而服务端换代时那份实现只会安静地少几页。
 - 失效分两档：语法坏或版本未知是 400；旧格式、跨进程、跨账号、跨会话、注册代次或数据源世代不符是 409 加 `reason: "cursor_reset_required"`。
   - 判据只看身份，不看内容——本仓自己的写入也会改大小与 mtime，把它们放进判据等于让游标每次新消息都失效。
   - 身份字段**先验语法再比身份**：形态非法（非十六进制、长度不对）是 400，不是 409。两档处置相反，判错会让客户端对一条重试必败的损坏游标全量重拉。回归 `pull_cursor_rejects_foreign_or_stale_tokens`、`syntactically_broken_identity_fields_are_malformed_not_reset`。
+- **编码与解码的长度上限同源**：解码拒收超限游标（400），编码按同一上限换算预算、放不下就**拒绝签发**（500）。
+  - 签出一条自己解不回的游标，会让多分片会话的续拉永远 400；排除线段用 `t` 前缀标记（十六进制字母表之外），与 `e` 等十六进制开头的分片代号无歧义。
+  - 回归 `eighteen_shards_with_epoch_bounds_round_trip_within_the_limit`、`e_prefixed_shard_codes_round_trip`、`progress_beyond_the_budget_is_refused_not_issued`。
 - 静默退回时间模式是最坏的一档：客户端以为续上了，实际从头重放，而重复行不会让任何断言变红。回归 `pull_cursor_rejects_foreign_or_stale_tokens`。
 - 进程 nonce 让跨进程复用在原理上不可能：注册代次与数据源世代都是进程内观察值，新进程没有资格替上一个进程相信它们。回归 `every_identity_mismatch_is_a_reset_not_a_silent_restart`。
 

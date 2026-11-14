@@ -900,3 +900,137 @@ async fn cursor_exclusion_line_covers_shards_outside_the_initial_window() {
     );
     assert_eq!(v["sync"]["hasMore"], json!(false), "排除后没有新行可交付");
 }
+
+/// 初始窗口外历史行的排除必须**按行标识**且不碍后续可达性（端到端链路）。
+/// 判据单元测试见 `server::cursor` 的 `same_shard_history_is_excluded_while_window_and_backfill_reach`。
+///
+/// 同一分片里三种行：窗口内常规行（ts …100–…103）、窗口外历史行（ts …050、
+/// 入库更晚故 lid 更大）、排除线确立之后入库的回溯行（ts …060、lid 更大）。
+/// 修复前的两种形态都会红：续拉只按时间排除会把历史行放出来（lid 大于已交付
+/// 行，时间排除拦不住「入库更晚」）；把历史 lid 并进水位线的单标量方案会把
+/// lid 更小的未交付窗口行永久滤掉。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "真实索引链路回归：随一致性步骤显式运行（cargo test --test conformance_runner -- --ignored）"]
+async fn cursor_continuation_excludes_same_shard_history_but_reaches_later_backfill() {
+    let dir = common::tmp_dir("cursor-shard-history");
+    let key = keystore::parse_db_key(common::FAKE_KEY_HEX).unwrap();
+    let storage = common::build_wechat_account(&dir, &key.0);
+    // 窗口外历史行在注册**之前**入库：时间 …050 低于首次请求的 since=…100，
+    // 行标识（AUTOINCREMENT）大于全部常规行——「时间早、行标识大」正是泄漏形态。
+    common::append_group_message_backdated(&storage, &key.0, 990, 1_700_000_050);
+
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let state = Arc::new(server::AppState::new(
+        cfg_for(&dir),
+        TOKEN.to_string(),
+        shutdown_tx,
+    ));
+    let app = server::build_router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = app.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let body = json!({
+        "wxid": common::FAKE_WXID,
+        "key": common::FAKE_KEY_HEX,
+        "db_path": dir.to_string_lossy(),
+    });
+    let mut r = req("POST", "/api/v1/accounts");
+    r.headers_mut().insert(
+        header::CONTENT_TYPE,
+        "application/json".parse().unwrap(),
+    );
+    *r.body_mut() = Body::from(body.to_string());
+    let reg = json_of(&client, r).await;
+    assert_eq!(reg["success"], json!(true), "注册失败：{reg}");
+    assert!(wait_ready(&client).await, "索引没能在 30 秒内到 ready");
+
+    let pull_url = format!("/chatlab/sessions/{}/messages", common::FAKE_GROUP);
+    let history_id = format!("{}", 8_450_000_000_000_000_000i64 + 990);
+
+    // 段一：首次拉取 since=…100。常规行（ts …100–…103）在窗口内全交付；
+    // 历史行（ts …050、lid 最大）被窗口排除。
+    let v = json_of(
+        &client,
+        req("GET", &format!("{pull_url}?limit=5000&since=1700000100")),
+    )
+    .await;
+    let got: Vec<String> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        !got.contains(&history_id),
+        "窗口外历史行（lid 更大）不得进入首次响应：{got:?}"
+    );
+    assert!(!got.is_empty(), "窗口内常规行必须交付");
+    let c0 = v["sync"]["nextCursor"].as_str().unwrap().to_string();
+
+    // 段二：按游标续拉（不带 since）。历史行不得冒出——它 lid 大于全部已交付
+    // 行，「local_id > 水位线」拦不住它，必须靠历史高水位。
+    let v = json_of(
+        &client,
+        req("GET", &format!("{pull_url}?limit=5000&cursor={c0}")),
+    )
+    .await;
+    let got: Vec<String> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        !got.contains(&history_id),
+        "续拉不得把同分片的窗口外历史行放出来：{got:?}"
+    );
+    assert_eq!(v["sync"]["hasMore"], json!(false), "排除后本页应为空");
+
+    // 段三：排除线确立之后入库的回溯行（ts …060 仍在初始窗口之外，lid 更大）
+    // 必须经同一游标可达——排除只作用于「签发时刻已在库」的历史。
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    common::append_group_message_backdated(&storage, &key.0, 9_900 + seq, 1_700_000_060);
+    let acct = state.accounts.lock().values().next().cloned();
+    if let Some(a) = acct {
+        let sync = a.sync.clone();
+        let _ = tokio::task::spawn_blocking(move || sync.lock().poll_once()).await;
+    }
+    let backfill_id = format!("{}", 8_450_000_000_000_000_000i64 + 9_900 + seq);
+    let v = json_of(
+        &client,
+        req("GET", &format!("{pull_url}?limit=5000&cursor={c0}")),
+    )
+    .await;
+    let got: Vec<String> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        got,
+        vec![backfill_id],
+        "排除线确立后入库的回溯行必须经原游标可达（且只交付它）：{got:?}"
+    );
+
+    // 段四：续拉后的游标再排空一次——历史行仍定局、无重放。
+    let c1 = v["sync"]["nextCursor"].as_str().unwrap();
+    let v = json_of(
+        &client,
+        req("GET", &format!("{pull_url}?limit=5000&cursor={c1}")),
+    )
+    .await;
+    let got: Vec<String> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        got.is_empty(),
+        "按游标推进后的续拉不得重放：{got:?}"
+    );
+}

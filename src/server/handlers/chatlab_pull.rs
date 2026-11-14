@@ -12,18 +12,6 @@ use crate::server::error::{ApiError, ApiResult};
 use crate::server::handlers::{require_auth, ready_account};
 use crate::server::AppState;
 
-/// 本页覆盖分片的进度 + 请求的排除线（见 handler 内「排除线」注释）。
-fn fresh_progress(
-    bounds: std::collections::HashMap<u64, i64>,
-    excluded_until: i64,
-) -> crate::server::cursor::CursorProgress {
-    if excluded_until == i64::MIN {
-        crate::server::cursor::CursorProgress::from_bounds(bounds)
-    } else {
-        crate::server::cursor::CursorProgress::with_exclusion(bounds, excluded_until)
-    }
-}
-
 // 游标编解码一律走 `crate::server::cursor`：它把「进程 / 账号 / 会话 / 注册代次 /
 // 数据源世代」绑进载荷，失效时返回 409 + `reason`，而不是静默退回时间模式。
 pub async fn handler(
@@ -84,7 +72,7 @@ pub async fn handler(
     };
 
     // 进度游标模式（cursor 给出）下分页以行标识（local_id）为准：过滤用
-    // 「local_id > 该行所在分片的进度线」的排他下界，排序与页推进都按 local_id
+    // 「local_id > 该行所在分片的定局下界」的排他下界，排序与页推进都按 local_id
     // 单调——入库序与时间序在乱序行上分叉时，续拉严格无重放、无跳行；乱序行
     // 的 messages 顺序不再是时间升序，这是「排空判据=入库进度」的直接后果。
     //
@@ -93,25 +81,25 @@ pub async fn handler(
     // 可以来自多个分片表。只编码会话最大值时，低分片的新追加行永远落在
     // 「local_id > 会话最大值」之外且拿不到任何重置信号——静默丢行。
     //
-    // **初始 since 窗口的排除随游标携带**（`CursorProgress` 的排除线）：首次
-    // 响应只覆盖部分分片时（其余分片在窗口外没有行），游标线上没有它们的进度；
-    // 排除线把「初始窗口对未覆盖分片的排除」钉进游标，续拉对未覆盖分片仍按它
-    // 过滤——带不带 since 都不会重放窗口外历史（分片 A 时间 30 响应了 since=20，
-    // 分片 B 时间 10 的历史行在续拉时不得冒出来）。分片一旦被覆盖，进度线接管。
-    // 无 cursor 的时间模式保持规范原行为：(create_time, sort_seq, local_id)
-    // 复合键升序、页不跨秒推进（nextSince 语义依赖它），契约不要求与游标同键。
+    // **初始窗口外历史行的排除也按行标识**（`admits` 的三参形态）：排除线
+    // （初始 since）确立时刻，「已交付行的最大 local_id」（水位线）与「窗口外
+    // 历史行的最大 local_id」（历史高水位）分别记账。时间序与行标识序在回溯行
+    // 上分叉（时间更早、行标识更大），按时间排除的续拉会把同分片的历史回溯行
+    // 放进来；行标识排除对它们成立——排除线确立之后新入库的回溯行 local_id
+    // 必然大于全部定局行，照常可达。无 cursor 的时间模式保持规范原行为：
+    // (create_time, sort_seq, local_id) 复合键升序、页不跨秒推进（nextSince
+    // 语义依赖它），契约不要求与游标同键。
     let cursor_mode = cursor_progress.is_some();
     let mut ascending: Vec<&crate::store::MessageRecord> = conv
         .iter()
         .filter(|m| {
             if let Some(progress) = &cursor_progress {
                 let shard = crate::server::cursor::shard_code(&m.source_shard);
-                let time_bound = progress.time_bound_for(shard);
-                return progress.admits(shard, m.local_id)
-                    && time_bound.is_none_or(|s| m.create_time > s)
-                    && end.is_none_or(|e| m.create_time <= e);
+                progress.admits(shard, m.local_id, m.create_time)
+                    && end.is_none_or(|e| m.create_time <= e)
+            } else {
+                since.is_none_or(|s| m.create_time > s) && end.is_none_or(|e| m.create_time <= e)
             }
-            since.is_none_or(|s| m.create_time > s) && end.is_none_or(|e| m.create_time <= e)
         })
         .collect();
     if cursor_mode {
@@ -157,62 +145,74 @@ pub async fn handler(
     // The page's OWN last timestamp. Using the whole set's maximum here would
     // tell the client to resume past everything it has not seen yet.
     let next_since = page.last().map(|m| m.create_time).unwrap_or(since.unwrap_or(0));
-    // 进度游标编码「**已交付集合**」的进度上界——不是页末行：
+    // 进度游标编码「**定局集合**」的行标识——不是页末行：
     //
-    // - cursor 模式：排序按 local_id 单调，页末行就是已交付集合的最大 local_id，
-    //   两者重合；进度线**按分片记账**（local_id 只在分片内唯一），本页覆盖的
-    //   分片取「已交付集合的最大值」，没覆盖的分片保留请求游标里的旧值——
-    //   进度对每个分片都只前进不回退。空页时整条进度线保持请求原值。
+    // - cursor 模式非空页：排序按 local_id 单调，本页覆盖分片的「已交付最大
+    //   local_id」推进该分片的水位线；没覆盖的分片保留请求游标里的旧值。历史
+    //   高水位与排除线**只由请求游标承载**（merged 不抬高）——排除线确立后
+    //   入库的回溯行必须可达。空页时整条进度线保持请求原值。
     // - 时间模式非空页：排序按时间复合键，页末行 local_id **可能不是已交付集合
     //   里最大的**（回溯入库的行：时间早、行标识大）。编码页末行会让后续游标链
-    //   重放它；必须编码「本次响应已交付的行里最大的 local_id」。
+    //   重放它；必须编码「本次响应已交付的行里最大的 local_id」。初始请求带
+    //   since 时，窗口外历史行（create_time ≤ since）的逐分片最大 local_id
+    //   作为历史高水位**一并进游标**——不编码它们会让客户端丢掉 since 的续拉
+    //   把历史行放出来（回溯行的时间序与行标识序分叉，按时间排除拦不住）。
     // - 时间模式空页：本响应没有交付任何行，但请求窗口 (since, end] 为空本身
     //   就是进度陈述——窗口内无行，则一切 create_time ≤ end 的行都已确立。
     //   游标编码「end 界内已确立的最大 local_id」（end 缺省时水位线=now 覆盖
     //   全部行）。编码 0 是「从头拉取」，周期轮询的客户端采纳它再丢掉时间过滤
     //   就会重放全历史。
     let request_progress = cursor_progress.clone().unwrap_or_default();
-    // 本请求的排除线：cursor 模式沿用请求游标里的线（merged 只收紧），时间模式
-    // 取本请求的 since（无 since = 无排除 = i64::MIN）。fresh 的排除线只在
-    // 「请求带 since」时进入下一游标——不带 since 的纯增量续拉不得凭空引入排除。
-    let fresh_exclusion = if cursor_progress.is_some() {
-        // 游标模式：排除线已在 request_progress 里，fresh 不再携带。
-        i64::MIN
-    } else {
-        since.unwrap_or(i64::MIN)
-    };
     let next_progress = if cursor_progress.is_some() {
         if page.is_empty() {
             // 空页：进度保持（游标值不变，不回退为从头拉取）。
             request_progress
         } else {
-            // 本页覆盖的分片推进到已交付集合的最大值，其余分片保留旧值。
-            let mut bounds = std::collections::HashMap::<u64, i64>::new();
+            // 本页覆盖的分片推进水位线到已交付集合的最大值；历史高水位与
+            // 排除线由请求游标保留（merged 不抬高压制新回溯行）。
+            let mut fresh = std::collections::HashMap::<u64, i64>::new();
             for m in &page {
                 let shard = crate::server::cursor::shard_code(&m.source_shard);
-                let slot = bounds.entry(shard).or_insert(m.local_id);
+                let slot = fresh.entry(shard).or_insert(m.local_id);
                 *slot = (*slot).max(m.local_id);
             }
-            request_progress.merged(&fresh_progress(bounds, fresh_exclusion))
+            request_progress.merged(&crate::server::cursor::CursorProgress::from_bounds(fresh))
         }
     } else if page.is_empty() {
-        let mut bounds = std::collections::HashMap::<u64, i64>::new();
+        // 时间模式空页：end 界内已确立的最大行标识（含历史回溯行）。
+        let mut settled = std::collections::HashMap::<u64, i64>::new();
         for m in conv.iter().filter(|m| m.create_time <= watermark) {
             let shard = crate::server::cursor::shard_code(&m.source_shard);
-            let slot = bounds.entry(shard).or_insert(m.local_id);
+            let slot = settled.entry(shard).or_insert(m.local_id);
             *slot = (*slot).max(m.local_id);
         }
-        fresh_progress(bounds, fresh_exclusion)
+        crate::server::cursor::CursorProgress::from_bounds(settled)
     } else {
-        let mut bounds = std::collections::HashMap::<u64, i64>::new();
+        // 时间模式非空页：已交付行记入水位线（delivered），窗口外历史行
+        // （不会进入任何窗口，定局）记入历史高水位（history）。后者只在
+        // 本请求带 since 时非空；同分片两线并存时各记各的（历史行可能插在
+        // 未交付窗口行之后，lid 更大——并成单值会把那条窗口行永久滤掉）。
+        let mut delivered = std::collections::HashMap::<u64, i64>::new();
         for m in &page {
             let shard = crate::server::cursor::shard_code(&m.source_shard);
-            let slot = bounds.entry(shard).or_insert(m.local_id);
+            let slot = delivered.entry(shard).or_insert(m.local_id);
             *slot = (*slot).max(m.local_id);
         }
-        fresh_progress(bounds, fresh_exclusion)
+        let mut history = std::collections::HashMap::<u64, i64>::new();
+        if let Some(s) = since {
+            for m in conv.iter().filter(|m| m.create_time <= s) {
+                let shard = crate::server::cursor::shard_code(&m.source_shard);
+                let slot = history.entry(shard).or_insert(m.local_id);
+                *slot = (*slot).max(m.local_id);
+            }
+        }
+        crate::server::cursor::CursorProgress::with_exclusion(
+            delivered,
+            history,
+            since.unwrap_or(i64::MIN),
+        )
     };
-    let next_cursor = cursor_ctx.encode(&next_progress);
+    let next_cursor = cursor_ctx.encode(&next_progress).map_err(|e| e.into_api_error())?;
 
     // `groupNickname` is the sender's per-chatroom card, which lives in
     // `group_cards` — NOT the contact's 备注. The two are different things and

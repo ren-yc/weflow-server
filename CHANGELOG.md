@@ -23,6 +23,7 @@
 
 ### 修复
 
+- 进度游标补齐「初始窗口外历史行」的排除并修两处签发缺陷：排除判据从时间改为**行标识**——同分片里时间更早、入库更晚的回溯行（local_id 更大）会越过按时间的排除在续拉里冒出来，现在水位线（已交付最大行标识）与历史高水位（排除线界内历史最大行标识）分别记账，排除线（初始 since）确立之后入库的回溯行照常可达。排除线段改用 `t` 前缀（十六进制字母表之外），与 `e` 等十六进制开头的分片代号不再混淆——此前该形态的游标签出即无法回传。编码端与解码长度上限**同源**：放不下的进度拒绝签发（500）而不是签出一条续拉必 400 的游标。游标不跨进程存活，无需迁移。回归：`cursor_continuation_excludes_same_shard_history_but_reaches_later_backfill`、`e_prefixed_shard_codes_round_trip`、`eighteen_shards_with_epoch_bounds_round_trip_within_the_limit`。
 - 进度游标改为**按分片记进度**：`local_id` 只在「库文件：表名」分片内唯一，同一会话的行可来自多个分片；此前游标只编码会话最大 local_id，先排空高分片再向低分片追加时，新行被「local_id > 会话最大值」永久滤掉且拿不到任何重置信号。游标不跨进程存活，旧游标随进程重启自然失效，无需迁移。回归：`cursor_progress_is_tracked_per_source_shard`。
 - 游标的账号/会话字段改为**先验语法再比身份**：字段形态非法（非十六进制、长度不对）从 409 改为 400——语法坏与身份不符的处置相反，判成失效会让客户端对一条永远重试不成功的损坏游标执行全量重拉。回归：`syntactically_broken_identity_fields_are_malformed_not_reset`。
 - 定向媒体在临时文件写完后复查注册，再发布产物；取消清理临时文件，已有有效副本可在源缓存清理后复用。回归：`targeted_media_cancels_staged_bytes_after_account_switch`。
