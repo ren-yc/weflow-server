@@ -672,7 +672,7 @@ fn row_from_pull(m: &weflow_client::generated::r#gen::types::PullMessage) -> exp
         msg_type: m.type_,
         content: m.content.clone(),
         reply_to_message_id: m.reply_to_message_id.clone(),
-        // 媒体先按拉取面给的原始名落行；--with-media 时 retain_downloaded_media 会按消息 id
+        // 媒体先按拉取面给的原始名落行；--with-media 时 retain_downloaded_media 按消息身份
         // 把它改写成实际落盘的内容摘要名。不带 --with-media 时 fileName 只是元数据，不是可取
         // 承诺（服务的媒体链接也刻意不写进导出物——导出文件会被拷进聊天工具、传上网盘）。
         media_file_name: m.media.as_ref().map(|x| x.file_name.clone()).filter(|s| !s.is_empty()),
@@ -709,36 +709,17 @@ async fn fetch_one_handle(
     Ok(Some(name.to_string()))
 }
 
-/// 给**一页 Pull 行**配齐媒体，返回「消息 id → 确实落盘的文件名」映射与被拒的非法名字数。
-///
-/// **两条路按行分派**：
-///
-/// · 快路径 —— Pull 行自带 `mediaId` 的那些（服务端已保证「出现即可取」）。**直接按句柄取
-///   字节，一次导出请求都不发**。
-/// · 慢路径 —— 有 `media` 却没有可用 `mediaId` 的那些：本面不执行导出，服务端不会凭空给出
-///   句柄，所以把**这些行的时间窗**交给消息面（`/chatlab/messages?media=1`）触发按需导出，
-///   再从回填的可取句柄取字节。
-///
-/// **为什么不能整批撤掉慢路径**：撤掉就等于「媒体句柄只能靠全历史那趟预遍历拿」，而那一趟不认
-/// `--since`（本仓刚修掉的正是这个）。快路径让「已经导出过」的会话（`--resume`、重复导出）近乎
-/// 零成本，慢路径只在真需要导出时才付出成本；两条路都不再有全历史遍历。
-/// 回归位置：`media_window_follows_the_pull_page`（慢路径窗口仍跟着页走）与
-/// `media_id_from_pull_row_skips_the_export_round`（快路径零导出请求）。
-///
-/// 映射按**消息 id**：消息面回填的是内容摘要名、拉取面 `media.fileName` 给的是索引里的原始名，
-/// 两者不必相同，只有 id 能把两边对上（`retain_downloaded_media` 按 id 改写句柄）。
-///
-/// 句柄与名字都来自 HTTP 响应、却要拿去拼本地路径：`../`、盘符、设备名配合 `join` 能写到导出
-/// 目录之外。`media_bytes_by_id` 会做 URL 段编码，那防的是 HTTP 层、替代不了写盘前的这一道。
-/// 非法名不进下载也不计数为媒体，按**去重后的名字**计数（同一个非法名在两个面上各出现一次时
-/// 只该报一次）；静默少下载而整体退 0，是不可发现的失败。
+/// 配齐本页媒体，以消息 ID、发送者和时间关联实际句柄。
+/// 已知 mediaId 优先直接取字节；缺失或过期时只导出唯一目标。
+/// 回归：`targeted_media_restores_each_missing_message_once` 与
+/// `media_id_from_pull_row_skips_the_export_round`。
 async fn media_for_page(
     client: &Client,
     talker: &str,
     media_dir: &std::path::Path,
     page: &[weflow_client::generated::r#gen::types::PullMessage],
-) -> Result<(std::collections::BTreeMap<String, String>, usize)> {
-    let mut by_message: std::collections::BTreeMap<String, String> =
+) -> Result<(std::collections::BTreeMap<(String, String, i64), String>, usize)> {
+    let mut by_message: std::collections::BTreeMap<(String, String, i64), String> =
         std::collections::BTreeMap::new();
     // 折叠名 → 实际落盘名：同一份字节被多条消息引用（或仅大小写不同）时，一律指到同一个
     // 物理文件，不重下也不另开一份。折叠口径与会话名去重一致（Windows 卷大小写不敏感）。
@@ -765,74 +746,41 @@ async fn media_for_page(
         };
         let folded = handle.to_lowercase();
         if let Some(known) = landed.get(&folded) {
-            by_message.insert(m.platform_message_id.clone(), known.clone());
+            by_message.insert((m.platform_message_id.clone(), m.sender.clone(), m.timestamp), known.clone());
             continue;
         }
         match fetch_one_handle(client, media_dir, handle).await? {
             Some(name) => {
                 landed.insert(folded, name.clone());
-                by_message.insert(m.platform_message_id.clone(), name);
+                by_message.insert((m.platform_message_id.clone(), m.sender.clone(), m.timestamp), name);
             }
-            // 服务端说过「出现即可取」而我们拿到 404：句柄已过期（缓存被清理之类）。按取不到
-            // 处理 —— 宁可少一个 media 字段，也不给一个指向不存在文件的句柄。
+            // 已知句柄过期时按完整消息身份恢复；不可恢复的错误由调用方报告。
             None => {
-                tracing::debug!("跳过 Pull 行句柄 {handle}: 404（服务端已不再可取）");
+                need_export.push(m);
             }
         }
     }
     if need_export.is_empty() {
         return Ok((by_message, rejected_names.len()));
     }
-    // 慢路径：只给「还没有句柄的那些行」配窗。窗口取这些行的时间跨度 —— 它正是消息面认的
-    // start/end（两端闭区间的秒级戳；同秒的行必然落在同一页，所以两端不漏行）。
-    let lo = need_export.iter().map(|m| m.timestamp).min().unwrap_or(0);
-    let hi = need_export.iter().map(|m| m.timestamp).max().unwrap_or(0);
-    let mut q = MessageQuery::new(talker.to_string());
-    q.media = true;
-    q.start = Some(lo.to_string());
-    q.end = Some(hi.to_string());
-    q.limit = Some(200);
-    let mut offset = 0u64;
-    loop {
-        let resp = client.chatlab_messages(&q).await?;
-        let count = resp.messages.len();
-        for m in &resp.messages {
-            let Some(media) = &m.media else { continue };
-            // 已经拿到句柄的消息不再重取：同一份字节在两个面上的**名字形态**可以不同
-            // （拉取面句柄 vs 导出回填名），只按折叠名去重会漏掉「同一消息、两个名字」。
-            // 与 qqflow 侧同一条守卫。
-            if by_message.contains_key(&m.platform_message_id) {
-                continue;
-            }
-            let name = media.file_name.clone();
-            if name.is_empty() {
-                continue;
-            }
-            if !crate::pathsafe::safe_segment(&name) {
-                rejected_names.insert(name.to_lowercase());
-                tracing::warn!("媒体文件名不是安全的单路径分量，跳过: {name}");
-                continue;
-            }
-            let folded = name.to_lowercase();
-            if let Some(known) = landed.get(&folded) {
-                by_message.insert(m.platform_message_id.clone(), known.clone());
-                continue;
-            }
-            match fetch_one_handle(client, media_dir, &name).await? {
-                Some(landed_name) => {
-                    landed.insert(folded, landed_name.clone());
-                    by_message.insert(m.platform_message_id.clone(), landed_name);
-                }
-                None => {
-                    tracing::debug!("跳过不可取句柄 {name}: 404（外链或未落盘）");
-                }
-            }
+    for m in need_export {
+        let result = client.export_media_by_message(talker, &m.platform_message_id, &m.sender, m.timestamp).await?;
+        let name = result.media_id;
+        if !crate::pathsafe::safe_segment(&name) {
+            rejected_names.insert(name.to_lowercase());
+            tracing::warn!("媒体文件名不是安全的单路径分量，跳过: {name}");
+            continue;
         }
-        if !resp.page.has_more || count == 0 {
-            break;
+        let key = (m.platform_message_id.clone(), m.sender.clone(), m.timestamp);
+        let folded = name.to_lowercase();
+        if let Some(known) = landed.get(&folded) {
+            by_message.insert(key, known.clone());
+            continue;
         }
-        offset += count as u64;
-        q.offset = Some(offset);
+        let landed_name = fetch_one_handle(client, media_dir, &name).await?
+            .ok_or_else(|| anyhow::anyhow!("定向媒体导出成功但字节不可取"))?;
+        landed.insert(folded, landed_name.clone());
+        by_message.insert(key, landed_name);
     }
     Ok((by_message, rejected_names.len()))
 }
@@ -840,16 +788,20 @@ async fn media_for_page(
 /// 逐个核对**复用会话**产物里的媒体句柄是否在同目录 `media/` 下有字节。
 ///
 /// 返回悬空的会话名。清单只含本轮 target 与复用命中的条目，所以复用会话都能在清单里找到
-/// 自己的 `file`。句柄用子串扫描取（不解析整份 JSON）：两种形态都按 `{"fileName":"<name>"}` 无空格
-/// 序列化，而整份解析会把 jsonl 的「内存与条数无关」这条承诺在这里破掉。
+/// 自己的 `file`。句柄用**按行**子串扫描取（不解析整份 JSON、不整份读入内存）：
+/// 两种形态都按 `{"fileName":"<name>"}` 无空格序列化，行内扫描与整份扫描等价——
+/// jsonl 的每个产物行是一条完整 JSON；`read_to_string` 会把峰值内存绑到最大
+/// 会话文件上，数 GB 导出在续跑检查阶段就可能耗尽内存。
+/// 读取错误（I/O、非法 UTF-8）原样上抛——把「检查无法完成」吞成「无悬空」
+/// 等于向自动化调用方谎报媒体完整性已验证。
 fn reused_dangling_handles(
     index: &std::path::Path,
     reused: &[String],
     media_dir: &std::path::Path,
 ) -> Result<Vec<String>> {
-    let text = std::fs::read_to_string(index)
+    let index_text = std::fs::read_to_string(index)
         .with_context(|| format!("读清单失败: {}", index.display()))?;
-    let v: Value = serde_json::from_str(&text).context("清单不是合法 JSON")?;
+    let v: Value = serde_json::from_str(&index_text).context("清单不是合法 JSON")?;
     let mut dangling = Vec::new();
     for row in v.get("sessions").and_then(Value::as_array).into_iter().flatten() {
         let Some(talker) = row.get("talker").and_then(Value::as_str) else { continue };
@@ -857,16 +809,32 @@ fn reused_dangling_handles(
             continue;
         }
         let Some(file) = row.get("file").and_then(Value::as_str) else { continue };
-        let body = std::fs::read_to_string(index.with_file_name(file))
+        let artifact = index.with_file_name(file);
+        let body = std::fs::File::open(&artifact)
             .with_context(|| format!("读复用产物失败: {file}"))?;
-        for handle in body.split("\"fileName\":\"").skip(1).filter_map(|s| s.split('"').next()) {
-            if handle.is_empty() {
+        let reader = std::io::BufReader::new(body);
+        let mut talker_dangling = false;
+        for line in std::io::BufRead::lines(reader) {
+            // 逐行读：非法 UTF-8 与 I/O 错误在这里显式失败——两者的下游都是
+            // 「媒体完整性没有验证过」，静默通过等于谎报。悬空已判定时也要把
+            // 文件读完：读到一半就停会把尾部的读错误吞成「无错误」，三态里的
+            // 「读失败」就再也报不出来了。
+            let line = line.with_context(|| format!("读复用产物失败（非 UTF-8 或 I/O）: {file}"))?;
+            if talker_dangling {
                 continue;
             }
-            if !media_dir.join(handle).exists() {
-                dangling.push(talker.to_string());
-                break;
+            for handle in line.split("\"fileName\":\"").skip(1).filter_map(|s| s.split('"').next()) {
+                if handle.is_empty() {
+                    continue;
+                }
+                if !media_dir.join(handle).exists() {
+                    talker_dangling = true;
+                    break;
+                }
             }
+        }
+        if talker_dangling {
+            dangling.push(talker.to_string());
         }
     }
     Ok(dangling)
@@ -959,16 +927,30 @@ fn run_export(a: &ExportArgs) -> Result<()> {
             .enable_all()
             .build()
             .context("建 tokio 运行时失败")?;
-        let mut next_since = since_pull;
-        let mut next_offset = 0u64;
+        // 进度游标**原样回传**，一个字都不自己算：服务端的进度模型（v2 起绑定进程、
+        // 账号、会话、注册代次与数据源世代）在客户端抄一份，随后必然与它漂移，而漂移
+        // 的表现是「少了几页」——产物看起来完整，缺口无从发现。
+        let mut cursor: Option<String> = None;
         // SDK 的回调要求它自己的错误类型，而这里真正会失败的是**写盘**：把写失败硬塞成
         // ClientError 会丢信息，所以错误先存起来、循环后立即上抛，后续页只跳过不再写
         // （半途而废的会话由 run 删掉，交给 --resume 重来）。
         let mut write_err: Option<anyhow::Error> = None;
         loop {
-            let page = rt
-                .block_on(client.pull_page(&talker, next_since, next_offset, None))
-                .map_err(anyhow::Error::new)?;
+            let page = match rt.block_on(client.pull_page_cursor(
+                &talker,
+                cursor.as_deref(),
+                since_pull,
+                None,
+            )) {
+                Ok(page) => page,
+                // 游标失效说明导出途中数据源被换掉或服务端重启过：这一页取不到，也不能
+                // 退回时间模式「接着拉」——那会把已经写进 .part 的行再写一遍，产物里出现
+                // 重复消息。半成品由 run 删掉、会话记 skipped，--resume 从头重建。
+                Err(ClientError::CursorReset { .. }) => anyhow::bail!(
+                    "会话 {talker} 的进度游标在导出途中失效（数据源被替换或服务端重启），请用 --resume 重跑"
+                ),
+                Err(e) => return Err(anyhow::Error::new(e)),
+            };
             if page.messages.is_empty() {
                 break;
             }
@@ -1010,8 +992,18 @@ fn run_export(a: &ExportArgs) -> Result<()> {
             if !page.sync.has_more {
                 break;
             }
-            next_since = Some(page.sync.next_since);
-            next_offset = page.sync.next_offset;
+            // hasMore 却没有游标、或游标与本次请求的原样相同，都是本端形状判断的问题：
+            // 继续用旧游标会原地打转（同一页反复追加进产物、永不完成），当作排空
+            // 又会静默丢数据——两种都不能算成功。
+            match page.sync.next_cursor.clone() {
+                Some(next) if cursor.as_deref() == Some(next.as_str()) => anyhow::bail!(
+                    "会话 {talker} 的拉取面在 hasMore=true 时返回了与请求相同的游标（原地打转），导出中止"
+                ),
+                Some(next) => cursor = Some(next),
+                None => anyhow::bail!(
+                    "会话 {talker} 的拉取面在 hasMore=true 时没有给出 nextCursor"
+                ),
+            }
         }
         match write_err {
             Some(e) => Err(e),
@@ -1037,8 +1029,11 @@ fn run_export(a: &ExportArgs) -> Result<()> {
         // 复用的会话本轮一个字节都没下载，而 `--with-media` 的承诺是「导出物里出现的每个
         // fileName，字节都在 media/ 下」。上一轮之后媒体目录被清理或搬走时，句柄会悬空在交付
         // 包里而退出码仍是 0——这里按最终名逐个核对，把静默成功变成响亮失败。
-        let dangling = reused_dangling_handles(&outcome.index, &outcome.reused, &media_dir)
-            .unwrap_or_default();
+        //
+        // 三态分明：「无悬空」「有悬空」「检查无法完成」——最后一种必须以错误上抛，
+        // 把它吞成空列表等于向自动化调用方谎报媒体完整性已验证（清单中部损坏、
+        // 产物被换、非法 UTF-8 都只有这里能发现，末尾换行检查只看最后一字节）。
+        let dangling = reused_dangling_handles(&outcome.index, &outcome.reused, &media_dir)?;
         if !dangling.is_empty() {
             for t in &dangling {
                 println!("[export] 媒体句柄悬空（复用产物缺字节）: {t}");
@@ -1238,6 +1233,44 @@ mod tests {
         std::fs::write(d.join(artifact), "{\"_type\":\"header\"}\n").unwrap();
         let none = reused_dangling_handles(&index, &reused, &d.join("media")).unwrap();
         assert!(none.is_empty(), "无句柄的产物不该被报为悬空: {none:?}");
+
+        // 悬空判定**之后**的尾部读错误必须仍然上抛：读到一半就停会把尾部
+        // 的损坏吞成「无错误」，三态里的「读失败」就再也报不出来——正是本次
+        // 修复的交错，必须有回归钉住。
+        let mut dangling_then_bad = b"{\"_type\":\"header\"}\n".to_vec();
+        dangling_then_bad.extend_from_slice(
+            b"{\"_type\":\"message\",\"media\":{\"type\":\"image\",\"fileName\":\"gone2.png\"}}\n",
+        );
+        dangling_then_bad.extend_from_slice(&[0xFF, 0xFE, 0xC0, 0x80]);
+        std::fs::write(d.join(artifact), &dangling_then_bad).unwrap();
+        let err_dangling = reused_dangling_handles(&index, &reused, &d.join("media"))
+            .expect_err("悬空后尾部的坏字节必须仍然让检查失败");
+        assert!(
+            err_dangling.to_string().contains(artifact),
+            "错误要指出失败的文件: {err_dangling}"
+        );
+
+        // 末尾完整但**中部非 UTF-8** → 检查必须失败而不是被当成「无悬空」：
+        // 末尾换行检查只看最后一字节，中部损坏只有这里能发现——吞掉它等于
+        // 向自动化调用方谎报媒体完整性已验证。
+        let mut corrupted = b"{\"_type\":\"header\"}\n".to_vec();
+        corrupted.extend_from_slice(&[0xFF, 0xFE, 0xC0, 0x80]);
+        std::fs::write(d.join(artifact), &corrupted).unwrap();
+        let err = reused_dangling_handles(&index, &reused, &d.join("media"))
+            .expect_err("中部损坏必须显式失败，不能静默当作无悬空");
+        assert!(
+            err.to_string().contains(artifact),
+            "错误要指出失败的文件: {err}"
+        );
+
+        // 产物读取期间失效（文件被删）→ 同样显式失败。
+        std::fs::remove_file(d.join(artifact)).unwrap();
+        let err2 = reused_dangling_handles(&index, &reused, &d.join("media"))
+            .expect_err("产物缺失必须显式失败");
+        assert!(
+            err2.to_string().contains("读复用产物失败"),
+            "错误要说明是读取失败: {err2}"
+        );
 
         let _ = std::fs::remove_dir_all(&d);
     }

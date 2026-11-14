@@ -332,6 +332,35 @@ pub fn append_group_message_unique(storage: &Path, key: &Key, seq: i64) {
     drop(conn);
 }
 
+/// Add one group message whose business timestamp is **earlier** than existing
+/// rows while its row identity (local_id) is larger.
+///
+/// Why the fixture needs this: cursor continuation pages by row identity while
+/// the no-cursor time mode pages by timestamp. When the two orders diverge, a
+/// continuation that mixed the two keys would replay rows it already served
+/// (page-end row is not the largest local_id under time order) — this fixture
+/// is the divergence itself, so the out-of-order regression can pin the
+/// row-identity ordering.
+pub fn append_group_message_backdated(storage: &Path, key: &Key, seq: i64, create_time: i64) {
+    let path = storage.join("message/message_0.db");
+    let conn = wx_conn(&path, key, false);
+    let group_md5 = md5_hex(FAKE_GROUP);
+    conn.execute(
+        &format!(
+            "INSERT INTO \"Msg_{md5}\" (server_id, local_type, create_time, sort_seq, real_sender_id, message_content) \
+             VALUES (?1, 1, ?2, 0, 2, ?3)",
+            md5 = group_md5
+        ),
+        rusqlite::params![
+            8_450_000_000_000_000_000i64 + seq,
+            create_time,
+            format!("回溯入库-{seq}")
+        ],
+    )
+    .unwrap();
+    drop(conn);
+}
+
 pub fn append_group_reply(storage: &Path, key: &Key, quoted_server_id: i64) {
     let path = storage.join("message/message_0.db");
     let conn = wx_conn(&path, key, false);
@@ -584,4 +613,81 @@ pub fn add_session_row_without_messages(storage: &Path, key: &Key) {
         "INSERT INTO Session VALUES ('wxid_empty_session', '空会话', 1700000020, 1700000020, '', 1, 0, 0);",
     )
     .unwrap();
+}
+
+/// 新建一个**第二分片库**（`message/message_1.db`），里面放同一会话的
+/// `Msg_<md5>` 表——表名与 `message_0.db` 的群表相同。
+///
+/// 为什么需要它：`local_id` 只在「库文件:表名」分片内唯一，而同一会话的行可以
+/// 落在多个分片（真实库 16/32 位 md5 表共存、多文件同名表并存）。进度游标若只
+/// 编会话最大 local_id，低分片的新追加行会永远滤不进来——这个夹具让游标测试
+/// 能在「先排空高分片、再向低分片追加」的形态下续拉。
+///
+/// 表形状与 `build_wechat_account` 的群表逐列一致；`Name2Id0` 同库自建
+/// （增量读按「本库自己的 name2id 表」解析发送者，缺表会把发送者解析成空）。
+pub fn add_second_message_shard(storage: &Path, key: &Key) {
+    let path = storage.join("message/message_1.db");
+    let conn = wx_conn(&path, key, false);
+    let group_md5 = md5_hex(FAKE_GROUP);
+    conn.execute_batch(&format!(
+        "CREATE TABLE \"Name2Id0\" (user_name TEXT);
+         INSERT INTO \"Name2Id0\" (rowid, user_name) VALUES (2, 'wxid_member_b');
+         CREATE TABLE \"Msg_{group_md5}\" (
+            local_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            server_id INTEGER NOT NULL,
+            local_type INTEGER NOT NULL,
+            create_time INTEGER NOT NULL,
+            sort_seq INTEGER NOT NULL DEFAULT 0,
+            real_sender_id INTEGER NOT NULL,
+            message_content TEXT,
+            compress_content BLOB
+         );",
+        group_md5 = group_md5,
+    ))
+    .unwrap();
+    drop(conn);
+}
+
+/// 向**第二分片**（`message_1.db`）的群表追加一行，行号独立于 message_0.db。
+///
+/// `seq` 只用于拼 `server_id`（会话内唯一即可，与第一分片的号段隔开）；
+/// 时间取 1700000200（与 `append_group_message_unique` 同秒组）。
+/// 返回这行的 `server_id`（即 API 的 `platformMessageId`）。
+pub fn append_second_shard_message(storage: &Path, key: &Key, seq: i64) -> i64 {
+    let path = storage.join("message/message_1.db");
+    let conn = wx_conn(&path, key, false);
+    let group_md5 = md5_hex(FAKE_GROUP);
+    let server_id = 8_500_000_000_000_000_000i64 + seq;
+    conn.execute(
+        &format!(
+            "INSERT INTO \"Msg_{md5}\" (server_id, local_type, create_time, sort_seq, real_sender_id, message_content) \
+             VALUES (?1, 1, 1700000200, 0, 2, ?2)",
+            md5 = group_md5
+        ),
+        rusqlite::params![server_id, format!("第二分片追加-{seq}")],
+    )
+    .unwrap();
+    drop(conn);
+    server_id
+}
+
+/// 向**第二分片**追加一行，业务时间由调用方指定（`append_second_shard_message`
+/// 的回溯变体）。回归「跨分片的历史排除」需要：分片 B 只有比首次请求 since
+/// 更早的行——首次响应只覆盖分片 A，续拉不得把 B 的窗口外历史行冒出来。
+pub fn append_second_shard_message_at(storage: &Path, key: &Key, seq: i64, create_time: i64) -> i64 {
+    let path = storage.join("message/message_1.db");
+    let conn = wx_conn(&path, key, false);
+    let group_md5 = md5_hex(FAKE_GROUP);
+    let server_id = 8_500_000_000_000_000_000i64 + seq;
+    conn.execute(
+        &format!(
+            "INSERT INTO \"Msg_{md5}\" (server_id, local_type, create_time, sort_seq, real_sender_id, message_content) \
+             VALUES (?1, 1, ?2, 0, 2, ?3)",
+            md5 = group_md5
+        ),
+        rusqlite::params![server_id, create_time, format!("第二分片回溯-{seq}")],
+    )
+    .unwrap();
+    drop(conn);
+    server_id
 }

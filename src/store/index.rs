@@ -7,7 +7,7 @@
 
 
 use anyhow::Result;
-use rusqlite::{Connection, Row};
+use rusqlite::{Connection, OptionalExtension, Row};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{Contact, MessageRecord, Session, SessionKind, Store, Watermark};
@@ -172,7 +172,7 @@ fn load_sessions_from(conn: &Connection, table: &str, store: &mut Store) -> Resu
 
 /// Parse the `contact` table of `contact.db`.
 pub fn load_contacts(conn: &Connection, store: &mut Store) -> Result<()> {
-    let cols = open::table_columns(conn, "contact");
+    let cols = open::table_columns_checked(conn, "contact")?;
     let c_username = pick(&cols, CONTACT_COLUMNS[0]);
     let c_remark = pick(&cols, CONTACT_COLUMNS[1]);
     let c_nick = pick(&cols, CONTACT_COLUMNS[2]);
@@ -180,6 +180,7 @@ pub fn load_contacts(conn: &Connection, store: &mut Store) -> Result<()> {
     let c_avatar = pick(&cols, CONTACT_COLUMNS[4]);
     let c_type = pick(&cols, CONTACT_COLUMNS[5]);
     let Some(c_username) = c_username else {
+        store.contacts.clear();
         return Ok(());
     };
     let selected: Vec<&str> = [
@@ -198,23 +199,27 @@ pub fn load_contacts(conn: &Connection, store: &mut Store) -> Result<()> {
     let has = [c_remark.is_some(), c_nick.is_some(), c_alias.is_some(), c_avatar.is_some(), c_type.is_some()];
     let pos = |n: usize| -> usize { 1 + has[..n].iter().filter(|b| **b).count() };
     let mut rows = stmt.query([])?;
+    let mut contacts = std::collections::HashMap::new();
     while let Some(row) = rows.next()? {
-        let username = get_opt_str(row, 0).unwrap_or_default();
+        let text = |idx| -> rusqlite::Result<Option<String>> {
+            Ok(row.get::<_, Option<String>>(idx)?.map(|s| s.trim().to_string()))
+        };
+        let username = text(0)?.unwrap_or_default();
         if username.is_empty() {
             continue;
         }
-        let remark = if c_remark.is_some() { get_opt_str(row, pos(0)).filter(|s| !s.is_empty()) } else { None };
-        let nickname = if c_nick.is_some() { get_opt_str(row, pos(1)).filter(|s| !s.is_empty()) } else { None };
-        let alias = if c_alias.is_some() { get_opt_str(row, pos(2)).filter(|s| !s.is_empty()) } else { None };
-        let avatar_url = if c_avatar.is_some() { get_opt_str(row, pos(3)).filter(|s| !s.is_empty()) } else { None };
-        let type_raw = if c_type.is_some() { get_i64(row, pos(4)) } else { 0 };
+        let remark = if c_remark.is_some() { text(pos(0))?.filter(|s| !s.is_empty()) } else { None };
+        let nickname = if c_nick.is_some() { text(pos(1))?.filter(|s| !s.is_empty()) } else { None };
+        let alias = if c_alias.is_some() { text(pos(2))?.filter(|s| !s.is_empty()) } else { None };
+        let avatar_url = if c_avatar.is_some() { text(pos(3))?.filter(|s| !s.is_empty()) } else { None };
+        let type_raw = if c_type.is_some() { row.get::<_, Option<i64>>(pos(4))?.unwrap_or_default() } else { 0 };
         let kind = match type_raw {
             1 => SessionKind::Private,
             2 => SessionKind::Group,
             3 => SessionKind::Official,
             _ => SessionKind::classify(&username),
         };
-        store.contacts.insert(
+        contacts.insert(
             username.clone(),
             Contact {
                 username,
@@ -226,6 +231,7 @@ pub fn load_contacts(conn: &Connection, store: &mut Store) -> Result<()> {
             },
         );
     }
+    store.contacts = contacts;
     Ok(())
 }
 
@@ -425,6 +431,7 @@ fn row_to_record(row: OwnedMsgRow, my_wxid: &str, contacts: &std::collections::H
         .filter(|s| !s.is_empty() && s != &row.sender_username)
         .unwrap_or_else(|| row.sender_username.clone());
     MessageRecord {
+        source_shard: std::sync::Arc::from(""),
         local_id: row.local_id,
         server_id: row.server_id,
         local_type: row.local_type,
@@ -468,40 +475,30 @@ pub fn load_sns(conn: &Connection, store: &mut Store) -> Result<()> {
 ///
 /// 便捷入口存在的理由：两个库的 id 空间**互相独立**，调用方若拿错库的表名就会解析到**错误的
 /// 人**（而不是解析失败）—— 那是最难查的一类错。让调用方只传连接，就少一个拿错的机会。
-pub fn uid_map(conn: &Connection) -> std::collections::HashMap<i64, String> {
-    load_uid_map(conn, name2id_table(conn).as_deref())
+pub fn uid_map(conn: &Connection) -> Result<std::collections::HashMap<i64, String>> {
+    let table: Option<String> = conn.query_row(
+        "SELECT name FROM sqlite_master WHERE type='table' AND lower(name) LIKE 'name2id%' ORDER BY name DESC LIMIT 1",
+        [], |row| row.get(0),
+    ).optional()?;
+    load_uid_map(conn, table.as_deref())
 }
 
-/// Load the `Name2Id` uid map: rowid -> user_name.
-fn load_uid_map(conn: &Connection, name2id: Option<&str>) -> std::collections::HashMap<i64, String> {
+/// Load this database's rowid-to-username map; optional schema may be absent,
+/// but a partial read must not be acknowledged as a complete mapping.
+fn load_uid_map(conn: &Connection, name2id: Option<&str>) -> Result<std::collections::HashMap<i64, String>> {
     let mut map = std::collections::HashMap::new();
-    let Some(t) = name2id else { return map };
-    // **列名要探测，不能二选一硬编码。** 真库实测：`contact.db` 与 `contact_fts.db` 的
-    // `name2id` 列叫 `username`（没有下划线），而消息库的 `Name2Id` 叫 `user_name`。
-    // 硬编码其中一个，另一个库的 SELECT 就会失败 —— 而它是**静默**返回空表的，于是症状是
-    // 「发送者全是空串」或「群主/名册一个都解析不出来」，不是报错。夹具若恰好写成另一个拼法，
-    // 夹具路径永远发现不了这个分歧（实测就是这样：夹具写 `user_name` 一路绿灯，真库全 0）。
-    let cols = crate::db::open::table_columns(conn, t);
-    let Some(col) = ["user_name", "username"]
-        .into_iter()
-        .find(|c| cols.iter().any(|x| x == c))
-    else {
-        tracing::warn!("{t} 里没有 user_name/username 列，发送者名将为空");
-        return map;
+    let Some(t) = name2id else { return Ok(map) };
+    let cols = open::table_columns_checked(conn, t)?;
+    let Some(col) = pick(&cols, &["user_name", "username"]) else {
+        return Ok(map);
     };
-    let Ok(mut stmt) = conn.prepare(&format!("SELECT rowid, \"{col}\" FROM \"{t}\"")) else {
-        return map;
-    };
-    let mut rows = match stmt.query([]) {
-        Ok(r) => r,
-        Err(_) => return map,
-    };
-    while let Ok(Some(row)) = rows.next() {
-        if let (Ok(id), Ok(name)) = (row.get::<_, i64>(0), row.get::<_, String>(1)) {
-            map.insert(id, name);
-        }
+    let table = t.replace('"', "\"\"");
+    let mut stmt = conn.prepare(&format!("SELECT rowid, \"{col}\" FROM \"{table}\""))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        map.insert(row.get::<_, i64>(0)?, row.get::<_, String>(1)?);
     }
-    map
+    Ok(map)
 }
 
 /// Read all rows of one message table (in order), returning owned records and
@@ -660,34 +657,41 @@ fn build_all_live_inner(
 
     // 1) session.db
     if let Some(f) = db_files.iter().find(|f| f.kind == DbKind::Session) {
-        let Some(key) = keys.key_for(&f.rel) else {
-            tracing::warn!("no key for session.db");
-            return Ok(store);
-        };
-        match pool.get_or_open(f, key) {
-            Ok(conn) => {
-                if let Err(e) = load_sessions(conn, &mut store) {
-                    tracing::warn!("session table unreadable: {e}");
+        match keys.key_for(&f.rel) {
+            Some(key) => match pool.get_or_open(f, key) {
+                Ok(conn) => {
+                    if let Err(e) = load_sessions(conn, &mut store) {
+                        tracing::warn!("session table unreadable: {e}");
+                    }
                 }
+                Err(e) => tracing::warn!("session.db live open failed: {e}"),
+            },
+            None => {
+                // 可选库缺密钥只是**降级**：会话列表缺失，告警后继续走后面各步。
+                // 此前这里的提前 return 把「少一个可选库」放大成「消息索引整体
+                // 不建」——注册照样 ready，消息却是零条。各分支互不 return，
+                // 缺哪面只缺哪面。
+                tracing::warn!("no key for session.db —— 会话名与类型将缺失，继续构建其余库");
             }
-            Err(e) => tracing::warn!("session.db live open failed: {e}"),
         }
     }
 
     // 2) contact.db —— 联系人，以及**群主与名册**（后两者也住这个库）。
     if let Some(f) = db_files.iter().find(|f| f.kind == DbKind::Contact) {
-        let Some(key) = keys.key_for(&f.rel) else {
-            tracing::warn!("no key for contact.db");
-            return Ok(store);
-        };
-        match pool.get_or_open(f, key) {
-            Ok(conn) => {
-                if let Err(e) = load_contacts(conn, &mut store) {
-                    tracing::warn!("contact table unreadable: {e}");
+        match keys.key_for(&f.rel) {
+            Some(key) => match pool.get_or_open(f, key) {
+                Ok(conn) => {
+                    match crate::store::group_meta::read_contact_metadata(conn) {
+                        Ok(metadata) => metadata.apply(&mut store),
+                        Err(e) => tracing::warn!("contact metadata unreadable: {e}"),
+                    }
                 }
-                crate::store::group_meta::load_chatroom_meta(conn, &mut store);
+                Err(e) => tracing::warn!("contact.db live open failed: {e}"),
+            },
+            None => {
+                // 同上：联系人名降级（显示名回退原始 id）不应连带丢掉整个消息索引。
+                tracing::warn!("no key for contact.db —— 联系人名与群主将缺失，继续构建其余库");
             }
-            Err(e) => tracing::warn!("contact.db live open failed: {e}"),
         }
     }
 
@@ -698,7 +702,10 @@ fn build_all_live_inner(
     if let Some(f) = db_files.iter().find(|f| f.kind == DbKind::ContactFts) {
         match keys.key_for(&f.rel) {
             Some(key) => match pool.get_or_open(f, key) {
-                Ok(conn) => crate::store::group_meta::load_group_cards(conn, &mut store),
+                Ok(conn) => match crate::store::group_meta::read_group_cards(conn) {
+                    Ok(cards) => store.group_cards = cards,
+                    Err(e) => tracing::warn!("group cards unreadable: {e}"),
+                },
                 Err(e) => tracing::warn!("contact_fts.db live open failed: {e}"),
             },
             None => tracing::debug!("no key for contact_fts.db —— 群名片将为空"),
@@ -751,10 +758,28 @@ fn build_all_live_inner(
                 continue;
             }
         };
-        let uid_map = load_uid_map(conn, name2id_table(conn).as_deref());
+        // 映射读不出来就**先不读这张库**：带着空映射建索引会把空发送者与错的
+        // `is_send` 写进库，同时记下扫描位置——之后映射修好也不会回补这些行。
+        // 留空位，由增量轮询重试（连续失败到上限才按空映射降级）。
+        let uid_map = match uid_map(conn) {
+            Ok(map) => map,
+            Err(e) => {
+                tracing::warn!("{} sender map unreadable: {e}; postponed to the next incremental pass", f.rel);
+                // 位置一条都不记，同时登记「欠账」：增量轮询据此无视 data_version
+                // 基线强制重查。只跳过不登记的话，构建期间没有新提交，那批消息
+                // 会一直缺失。
+                store.deferred_sender_maps.insert(f.rel.clone());
+                continue;
+            }
+        };
         for (table, md5_suffix) in message_tables(conn) {
             match load_message_table(conn, &table, &uid_map, &contacts, my_wxid, progress) {
-                Ok((records, watermark)) => {
+                Ok((mut records, watermark)) => {
+                    let source: std::sync::Arc<str> = format!("{}:{table}", f.rel).into();
+                    if let Some(last_id) = records.iter().map(|r| r.local_id).max() {
+                        store.scan_positions.insert(source.to_string(), last_id);
+                    }
+                    for record in &mut records { record.source_shard = source.clone(); }
                     let session = table_session(&md5_suffix, &store);
                     let conv = store.convs.entry(session).or_default();
                     conv.extend(records);
@@ -778,25 +803,34 @@ fn build_all_live_inner(
 
     // 4) sns.db — moments timeline
     if let Some(f) = db_files.iter().find(|f| f.kind == DbKind::Sns) {
-        let Some(key) = keys.key_for(&f.rel) else {
-            tracing::warn!("no key for {}", f.rel);
-            return Ok(store);
-        };
-        match pool.get_or_open(f, key) {
-            Ok(conn) => {
-                if let Err(e) = load_sns(conn, &mut store) {
-                    tracing::warn!("sns timeline unreadable: {e}");
+        match keys.key_for(&f.rel) {
+            Some(key) => match pool.get_or_open(f, key) {
+                Ok(conn) => {
+                    if let Err(e) = load_sns(conn, &mut store) {
+                        tracing::warn!("sns timeline unreadable: {e}");
+                    }
                 }
+                Err(e) => tracing::warn!("{} live open failed: {e}", f.rel),
+            },
+            None => {
+                // 同上：朋友圈时间线是可选面，缺密钥不连累消息索引与计数回填。
+                tracing::warn!("no key for {} —— 朋友圈时间线将缺失，messageCount 照常回填", f.rel);
             }
-            Err(e) => tracing::warn!("{} live open failed: {e}", f.rel),
         }
     }
 
     // 5) fill session message counts from convs
+    fill_session_message_counts(&mut store);
+    Ok(store)
+}
+
+/// 第 5 步的提取：会话消息计数从 convs 回填。缺密钥降级路径（session/contact/sns）
+/// 跳过的只是它们自己的库，这条回填在任何一条路径上都必须照常执行——各分支
+/// 现在不提前 return，函数唯一的调用点就是主路径末尾。
+fn fill_session_message_counts(store: &mut Store) {
     for (username, s) in store.sessions.iter_mut() {
         s.message_count = store.convs.get(username).map_or(0, |v| v.len());
     }
-    Ok(store)
 }
 
 /// 增量读取的单页上限。与 SQL 的 LIMIT 同值：调用方（sync 的排空循环）按
@@ -810,16 +844,17 @@ pub const READ_PAGE: usize = 5000;
 #[cfg(test)]
 pub const READ_PAGE: usize = 5;
 
-/// Incremental read: rows of one table after the watermark, in order.
+/// Incremental read after the shard's local-ID scan position. Time fields in
+/// the argument are descriptive only; late rows may have older timestamps.
 pub fn read_new(
     conn: &Connection,
     table: &str,
     watermark: &Watermark,
-    name2id: Option<&str>,
+    uid_map: &std::collections::HashMap<i64, String>,
 ) -> Result<Vec<MessageRecord>> {
     let cols =
         MsgCols::probe(conn, table).ok_or_else(|| anyhow::anyhow!("no local_id column"))?;
-    let Some(time) = cols.time.as_deref() else {
+    let Some(_time) = cols.time.as_deref() else {
         // 与「无 local_id 列」同口径报 Err，而不是返回空 Vec：空 Vec 与「真的没有新行」
         // 在调用方完全不可区分，于是这张表的增量**永久静默为空**——水位照记、页面照答，
         // 谁也不会再回头看它。真库里出现过这种列形态时，唯一能发现它的就是这个错误串。
@@ -828,33 +863,25 @@ pub fn read_new(
             "message table {table} has no time column: incremental read cannot be ordered"
         ));
     };
-    let uid_map = load_uid_map(conn, name2id);
-    let order = [time, cols.seq.as_deref().unwrap_or(&cols.local), &cols.local];
     let query = format!(
-        "SELECT {sel} FROM \"{table}\" WHERE ({ts}, {seq}, {lid}) > (?1, ?2, ?3) ORDER BY {ord} LIMIT {page}",
+        "SELECT {sel} FROM \"{table}\" WHERE {lid} > ?1 ORDER BY {lid} LIMIT {page}",
         sel = cols.selected.join(", "),
-        ord = order.join(", "),
-        ts = time,
-        seq = cols.seq.as_deref().unwrap_or(&cols.local),
         lid = cols.local,
         page = READ_PAGE,
     );
     let mut stmt = conn.prepare(&query)?;
-    let mut rows = stmt.query(rusqlite::params![
-        watermark.create_time,
-        watermark.sort_seq,
-        watermark.local_id
-    ])?;
+    let mut rows = stmt.query([watermark.local_id])?;
     let mut out = Vec::new();
-    // sender display resolution needs contacts, which we do not have here;
-    // caller (sync engine) re-resolves names after applying
-    let empty: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+    // Sender display names are resolved by the applying sync engine.
     let no_contacts: std::collections::HashMap<String, Contact> = std::collections::HashMap::new();
     while let Some(row) = rows.next()? {
-        let owned = cols.extract(row, &uid_map);
+        // A malformed local ID cannot silently become zero and stall/replay
+        // the drain loop. Its decode must fail before any progress is applied.
+        let local_id: i64 = row.get(0)?;
+        anyhow::ensure!(local_id > watermark.local_id, "message scan position did not advance");
+        let owned = cols.extract(row, uid_map);
         out.push(row_to_record(owned, "", &no_contacts));
     }
-    let _ = empty;
     Ok(out)
 }
 
@@ -895,7 +922,7 @@ mod tests {
             1,
             "夹具表必须落在 message_tables 的谓词里: {tables:?}"
         );
-        let err = read_new(&conn, "msg_2021f50af0b435101c0219d73dd2d44b", &Watermark::default(), None)
+        let err = read_new(&conn, "msg_2021f50af0b435101c0219d73dd2d44b", &Watermark::default(), &std::collections::HashMap::new())
             .expect_err("无 time 列必须报错，不能静默返回空增量");
         let text = format!("{err}");
         assert!(
@@ -924,7 +951,7 @@ mod tests {
         "
         )
         .unwrap();
-        let rows = read_new(&conn, "msg_2021f50af0b435101c0219d73dd2d44b", &Watermark::default(), None)
+        let rows = read_new(&conn, "msg_2021f50af0b435101c0219d73dd2d44b", &Watermark::default(), &std::collections::HashMap::new())
             .expect("补上时间列后同一张表必须可读");
         // 不只数条数：一个「无论有没有时间列都吐 1 行」的实现会骗过 len 断言。
         // 内容断言把它钉死——上一测试要红，这条要绿，两个方向才都成立。
@@ -1138,5 +1165,90 @@ mod tests {
             .filter(|l| l.contains("no key for") && l.contains("DEBUG"))
             .count();
         assert!(debugs >= 1, "分母枚举步的同一事实应落 debug（至少一行）");
+    }
+
+    /// 可选元库（contact）缺密钥时消息索引照常构建：降级不得放大成整体缺失。
+    ///
+    /// 失败模式（修之前）：缺 contact 密钥的分支 `return Ok(store)`，消息扫描
+    /// 整体不跑——注册照样 ready，消息零条。
+    #[test]
+    fn missing_contact_key_still_builds_the_message_index() {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "weflow-idx-contact-key-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("message")).unwrap();
+        std::fs::create_dir_all(dir.join("contact")).unwrap();
+
+        // contact.db：文件存在、但**不提供密钥**——降级路径的精确形态。
+        let contact = dir.join("contact/contact.db");
+        {
+            let conn = rusqlite::Connection::open(&contact).unwrap();
+            conn.execute_batch(&format!(
+                "PRAGMA cipher_page_size = 4096;
+                 PRAGMA key = \"x'{}'\";
+                 PRAGMA journal_mode = DELETE;
+                 CREATE TABLE Contact (userName TEXT PRIMARY KEY, nickName TEXT);",
+                hex::encode([9u8; 32])
+            ))
+            .unwrap();
+        }
+        // 消息库：有键、含一行。它必须被读到。
+        let keyed = dir.join("message/message.db");
+        {
+            let conn = rusqlite::Connection::open(&keyed).unwrap();
+            conn.execute_batch(&format!(
+                "PRAGMA cipher_page_size = 4096;
+                 PRAGMA key = \"x'{}'\";
+                 PRAGMA journal_mode = DELETE;
+                 CREATE TABLE \"msg_2021f50af0b435101c0219d73dd2d44b\" (
+                    local_id INTEGER PRIMARY KEY,
+                    server_id INTEGER,
+                    local_type INTEGER,
+                    create_time INTEGER,
+                    sort_seq INTEGER,
+                    real_sender_id INTEGER,
+                    message_content TEXT,
+                    compress_content BLOB
+                 );
+                 INSERT INTO \"msg_2021f50af0b435101c0219d73dd2d44b\"
+                    (local_id, server_id, local_type, create_time, sort_seq, real_sender_id, message_content)
+                    VALUES (1, 100, 1, 1700000000, 0, 0, '你好');",
+                hex::encode([1u8; 32])
+            ))
+            .unwrap();
+        }
+        let files = vec![
+            crate::db::scan::DbFile {
+                rel: "contact/contact.db".into(),
+                abs: contact,
+                wal: None,
+                kind: crate::db::scan::DbKind::Contact,
+            },
+            crate::db::scan::DbFile {
+                rel: "message/message.db".into(),
+                abs: keyed,
+                wal: None,
+                kind: crate::db::scan::DbKind::Message,
+            },
+        ];
+        let keys = crate::keystore::KeyMap::Map(
+            [("message/message.db".to_string(), crate::keystore::DbKey([1; 32]))]
+                .into_iter()
+                .collect(),
+        );
+        let mut pool = crate::db::live::LivePool::new();
+        let progress = IndexProgress::default();
+        let store = build_all_live(&mut pool, &keys, "wxid_x", &files, &progress)
+            .expect("缺 contact 密钥不该让索引失败");
+        assert_eq!(
+            store.convs["2021f50af0b435101c0219d73dd2d44b"].len(),
+            1,
+            "contact 缺密钥只是降级：消息库的行必须照常进索引"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -296,6 +296,7 @@ curl -H "Authorization: Bearer <token>" \
 | `end` | string | 否 | 上界，Unix 秒或 `YYYYMMDD`（含当天 23:59:59） |
 | `limit` | integer | 否 | 单页条数，默认与上限均为 5000 |
 | `offset` | integer | 否 | 页内偏移，默认 0 |
+| `cursor` | string | 否 | 不透明进度游标，原样回传 `sync.nextCursor`；给出时取代 `since` / `offset` |
 
 **响应**：
 ```json
@@ -304,8 +305,8 @@ curl -H "Authorization: Bearer <token>" \
 "platformId": "<wxid>", "accountName": "<昵称>", "groupNickname": "<群名片>", "avatar": "" } ], "messages": [ {
 "sender": "<wxid>", "accountName": "<昵称>", "groupNickname": "<群名片>", "timestamp": 1700000103, "type": 0,
 "content": "大家好", "platformMessageId": "8200000000000000000", "media": { "type": "image",
-"fileName": "<md5>.jpg", "md5": "<md5>" } } ], "sync": { "hasMore": true, "nextSince": 1700000103,
-"nextOffset": 0, "watermark": 1700000200 } }
+"fileName": "<md5>.jpg", "md5": "<md5>" } } ], "sync": { "hasMore": true, "nextCursor": "<opaque>",
+"nextSince": 1700000103, "nextOffset": 0, "watermark": 1700000200 } }
 ```
 
 `messages[].mediaId` 是「此刻取得到字节」的承诺：出现时按它去 `GET /api/v1/media/{id}` 必须成功。判据是本会话导出目录下确有该文件、且名字由内容摘要派生；缺一个就整个键省略。
@@ -317,6 +318,9 @@ curl -H "Authorization: Bearer <token>" \
 - `since` 排他（`create_time > since`），`end` 包含（`<= end`）。
 - 页面按时间戳整秒组补齐：达到 `limit` 后仍会把当前秒的剩余消息取完，故一页可能略多于 `limit`。这保证 `nextSince` 一定能前进。
 - `nextSince` 是本页最后一条的时间戳，不是整个会话的最大时间戳。`nextOffset` 常为 `0`；两个游标都应原样回传，叠加会二次跳过同一批行。`watermark` 是本次拉取的时间上界；排空后 `nextSince` 停在该上界。类型码与字段语义见「ChatLab 适配面」的「字段语义」小节。
+- `nextCursor` 是不透明进度游标：原样回传给 `cursor`，不要解析，也不要自己按 `nextSince` / `offset` 续拉。排空后它仍在场（与消息面 `page.nextCursor` 排空为 `null` 不同），它是下一次增量请求的起点。
+- 它绑定进程、账号、会话、注册代次与数据源世代。语法坏或版本未知返回 400；旧格式游标、跨进程 / 账号 / 会话、代次不符一律返回 409，响应体带 `reason: "cursor_reset_required"`。此时丢弃游标、从头拉一次，不要重试同一条。
+- 失效判据只到数据源身份（换库、分片增删）；同一库文件的备份还原检测不到，边界见 `docs/architecture.md` 的「导出与媒体」。
 
 ### GET `/api/v1/contacts` — 联系人
 
@@ -373,11 +377,46 @@ curl -H "Authorization: Bearer <token>" \
 
 - 成员标识键为 `wxid`（非 `username`）。成员集合是「名册 ∪ 发言人」：潜水成员也会出现，其 `messageCount` 为 `0`；发过言但已不在名册里的照旧保留。
 - 名册里的成员可能连联系人档案都没有：那时 `displayName` 回落 `wxid`。排序按 `messageCount` 降序、`wxid` 升序。`messageCount` 仅在 `includeMessageCounts=1` 时为真实值。
+- 元数据刷新失败时保留上一份完整联系人、群主、名册或群名片，并在后续同步重试；成功刷新后移除已删除的元数据项。
 - `isOwner` 由 `chat_room.owner` 解析；群主不在本页时全为 `false`。`fromCache` 恒为 `false`：本请求既不读盘、也不触发同步。`updatedAt` 是索引构建/更新完成时刻，毫秒。
+
+### POST `/api/v1/media/export` — 定向导出消息媒体
+
+在当前账号整个会话中唯一定位目标，并导出可取的本地字节。
+
+**请求**
+
+```bash
+curl -X POST -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"talker":"<session-id>","platformMessageId":"<message-id>","sender":"<sender-id>","timestamp":1700000000}' \
+  "http://127.0.0.1:5033/api/v1/media/export"
+```
+
+将 `<session-id>`、`<message-id>` 和 `<sender-id>` 替换为消息所在会话、消息 ID 和发送者 ID。
+
+**参数**
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `talker` | string | 是 | 会话 ID |
+| `platformMessageId` | string | 是 | 平台消息 ID |
+| `sender` | string | 是 | 发送者 ID |
+| `timestamp` | integer | 是 | 发送时刻，Unix 秒 |
+
+**响应**
+
+```json
+{"success":true,"mediaId":"<64-hex>.png","fileName":"<md5>.jpg","mediaUrl":"/api/v1/media/<64-hex>.png"}
+```
+
+- `mediaId` 是可取句柄：URL 安全单段 token，由落盘字节的摘要派生。`fileName` 是消息自带的展示名，**不能拿它取字节**，两者通常不相等。
+- `mediaUrl` 是不含凭据的根相对地址，末段就是 `mediaId`；随后通过 `GET /api/v1/media/{id}` 取字节。接口不下载任意外链。
+- 字段非法为 400、未鉴权为 401、目标或源文件缺失为 404、目标不唯一、注册切换或**数据源身份变化**为 409。
+- 无可导出的本地媒体为 422、读取或导出失败为 500、账号未就绪为 503。旧消息不受默认分页大小限制。
 
 ### GET `/api/v1/media/{id}` — 按文件名取字节（唯一的字节面）
 
-`{id}` 是导出文件名（形如 `<md5>.<ext>`），也就是消息的 `media.fileName` 或 `mediaId`。
+`{id}` 是导出产物的文件名，也就是消息的 `mediaId`；消息面的 `media.fileName` 只在导出回填后才与它相同。
 
 **请求**：
 ```bash
@@ -389,7 +428,7 @@ curl -H "Authorization: Bearer <token>" \
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `id` | string(path) | 是 | 导出文件名，即消息的 `media.fileName` / `mediaId` |
+| `id` | string(path) | 是 | 导出产物文件名，即消息的 `mediaId` |
 
 **响应**：
 ```text
@@ -447,7 +486,7 @@ curl -X POST -H "Authorization: Bearer <token>" http://127.0.0.1:5033/api/v1/syn
 { "success": true, "newMessages": 3, "revokeMessages": 0 }
 ```
 
-立即跑一次水位增量同步。正常情况下由文件监视自动触发，此端点用于强制对账。
+立即跑一次入库进度增量同步。新增行即使携带较早的发送时间也会进入索引；每个数据库分片独立推进。正常情况下由文件监视自动触发，此端点用于强制对账。
 
 - 撤回计数键为 `revokeMessages`，不计入 `newMessages`。新消息同时会通过 SSE 推给已订阅的客户端。这是一个触发器，不返回消息体。
 
@@ -637,14 +676,18 @@ timeline / export 的条目键共 20 个：
 **只读查询**：
 
 - 账号与就绪：`health()` / `accounts()` / `wait_ready()`
-- 消息与其它面：`pull_page()` / `drain_session()` / `list_messages()` / `chatlab_messages()` / `contacts()` / `group_members()` / `list_all_sessions()`
+- 消息与其它面：`pull_page()` / `pull_page_cursor()` / `drain_session()` / `drain_session_cursor()` / `list_messages()` / `chatlab_messages()` / `contacts()` / `group_members()` / `list_all_sessions()`
 - 媒体与推送：`media_bytes()` / `media_bytes_by_id()` / `watch()`
 
 **动作**：`register()`（非阻塞，返回原始 `state`/`status`）、`ensure_ready()`（注册 + 轮询，200 的拒绝态立即失败）、`sync_now()`（写动作，只有显式调用才触发）。
 
 - 一页语义 vs 取尽语义：`pull_page` / `list_messages` / `chatlab_messages` / `contacts` 只取一页；`drain_session` / `list_all_sessions` 内部翻页到 `hasMore=false`。
-- 游标必须原样回传：`pull_page` 的 `nextSince` / `nextOffset` 叠加会二次跳过同一批行。
+- 游标必须原样回传：`pull_page` 的 `nextSince` / `nextOffset` 叠加会二次跳过同一批行；`pull_page_cursor` / `drain_session_cursor` 走不透明游标，给出游标时不发 `since` / `offset`。
+- 游标失效（409 + `reason: "cursor_reset_required"`）单独成一类错误：`ClientError::CursorReset` / `CursorReset`，不并进 `Status`。
+  - `drain_session_cursor` 把它**原样上抛**：循环已把先前的页交给回调，自动从头重来会重复交付已交付的页；从头拉一次并对已交付集合去重是调用方的事。
+  - 翻页中「下一游标为空或与请求游标相同」是形状错误，同样上抛（继续翻页会原地打转）。
 - `group_members` 的计数开关关闭时不发参数（不是发 `0`）；`list_all_sessions` 的 `page_size` 上限 10000。`media_bytes` 在 404 后按「先 `media=1` 导出再取」自动重试一次；`media_bytes_by_id` 不触发导出。
+- 重试时导出行按（平台消息 id、sender、timestamp）三元组定位：恰好一行用它的落盘名重试，零行报「导出页不含目标」，多行报「无法确定哪一行才是本条」。
 - `watch()` 的游标只在帧被消费时推进；只有 `id:` 没有 `data:` 的悬空帧不推进。类型与操作客户端由 `/openapi.json` 生成（`cargo run -p weflow-regen` / `python scripts/regen.py`），生成物入库、CI 断言无 diff；不要手改生成物。
 - 行为层手写：`clients/rust/src/client.rs` 与 `clients/python/src/weflow_sdk/client.py`。Python 另有 `SyncClient`，方法面与 `Client` 一一对应，内部跑专属事件循环线程。
 - 错误按性质分派：HTTP 非 2xx → `Status`；连接/超时/重置/URL 解析失败 → `Transport`；JSON 合法但不合承诺形状 → `Shape`。超时按单次操作计时、有进展即复位，没有总时限：连接 5s、普通 JSON 请求 30s、成本由数据量决定的一族 90s。

@@ -37,7 +37,7 @@ pub async fn handler(
     let include_media = media_requested(&params);
 
     // store 的读 guard 不是 Send：所有碰索引的事都在这个 scope 内做完，出 scope 再 await。
-    let (page, export_jobs, messages, members, meta, local_ids) = {
+    let (page, export_jobs, messages, members, meta, row_positions) = {
         let store = account.store.read();
         let page = page_slice(&store, &q)?;
         let jobs = if include_media {
@@ -63,12 +63,11 @@ pub async fn handler(
             .filter(|m| !m.sender_username.is_empty() && seen.insert(m.sender_username.as_str()))
             .map(|m| crate::server::chatlab::member_fields(&store, chatroom, &m.sender_username))
             .collect();
-        let mut local_ids: Vec<i64> = Vec::with_capacity(slice.len());
+        let row_positions: Vec<i64> = page.indices.iter().rev().map(|i| *i as i64).collect();
         let messages: Vec<ChatlabMessage> = slice
             .iter()
             .map(|m| {
                 // 字段怎么填只有一处出处（server::chatlab）；这里只剩这个面自己的信封。
-                local_ids.push(m.local_id);
                 let f = crate::server::chatlab::message_fields(&store, chatroom, m);
                 ChatlabMessage {
                     account_name: f.account_name,
@@ -85,7 +84,7 @@ pub async fn handler(
             .collect();
         let (group_id, owner_id) = (q.talker.clone(), store.my_wxid.clone());
         let meta = crate::server::chatlab::meta(&store, &q.talker, group_id, owner_id);
-        (page, jobs, messages, members, meta, local_ids)
+        (page, jobs, messages, members, meta, row_positions)
     };
 
     // media=1：**真正执行导出**。旧混合面在收集任务之前就 return 了，因此 media=1 在 ChatLab
@@ -95,8 +94,8 @@ pub async fn handler(
     // 句柄（外链与平台名都给不出跨会话唯一的句柄）。没落盘的照给元数据、不给句柄。
     let exported = run_export_batch(&state, &account, export_jobs).await;
     let mut messages = messages;
-    for (idx, local_id) in local_ids.iter().enumerate() {
-        let Some(res) = exported.get(local_id) else {
+    for (idx, position) in row_positions.iter().enumerate() {
+        let Some(res) = exported.get(position) else {
             continue;
         };
         if res.external_url.is_some() || !res.digest_named {

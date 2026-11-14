@@ -27,7 +27,7 @@ WEFLOW_BASE_URL=http://127.0.0.1:6002 weflow-server mcp
 | 工具 | 面 | 说明 |
 |---|---|---|
 | `list_sessions` | 会话发现面 | 可选 `keyword`（服务端过滤）；返回 username / displayName / sessionType / messageCount 等 |
-| `get_messages` | Pull 面 | ChatLab 形状、时间升序；游标 `nextSince`/`nextOffset`，另回 `sinceResolved` |
+| `get_messages` | Pull 面 | ChatLab 形状、时间升序；游标 `nextCursor`（不透明，原样回传 `cursor`），另回 `nextSince`/`nextOffset`/`sinceResolved` |
 | `get_messages_raw` | 原生消息面 | 带 `rawContent` / `isSend` / `localType` 与媒体元数据；按 `offset` 翻页 |
 | `search_messages` | ChatLab 消息面 | 会话内关键词检索；按 `offset` 翻页 |
 | `get_contacts` | 联系人面 | 备注 / 昵称 / 别名只在这个面出现 |
@@ -39,14 +39,20 @@ WEFLOW_BASE_URL=http://127.0.0.1:6002 weflow-server mcp
 
 - 「取一页」类工具的 `limit` 默认 50、上限 200（超出按 200 计）。
 - 单次输出预算约 32 KB：超出时**少给若干条**并置 `truncated: true`。第一条永远保留——否则一条长消息会得到「既无内容又无截断标记」的结果。
-- `get_messages` 截断时**不返回整页游标** `nextSince`（用它续拉会跳过没给出去的那些条），但**返回 `nextOffset`**（连续切片，正好指向被砍掉的第一条）与 `sinceResolved`（本轮 `since` 解析出的**排他**绝对下界）。
-  - 续拉请传 `nextOffset` 且 `since` 传 `sinceResolved`——不要重发相对串（如 `7d`）：续拉发生在下一轮对话，「现在」已经前移，相对串会把窗口悄悄前移。
-  - 未提供 `since` 时 `sinceResolved` 为 null（等价于不传）。
+- `get_messages` 的 `nextCursor` 是服务端编码的进度游标：原样回传给 `cursor`，不要解析。
+  - 给了 `cursor` 的请求不再返回 `nextOffset`：它是同一时间组内的位置，套在游标流上没有意义。
+  - 游标失效是工具级错误，并指名「不要带 `cursor` 重来」：409 加 `reason` 属可自愈的输入过期。
+- `get_messages` 截断时**不返回**整页游标 `nextSince`（用它续拉会跳过没给出去的条），但**返回** `nextOffset` 与 `sinceResolved`。
+  - **非游标模式**（请求没带 `cursor`）：`nextOffset` 是连续切片，正好指向被砍掉的第一条；续拉传 `nextOffset` 且 `since` 传 `sinceResolved`——不要重发相对串（如 `7d`）：续拉发生在下一轮对话，「现在」已经前移，相对串会把窗口悄悄前移。未提供 `since` 时 `sinceResolved` 为 null（等价于不传）。
+  - **游标模式**（请求带了 `cursor`）：`nextOffset` 为 null——它是同一时间组内的位置，套在游标流上没有意义。续拉**保留原游标**、减小 `limit` 重取本页。
+    - 重取结果按 `(timestamp, sender, platformMessageId)` 组合去重：`platformMessageId` 单独不是全局唯一身份，不同源分片表的行可带同一 `server_id`。
+    - 此时 `nextCursor` 原样回传**本次入参游标**（表示「本页还没读完」）。`nextOffset` 不是游标页的续拉机制。
+  - 截断时 `nextCursor` 原样回传**本次入参游标**：它表示「本页还没读完」，配更小的 `limit` 重取本页即可。
 - `search_messages` 与 `get_messages_raw` 同按 `offset` 翻页、本页是连续切片，截断时 `nextOffset` 正好指向被砍掉的第一条（并把 `hasMore` 置真）。
 
 ## 失败通道
 
-- **工具级错误**（会话不存在、查无结果）：调用方看得到我们写的说明。
+- **工具级错误**（会话不存在、查无结果、`get_messages` 的游标已失效）：调用方看得到我们写的说明。
 - **协议级错误**（缺 token、传输层失败）：多数客户端只渲染成一句笼统的内部错误，所以可读的说明只留给前者。
 
 ## 刻意不做

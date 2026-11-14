@@ -20,11 +20,10 @@ use serde_json::{json, Value};
 const TOKEN: &str = "e2e-token-0123456789abcdef";
 const TALKER: &str = "wxid_demo";
 
-/// 媒体导出请求的**观测探针**：桩服务端记下每一次 `/chatlab/messages` 的完整查询串，
-/// 只记 `win-talker` 与 `handle-talker` 两个会话（其余测试也打这个面）。记录时**带上
-/// 窗口断言靠它钉「导出请求的 `start`/`end` 跟着 Pull 页走」与「次数与窗口大小成
-/// 比例而不是与全历史成比例」——没有这个观测面，成本类的断言就只能靠推断。
+/// Record legacy window requests so targeted restoration can assert none occur.
+/// Concurrent tests use separate conversation IDs before comparing records.
 static WINDOW_QUERIES: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+static TARGET_EXPORTS: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
 
 fn session_json() -> Value {
     json!({
@@ -64,6 +63,7 @@ async fn spawn_stub() -> String {
         .route("/api/v1/messages", get(messages_with_status))
         .route("/api/v1/contacts", get(contacts))
         .route("/api/v1/media/{id}", get(media))
+        .route("/api/v1/media/export", post(target_export))
         .route("/chatlab/messages", get(chatlab));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -106,10 +106,10 @@ async fn pull(
     // map-talker：拉取面给**原始名**（photo.png），而消息面给回填名（digest.png，见 chatlab 分支），
     // 同一条消息 id——CLI 必须按消息 id 把导出物的句柄对回实际落盘的名字。
     // `win-talker`：250 条带媒体的消息，分两页给（150＋100），时间戳刻意跨两个秒段，
-    // 用来验单遍化后「一次 Pull 页 ⇒ 一次窗口导出请求」。
+    // 用来验证缺少句柄的消息逐条定向恢复。
     // `handle-talker`：三行都带媒体，但只有前两行**带 mediaId**（拉取面已经给出可取句柄），
-    // 第三行只有 media、没有句柄 ⇒ 必须走「按页窗口导出」那一条路。用来钉两件事：
-    // ① 有句柄的行一发导出请求都不发；② 慢路径的窗口只覆盖**剩下那些行**的时间戳。
+    // 第三行只有 media、没有句柄，必须走定向导出。
+    // 有句柄的行不发导出请求；缺少句柄的行按完整身份定位。
     if id == "wxid_nope" {
         // B 侧：不存在的会话在拉取面 404 统一信封——`--session` 拼错必须仍进
         // skipped 并退 1（「空会话不算失败」的口径不放宽到 404）。
@@ -160,20 +160,99 @@ async fn pull(
         }))
         .into_response();
     }
+    if id == "cursor-talker" {
+        // 两页各三条：小到不会撞上字符预算，于是「有没有截断」不会混进游标断言。
+        let raw = q.as_deref().unwrap_or_default();
+        let second = raw.split('&').any(|kv| kv == "cursor=ct1");
+        if raw.split('&').any(|kv| kv == "cursor=ct2") {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(json!({
+                    "success": false, "code": 400,
+                    "message": "stub: hasMore=false 之后不应再翻页"
+                })),
+            )
+                .into_response();
+        }
+        let messages: Vec<Value> = (0..3)
+            .map(|k| {
+                let mut m = pull_message();
+                m["platformMessageId"] = json!(format!("c-{}-{k}", usize::from(second)));
+                m["timestamp"] = json!(1_700_000_000 + k as i64);
+                m
+            })
+            .collect();
+        return Json(json!({
+            "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
+            "members": [], "messages": messages,
+            "meta": {"groupId": "", "name": "演示会话", "ownerId": "", "platform": "wechat", "type": "private"},
+            "sync": {
+                "hasMore": !second,
+                "nextCursor": if second { "ct2" } else { "ct1" },
+                "nextSince": 1_700_000_002, "nextOffset": 0, "watermark": 1_700_000_002,
+            },
+        }))
+        .into_response();
+    }
+    if id == "reset-talker" {
+        // 游标在导出途中失效：服务端回 409 + 机器可读的 `reason`（客户端不得去匹配中文
+        // `message`）。第一页故意留 hasMore=true 且给出游标，失效就发生在第二页。
+        let raw = q.as_deref().unwrap_or_default();
+        if raw.split('&').any(|kv| kv == "cursor=r1") {
+            return (
+                axum::http::StatusCode::CONFLICT,
+                axum::Json(json!({
+                    "success": false, "code": 409,
+                    "message": "cursor is no longer valid; restart the pull without a cursor",
+                    "reason": "cursor_reset_required",
+                })),
+            )
+                .into_response();
+        }
+        return Json(json!({
+            "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
+            "members": [], "messages": [pull_message()],
+            "meta": {"groupId": "", "name": "演示会话", "ownerId": "", "platform": "wechat", "type": "private"},
+            "sync": {"hasMore": true, "nextCursor": "r1", "nextSince": 1_700_000_000, "nextOffset": 0, "watermark": 1_700_000_000},
+        }))
+        .into_response();
+    }
     if id == "win-talker" {
         let raw = q.unwrap_or_default();
-        let offset: usize = raw
-            .split('&')
-            .find_map(|kv| kv.strip_prefix("offset="))
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        let second = offset > 0;
+        // 拉取面的进度游标必须**原样回传**。客户端若自己按 offset/since 续拉，这里直接
+        // 拒绝：少了几页在产物里看不出来，只有让旧的续拉方式响亮失败，回归才有信号。
+        if raw.split('&').any(|kv| kv.starts_with("offset=")) {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(json!({
+                    "success": false, "code": 400,
+                    "message": "stub: 拉取面不接受 offset，客户端必须原样回传 nextCursor"
+                })),
+            )
+                .into_response();
+        }
+        let second = raw.split('&').any(|kv| kv == "cursor=c1");
+        // 排空后游标**仍在场**（服务端的契约如此：它是下一次增量的起点，不终结）。客户
+        // 端必须按 hasMore 停，而不是按「游标没了」停；真按 c2 再翻一次就是错的。
+        if raw.split('&').any(|kv| kv == "cursor=c2") {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(json!({
+                    "success": false, "code": 400,
+                    "message": "stub: hasMore=false 之后不应再翻页"
+                })),
+            )
+                .into_response();
+        }
         let n = if second { 100 } else { 150 };
+        // 号的**段基**跟着页走（0 段 + 150 段），这样两条消息的句柄必然不同：句柄一旦
+        // 撞名，产物里少掉的那一条就只能靠「250 条都各有句柄」这条断言发现。
+        let base_id = if second { 150 } else { 0 };
         let base = if second { 1_700_001_000 } else { 1_700_000_000 };
         let messages: Vec<Value> = (0..n)
             .map(|k| {
                 let mut m = pull_message();
-                m["platformMessageId"] = json!(format!("w{offset}-{k}"));
+                m["platformMessageId"] = json!(format!("w{}-{k}", base_id));
                 m["timestamp"] = json!(base + (k as i64 / 50));
                 m["media"] = json!({"fileName": format!("{:032x}.png", k), "type": "image"});
                 m
@@ -184,7 +263,12 @@ async fn pull(
             "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
             "members": [], "messages": messages,
             "meta": {"groupId": "", "name": "演示会话", "ownerId": "", "platform": "wechat", "type": "private"},
-            "sync": {"hasMore": !second, "nextSince": next_ts, "nextOffset": if second { 0 } else { 150 }, "watermark": next_ts},
+            "sync": {
+                "hasMore": !second,
+                // 排空后仍给一条游标：与「hasMore 决定是否继续」的约定一起钉住。
+                "nextCursor": if second { "c2" } else { "c1" },
+                "nextSince": next_ts, "nextOffset": 0, "watermark": next_ts,
+            },
         }))
         .into_response();
     }
@@ -275,6 +359,31 @@ async fn media(
     } else {
         (axum::http::StatusCode::OK, b"PNG-BYTES".to_vec())
     }
+}
+
+async fn target_export(Json(target): Json<Value>) -> axum::response::Response {
+    let talker = target["talker"].as_str().unwrap();
+    let mid = target["platformMessageId"].as_str().unwrap();
+    if matches!(talker, "win-talker" | "handle-talker") {
+        TARGET_EXPORTS.lock().unwrap().push(target.clone());
+    }
+    if talker == "gone-talker" {
+        return (axum::http::StatusCode::NOT_FOUND, Json(json!({"success":false}))).into_response();
+    }
+    let name = match talker {
+        "map-talker" => "digest.png".into(),
+        "evil-talker" if mid == "100" => "../../escape.png".into(),
+        "evil-talker" => "digest.png".into(),
+        "handle-talker" => "ccc.png".into(),
+        "boom-talker" => "boom.png".into(),
+        "win-talker" => {
+            let (offset, index) = mid.strip_prefix('w').unwrap().split_once('-').unwrap();
+            format!("{:032x}.png", offset.parse::<usize>().unwrap() + index.parse::<usize>().unwrap())
+        }
+        _ => "deadbeef.png".into(),
+    };
+    Json(json!({"success":true, "mediaId":name, "fileName":name,
+                "mediaUrl":format!("/api/v1/media/{name}")})).into_response()
 }
 
 async fn chatlab(axum::extract::RawQuery(q): axum::extract::RawQuery) -> Json<Value> {
@@ -624,30 +733,16 @@ async fn with_media_fails_loudly_when_bytes_fetch_errors() {
 /// 404 与 5xx **必须区别对待**：404 =「这个句柄本来就取不到」→ 跳过、整轮仍成功；
 /// 5xx =「这次没拿到」→ 上抛、该会话进 skipped。只测一侧，就会漏掉「把 404 也改成失败」的实现。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn with_media_skips_an_unfetchable_handle_without_failing() {
+async fn with_media_reports_an_unrecoverable_source() {
     let base = spawn_stub().await;
     let dir = std::env::temp_dir().join(format!("weflow-e2e-mediagone-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let (code, stdout, stderr) = run(
-        &base,
-        &[
-            "export", "--out", dir.to_str().unwrap(), "--format", "jsonl", "--with-media",
-            "--session", "gone-talker",
-        ],
-    );
-    assert_eq!(code, 0, "404 是「不可取句柄」，不该让整轮失败；stdout: {stdout} stderr: {stderr}");
-    assert!(!dir.join("media").join("gone.png").exists(), "取不到的句柄不该留下字节");
-    let jsonl = std::fs::read_dir(&dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
-        .expect("应有 jsonl");
-    let body = std::fs::read_to_string(&jsonl).unwrap();
-    assert!(!body.contains("gone.png"), "没有字节的句柄不该写进导出物: {body}");
-    // 对账是承重的：两面都带这个句柄，若「取到 404 后不把句柄从导出物里清掉」，
-    // 上面那条 !contains 就会红 —— 这里点名对账调用本身被删的情形（回归位置：
-    // retain_downloaded_media 调用点）。删掉它 ⇒ 本用例必须红。
+    let (code, stdout, stderr) = run(&base, &[
+        "export", "--out", dir.to_str().unwrap(), "--format", "jsonl", "--with-media", "--session", "gone-talker",
+    ]);
+    assert_eq!(code, 1, "missing source must be observable: {stdout} {stderr}");
+    assert!(!dir.join("media/gone.png").exists());
+    assert!(!std::fs::read_dir(&dir).unwrap().flatten().any(|e| e.path().extension().is_some_and(|s| s == "jsonl")));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -857,6 +952,51 @@ async fn mcp_three_step_demo_lists_searches_and_fetches() {
     let _ = child.wait();
 }
 
+/// 取消息工具的游标必须原样回传：给出去的是服务端那串，拿回来照发，不改写也不解析。
+///
+/// 同时钉住两个字段的分工：游标模式不再给 `nextOffset`（它表示同一时间组内的位置，
+/// 套在游标流上等于把服务端编码的进度当偏移量用）。失效时给的是工具级错误并指名
+/// 「不要带 cursor 重来」——内部错误没有处置动作，agent 只会原地重试。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mcp_get_messages_echoes_the_opaque_cursor_and_says_what_to_do_when_it_expires() {
+    let base = spawn_stub().await;
+    let json_of = |r: &Value| -> Value {
+        let text = r["content"][0]["text"].as_str().unwrap_or_default();
+        serde_json::from_str(text).unwrap_or_else(|e| panic!("工具输出应是 JSON: {e} / {text}"))
+    };
+
+    let first = mcp_call(&base, "get_messages", json!({"talker": "cursor-talker"})).await;
+    assert_ne!(first["isError"], json!(true), "不该是工具级错误: {first}");
+    let first = json_of(&first);
+    assert_eq!(first["truncated"], json!(false), "三条消息不该被截断: {first}");
+    assert_eq!(first["hasMore"], json!(true), "第一页应报还有更多: {first}");
+    assert_eq!(first["nextCursor"], json!("ct1"), "游标要原样交出去: {first}");
+
+    let second = mcp_call(
+        &base,
+        "get_messages",
+        json!({"talker": "cursor-talker", "cursor": "ct1"}),
+    )
+    .await;
+    assert_ne!(second["isError"], json!(true), "不该是工具级错误: {second}");
+    let second = json_of(&second);
+    assert_eq!(second["count"], json!(3), "第二页取到剩下的三条: {second}");
+    assert_eq!(second["hasMore"], json!(false), "第二页已排空: {second}");
+    assert_eq!(second["nextCursor"], json!("ct2"), "排空后游标仍在场: {second}");
+    assert_eq!(second["nextOffset"], Value::Null, "游标模式不给 nextOffset: {second}");
+
+    let expired = mcp_call(
+        &base,
+        "get_messages",
+        json!({"talker": "reset-talker", "cursor": "r1"}),
+    )
+    .await;
+    assert_eq!(expired["isError"], json!(true), "失效游标应是工具级错误: {expired}");
+    let text = expired["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(text.contains("cursor"), "错误文本要指名字段: {expired}");
+    assert!(text.contains("不要带 cursor"), "错误文本要给出处置动作: {expired}");
+}
+
 /// 起一个 `mcp` 子进程、握手、调一次工具，返回 `result` 对象后杀掉进程。
 async fn mcp_call(base: &str, tool: &str, args: Value) -> Value {
     let mut child = Command::new(env!("CARGO_BIN_EXE_weflow-server"))
@@ -991,16 +1131,9 @@ fn export_rows_keeps_peak_rss_flat() {
 }
 
 
-/// 单遍化：媒体导出请求的**窗口跟着 Pull 页走**，而不是各扫一遍全历史。
-///
-/// 改造前是两趟独立的全历史遍历：消息面那一趟**不带 `start`/`end`**（那个面此前根本没被
-/// 下推过 `--since`），于是 `--since` 只管写出来的行、媒体照样把整个会话导出并重下一遍；
-/// 而两趟之间一旦有并发同步推进水位，第一趟没覆盖到的消息会「有行、无句柄」地静默缺件，
-/// 且没有任何计数说得出少了件。现在一条 Pull 页 ⇒ 一次窗口导出请求，两条断言一起钉住：
-/// ① 每个导出请求都带 `start`/`end`（下推成立）；② 请求条数等于 Pull 页数（窗口随分页
-/// 移动，而不是「整会话一次搞定」或「与页数无关的全历史」）。
+/// Every missing message triggers exactly one targeted export; legacy window queries stay unused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn media_window_follows_the_pull_page() {
+async fn targeted_media_restores_each_missing_message_once() {
     let base = spawn_stub().await;
     let dir = std::env::temp_dir().join(format!("weflow-e2e-window-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -1015,26 +1148,16 @@ async fn media_window_follows_the_pull_page() {
     // 只取本会话那几条：同一进程里另一条记录型用例（handle-talker）也在打这个面，
     // 不过滤就会被它写进来的记录打挂 —— 清表救不了（并发，另一条用例可能正好在清表与
     // 读表之间写入）。
-    let all = WINDOW_QUERIES.lock().unwrap().clone();
-    let queries: Vec<String> = all
-        .into_iter()
-        .filter(|(k, _)| k == "win-talker")
-        .map(|(_, q)| q)
-        .collect();
-    assert_eq!(queries.len(), 2, "一页 Pull 配一次窗口导出（桩给 150＋100 两页）: {queries:?}");
-    for q in &queries {
-        assert!(q.contains("start="), "导出请求必须带下推的 start: {q}");
-        assert!(q.contains("end="), "导出请求必须带下推的 end: {q}");
-    }
-    // 两页的窗口互不重叠 ⇒ 窗口是从 Pull 游标推出来的，不是同一个全历史区间被发了两遍。
-    let grab = |s: &str, key: &str| -> Option<i64> {
-        s.split('&').find_map(|kv| kv.strip_prefix(key))?.parse::<i64>().ok()
-    };
-    let w0 = (grab(&queries[0], "start="), grab(&queries[0], "end="));
-    let w1 = (grab(&queries[1], "start="), grab(&queries[1], "end="));
-    assert!(w0.0.is_some() && w0.1.is_some() && w1.0.is_some() && w1.1.is_some(), "窗口两端都可解析: {w0:?} {w1:?}");
-    assert!(w0.1.unwrap() < w1.0.unwrap(), "两页窗口应各自落在自己的时间段内（不重叠、不共用全历史）: {w0:?} vs {w1:?}");
-    // 地板：导出物里的句柄数与落盘文件数一致（单遍化没把任何一页的媒体漏掉）。
+    let requests: Vec<_> = TARGET_EXPORTS.lock().unwrap().iter()
+        .filter(|v| v["talker"] == "win-talker").cloned().collect();
+    assert_eq!(requests.len(), 250, "each missing media target must be restored once");
+    let unique: std::collections::BTreeSet<_> = requests.iter().map(|v| {
+        assert!(v.get("start").is_none() && v.get("end").is_none());
+        assert_eq!(v["sender"], "alice");
+        (v["platformMessageId"].as_str().unwrap(), v["timestamp"].as_i64().unwrap())
+    }).collect();
+    assert_eq!(unique.len(), 250);
+    assert!(WINDOW_QUERIES.lock().unwrap().iter().all(|(talker, _)| talker != "win-talker"));
     let jsonl = std::fs::read_dir(&dir)
         .unwrap()
         .flatten()
@@ -1062,6 +1185,33 @@ async fn media_window_follows_the_pull_page() {
     for h in &handles {
         assert!(dir.join("media").join(h).is_file(), "句柄 {h} 没有落盘字节");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 游标在导出途中失效时整个会话判失败，而不是「退回时间游标接着拉」。
+///
+/// 后者看起来更友好，实际会把已经写进 `.part` 的行再写一遍：产物里出现重复消息，而
+/// 重复的行不会让任何断言变红。失败后由 `--resume` 从头重建，错误文本必须点名它。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_expired_cursor_fails_the_session_instead_of_splicing_a_new_one() {
+    let base = spawn_stub().await;
+    let dir = std::env::temp_dir().join(format!("weflow-e2e-reset-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (code, stdout, stderr) = run(
+        &base,
+        &["export", "--out", dir.to_str().unwrap(), "--format", "jsonl", "--session", "reset-talker"],
+    );
+    assert_eq!(code, 1, "游标失效必须退 1（该会话记 skipped）: stdout: {stdout} stderr: {stderr}");
+    assert!(stderr.contains("--resume"), "错误文本要指名恢复手段: {stderr}");
+    assert!(stderr.contains("reset-talker"), "错误文本要指名是哪个会话: {stderr}");
+    let left: Vec<String> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".jsonl"))
+        .collect();
+    assert!(left.is_empty(), "半途而废的产物必须被删掉，不能留在交付包里: {left:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1097,12 +1247,7 @@ async fn with_media_reuses_bytes_already_on_disk() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 拉取面句柄的**快路径**：带 `mediaId` 的行直接取字节，**一发导出请求都不发**；只有没有
-/// 句柄的那些行才走「按页窗口导出」，且窗口只覆盖**那些行**的时间戳。
-///
-/// 为什么这条必须单独钉：两条路的分派写在同一个函数里，撤掉快路径（一律走窗口）时
-/// `media_window_follows_the_pull_page` 仍然全绿 —— 它看的是「窗口跟着页走」，而全走窗口恰好
-/// 是它的期望形状。只有「有句柄时导出请求数为 0」能抓住快路径被删掉这件事。
+/// Existing handles skip export; only the remaining message is restored by identity.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn media_id_from_pull_row_skips_the_export_round() {
     let base = spawn_stub().await;
@@ -1116,17 +1261,12 @@ async fn media_id_from_pull_row_skips_the_export_round() {
         ],
     );
     assert_eq!(code, 0, "stdout: {stdout} stderr: {stderr}");
-    let all = WINDOW_QUERIES.lock().unwrap().clone();
-    let queries: Vec<String> = all
-        .into_iter()
-        .filter(|(k, _)| k == "handle-talker")
-        .map(|(_, q)| q)
-        .collect();
-    assert_eq!(queries.len(), 1, "三行里只有第三行需要导出 ⇒ 恰好一发导出请求: {queries:?}");
-    // 窗口只覆盖**剩下那一行**的时间戳：1_700_000_500（前两行的 1_700_000_000 不得进窗口）。
-    assert!(queries[0].contains("start=1700000500"), "窗口应只覆盖缺句柄那些行: {}", queries[0]);
-    assert!(queries[0].contains("end=1700000500"), "同上（end 也是那一行的时间戳）: {}", queries[0]);
-    // 三行都要有字节：前两行来自拉取面句柄，第三行来自窗口导出。
+    let requests: Vec<_> = TARGET_EXPORTS.lock().unwrap().iter()
+        .filter(|v| v["talker"] == "handle-talker").cloned().collect();
+    assert_eq!(requests.len(), 1, "only the missing handle requires export");
+    assert_eq!(requests[0]["platformMessageId"], "h3");
+    assert_eq!(requests[0]["timestamp"], 1_700_000_500i64);
+    assert!(WINDOW_QUERIES.lock().unwrap().iter().all(|(talker, _)| talker != "handle-talker"));
     for name in ["aaa.png", "bbb.png", "ccc.png"] {
         assert!(
             dir.join("media").join(name).is_file(),

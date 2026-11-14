@@ -163,16 +163,16 @@ fn message_line(r: &Row) -> Value {
     v
 }
 
-/// 把一行的媒体句柄改写成该消息**确实落盘**的那个名字（按消息 id 查映射）。
+/// 把一行的媒体句柄改写成该消息**确实落盘**的那个名字（按消息 ID、发送者和时间查映射）。
 ///
 /// `--with-media` 给出的承诺是「导出物里出现的每一个 `fileName`，其字节都在同目录 `media/`
 /// 下」。拉取面携带的 fileName 是索引里的原始名，消息面回填的是导出后的内容摘要名，两者
-/// 不必相同——按名字对账会把下载成功的媒体引用整条删掉，所以映射的键是消息 id。映射里
+/// 不必相同——按名字对账会把下载成功的媒体引用整条删掉，所以映射的键是消息 ID、发送者和时间。映射里
 /// 没有的消息（外链、未导出、名字被拒）宁可**少一个 media 字段**，也不留下指向不存在文件
 /// 的句柄 —— 后者会让导入器在几万条消息之后才发现缺件。
-pub fn retain_downloaded_media(row: &mut Row, downloaded: &BTreeMap<String, String>) {
+pub fn retain_downloaded_media(row: &mut Row, downloaded: &BTreeMap<(String, String, i64), String>) {
     if row.media_file_name.is_some() {
-        row.media_file_name = downloaded.get(&row.platform_message_id).cloned();
+        row.media_file_name = downloaded.get(&(row.platform_message_id.clone(), row.sender.clone(), row.timestamp)).cloned();
     }
 }
 
@@ -934,8 +934,8 @@ mod tests {
     fn with_media_keeps_only_handles_whose_bytes_are_on_disk() {
         // 映射的键是消息 id：落盘名与拉取面给的原始名可以不同，按名字对账会把成功下载的
         // 媒体引用整条删掉（导出行仍引用原始名，磁盘上却是回填名）。
-        let mut have: BTreeMap<String, String> = BTreeMap::new();
-        have.insert("1".to_string(), "deadbeef.png".to_string());
+        let mut have: BTreeMap<(String, String, i64), String> = BTreeMap::new();
+        have.insert(("1".to_string(), "u1".to_string(), 1), "deadbeef.png".to_string());
 
         let mut kept = row("1", 1, "u1", "");
         kept.media_file_name = Some("original-name.png".into());
@@ -952,6 +952,11 @@ mod tests {
         dropped.media_type = Some("image".into());
         retain_downloaded_media(&mut dropped, &have);
         assert!(dropped.media_file_name.is_none(), "没有本地副本就不能留下句柄");
+        let mut collision = row("1", 1, "another-sender", "");
+        collision.media_file_name = Some("original-name.png".into());
+        retain_downloaded_media(&mut collision, &have);
+        assert!(collision.media_file_name.is_none(), "same ID with another sender must not borrow a handle");
+
 
         // 本来没有媒体的行不该被别的 id 的落盘名凭空加上句柄。
         let mut no_media = row("1", 3, "u1", "");

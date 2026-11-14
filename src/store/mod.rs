@@ -112,6 +112,8 @@ impl Contact {
 /// 一条消息。
 #[derive(Debug, Clone)]
 pub struct MessageRecord {
+    /// Source database/table shard. Local row numbers are unique only within it.
+    pub source_shard: std::sync::Arc<str>,
     /// 库内自增行号，同一 `(create_time, sort_seq)` 下的最终定序依据。
     pub local_id: i64,
     /// 服务端 id（微信分配）。**不保证唯一**：不同会话里可能出现同一个值。
@@ -237,6 +239,11 @@ pub struct SnsMedia {
 #[derive(Debug, Clone, Default)]
 pub struct Store {
     pub my_wxid: String,
+    /// 全量构建时因**发送者映射读不出来**而整库推迟的库（相对路径）。
+    ///
+    /// 这些库一条位置都没记，靠 `data_version` 基线永远等不到重试——构建期间
+    /// 没有任何新提交。增量轮询据此把它们强制重查，读成功后移除。
+    pub deferred_sender_maps: std::collections::BTreeSet<String>,
     /// username -> session summary
     pub sessions: HashMap<String, Session>,
     /// username -> messages (append-only; sorted lazily by the query layer)
@@ -263,6 +270,8 @@ pub struct Store {
     pub index_built_at_ms: i64,
     /// `<rel>:<table>` -> watermark of the last indexed row
     pub watermarks: HashMap<String, Watermark>,
+    /// Last scanned local ID per source shard, independent of message time.
+    pub scan_positions: HashMap<String, i64>,
     /// Moments timeline, sorted newest-first
     pub sns_feeds: Vec<SnsFeed>,
 }

@@ -28,13 +28,30 @@ Requires `tokio` with `rt-multi-thread` and `macros`; the SDK uses tokio for tim
 
 ## Generated and handwritten layers
 
-Types and request plumbing are generated; the behavior layer is handwritten. Never edit them by hand — run `cargo run -p weflow-regen --` instead.
+Types and request plumbing are generated; the behavior layer is handwritten. Never edit generated files by hand.
+
+From the repository root, run `powershell -File scripts/build.ps1 run -p weflow-regen --`.
 
 ## Scope
 
-Read-only over the user's databases; `sync` is the one state-changing call. Covers all read surfaces plus media export.
+Source databases stay read-only. `sync` refreshes the in-memory index; media export writes local copies.
 
 SNS timelines are the one gap: the server has those endpoints, the generated layer does not wrap them yet.
+
+## Targeted media recovery
+
+Restore one unique message with `export_media_by_message(talker, platform_message_id, sender, timestamp)`.
+
+The result provides the actual `mediaId`, `fileName` and credential-free relative `mediaUrl`.
+
+`media_bytes` tries the existing filename first. After a 404 it exports the target once and fetches the returned handle once.
+
+- 404: target or original media missing.
+- 409: ambiguous target or registration changed.
+- 422: no supported local media.
+- 405/501: server lacks targeted export; upgrade it before recovery.
+
+I/O and decode errors propagate. No recent-message search is used.
 
 ## Links
 

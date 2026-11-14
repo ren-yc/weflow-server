@@ -71,6 +71,7 @@
     },
     "sync": {
       "hasMore": false,
+      "nextCursor": "<volatile>",
       "nextOffset": 0,
       "nextSince": "<volatile>",
       "watermark": "<volatile>"
@@ -133,6 +134,7 @@
     "hasMore",
     "nextOffset",
     "nextSince",
+    "nextCursor",
     "watermark"
   ],
   "status": 200

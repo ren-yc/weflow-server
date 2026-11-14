@@ -2,18 +2,9 @@
 """Regenerate clients/python/src/weflow_sdk/generated from the server's
 OpenAPI description.
 
-Source of truth is the committed golden snapshot's body (the same bytes the
-server served when the snapshot was pinned), normalized to OpenAPI 3.0 the
-same way the Rust regen tool does it:
-
-  1. placeholder-masked volatile values (the golden masks a few string
-     properties) are restored to plain string schemas;
-  2. `type: [T, null]` becomes `T` + `nullable: true` (3.1 -> 3.0);
-  3. `oneOf: [T, {type: null}]` - utoipa's spelling of `Option<T>` - keeps
-     only the non-null arm (the handlers omit the key entirely when absent);
-  4. path-template placeholders get matching `parameters` declarations (the
-     server emits them since the same batch; kept here so regeneration also
-     works from a description fetched over HTTP).
+Source of truth is the server's live OpenAPI document, emitted by the Rust
+regenerator through the repository build wrapper. Build or document failures
+stop generation; golden placeholders are never used as model definitions.
 
 The normalized spec is committed next to the generated client, and CI
 asserts that rerunning this script produces no diff. Edit nothing under
@@ -36,7 +27,6 @@ import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
-GOLDEN = REPO / "tests" / "golden" / "openapi.json"
 OUT = Path(__file__).resolve().parents[1] / "src" / "weflow_sdk" / "generated"
 PKG = OUT.parent.name          # the generated package directory (its import root)
 PKGDIR = Path(__file__).resolve().parents[1]      # clients/python
@@ -47,98 +37,23 @@ CONFIG = PKGDIR / "openapitools.json"             # pins the generator jar versi
 WRAPPER = "@openapitools/openapi-generator-cli@2.41.0"
 
 
-def normalize(node):
-    """3.1-to-3.0 normalization, in place. Deterministic."""
-    if isinstance(node, list):
-        for item in node:
-            normalize(item)
-        return
-    if not isinstance(node, dict):
-        return
-    types = node.get("type")
-    if isinstance(types, list) and len(types) == 2 and "null" in types:
-        rest = [t for t in types if t != "null"]
-        node["nullable"] = True
-        node["type"] = rest[0] if len(rest) == 1 else rest
-    arms = node.get("oneOf")
-    if isinstance(arms, list):
-        kept = [a for a in arms if a.get("type") != "null"]
-        if len(kept) != len(arms):
-            if len(kept) == 1:
-                only = kept[0]
-                node.pop("oneOf")
-                node.update(only)
-            else:
-                node["oneOf"] = kept
-    for value in list(node.values()):
-        normalize(value)
-
-
 def build_spec() -> dict:
-    """Get the normalized 3.0 spec.
+    """Read the live OpenAPI document through the required Rust build wrapper."""
+    if sys.platform == "win32":
+        command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                   "-File", str(REPO / "scripts" / "build.ps1")]
+    else:
+        command = ["bash", str(REPO / "scripts" / "build.sh")]
+    command += ["run", "--locked", "-p", "weflow-regen", "--", "--dump-spec"]
+    result = subprocess.run(command, cwd=str(REPO), check=True,
+                            capture_output=True, text=True, encoding="utf-8", errors="replace")
+    # The wrapper emits its toolchain banner before the JSON document.
+    lines = result.stdout.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() == "{":
+            return json.loads("\n".join(lines[index:]))
+    raise RuntimeError("build wrapper returned no OpenAPI document")
 
-    Preferred source: ``cargo run -p weflow-regen -- --dump-spec`` - the
-    same normalization the Rust client's generator consumes, taken from the
-    live ``document()`` rather than the golden snapshot (whose placeholder
-    masking would burn wrong types - e.g. an integer watermark restored as
-    string - into generated models). Falls back to the snapshot when cargo
-    is unavailable, with a loud warning: the fallback can mis-type masked
-    properties.
-    """
-    import subprocess
-
-    try:
-        raw = subprocess.run(
-            ["cargo", "run", "--locked", "-p", "weflow-regen", "--", "--dump-spec"],
-            cwd=str(REPO),
-            check=True, capture_output=True, text=True,
-        ).stdout
-        return json.loads(raw)
-    except (OSError, subprocess.CalledProcessError) as exc:
-        print(
-            "WARNING: falling back to the golden snapshot; volatile-masked"
-            " properties will be typed as strings. Reason: "
-            + str(exc),
-            file=sys.stderr,
-        )
-    import re
-
-    doc = json.loads(GOLDEN.read_text(encoding="utf-8"))["body"]
-
-    def restore(node):
-        if isinstance(node, list):
-            for item in node:
-                restore(item)
-            return
-        if not isinstance(node, dict):
-            return
-        for key, value in list(node.items()):
-            if value == "<volatile>":
-                node[key] = {"type": "string"}
-            else:
-                restore(value)
-
-    restore(doc)
-    normalize(doc)
-    doc["openapi"] = "3.0.3"
-    for path, item in doc.get("paths", {}).items():
-        names = re.findall(r"\{(\w+)\}", path)
-        if not names:
-            continue
-        for op in item.values():
-            if not isinstance(op, dict):
-                continue
-            op["parameters"] = [
-                {
-                    "name": name,
-                    "in": "path",
-                    "required": True,
-                    "style": "simple",
-                    "schema": {"type": "string"},
-                }
-                for name in names
-            ]
-    return doc
 
 def tree_digest(root: Path) -> str:
     # Byte-compiled artifacts are excluded deliberately: a local pytest run

@@ -86,6 +86,7 @@ async fn start(dir: &std::path::Path) -> TestServer {
         session_db: Some(storage.join("session/session.db")),
     };
     let stopped = sync.lock().stop_flag();
+    let generation = sync.lock().generation_handle();
     let progress = sync.lock().progress_handle();
     let handle = Arc::new(AccountHandle {
         info,
@@ -97,6 +98,7 @@ async fn start(dir: &std::path::Path) -> TestServer {
         watcher: Mutex::new(None),
         stopped,
         progress,
+        generation,
     });
     state
         .accounts

@@ -6,6 +6,7 @@
 //! qqflow-server 5032).
 
 pub mod auth;
+pub mod cursor;
 pub mod dto;
 pub mod error;
 pub mod openapi;
@@ -170,6 +171,9 @@ pub struct AccountHandle {
     /// 建索引进度。`Arc` 的理由与 `stopped` 相同：`full_sync` 持锁数分钟，HTTP 侧
     /// 必须能在锁外读进度，否则「问一句到哪了」会阻塞到建索引结束。
     pub progress: Arc<crate::store::index::IndexProgress>,
+    /// 数据源世代：身份类线索变化时前进一格。`Arc` 的理由同上——导出发布前要复查
+    /// 「源是不是在这期间换了」，而那时可能正有一轮扫描占着 sync 锁。
+    pub generation: Arc<std::sync::atomic::AtomicU32>,
 }
 
 pub use crate::sync::history::{HistoryBuf, HistoryItem};
@@ -192,6 +196,20 @@ pub fn current_generation() -> u64 {
 /// 推进基线代号（注销时调用）。
 pub fn bump_generation() -> u64 {
     GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+}
+
+/// 进程级 nonce：游标里带上它，重启后旧游标一律按「需要重拉」处理。
+///
+/// 内存索引的行标识只在**本进程**内连续；跨进程沿用等于按一张新表的位置去读
+/// 旧表。用随机值而不是 pid + 启动时间：后者在同一秒内重启会撞。
+pub fn process_nonce() -> &'static str {
+    static NONCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NONCE.get_or_init(|| {
+        use rand::RngCore;
+        let mut raw = [0u8; 8];
+        rand::thread_rng().fill_bytes(&mut raw);
+        hex::encode(raw)
+    })
 }
 
 
@@ -445,6 +463,7 @@ async fn method_not_allowed() -> crate::server::error::ApiError {
     crate::server::error::ApiError {
         status: axum::http::StatusCode::METHOD_NOT_ALLOWED,
         message: "方法不允许".into(),
+        reason: None,
     }
 }
 
@@ -573,14 +592,10 @@ pub async fn start_account(
             // the storage dir itself. A path that is neither passes through
             // unchanged so the `is_dir` check below reports it against the
             // value the client actually sent.
-            let storage = if p.join("db_storage").is_dir() {
-                p.join("db_storage")
-            } else {
-                p.clone()
-            };
+            let (dir, storage) = resolve_account_dir(&p);
             Some(scan::AccountInfo {
                 wxid: wxid.clone(),
-                dir: p.clone(),
+                dir,
                 db_storage: storage,
                 session_db: scan::find_session_db(&p),
             })
@@ -799,9 +814,9 @@ pub fn register_account(
     // `Arc`s out of the sync engine: `stopped` lets deregistration skip in-flight
     // writes, `progress` lets HTTP read the build's position — neither may take
     // this mutex, which `full_sync` holds for minutes.
-    let (stopped, progress) = {
+    let (stopped, progress, generation) = {
         let guard = sync.lock();
-        (guard.stop_flag(), guard.progress_handle())
+        (guard.stop_flag(), guard.progress_handle(), guard.generation_handle())
     };
     let handle = Arc::new(AccountHandle {
         info,
@@ -813,6 +828,7 @@ pub fn register_account(
         watcher: Mutex::new(None),
         stopped,
         progress,
+        generation,
     });
 
     let mut accounts = state.accounts.lock();
@@ -914,18 +930,79 @@ fn purge_exported_media(root: &std::path::Path, talkers: &[String]) -> usize {
             continue;
         }
         let dir = root.join(talker);
+        // 目录不存在时直接跳过：is_contained 会 canonicalize——不存在的路径
+        // canonicalize 失败，把「账号没导出过媒体」误报成「越界导出目录」。
+        if !dir.is_dir() {
+            continue;
+        }
+        // 逐个 kind 判定，不拿某个固定 kind 当「这里有没有导出」的前置条件：
+        // 只导出过语音或视频的会话没有 images 目录，以 images 为闸门会把
+        // voices / videos 永久留在盘上——注销后仍能导出，正是清理要防的。
+        //
+        // 树级删除与写侧同一归属守卫：导出树里可能预置指向根外的 junction，
+        // remove_dir_all 沿链接删的是链接本身（树级删除不破坏目标，已实测），
+        // 但**目录被替换**的 TOCTOU（校验时是目录、删除时已换成链接到别处的
+        // 目录）没有别的防线——canonicalize 解析后的真实路径必须仍在导出根内。
+        let mut saw_kind = false;
         for kind in EXPORT_KINDS {
             let sub = dir.join(kind);
+            // 不存在的 kind 不参与判定：is_contained 对不存在的路径必然
+            // fail-closed，别为没导出过这类媒体的会话打「越界」警告。
+            if !sub.exists() {
+                continue;
+            }
+            saw_kind = true;
+            if !crate::pathsafe::is_contained(root, &sub) {
+                tracing::warn!("[deregister] 跳过越界导出目录: {:?}", dir.display());
+                continue;
+            }
             match std::fs::remove_dir_all(&sub) {
                 Ok(()) => removed += 1,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => tracing::warn!("[deregister] 清理导出媒体失败 {}: {e}", sub.display()),
             }
         }
+        // 一个导出目录都没有：这个会话从没导出过媒体，别去碰它的目录
+        // （空目录也可能不是我们建的）。
+        if !saw_kind {
+            continue;
+        }
         // Empty-only: anything the server did not put there survives.
         let _ = std::fs::remove_dir(&dir);
     }
     removed
+}
+
+/// Resolve the **account root** from a `db_storage` user input.
+///
+/// 接受账号根（内含 `db_storage` 子目录）或 storage 目录本身两种输入；`dir`
+/// 必须是账号根（媒体导出按 `<root>/msg/...` 找源文件）——输入指向 db_storage
+/// 本身时取它的父目录，否则媒体被定位到 `<account>/db_storage/msg/...`（实际
+/// 在 `<account>/msg/...`），文本索引正常、媒体静默缺失。大小写不敏感（Windows
+/// 文件系统不区分，`DB_STORAGE` 是合法输入）；裸相对名的父目录映射为 `.`。
+/// 返回 `(account_root, storage_dir)`。两处调用（start_account 与它的测试镜像）
+/// 各写一遍时，改一处忘另一处，媒体定位就会分叉。
+fn resolve_account_dir(p: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let storage = if p.join("db_storage").is_dir() {
+        p.join("db_storage")
+    } else {
+        p.to_path_buf()
+    };
+    let dir = if storage != p {
+        p.to_path_buf()
+    } else if p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("db_storage"))
+    {
+        p.parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(|parent| parent.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+    } else {
+        p.to_path_buf()
+    };
+    (dir, storage)
 }
 
 /// Undo one account's registration: stop its sync, drop its index, and return
@@ -1078,6 +1155,76 @@ pub fn watch_config(cfg: &Config) -> WatchConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// db_storage 本身作为 db_path 注册时，`AccountInfo.dir` 必须取账号父目录：
+    /// 媒体导出按 `<dir>/msg/...` 找源文件——dir 存的是原始输入（db_storage）时，
+    /// 媒体被定位到 `<account>/db_storage/msg/...`（实际在 `<account>/msg/...`），
+    /// 文本索引正常、媒体静默缺失。
+    #[test]
+    fn db_storage_input_resolves_the_account_root_for_media() {
+        let base = std::env::temp_dir().join(format!(
+            "weflow-reg-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let account = base.join("wxid_media_root");
+        let storage = account.join("db_storage");
+        std::fs::create_dir_all(storage.join("message")).unwrap();
+        std::fs::create_dir_all(account.join("msg").join("video")).unwrap();
+
+        // 直接调与 start_account 共用的 helper（解析语义只有一处出处）：输入
+        // 指向 db_storage 本身时 dir 必须是父目录。start_account 的完整路径由
+        // 探针级测试与 api_smoke 覆盖。
+        let p = std::path::PathBuf::from(storage.to_string_lossy().into_owned());
+        let (dir, storage_resolved) = resolve_account_dir(&p);
+        assert_eq!(
+            dir, account,
+            "db_storage 输入必须解析出账号根（媒体导出的基准）"
+        );
+        assert_eq!(storage_resolved, storage, "storage 目录必须原样返回");
+        assert!(dir.join("msg").is_dir(), "账号根下 msg/ 必须可达");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 大小写不敏感（`DB_STORAGE`）与裸相对名的解析：Windows 文件系统不区分
+    /// 大小写，合法输入不得被拒；裸相对名（无父目录）映射为 `.` 而不是空路径。
+    #[test]
+    fn db_storage_input_is_case_insensitive_and_bare_relative_name_maps_to_dot() {
+        let (dir, storage) = resolve_account_dir(std::path::Path::new("DB_STORAGE"));
+        assert_eq!(dir, std::path::Path::new("."), "裸相对名的父目录映射为 .");
+        assert_eq!(storage, std::path::Path::new("DB_STORAGE"), "storage 原样返回");
+        let account = std::env::temp_dir().join(format!(
+            "weflow-reg-case-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&account);
+        std::fs::create_dir_all(account.join("DB_STORAGE")).unwrap();
+        let (dir2, storage2) = resolve_account_dir(&account);
+        // 大小写语义是**文件系统**的属性：大小写不敏感的平台（Windows）上
+        // `join("db_storage").is_dir()` 命中大写目录 → storage=小写拼出的
+        // 子目录（同一位置，须等价比较）；大小写敏感的平台（Linux）上不命中
+        // → 输入被当作 storage 目录本身 → storage=account。
+        if cfg!(windows) {
+            assert_eq!(dir2, account, "含 DB_STORAGE 子目录的输入按账号根解析");
+            assert_eq!(
+                storage2.to_string_lossy().to_ascii_lowercase(),
+                account.join("DB_STORAGE").to_string_lossy().to_ascii_lowercase(),
+                "storage 必须指向（大小写等价的）DB_STORAGE 子目录"
+            );
+        } else {
+            assert_eq!(dir2, account, "Linux 不折叠大小写：输入按 storage 目录本身解析");
+            assert_eq!(storage2, account, "storage 原样返回");
+        }
+        let _ = std::fs::remove_dir_all(&account);
+    }
 
     /// 进程级 `GENERATION` 的串行化：会走**有效**注销的用例都先拿这把锁。
      /// 不加锁时 `--lib` 套件的并行执行里，任何一条并发注销都会
@@ -1525,6 +1672,23 @@ mod tests {
         assert!(!root.join("talker_b").exists());
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&victim);
+    }
+
+    /// A talker that only ever exported voices has no `images` directory:
+    /// treating `images` as the "did this account export anything" gate leaves
+    /// `voices` / `videos` on disk, and they stay exportable after the account
+    /// is deregistered — exactly what the purge exists to prevent.
+    #[test]
+    fn purge_reaches_a_talker_that_only_exported_voices() {
+        let root = std::path::PathBuf::from("target/test-tmp/purge-voices-only");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("talker_voice/voices")).unwrap();
+        std::fs::write(root.join("talker_voice/voices/1.silk"), b"x").unwrap();
+
+        assert_eq!(purge_exported_media(&root, &["talker_voice".into()]), 1);
+        assert!(!root.join("talker_voice/voices").exists());
+        assert!(!root.join("talker_voice").exists(), "只剩导出目录时整目录一起消失");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

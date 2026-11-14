@@ -17,7 +17,7 @@ use crate::server::handlers::{extract_params, ready_account, require_auth};
 use crate::server::AppState;
 use crate::store::Store;
 
-/// 一条导出任务：(local_id, kind, md5, server_id, talker)。
+/// 导出任务首字段是本次会话快照中的行位置，避免跨分片 local_id 相同导致回填串行。
 pub(crate) type ExportJob = (i64, crate::parser::MediaKind, Option<String>, i64, String);
 
 /// 一次消息查询的参数。
@@ -175,13 +175,13 @@ pub(crate) fn collect_export_jobs(
         if hint.md5.is_none() && hint.kind != crate::parser::MediaKind::Voice {
             continue;
         }
-        jobs.push((m.local_id, hint.kind, hint.md5.clone(), m.server_id, talker.to_string()));
+        jobs.push((i as i64, hint.kind, hint.md5.clone(), m.server_id, talker.to_string()));
     }
     jobs.truncate(200); // bound latency per request
     jobs
 }
 
-/// 执行一批导出任务（阻塞池）。返回 localId → 导出结果。
+/// 执行一批导出任务（阻塞池）。返回请求内行位置 → 导出结果。
 ///
 /// 调用点必须在**读 guard 的 scope 之外**：guard 不是 Send，跨 await 拿着它编译不过。
 pub(crate) async fn run_export_batch(
@@ -285,8 +285,8 @@ pub async fn handler(
 
     let exported = run_export_batch(&state, &account, export_jobs).await;
     let mut exported_count = 0usize;
-    for msg in &mut messages {
-        let Some(res) = exported.get(&msg.local_id) else {
+    for (msg, row_position) in messages.iter_mut().zip(&page.indices) {
+        let Some(res) = exported.get(&(*row_position as i64)) else {
             continue;
         };
         if let Some(media) = msg.media.as_mut() {

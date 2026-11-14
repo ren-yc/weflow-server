@@ -2,6 +2,36 @@
 
 本文件从 0.5.0 起维护。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased]
+
+### 新增
+
+- 新增 `POST /api/v1/media/export`，按完整消息身份恢复窗口外的本地媒体，返回实际摘要句柄；歧义、源缺失和导出失败保留不同错误状态。回归：`targeted_media_restores_old_image_and_actual_handle`。
+- Rust 和 Python SDK 新增 `export_media_by_message`；媒体恢复最多触发一次定向导出。CLI 采用同一接口并按消息身份回填。回归：`media_bytes_exports_then_retries_once_after_404`、`targeted_media_restores_each_missing_message_once`。
+
+### 变更
+
+- 接口契约 pin 由 `v0.9.0` 升 `v0.10.0`：新增 `mediaExportByMessage` 能力与 `media_export` 端点，共享用例 `targeted-media-export-fetch` 随一致性套件执行。
+- **SDK 的 `drain_session_cursor` 收到游标失效改为直接上抛**：此前失效后自动从头重启一次，已交付给回调的页会重复投递、`total` 重复计数；撤销回调结果或通知调用方清空的机制并不存在。迁移：调用方改为捕获 `CursorReset` 自行从头拉取并对已交付集合去重（CLI 的批量导出语义不变——它本就把失效当失败处理）。回归：`drain_session_cursor_propagates_cursor_reset_without_restarting`（Rust）/ `test_drain_session_cursor_propagates_cursor_reset_without_restarting`（Python）。
+- **SDK 与 CLI 翻页拒绝不推进的游标**：`hasMore=true` 且下一游标为空或与请求游标相同时报错终止，而不是把同一页反复交付（或把重复行追加进导出产物）。回归：`drain_session_cursor_rejects_a_non_advancing_cursor`（Rust）/ `test_drain_session_cursor_rejects_a_non_advancing_cursor`（Python）。
+
+### 破坏性变更
+
+- 定向导出响应的 `fileName` 改为消息自带的展示名（取不到时为空串），`mediaId` 才是可取句柄，两者通常不相等。迁移：取字节一律用 `mediaId`，不要拿 `fileName` 拼地址。回归：`targeted_media_restores_old_image_and_actual_handle`。
+- 自动媒体恢复改用定向接口；旧服务缺少该能力时显式报错，源不可恢复时 CLI 导出返回失败。迁移：服务与 SDK/CLI 同步升级，调用方处理 404、409 和 422。回归：`targeted_export_reports_missing_server_capability`、`with_media_reports_an_unrecoverable_source`。
+- 嵌入数据类型 `MessageRecord` 新增 `source_shard`，同会话跨分片的本地行号可重复。使用结构体字面量的调用方须补充该字段；去重键改为源分片与本地号。回归：`new_shard_reuses_local_and_platform_ids_without_losing_rows`。
+
+### 修复
+
+- 进度游标补齐「初始窗口外历史行」的排除并修两处签发缺陷：排除判据从时间改为**行标识**——同分片里时间更早、入库更晚的回溯行（local_id 更大）会越过按时间的排除在续拉里冒出来，现在水位线（已交付最大行标识）与历史高水位（排除线界内历史最大行标识）分别记账，排除线（初始 since）确立之后入库的回溯行照常可达。排除线段改用 `t` 前缀（十六进制字母表之外），与 `e` 等十六进制开头的分片代号不再混淆——此前该形态的游标签出即无法回传。编码端与解码长度上限**同源**：放不下的进度拒绝签发（500）而不是签出一条续拉必 400 的游标。游标不跨进程存活，无需迁移。回归：`cursor_continuation_excludes_same_shard_history_but_reaches_later_backfill`、`e_prefixed_shard_codes_round_trip`、`eighteen_shards_with_epoch_bounds_round_trip_within_the_limit`。
+- 进度游标改为**按分片记进度**：`local_id` 只在「库文件：表名」分片内唯一，同一会话的行可来自多个分片；此前游标只编码会话最大 local_id，先排空高分片再向低分片追加时，新行被「local_id > 会话最大值」永久滤掉且拿不到任何重置信号。游标不跨进程存活，旧游标随进程重启自然失效，无需迁移。回归：`cursor_progress_is_tracked_per_source_shard`。
+- 游标的账号/会话字段改为**先验语法再比身份**：字段形态非法（非十六进制、长度不对）从 409 改为 400——语法坏与身份不符的处置相反，判成失效会让客户端对一条永远重试不成功的损坏游标执行全量重拉。回归：`syntactically_broken_identity_fields_are_malformed_not_reset`。
+- 定向媒体在临时文件写完后复查注册，再发布产物；取消清理临时文件，已有有效副本可在源缓存清理后复用。回归：`targeted_media_cancels_staged_bytes_after_account_switch`。
+- 明文图片先识别格式再尝试 DAT 解密，跨分片重复本地行号按请求内位置回填媒体。回归：`page_media_backfill_keeps_equal_local_ids_in_separate_shards`。
+- 消息入库按每张表的本地行号推进，新增旧时间消息不再被时间水位跳过；初次构建也记录独立扫描位置。回归：`backdated_append_is_indexed_without_replaying_the_initial_snapshot`。
+- 联系人、群主和名册完整读取后整体替换；读取失败不确认版本并保留旧数据。回归：`metadata_failure_preserves_snapshot_and_pending_version`。
+- 群名片读取错误保留失败语义，恢复后重试；成功的空结果清除删除项。回归：`group_cards_failure_retries_and_empty_snapshot_clears_deleted_cards`。
+
 ## [0.10.0] - 2026-10-24
 
 ### 破坏性变更

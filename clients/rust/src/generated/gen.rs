@@ -521,6 +521,34 @@ coarser [`AccountPhase`] instead, which has no `AwaitingKey` variant.*/
         #[serde(rename = "exportPath")]
         pub export_path: ::std::string::String,
     }
+    ///Locate exactly one media-bearing message in the bound account.
+    #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+    #[serde(deny_unknown_fields)]
+    pub struct MediaExportRequest {
+        #[serde(rename = "platformMessageId")]
+        pub platform_message_id: ::std::string::String,
+        pub sender: ::std::string::String,
+        pub talker: ::std::string::String,
+        pub timestamp: i64,
+    }
+    /**定向导出的结果：`mediaId` 是可按名取字节的句柄，`fileName` 只是展示名。
+
+两者分工与消息层的 `media.fileName` / `mediaId` 一致：名字说这条媒体叫什么，
+句柄说这份字节现在取得到。它们通常不相等 —— 展示名来自消息元数据（原文件摘要或
+平台原名），句柄由落盘字节的摘要派生。*/
+    #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+    pub struct MediaExportResult {
+        ///展示名（消息自带的元数据名）。**不是句柄**，不能拿它取字节。
+        #[serde(rename = "fileName")]
+        pub file_name: ::std::string::String,
+        ///可按名取字节的句柄：URL 安全单段 token，末段直接拼进 `mediaUrl`。
+        #[serde(rename = "mediaId")]
+        pub media_id: ::std::string::String,
+        ///根相对的字节地址，末段就是 `mediaId`；不带凭据与查询串。
+        #[serde(rename = "mediaUrl")]
+        pub media_url: ::std::string::String,
+        pub success: bool,
+    }
     /**消息的媒体元数据 —— **原生面专用**（拉取面与消息面用 `MediaBrief`，SSE 用 `EventMedia`）。
 
 - 未导出：`url` / `localPath` / `mediaId` **都不出现**，`exported` 也不出现；
@@ -740,6 +768,20 @@ coarser [`AccountPhase`] instead, which has no `AwaitingKey` variant.*/
     pub struct PullSync {
         #[serde(rename = "hasMore")]
         pub has_more: bool,
+        /**不透明进度游标（契约 0.9.0 的 opaqueCursor 能力）：编码入库进度，客户端
+原样回传、不得解析。v2 起它还绑定「进程 / 账号 / 会话 / 注册代次 / 数据源
+世代」，所以**换进程、换账号、换会话或数据源被替换后，旧游标一律失效**。
+
+排空后仍在场且非空——进度游标不终结（与消息面 page.nextCursor 排空为 null
+的约定不同），它是下一次增量请求的起点。失效时请求返回 409，响应体带
+`reason: "cursor_reset_required"`：客户端丢弃游标、从头拉一次，
+**不要重试同一条游标**。时间游标的盲区（排空后同秒晚入库的行永远落在
+nextSince 之后）由它补上。*/
+        #[serde(
+            rename = "nextCursor",
+            skip_serializing_if = "::std::option::Option::is_none"
+        )]
+        pub next_cursor: ::std::option::Option<::std::string::String>,
         #[serde(rename = "nextOffset")]
         pub next_offset: u64,
         #[serde(rename = "nextSince")]
@@ -1198,6 +1240,52 @@ Sends a `GET` request to `/api/v1/group-members`
         let response = result?;
         match response.status().as_u16() {
             200u16 => ResponseValue::from_response(response).await,
+            _ => Err(Error::UnexpectedResponse(response)),
+        }
+    }
+    /**按会话、消息 ID、发送者及时间唯一定位并导出本地媒体。
+
+Sends a `POST` request to `/api/v1/media/export`
+
+*/
+    pub async fn post_api_v1_media_export<'a>(
+        &'a self,
+        body: &'a types::MediaExportRequest,
+    ) -> Result<ResponseValue<types::MediaExportResult>, Error<()>> {
+        let url = format!("{}/api/v1/media/export", self.baseurl,);
+        let mut header_map = ::reqwest::header::HeaderMap::with_capacity(1usize);
+        header_map
+            .append(
+                ::reqwest::header::HeaderName::from_static("api-version"),
+                ::reqwest::header::HeaderValue::from_static(Self::api_version()),
+            );
+        #[allow(unused_mut)]
+        let mut request = self
+            .client
+            .post(url)
+            .header(
+                ::reqwest::header::ACCEPT,
+                ::reqwest::header::HeaderValue::from_static("application/json"),
+            )
+            .json(&body)
+            .headers(header_map)
+            .build()?;
+        let info = OperationInfo {
+            operation_id: "post_api_v1_media_export",
+        };
+        self.pre(&mut request, &info).await?;
+        let result = self.exec(request, &info).await;
+        self.post(&result, &info).await?;
+        let response = result?;
+        match response.status().as_u16() {
+            200u16 => ResponseValue::from_response(response).await,
+            400u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            401u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            404u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            409u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            422u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            500u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            503u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
             _ => Err(Error::UnexpectedResponse(response)),
         }
     }

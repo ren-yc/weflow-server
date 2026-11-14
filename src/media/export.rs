@@ -67,7 +67,7 @@ pub struct ExportedMedia {
     pub digest_named: bool,
 }
 
-fn sniff_image_ext(bytes: &[u8]) -> &'static str {
+pub(super) fn sniff_image_ext(bytes: &[u8]) -> &'static str {
     if bytes.starts_with(b"wxgf") {
         // WeChat Graphics Format = raw HEVC still; converted to PNG when an
         // ffmpeg binary is available (see `wxgf_to_png`), else kept raw.
@@ -254,6 +254,17 @@ fn write_out(
     bytes: &[u8],
     digest_named: bool,
 ) -> Option<ExportedMedia> {
+    write_out_checked(export_dir, talker, kind_dir, file_name, bytes, digest_named).ok()
+}
+
+pub(super) fn prepare_out(
+    export_dir: &Path,
+    talker: &str,
+    kind_dir: &'static str,
+    file_name: &str,
+    bytes: &[u8],
+    digest_named: bool,
+) -> std::io::Result<PreparedExport> {
     // Both of these become path components. `talker` reaches here from the
     // store (external data — the WeChat database), and `file_name` is derived
     // from the message's own `md5` XML attribute, which the *sender* controls
@@ -266,33 +277,104 @@ fn write_out(
         tracing::warn!(
             "[media-export] 拒绝异常路径分量: talker={talker:?} file_name={file_name:?}"
         );
-        return None;
+        return Err(std::io::Error::other("unsafe media export path"));
     }
     let dir = export_dir.join(talker).join(kind_dir);
-    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::create_dir_all(&dir)?;
+    // 分量校验只约束字符串形状，管不住**已存在的目录结构**：导出树里预置一个
+    // 指向根外的 junction/符号链接（Windows 上 mklink /J 人人可用），随后的
+    // read / write / rename 全都会跟着链接走出去。校验放在 create_dir_all
+    // **之后**写文件之前——目录树成形后 canonicalize 才能解析链接（放在
+    // create_dir_all 之前会因目录不存在而 fail-closed 拒绝一切）；mkdir 本身
+    // 无害（空目录），写文件才是要拦的动作。归属校验：解析后的父目录必须
+    // 仍在导出根内，fail-closed（解析不了就拒绝）。
+    if !crate::pathsafe::is_contained(export_dir, &dir.join(file_name)) {
+        tracing::warn!(
+            "[media-export] 目标目录越界（junction/symlink?）: dir={:?}",
+            dir.display()
+        );
+        return Err(std::io::Error::other("unsafe media export path"));
+    }
     let path = dir.join(file_name);
     // idempotent: identical content already exported
     if let Ok(existing) = std::fs::read(&path)
         && existing == bytes
     {
-        return Some(ExportedMedia {
+        return Ok(PreparedExport { root: export_dir.to_path_buf(), temp: None, result: ExportedMedia {
             file_name: file_name.to_string(),
             kind_dir,
             local_path: path,
             external_url: None,
             digest_named,
-        });
+        }});
     }
-    let tmp = dir.join(format!(".{file_name}.tmp"));
-    std::fs::write(&tmp, bytes).ok()?;
-    std::fs::rename(&tmp, &path).ok()?;
-    Some(ExportedMedia {
-        file_name: file_name.to_string(),
-        kind_dir,
-        local_path: path,
-        external_url: None,
-        digest_named,
-    })
+    // 临时文件用唯一名 + 排他创建：固定 `.name.tmp` 会让并发导出互踩——
+    // 两个写入方各自 write→rename，后写者可以把先写者刚 rename 的成品覆盖掉，
+    // 或在对方 rename 前把半成品当成对方的目标。排他创建保证只有**建出这个
+    // 名字的写入方**处置它：open 撞名（并发同名导出）时那份 tmp 是别人的
+    // 半成品，直接退出、绝不 remove——失败清理只针对自己创建的 tmp（半成品
+    // 留在导出目录里会被目录扫描当成可取句柄通告出去，取到的是截断字节）。
+    // Staging is outside the byte route's <talker>/<kind>/<name> layout.
+    let pending = export_dir.join(".pending");
+    std::fs::create_dir_all(&pending)?;
+    let tmp = pending.join(format!("{}-{}.tmp", std::process::id(), rand::random::<u64>()));
+    if !crate::pathsafe::is_contained(export_dir, &tmp) {
+        return Err(std::io::Error::other("unsafe staging directory"));
+    }
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+    if let Err(e) = std::io::Write::write_all(&mut f, bytes) {
+        drop(f);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    drop(f);
+    Ok(PreparedExport { root: export_dir.to_path_buf(), temp: Some(tmp), result: ExportedMedia {
+        file_name: file_name.to_string(), kind_dir, local_path: path,
+        external_url: None, digest_named,
+    }})
+}
+
+/// Private staged bytes. Dropping a cancelled export removes only its own file.
+pub struct PreparedExport {
+    root: PathBuf,
+    temp: Option<PathBuf>,
+    result: ExportedMedia,
+}
+
+impl PreparedExport {
+    pub(super) fn existing(root: &Path, result: ExportedMedia) -> Self {
+        Self { root: root.to_path_buf(), temp: None, result }
+    }
+
+    /// Call only after the caller has revalidated the registration under its lock.
+    pub fn publish(mut self) -> std::io::Result<ExportedMedia> {
+        if !crate::pathsafe::is_contained(&self.root, &self.result.local_path) {
+            return Err(std::io::Error::other("unsafe export destination"));
+        }
+        if let Some(temp) = &self.temp {
+            if !crate::pathsafe::is_contained(&self.root, temp) {
+                return Err(std::io::Error::other("unsafe staging directory"));
+            }
+            std::fs::rename(temp, &self.result.local_path)?;
+            self.temp = None;
+        } else if !self.result.local_path.is_file() {
+            return Err(std::io::Error::other("export disappeared before publication"));
+        }
+        Ok(self.result.clone())
+    }
+}
+
+impl Drop for PreparedExport {
+    fn drop(&mut self) {
+        if let Some(temp) = &self.temp { let _ = std::fs::remove_file(temp); }
+    }
+}
+
+pub(super) fn write_out_checked(
+    export_dir: &Path, talker: &str, kind_dir: &'static str,
+    file_name: &str, bytes: &[u8], digest_named: bool,
+) -> std::io::Result<ExportedMedia> {
+    prepare_out(export_dir, talker, kind_dir, file_name, bytes, digest_named)?.publish()
 }
 
 /// Resolve + export one media item against an already-open set of auxiliary
@@ -348,7 +430,7 @@ pub fn export_one(
             }
             let src = candidates.first()?.clone();
             let raw = std::fs::read(&src).ok()?;
-            let decoded = match media::detect_format(&raw) {
+            let decoded = if sniff_image_ext(&raw) != "bin" { raw } else { match media::detect_format(&raw) {
                 Some(fmt @ (DatFormat::V1 | DatFormat::V2)) => {
                     // V1 uses the fixed built-in key; V2 requires registered keys
                     let keys = if fmt == DatFormat::V1 {
@@ -374,7 +456,7 @@ pub fn export_one(
                         return None;
                     }
                 }
-            };
+            }};
             if decoded.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
                 return None; // still compressed — wrong key, refuse garbage
             }
@@ -719,6 +801,25 @@ mod tests {
         // 正向对照：合法分量照常写入。
         assert!(write_out(&root, "wxid_a", "images", "ok.jpg", b"x", false).is_some());
         assert!(root.join("wxid_a/images/ok.jpg").exists());
+
+        // rename 失败（目标位置被一个**目录**占用）→ 清理自己创建的 tmp：
+        // 半成品留在导出目录里会被目录扫描当成可取句柄通告出去，取到的是
+        // 截断字节。目标位置预置目录让 rename 必然失败（文件不能覆盖目录）。
+        std::fs::create_dir_all(root.join("wxid_a/images/blocked.jpg")).unwrap();
+        assert!(
+            write_out(&root, "wxid_a", "images", "blocked.jpg", b"x", false).is_none(),
+            "目标被目录占用时写入必须失败"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(root.join(".pending"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "失败后不得残留临时文件: {:?}",
+            leftovers.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

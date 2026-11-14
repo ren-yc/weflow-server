@@ -185,6 +185,11 @@ impl LivePool {
     ///
     /// A previously-marked keyless rel is retried exactly once per call so a
     /// corrected registration can recover without a restart.
+    ///
+    /// 采样借用限制的说明：调用方在持有返回的 `&Connection` 期间不能再次进入
+    /// pool（`&mut self`）。需要「读取前 data_version 采样 + 连接」两样东西时，
+    /// 走 [`LivePool::get_or_open_sampled`] —— 采样在同一个 `&mut self` 借用内
+    /// 完成，借用结束后采样值已经到手。
     pub fn get_or_open(
         &mut self,
         f: &DbFile,
@@ -210,6 +215,27 @@ impl LivePool {
         // keep the stored raw key in sync if registration changed it
         entry.set_key_hex64(incoming);
         entry.acquire()
+    }
+
+    /// [`LivePool::get_or_open`] plus a pre-read `data_version` sample taken
+    /// **inside the same borrow**, right after the connection is (re)acquired.
+    /// The sync layer acknowledges exactly this sampled value after a fully
+    /// drained read: commits landing between the last SELECT and the
+    /// acknowledge carry a newer version and stay pending for the next round
+    /// (re-sampling "current" at acknowledge time is what made that window
+    /// eat rows). `Ok((conn, None))` = connected but no version readable
+    /// (treat as "cannot acknowledge", not as "unchanged").
+    pub fn get_or_open_sampled(
+        &mut self,
+        f: &DbFile,
+        key: DbKey,
+    ) -> Result<(&Connection, Option<i64>), AcquireError> {
+        let conn = self.get_or_open(f, key)?;
+        // Borrow of `self.pool` for the connection is live; re-entering the
+        // pool to read the version would be a second borrow. Read it straight
+        // off the handed-out connection instead.
+        let v = LiveDb::read_data_version(conn).ok();
+        Ok((conn, v))
     }
 
     /// Is there an **open** connection for this rel? The sync layer uses this
@@ -240,13 +266,28 @@ impl LivePool {
     }
 
     /// Consume the pending change state: re-baseline `data_version` to the
-    /// current value. Called after a successful incremental read.
+    /// **current** value.
+    ///
+    /// 已弃用：确认应当使用 [`LivePool::set_data_version`] 写入**读取前采样**
+    /// 的值——在这里重新读「当前值」会把 SELECT 结束后、确认前落库的提交
+    /// 错误地记成已读（正是修掉的缺陷形态）。保留实体以便对照阅读与回滚，
+    /// 但 poll 路径不再引用它。
+    #[allow(dead_code)]
     pub fn advance_data_version(&mut self, rel: &str) {
         if let Some(entry) = self.pool.get_mut(rel)
             && let Some(conn) = entry.conn.as_ref()
             && let Ok(now) = LiveDb::read_data_version(conn)
         {
             entry.data_version = Some(now);
+        }
+    }
+
+    /// Re-baseline to an **exact** value sampled earlier on the same
+    /// connection. `None` leaves everything untouched (no connection, or the
+    /// file was never opened — nothing to acknowledge).
+    pub fn set_data_version(&mut self, rel: &str, v: i64) {
+        if let Some(entry) = self.pool.get_mut(rel) {
+            entry.data_version = Some(v);
         }
     }
 }

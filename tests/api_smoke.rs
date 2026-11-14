@@ -87,6 +87,7 @@ fn test_state_inner(
     sync.lock().full_sync().unwrap();
 
     let stopped = sync.lock().stop_flag();
+    let generation = sync.lock().generation_handle();
     // `indexing` 变体用独立计数器：夹具构建时真实计数器已经跑完一整遍（`done == total`），
     // 沿用它会得到与 `indexing` 自相矛盾的数。`ready` 变体则沿用同步引擎那一份，与线上路径一致。
     let progress = if indexing {
@@ -110,6 +111,7 @@ fn test_state_inner(
         watcher: Mutex::new(None),
         stopped,
         progress,
+        generation,
     });
     state
         .accounts
@@ -1803,6 +1805,38 @@ async fn both_pull_paths_are_byte_identical() {
         out.push_str(rest);
         out
     }
+    /// `nextCursor` 里嵌着**进程级**代号（注销会推进它），并发跑别的用例时两次请求
+    /// 之间就可能不同。逐字节比对前把它掩掉，位置另用解码后的 `(版本, localId)`
+    /// 比——代号属于进程状态，不属于「两条路是否一致」的判据。
+    fn mask_next_cursor(raw: &str) -> String {
+        let key = "\"nextCursor\":\"";
+        let mut out = String::with_capacity(raw.len());
+        let mut rest = raw;
+        while let Some(i) = rest.find(key) {
+            let (head, tail) = rest.split_at(i + key.len());
+            out.push_str(head);
+            let end = tail.find('"').unwrap_or(tail.len());
+            out.push_str("<cursor>");
+            rest = &tail[end..];
+        }
+        out.push_str(rest);
+        out
+    }
+    fn cursor_position(raw: &str) -> String {
+        use base64::Engine as _;
+        let key = "\"nextCursor\":\"";
+        let start = raw.find(key).expect("响应必须带 sync.nextCursor") + key.len();
+        let cursor = raw[start..].split('"').next().expect("游标是字符串").to_string();
+        assert!(!cursor.is_empty(), "sync.nextCursor 不得为空");
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&cursor)
+            .expect("游标必须是 URL-safe base64");
+        let text = String::from_utf8(decoded).expect("游标必须是 UTF-8");
+        // v2.<nonce>.<账号摘要>.<注册代次>.<数据源世代>.<会话摘要>.<localId>
+        let parts: Vec<&str> = text.split('.').collect();
+        assert_eq!(parts.len(), 7, "游标字段数固定，实际 {text}");
+        format!("{}.{}", parts[0], parts[6])
+    }
 
     let a = raw_body(
         app.clone(),
@@ -1815,10 +1849,63 @@ async fn both_pull_paths_are_byte_identical() {
     )
     .await;
     assert_eq!(
-        mask_exported_at(&a),
-        mask_exported_at(&b),
-        "两条拉取路径必须是同一份响应（只有 exportedAt 允许不同）"
+        cursor_position(&a),
+        cursor_position(&b),
+        "两条路的进度游标必须指向同一位置"
     );
+    assert_eq!(
+        mask_next_cursor(&mask_exported_at(&a)),
+        mask_next_cursor(&mask_exported_at(&b)),
+        "两条拉取路径必须是同一份响应（只有 exportedAt 与游标代号允许不同）"
+    );
+}
+
+/// 游标的失效必须被**区分**：语法坏是 400，版本/身份/代次不符是 409 +
+/// `reason: cursor_reset_required`。最坏的实现是静默退回时间模式——客户端以为
+/// 续上了，实际从头重放一遍。
+#[tokio::test]
+async fn pull_cursor_rejects_foreign_or_stale_tokens() {
+    let dir = common::tmp_dir("cursor-invalidate");
+    let state = test_state(&dir);
+    let app = server::build_router(state);
+    let pull = |session: &str, cursor: &str| {
+        format!(
+            "/chatlab/sessions/{session}/messages?limit=1&cursor={cursor}&access_token={TOKEN}"
+        )
+    };
+    let call = |uri: String| {
+        let app = app.clone();
+        async move { json_body(app.oneshot(request("GET", &uri, None)).await.unwrap()).await }
+    };
+
+    // 1) 语法坏：400，且不带「重拉」信号（重试同样的请求也不会好）。
+    let (status, body) = call(pull(common::FAKE_GROUP, "not-a-cursor")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.get("reason").is_none(), "语法错不是重拉信号：{body}");
+
+    // 2) 旧版本游标：409 + reason。
+    use base64::Engine as _;
+    let v1 = base64::engine::general_purpose::STANDARD.encode("v1.1.3");
+    let (status, body) = call(pull(common::FAKE_GROUP, &v1)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["reason"], "cursor_reset_required", "{body}");
+
+    // 3) 跨会话：拿 A 的游标去拉 B。
+    let (status, body) = call(format!(
+        "/chatlab/sessions/{}/messages?limit=1&access_token={TOKEN}",
+        common::FAKE_GROUP
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let foreign = body["sync"]["nextCursor"].as_str().expect("必须有游标").to_string();
+    let (status, body) = call(pull(common::FAKE_FRIEND, &foreign)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "跨会话游标必须被拒：{body}");
+    assert_eq!(body["reason"], "cursor_reset_required", "{body}");
+
+    // 4) 自家游标照常可用（不是把所有游标都拒掉）。
+    let (status, body) = call(pull(common::FAKE_GROUP, &foreign)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["sync"]["nextCursor"].as_str().is_some(), "{body}");
 }
 
 mod golden {
@@ -1826,6 +1913,11 @@ mod golden {
 
     /// 值易变、但键必须留下的字段。按**键名**匹配：同一个字段换个端点仍叫这个名字，
     /// 所以清单不随端点增长。
+    ///
+    /// `nextCursor` **不在**这里：同名键装的是两种东西——`sync.nextCursor` 是不透明的
+    /// 进度游标（base64(generation + localId)，generation 随注销计数变），`page.nextCursor`
+    /// 是确定的偏移量字符串。整名掩掉会把「排空后从 `null` 变成数字或字符串」这种回归
+    /// 一起吃掉，所以按父键区分，见 `mask`。
     const VOLATILE_KEYS: &[&str] = &[
         // 每次请求都不同
         "exportedAt",
@@ -1854,26 +1946,46 @@ mod golden {
     /// 那条断言是这套快照的关键：漏掩盖一个易变字段时，测试会**响亮地失败**，
     /// 而不是每次运行都产生一份新快照——后者会让人习惯性地点「更新快照」，
     /// 护栏于是名存实亡。
-    fn mask(value: &mut serde_json::Value, tmp: &str) {
+    fn mask(value: &mut serde_json::Value, tmp: &str, parent: &str) {
         match value {
             serde_json::Value::Object(map) => {
                 for (key, val) in map.iter_mut() {
-                    if VOLATILE_KEYS.contains(&key.as_str()) {
+                    // `sync.nextCursor` 是每次运行都可能不同的进度游标：掩值之前先证明
+                    // 它确实是非空字符串，否则「游标返回 null / 数字」的回归会被掩码
+                    // 顺手盖掉，快照照样绿。`page.nextCursor` 是确定的偏移量，不掩，
+                    // 让它以真实值参与比对。
+                    let volatile = if key == "nextCursor" {
+                        match val {
+                            // 对象/数组位置上是 schema 形状，不是取值。
+                            serde_json::Value::Object(_) | serde_json::Value::Array(_) => false,
+                            _ if parent == "sync" => {
+                                assert!(
+                                    val.as_str().is_some_and(|s| !s.is_empty()),
+                                    "sync.nextCursor 必须是非空字符串，实际是 {val}"
+                                );
+                                true
+                            }
+                            _ => false,
+                        }
+                    } else {
+                        VOLATILE_KEYS.contains(&key.as_str())
+                    };
+                    if volatile {
                         // 只掩**标量**。对象/数组位置上的同名键装的是形状而非取值：
                         // /openapi.json 里 `updatedAt` 的值就是整个 schema，整值替换会把
                         // description 与类型一起从比对里抹掉——字段语义写红也不会红。
                         match val {
-                            serde_json::Value::Object(_) | serde_json::Value::Array(_) => mask(val, tmp),
+                            serde_json::Value::Object(_) | serde_json::Value::Array(_) => mask(val, tmp, key),
                             _ => *val = serde_json::Value::String("<volatile>".into()),
                         }
                     } else {
-                        mask(val, tmp);
+                        mask(val, tmp, key);
                     }
                 }
             }
             serde_json::Value::Array(items) => {
                 for it in items.iter_mut() {
-                    mask(it, tmp);
+                    mask(it, tmp, parent);
                 }
             }
             serde_json::Value::String(s) => {
@@ -2078,7 +2190,7 @@ mod golden {
             "keys": keys,
             "body": body,
         });
-        mask(&mut snapshot, tmp);
+        mask(&mut snapshot, tmp, "");
         assert_no_wall_clock(&snapshot, name);
         let actual = serde_json::to_string_pretty(&snapshot).unwrap() + "\n";
 
@@ -2624,4 +2736,193 @@ async fn media_kind_whitelist_serves_only_requested_kinds() {
         "白名单里没有的 kind 必须被排除: {voice_only}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+
+fn targeted_media_fixture(dir: &std::path::Path, duplicate: bool) -> (Arc<server::AppState>, std::path::PathBuf) {
+    use md5::Digest;
+    let bytes = b"\x89PNG\r\n\x1a\nactual bytes";
+    let digest = format!("{:x}", md5::Md5::digest(bytes));
+    let room = format!("{:x}", md5::Md5::digest(common::FAKE_GROUP.as_bytes()));
+    let source = dir.join("msg/attach").join(&room).join("fixture/Img").join(format!("{digest}.dat"));
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, bytes).unwrap();
+    let state = test_state_with(dir, |storage, key| {
+        let writer = common::wx_conn(&storage.join("message/message_0.db"), key, false);
+        let table = format!("Msg_{room}");
+        let sql = format!("INSERT INTO \"{table}\" (server_id,local_type,create_time,sort_seq,real_sender_id,message_content) VALUES (?1,?2,?3,0,?4,?5)");
+        writer.execute_batch("BEGIN").unwrap();
+        for i in 0..180 {
+            writer.execute(&sql, rusqlite::params![1000+i, 1, 1_700_000_000+i, 2, "later"]).unwrap();
+        }
+        let xml = format!("<msg><img md5=\"{digest}\"/></msg>");
+        writer.execute(&sql, rusqlite::params![99, 3, 1_500_000_000, 2, xml]).unwrap();
+        writer.execute(&sql, rusqlite::params![99, 3, 1_500_000_000, 1, xml]).unwrap();
+        if duplicate { writer.execute(&sql, rusqlite::params![99, 3, 1_500_000_000, 2, xml]).unwrap(); }
+        writer.execute_batch("COMMIT").unwrap();
+    });
+    (state, source)
+}
+
+fn targeted_media_request() -> Value {
+    serde_json::json!({"talker": common::FAKE_GROUP, "platformMessageId":"99",
+        "sender":"wxid_member_b", "timestamp":1_500_000_000i64})
+}
+
+async fn export_targeted(app: axum::Router, target: Value) -> (StatusCode, Value) {
+    let mut req = request("POST", "/api/v1/media/export", Some(TOKEN));
+    req.headers_mut().insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+    *req.body_mut() = Body::from(target.to_string());
+    json_body(app.oneshot(req).await.unwrap()).await
+}
+
+#[tokio::test]
+async fn targeted_media_restores_old_image_and_actual_handle() {
+    let dir = common::tmp_dir("targeted-media-old");
+    let (state, _source) = targeted_media_fixture(&dir, false);
+    let app = server::build_router(state);
+    let (_, latest) = json_body(app.clone().oneshot(request("GET",
+        &format!("/chatlab/messages?talker={}", common::FAKE_GROUP), Some(TOKEN))).await.unwrap()).await;
+    assert!(!latest["messages"].as_array().unwrap().iter().any(|m| m["platformMessageId"] == "99"));
+    let (status, result) = export_targeted(app.clone(), targeted_media_request()).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let id = result["mediaId"].as_str().unwrap();
+    assert!(id.ends_with(".png"));
+    let display = result["fileName"].as_str().unwrap();
+    assert!(!display.is_empty() && display.ends_with(".jpg"),
+        "fileName 是消息元数据里的展示名（本夹具是原文件摘要 + 扩展名）：{result}");
+    assert_ne!(display, id, "fileName 是展示名、mediaId 才是句柄：{result}");
+    assert_eq!(result["mediaUrl"], format!("/api/v1/media/{id}"));
+    let response = app.clone().oneshot(request("GET", &format!("/api/v1/media/{id}"), Some(TOKEN))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(axum::body::to_bytes(response.into_body(), 1024).await.unwrap().as_ref(), b"\x89PNG\r\n\x1a\nactual bytes");
+    std::fs::remove_file(dir.join("api-media").join(common::FAKE_GROUP).join("images").join(id)).unwrap();
+    assert_eq!(export_targeted(app, targeted_media_request()).await, (StatusCode::OK, result));
+}
+
+#[tokio::test]
+async fn targeted_media_reports_ambiguity_missing_and_decode_errors() {
+    let dir = common::tmp_dir("targeted-media-ambiguous");
+    let (state, _) = targeted_media_fixture(&dir, true);
+    assert_eq!(export_targeted(server::build_router(state), targeted_media_request()).await.0, StatusCode::CONFLICT);
+    let dir = common::tmp_dir("targeted-media-errors");
+    let (state, source) = targeted_media_fixture(&dir, false);
+    let app = server::build_router(state);
+    std::fs::write(&source, b"\x89PNG corrupt bytes").unwrap();
+    assert_eq!(export_targeted(app.clone(), targeted_media_request()).await.0, StatusCode::INTERNAL_SERVER_ERROR);
+    std::fs::remove_file(source).unwrap();
+    assert_eq!(export_targeted(app.clone(), targeted_media_request()).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(export_targeted(app.clone(), serde_json::json!({})).await.0, StatusCode::BAD_REQUEST);
+    let mut missing = targeted_media_request(); missing["platformMessageId"] = serde_json::json!("missing");
+    assert_eq!(export_targeted(app, missing).await.0, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn targeted_media_cancels_staged_bytes_after_account_switch() {
+    let dir = common::tmp_dir("targeted-media-switch");
+    let (state, _) = targeted_media_fixture(&dir, false);
+    let current = state.clone();
+    let error = server::handlers::media_export::restore_before_publish(
+        state, serde_json::from_value(targeted_media_request()).unwrap(), move || {
+            server::deregister_account(&current, common::FAKE_WXID, false);
+        },
+    ).await.unwrap_err();
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert_eq!(std::fs::read_dir(dir.join("api-media").join(common::FAKE_GROUP).join("images")).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(dir.join("api-media/.pending")).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn targeted_media_cancels_when_the_source_identity_changes_midway() {
+    let dir = common::tmp_dir("targeted-media-identity");
+    let (state, _) = targeted_media_fixture(&dir, false);
+    let storage = dir.join("db_storage");
+    let error = server::handlers::media_export::restore_before_publish(
+        state, serde_json::from_value(targeted_media_request()).unwrap(), move || {
+            // 新增一个分片文件：身份指纹随之改变（不动正在被读的库，避免共享冲突）。
+            std::fs::write(storage.join("message/message_99.db"), b"x").unwrap();
+        },
+    ).await.unwrap_err();
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert_eq!(std::fs::read_dir(dir.join("api-media").join(common::FAKE_GROUP).join("images")).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(dir.join("api-media/.pending")).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn targeted_media_cancels_when_the_source_generation_changes() {
+    let dir = common::tmp_dir("targeted-media-generation");
+    let (state, _) = targeted_media_fixture(&dir, false);
+    let account = state.accounts.lock().values().next().cloned().expect("已注册账号");
+    let error = server::handlers::media_export::restore_before_publish(
+        state, serde_json::from_value(targeted_media_request()).unwrap(), move || {
+            // 模拟导出期间数据源被换掉：世代前进一格。
+            account.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        },
+    ).await.unwrap_err();
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert_eq!(std::fs::read_dir(dir.join("api-media").join(common::FAKE_GROUP).join("images")).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(dir.join("api-media/.pending")).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn targeted_media_concurrent_retries_share_complete_bytes() {
+    let dir = common::tmp_dir("targeted-media-concurrent");
+    let (state, _) = targeted_media_fixture(&dir, false);
+    let app = server::build_router(state);
+    let (a, b) = tokio::join!(export_targeted(app.clone(), targeted_media_request()), export_targeted(app.clone(), targeted_media_request()));
+    assert_eq!(a.0, StatusCode::OK, "{a:?}");
+    assert_eq!(a, b);
+    assert_eq!(export_targeted(app, targeted_media_request()).await, a);
+}
+
+#[tokio::test]
+async fn targeted_media_reuses_a_valid_export_after_source_removal() {
+    let dir = common::tmp_dir("targeted-media-reuse");
+    let (state, source) = targeted_media_fixture(&dir, false);
+    let app = server::build_router(state);
+    let uri = format!("/chatlab/messages?talker={}&media=1&start=1500000000&end=1500000000", common::FAKE_GROUP);
+    let (status, exported) = json_body(app.clone().oneshot(request("GET", &uri, Some(TOKEN))).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    let previous = exported["messages"].as_array().unwrap().iter().find(|m| m["sender"] == "wxid_member_b").unwrap()["media"]["fileName"].as_str().unwrap();
+    assert!(previous.ends_with(".png"));
+    std::fs::remove_file(source).unwrap();
+    let (status, restored) = export_targeted(app, targeted_media_request()).await;
+    assert_eq!(status, StatusCode::OK, "{restored}");
+    assert_eq!(restored["mediaId"], previous);
+}
+
+#[tokio::test]
+async fn page_media_backfill_keeps_equal_local_ids_in_separate_shards() {
+    use md5::Digest;
+    let dir = common::tmp_dir("media-shard-backfill");
+    let bodies = [b"\x89PNG first".as_slice(), b"\x89PNG second".as_slice()];
+    let digests = bodies.map(|body| format!("{:x}", md5::Md5::digest(body)));
+    let room = format!("{:x}", md5::Md5::digest(common::FAKE_GROUP.as_bytes()));
+    let source = dir.join("msg/attach").join(&room).join("fixture/Img");
+    std::fs::create_dir_all(&source).unwrap();
+    for (digest, body) in digests.iter().zip(bodies) { std::fs::write(source.join(format!("{digest}.dat")), body).unwrap(); }
+    let state = test_state_with(&dir, |storage, key| {
+        for (n, digest) in digests.iter().enumerate() {
+            let writer = common::wx_conn(&storage.join(format!("message/message_{}.db", n + 1)), key, false);
+            let table = format!("Msg_{room}");
+            writer.execute_batch(&format!("CREATE TABLE \"{table}\" (local_id INTEGER PRIMARY KEY AUTOINCREMENT, server_id INTEGER, local_type INTEGER, create_time INTEGER, sort_seq INTEGER, sender_username TEXT, message_content TEXT)")).unwrap();
+            writer.execute(&format!("INSERT INTO \"{table}\" VALUES (999, ?1, 3, 1800000000, 0, 'wxid_member_b', ?2)"),
+                rusqlite::params![90 + n as i64, format!("<msg><img md5=\"{digest}\"/></msg>")]).unwrap();
+        }
+    });
+    let app = server::build_router(state);
+    for endpoint in ["/api/v1/messages", "/chatlab/messages"] {
+        let uri = format!("{endpoint}?talker={}&media=1&start=1800000000&end=1800000000", common::FAKE_GROUP);
+        let (status, body) = json_body(app.clone().oneshot(request("GET", &uri, Some(TOKEN))).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let rows = body["messages"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        for (n, digest) in digests.iter().enumerate() {
+            let expected_id = (90 + n).to_string();
+            let row = rows.iter().find(|m| m["platformMessageId"].as_str() == Some(expected_id.as_str()) || m["serverId"].as_str() == Some(expected_id.as_str())).unwrap();
+            let media = &row["media"];
+            let name = if endpoint == "/api/v1/messages" { &media["mediaId"] } else { &media["fileName"] };
+            assert_eq!(name.as_str().unwrap(), format!("{digest}.png"), "{row}");
+        }
+    }
 }

@@ -337,14 +337,31 @@ v0.6.1 至 v0.6.6 都是纯文档 tag，v0.7.0 新增跨仓文档模板；v0.8.0
 
 ### 增量同步
 
+- 消息扫描按每库每表的 `local_id` 推进；源分片与行号共同标识一行，业务时间不参与入库判定。初次扫描以最大行号建立位置，避免重放已收录的旧时间行。
+- 内部扫描位置独立于 SSE 的时间三元组；晚到行可以早于既有时间水位。回归：`backdated_append_is_indexed_without_replaying_the_initial_snapshot`。
+- 新分片从自己的行号起点扫描，同会话同本地号或平台 ID 不互相覆盖。回归：`new_shard_reuses_local_and_platform_ids_without_losing_rows`。真实源聚合探针为 `real_message_source_identity_aggregate`。
+
 - **WAL 预分配 4 MiB ⇒ 文件大小恒定，指纹只能看 mtime**：库是 WAL 模式且预分配固定大小的日志，写入不会改变文件大小，所以「靠 size 判断有没有新消息」永远为假。反过来说 mtime 变了不代表真有新消息，水位线才是权威。
 - **增量检测是两级**：已打开的库用 SQLite `PRAGMA data_version` 探测外部提交——它是连接本地属性，只在同一连接的两个时点之间比较才有意义，且别的连接提交后必然不同但不保证递增（比较用不等，不用大小）。文件 mtime/size 戳退为未打开文件的前置门。Windows 高负载下元数据回读可能滞后，只靠文件戳会把一次写入误判成「未变」。
-- **记账规则**：只有真正读到数据的文件才记账（记文件戳 ＋ 推进 data_version 基线）——无密钥、打开失败的文件不记账，下一轮才不会把它判成「未变」而把变更永久吞掉。qqflow 侧语义天然如此，无需同构。
+- **记账规则**：只有真正读到数据的文件才记账（记文件戳 ＋ 确认 data_version 基线）——无密钥、打开失败的文件不记账，下一轮才不会把它判成「未变」而把变更永久吞掉。qqflow 侧语义天然如此，无需同构。
+- **确认的是读取前采样值，且只有排空才确认**：消息库在 SELECT 之前采样 `data_version`，本轮完全排空（未触顶）才把采样值写回基线。SELECT 结束到确认之间落库的提交版本更大、留在基线之后，下一轮必读；确认时刻重读「当前值」会把那批提交错误记成已读。
+- 回归位置分两层：采样与排空判据的原语级单元回归见 `unread_commit_between_read_and_ack_survives`；`poll_once` 全路径只能观察到结果（`incremental_poll_picks_up_new_rows_after_watermark`），确认窗口本身无法逐指令构造。
+- **元库重载与消息库同一确认纪律**：session/contact/fts/sns 成功重载后按**装载前采样值**确认，一次提交只产生一次有效重载。回归见 `metadata_reload_confirms_once`。
+- 联系人、群主与名册在同一读取事务中暂存，全部成功后才整体替换并确认版本；失败保留上一份完整数据。回归：`metadata_failure_preserves_snapshot_and_pending_version`。
+- 群名片和本库名字映射也须完整读取；成功的空快照清除已删除名片。回归：`group_cards_failure_retries_and_empty_snapshot_clears_deleted_cards`。
+- 可选表或列缺失可降级；查询、锁冲突与行解码错误须重试。回归：`optional_schema_is_empty_but_query_and_decode_failures_are_errors`、`metadata_lock_error_is_not_an_absent_optional_table`。
+- **updatedAt 只随索引内容变化推进**：判据是本轮压入会话的行数或任一元库完成重载，不是事件数——只含自身发送消息、或只刷了名册的轮次同样改变索引内容；空轮询不推进。
 - 回归见 `stamp_unchanged_but_committed_row_is_still_polled` 与 `failed_open_does_not_swallow_the_next_poll`。
 - **增量读遇到「没有时间列」的表：报错，不能返回空增量**：空 Vec 与「真的没有新行」在调用方完全不可区分，于是这张表的增量永久静默为空。同函数里「无 `local_id` 列」本来就是 `Err`，两者行为不一致本身就是线索。
 - 影响面：该错误经 `?` 上抛会中止本轮整账号增量（水位不推进，下一轮重来），而初始建索引那边是逐表 `warn + skip`——两条路径并不对称。回归位置：`no_time_column_is_an_error_not_an_empty_increment`。
 
 ### 导出与媒体
+
+- 定向导出以会话、消息 ID、发送者及时间唯一定位，耗时工作在阻塞池执行，在不对外服务的临时目录写完后，持生命周期锁复查注册身份，再发布文件。实际字节摘要形成可取句柄，非唯一平台文件名不能成为全局地址。
+- 发布前还要复查**数据源身份**：请求开始时采一次指纹（每个库的路径 + 文件创建时间 + 页 1 的 salt），发布前再采一次，不一致返回 409。之所以不能只比世代计数：导出的整个阻塞任务都持有 `sync` 锁，轮询采样跑不了，计数器必然不动。
+- 这条复查是**尽力检测**，盲区必须说清：同一库文件的备份还原可能连指纹都不变（salt 与创建时间都可保持不变），起始采样失败时还会退回只比世代。要闭合它得把文件身份做到卷序列号/FileId 一级，本仓不做。回归：`targeted_media_cancels_when_the_source_identity_changes_midway`。
+- 账号切换时清理本次临时文件，不发布旧任务结果。已有可取副本优先复用；新产物按实际字节摘要命名。
+- SDK 在取字节 404 后只触发一次定向导出，并使用实际返回句柄；CLI 对缺失句柄逐消息恢复，以消息 ID、发送者和时间关联回填。回归：`media_bytes_exports_then_retries_once_after_404`、`targeted_media_restores_each_missing_message_once`。
 
 - **子集导出的文件名是按本轮输入算的，撞名要按归属拒绝**：`export --session` 非续跑轮的去重集合从空开始，本轮某个会话可以算出与一个未在本轮的会话已交付产物同名的文件名，`.part` 收尾 rename 直接把它盖掉；而新 `index.json` 没有那个条目，交付物被换掉、下一轮也无从自愈。
 - 判据必须是归属（既有产物登记在别的会话名下，或没被任何清单认领），不是「本轮有没有写过这个路径」——后者会把同会话有意重导一并拒掉。处置是会话级：记入 `skipped`（起手前就拒，不发请求、不留 `.part`），`skipped` 非空则 CLI 以 1 退出。
@@ -358,6 +375,29 @@ v0.6.1 至 v0.6.6 都是纯文档 tag，v0.7.0 新增跨仓文档模板；v0.8.0
 - 所以按摘要干查（`media::export::digest_handles` 列出本会话导出目录里所有摘要派生名），命中才把实际落盘名当句柄给出。语音的 `voice_<svr>.silk` 与视频的平台名都不是摘要派生，拉取面同样不给句柄。
 - **目录扫描是阻塞 IO 且按请求算一次**（逐条 stat 会让一页变成几十次目录打开），因此走 `spawn_blocking`，并且放在取 store 读锁之前——`RwLockReadGuard` 不是 `Send`，跨 `.await` 会让 axum 的 `Handler` bound 直接编译失败。
 - 回归位置：`api_smoke::pull_advertises_media_id_only_for_exported_digest_files`；CLI 侧快路径钉在 `cli_e2e::media_id_from_pull_row_skips_the_export_round`。
+- **落盘与清理都有真实归属守卫**：路径分量校验（`safe_segment`）管不住已存在的目录结构——导出树里预置指向根外的 junction 后，读/写/rename 全都会跟着链接走出去。`write_out` 在目录树成形后、写文件前用 `is_contained` 校验父目录解析后的真实归属（fail-closed）；清理路径复用同一守卫。
+- 回归位置（归属守卫）：`media_export::junctioned_voice_dir_is_rejected_and_outside_is_untouched`。
+- **临时文件唯一名 + 排他创建**：固定 `.name.tmp` 会让两个写入方 write→rename 互踩；排他创建保证只有建出该名字的写入方自己 rename 它。
+- **续跑的媒体完整性检查是流式且三态的**：复用的 jsonl 产物按行扫描句柄，峰值内存不随文件大小增长（json 格式单行整份，不在本条承诺内）；「无悬空 / 有悬空 / 检查失败」三种结果分明，中部损坏与产物读取失败都以错误上抛并指出失败文件。
+- 回归位置（续跑检查）：`cli::reused_dangling_handles_are_detected_and_clean_rounds_pass`（中部非 UTF-8 与产物缺失两个失败分支）。
+
+### 拉取面的进度游标
+
+游标是**不透明的身份绑定串**：客户端原样回传，失效时响亮失败，绝不静默退回时间模式。
+
+- 载荷是本进程 nonce、账号摘要、注册代次、数据源世代、会话摘要与**各分片的进度线**。
+  - 进度线按分片（`source_shard`）记账而不是整个会话：`local_id` 只在分片内唯一，同一会话的行可以来自多个分片表。只编码会话最大值会把低分片的新追加行永远滤在续拉之外且拿不到任何重置信号。
+  - 每分片两个量：**水位线**（已交付最大行标识）与**历史高水位**（初始 since 界内历史行的最大行标识），外加全局**排除线**（初始 since）。
+  - 排除按行标识而不是时间：时间序与行标识序在回溯行上分叉，按时间排除的续拉会把同分片的历史回溯行放出来。排除线确立之后入库的回溯行（lid 必然更大）照常可达。回归 `cursor_continuation_excludes_same_shard_history_but_reaches_later_backfill`。
+  - 字段多到没有「解析一下再用」的价值，是刻意的：任何客户端解析实现都绑定当版服务端，而服务端换代时那份实现只会安静地少几页。
+- 失效分两档：语法坏或版本未知是 400；旧格式、跨进程、跨账号、跨会话、注册代次或数据源世代不符是 409 加 `reason: "cursor_reset_required"`。
+  - 判据只看身份，不看内容——本仓自己的写入也会改大小与 mtime，把它们放进判据等于让游标每次新消息都失效。
+  - 身份字段**先验语法再比身份**：形态非法（非十六进制、长度不对）是 400，不是 409。两档处置相反，判错会让客户端对一条重试必败的损坏游标全量重拉。回归 `pull_cursor_rejects_foreign_or_stale_tokens`、`syntactically_broken_identity_fields_are_malformed_not_reset`。
+- **编码与解码的长度上限同源**：解码拒收超限游标（400），编码按同一上限换算预算、放不下就**拒绝签发**（500）。
+  - 签出一条自己解不回的游标，会让多分片会话的续拉永远 400；排除线段用 `t` 前缀标记（十六进制字母表之外），与 `e` 等十六进制开头的分片代号无歧义。
+  - 回归 `eighteen_shards_with_epoch_bounds_round_trip_within_the_limit`、`e_prefixed_shard_codes_round_trip`、`progress_beyond_the_budget_is_refused_not_issued`。
+- 静默退回时间模式是最坏的一档：客户端以为续上了，实际从头重放，而重复行不会让任何断言变红。回归 `pull_cursor_rejects_foreign_or_stale_tokens`。
+- 进程 nonce 让跨进程复用在原理上不可能：注册代次与数据源世代都是进程内观察值，新进程没有资格替上一个进程相信它们。回归 `every_identity_mismatch_is_a_reset_not_a_silent_restart`。
 
 ### 分页与免鉴权面
 

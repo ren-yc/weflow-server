@@ -23,7 +23,7 @@ pub mod history;
 pub mod watch;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -211,6 +211,21 @@ pub struct AccountSync {
     /// 与 `stopped` 同族的理由：它必须能在 `full_sync` 持锁期间被 HTTP 侧读到，
     /// 所以复制的是 `Arc`，不是值；读侧永远不碰这把锁。
     progress: Arc<index::IndexProgress>,
+    /// 上一次采到的数据源指纹；`None` 表示还没建立基线。
+    source_digest: Option<[u8; 32]>,
+    /// 数据源世代：身份类线索变化时前进一格。与 `stopped`／`progress` 同族，
+    /// 以 `Arc<AtomicU32>` 交出去，HTTP 侧判断「导出期间源是否换了」不必拿这把锁。
+    generation: Arc<AtomicU32>,
+    /// 每个库「发送者映射连续读失败了几轮」。
+    ///
+    /// 映射读不出来时**不能**推进扫描位置：那会把空发送者与错的 `is_send` 固化
+    /// 下来（增量只读更大的 `local_id`，事后修好映射也不会回补）。但也不能无限
+    /// 等待——损坏的映射表永远读不出来，那张库会永久停在原地。折中是连续失败
+    /// 达到 `SENDER_MAP_MAX_ATTEMPTS` 轮后按空映射入库并告警。
+    ///
+    /// 以 `Arc<Mutex<…>>` 持有：`poll_once` 里 `conn` 借走 `self.pool` 的可变借用，
+    /// 之后再调 `&self` 方法会撞借用检查——所以先把这张表 clone 出来，用自由函数记账。
+    sender_map_failures: SenderMapFailures,
 }
 
 /// 单轮排空的页数上限：防坏数据（水位推不动的表）把一轮 poll 拖死。
@@ -222,6 +237,47 @@ pub struct AccountSync {
 const READ_MAX_PAGES: usize = 64;
 #[cfg(test)]
 const READ_MAX_PAGES: usize = 2;
+
+/// 发送者映射读不出来时的处置。
+#[derive(Debug, PartialEq, Eq)]
+enum SenderMapAction {
+    /// 还没到上限：这张库这一轮**不读**，扫描位置也不推进。
+    Defer,
+    /// 到上限了：按空映射入库（发送者与 `is_send` 降级），并告警。
+    DegradeWithEmptyMap,
+}
+
+fn sender_map_action(attempt: u32) -> SenderMapAction {
+    if attempt < AccountSync::SENDER_MAP_MAX_ATTEMPTS {
+        SenderMapAction::Defer
+    } else {
+        SenderMapAction::DegradeWithEmptyMap
+    }
+}
+
+/// 每个库「发送者映射连续读失败了几轮」。以 `Arc` 持有，见字段注释。
+type SenderMapFailures = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u32>>>;
+
+fn note_sender_map_failure(failures: &SenderMapFailures, rel: &str) -> u32 {
+    let mut guard = failures.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let counter = guard.entry(rel.to_string()).or_insert(0);
+    *counter = counter.saturating_add(1);
+    *counter
+}
+
+fn clear_sender_map_failure(failures: &SenderMapFailures, rel: &str) {
+    let mut guard = failures.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.remove(rel);
+}
+
+/// 这一轮要不要读这个库。
+///
+/// `deferred` 是「发送者映射还没读成功、欠着一批行」：这类库必须无视
+/// `data_version` 基线的「未变化」结论——全量构建跳过它时**没有**任何新提交，
+/// 只靠基线永远等不到重试，那批消息会一直缺失。
+fn reread_needed(changed: bool, deferred: bool) -> bool {
+    changed || deferred
+}
 
 impl AccountSync {
     pub fn new(wxid: &str, storage: &Path, keys: KeyMap, store: Arc<RwLock<Store>>) -> Self {
@@ -239,6 +295,9 @@ impl AccountSync {
             stamps: std::collections::HashMap::new(),
             stopped: Arc::new(AtomicBool::new(false)),
             progress: Arc::new(index::IndexProgress::default()),
+            source_digest: None,
+            generation: Arc::new(AtomicU32::new(0)),
+            sender_map_failures: SenderMapFailures::default(),
         }
     }
 
@@ -262,8 +321,15 @@ impl AccountSync {
             stamps: std::collections::HashMap::new(),
             stopped: Arc::new(AtomicBool::new(false)),
             progress: Arc::new(index::IndexProgress::default()),
+            source_digest: None,
+            generation: Arc::new(AtomicU32::new(0)),
+            sender_map_failures: SenderMapFailures::default(),
         }
     }
+
+    /// 发送者映射连续失败多少轮后放弃等待。达到上限按空映射入库：损坏的映射表
+    /// 永远读不出来，无限等待等于让这张库永久停止入库。
+    const SENDER_MAP_MAX_ATTEMPTS: u32 = 3;
 
     /// 取走自上次调用以来积压的事件（按发生顺序）。
     ///
@@ -306,6 +372,44 @@ impl AccountSync {
         self.progress.clone()
     }
 
+    /// 数据源世代的共享句柄，给拥有它的 `AccountHandle`。
+    ///
+    /// 与 `stop_flag`／`progress_handle` 同一条理由：HTTP 侧判断「导出期间数据源是否换了」
+    /// 时不能去拿这把锁，而 `full_sync` 可能正持有它数分钟。
+    pub fn generation_handle(&self) -> Arc<AtomicU32> {
+        self.generation.clone()
+    }
+
+    /// 采一次数据源指纹；身份类线索变化时推进世代并返回 `true`。
+    ///
+    /// 只比对相对路径、创建时间与每个库的 salt——**追加写入不会改变它们**，所以正常的
+    /// 新消息入库不会让游标失效。采样失败时**不推进**世代：一次读失败不能把所有在用
+    /// 游标判死，下一轮重试即可；失败本身会记一条警告，不静默吞掉。
+    fn sample_source(&mut self) -> bool {
+        match crate::db::source_identity::fingerprint(&self.storage) {
+            Ok(fp) => match self.source_digest {
+                None => {
+                    self.source_digest = Some(fp.digest);
+                    false
+                }
+                Some(previous) if previous != fp.digest => {
+                    self.source_digest = Some(fp.digest);
+                    self.generation.fetch_add(1, Ordering::SeqCst);
+                    tracing::warn!(
+                        files = fp.files,
+                        "数据源身份发生变化：旧游标与进行中的导出将失效"
+                    );
+                    true
+                }
+                Some(_) => false,
+            },
+            Err(err) => {
+                tracing::warn!(error = %err, "数据源指纹采样失败，本轮不推进世代");
+                false
+            }
+        }
+    }
+
     pub fn is_stopped(&self) -> bool {
         self.stopped.load(Ordering::SeqCst)
     }
@@ -313,6 +417,8 @@ impl AccountSync {
     /// Full build: read every database through the live pool and rebuild the
     /// index from scratch. Returns the number of databases processed.
     pub fn full_sync(&mut self) -> Result<usize> {
+        // 建索引前先建立（或刷新）数据源身份基线：换了库就从这里开始算新世代。
+        self.sample_source();
         let files = self.rescan();
         let keys = self.keys.clone();
         let store = index::build_all_live(&mut self.pool, &keys, &self.wxid, &files, &self.progress)?;
@@ -327,6 +433,23 @@ impl AccountSync {
             let mut guard = self.store.write();
             *guard = store;
             guard.mark_index_built();
+        }
+        // 把「构建期欠账」的库登记进待处理集合：`classify_changed` 会因此无视
+        // `data_version` 基线强制重查。构建期间没有任何新提交，只靠基线永远等
+        // 不到重试，那批消息会一直缺失。
+        let deferred: Vec<String> = self
+            .store
+            .read()
+            .deferred_sender_maps
+            .iter()
+            .cloned()
+            .collect();
+        {
+            let mut guard = self.sender_map_failures.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.clear();
+            for rel in deferred {
+                guard.insert(rel, 0);
+            }
         }
         // seed stamps so the next poll starts from a clean baseline
         // 只给**成功打开过**的文件记基线：构建期间打不开的库（缺 key / busy）
@@ -365,28 +488,32 @@ impl AccountSync {
         let files = self.rescan();
         let mut work: Vec<Work> = Vec::new();
         for f in &files {
+            // 发送者映射欠着账的库强制重查：全量构建跳过它时**没有**新提交，
+            // 只靠 `data_version` 基线永远等不到重试。
+            let deferred = self
+                .sender_map_failures
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&f.rel);
             // 两级检测：**已打开**的文件走 `data_version`（别的连接提交后必然
             // 变化，与文件系统时间戳无关 —— Windows 高负载下 mtime/size 回读
             // 滞后不会再把一次写入误判成「未变」）；**未打开**的文件没有连接，
             // 只能继续用 mtime/size 戳做前置门。无基线（首见文件）一律判变。
-            if self.pool.is_open(&f.rel) {
+            let changed = if self.pool.is_open(&f.rel) {
                 // 只**窥探**不推进基线：这一轮若因无 key / 打开失败而读不到数据，
                 // 基线必须保持原样，否则变更同样会被吞掉（换了个机制的同一 bug）。
-                let changed = self.pool.foreign_commit_pending(&f.rel).unwrap_or(true);
-                if !changed {
-                    continue;
-                }
+                self.pool.foreign_commit_pending(&f.rel).unwrap_or(true)
             } else {
                 let main = src_stamp(&f.abs);
                 let wal = f.wal.as_deref().and_then(src_stamp);
                 let cur = DbStamps { main, wal };
-                let unchanged = self
+                !self
                     .stamps
                     .get(&f.rel)
-                    .is_some_and(|prev| *prev == cur);
-                if unchanged {
-                    continue;
-                }
+                    .is_some_and(|prev| *prev == cur)
+            };
+            if !reread_needed(changed, deferred) {
+                continue;
             }
             match f.kind {
                 DbKind::Message => work.push(Work::Messages(f.clone())),
@@ -410,19 +537,38 @@ impl AccountSync {
         if self.is_stopped() {
             return Ok((0, 0));
         }
+        // 每轮扫描前采一次身份指纹：换库要尽快被发现，而增量本身不会被误判。
+        self.sample_source();
         let work = self.classify_changed();
         if work.is_empty() {
             return Ok((0, 0));
         }
 
         // phase 1: incremental reads (read-only wrt the store)
+        // 失败计数先 clone 出来：下面 `conn` 会借走 `self.pool` 的可变借用，
+        // 之后再碰 `&self` 会撞借用检查。
+        let sender_failures = self.sender_map_failures.clone();
         let mut new_rows: Vec<(String, MessageRecord)> = Vec::new();
-        let mut new_watermarks: Vec<(String, Watermark)> = Vec::new();
+        let mut new_watermarks = std::collections::HashMap::<String, Watermark>::new();
+        let mut scan_positions = std::collections::HashMap::<String, i64>::new();
         let mut revoke_rows: Vec<(String, MessageRecord)> = Vec::new();
         // 本轮**真正读过数据**的文件：只有它们才允许在 phase 4 记账
         // （戳与 data_version 基线）。读失败/无 key/打开失败的文件不记账，
         // 下一轮 classify 才会把它再当「已变更」重查。
         let mut read_done: Vec<String> = Vec::new();
+        // 元数据库（session/contact/fts/sns）本轮**成功刷新**的：它们的
+        // 成功读取同样进入确认集合。此前只有 Messages 会确认，一次联系人
+        // 提交之后 foreign_commit_pending 永远为真，每轮空轮询都全量重扫
+        // 并刷新 index_built_at_ms（回归：metadata_reload_confirms_once）。
+        //
+        // 版本确认采用**读取前采样**：消息库的采样在 SELECT 之前经
+        // `get_or_open_sampled` 拿到（连接与采样同一次借用，见 live.rs）；
+        // 元库的采样以「刷新成功」为准在 phase 3 补记。phase 4 确认的正是
+        // 这些采样值——SELECT 结束到确认之间落库的提交版本更大、不在集合里，
+        // 下一轮 classify 仍判「已变更」；在确认阶段重新采样当前版本会把那批
+        // 提交错误地记成「已读」，行就被永久吞掉
+        // （回归：unread_commit_between_read_and_ack_survives）。
+        let mut ack_versions: Vec<(String, i64)> = Vec::new();
 
         for w in &work {
             match w {
@@ -431,8 +577,14 @@ impl AccountSync {
                     let Some(key) = self.keys.key_for(&f.rel) else {
                         continue;
                     };
-                    let conn = match self.pool.get_or_open(f, key) {
-                        Ok(c) => c,
+                    // 连接与**读取前采样**同一次借用取得（get_or_open_sampled）：
+                    // 后面整个 SELECT 阶段都以这个版本为确认基准。
+                    // 采样值先落在局部：只有本轮**真正排空**（未触顶）才进入
+                    // 确认集合——触顶意味着还有行没读完，此时确认任何版本
+                    // 都可能把未读余量记成已读（这正是排空回归要防的形态）。
+                    let mut sampled_version: Option<i64> = None;
+                    let (conn, sampled) = match self.pool.get_or_open_sampled(f, key) {
+                        Ok(pair) => pair,
                         Err(AcquireError::WrongKey) => {
                             // 确定性失败进退避：busy_timeout 5 秒 × watch 350ms
                             // 高频触发会让坏 key 的文件拖垮整个 poll 节奏。
@@ -447,7 +599,43 @@ impl AccountSync {
                             continue;
                         }
                     };
-                    let name2id = index::name2id_table(conn);
+                    if let Some(v) = sampled {
+                        sampled_version = Some(v);
+                    }
+                    // 发送者映射读不出来时**不读这张库**：读进来的是空发送者与错的
+                    // `is_send`，而扫描位置会随行一起推进——增量只读更大的 `local_id`，
+                    // 事后把映射修好也不会回补这批行。所以先欠着，下一轮再试；连续失败
+                    // 达到上限才按空映射降级（损坏的表永远读不出来，无限等待等于让这张
+                    // 库永久停止入库）。
+                    let uid_map = match index::uid_map(conn) {
+                        Ok(map) => {
+                            clear_sender_map_failure(&sender_failures, &f.rel);
+                            map
+                        }
+                        Err(e) => {
+                            let attempt = note_sender_map_failure(&sender_failures, &f.rel);
+                            match sender_map_action(attempt) {
+                                SenderMapAction::Defer => {
+                                    tracing::warn!(
+                                        "{} sender map unreadable ({e}); deferring this database, attempt {attempt}/{}",
+                                        f.rel,
+                                        Self::SENDER_MAP_MAX_ATTEMPTS
+                                    );
+                                    continue;
+                                }
+                                SenderMapAction::DegradeWithEmptyMap => {
+                                    tracing::warn!(
+                                        "{} sender map still unreadable ({e}) after {attempt} attempts; indexing with empty senders",
+                                        f.rel
+                                    );
+                                    // 降级只做一次：位置与行都照常落库，再把欠账销掉，
+                                    // 否则每轮都会重新尝试读那张坏表并重复告警。
+                                    clear_sender_map_failure(&sender_failures, &f.rel);
+                                    std::collections::HashMap::new()
+                                }
+                            }
+                        }
+                    };
                     // 排空循环：单页读满 ⇒ 该表可能还有 ⇒ 继续读，直到不满页。只读一次就记
                     // 「本轮读过」的话，同一提交里第 5001 行之后的内容留在表里、而 phase 4 已
                     // 给该文件记了戳与 data_version 基线 —— 下一轮判「未变」，余量被永久吞掉。
@@ -457,14 +645,19 @@ impl AccountSync {
                         let wm_key = format!("{}:{table}", f.rel);
                         let mut wm = {
                             let guard = self.store.read();
-                            guard.watermarks.get(&wm_key).copied().unwrap_or_default()
+                            Watermark {
+                                local_id: guard.scan_positions.get(&wm_key).copied().unwrap_or(0),
+                                ..Watermark::default()
+                            }
                         };
+                        let source: Arc<str> = wm_key.clone().into();
                         let mut pages = 0usize;
                         loop {
                             pages += 1;
-                            let rows = read_new(conn, &table, &wm, name2id.as_deref())?;
+                            let rows = read_new(conn, &table, &wm, &uid_map)?;
                             let full = rows.len() >= index::READ_PAGE;
-                            for row in rows {
+                            for mut row in rows {
+                                row.source_shard = source.clone();
                                 let session_username = {
                                     let guard = self.store.read();
                                     index::resolve_table_session(&guard, &md5_suffix)
@@ -482,14 +675,21 @@ impl AccountSync {
                                 // latent bug that killed the parser's appmsg branch.
                                 let (base_type, _) =
                                     crate::parser::split_local_type(row.local_type);
+                                // 「记录进入索引」与「发布哪一种通知」是两件事：
+                                // 10000/10002（系统通知/撤回信令）与带撤回载荷的行
+                                // **照常入索引**——全量构建不过滤它们（index.rs 的
+                                // load_message_table），增量把它们丢掉就造成重启前后
+                                // 消息查询结果不一致（群公告、系统提示、撤回历史缺失）。
+                                // 通知类型只决定 phase 2 发哪一种事件。
                                 if matches!(base_type, 10000 | 10002)
                                     || row.parsed.revoke.is_some()
                                 {
-                                    revoke_rows.push((session_username.clone(), row));
-                                } else {
-                                    new_rows.push((session_username.clone(), row));
+                                    revoke_rows.push((session_username.clone(), row.clone()));
                                 }
-                                new_watermarks.push((wm_key.clone(), wm));
+                                new_rows.push((session_username.clone(), row));
+                                let previous = new_watermarks.entry(wm_key.clone()).or_default();
+                                *previous = (*previous).max(wm);
+                                scan_positions.insert(wm_key.clone(), wm.local_id);
                             }
                             if !full { break; }
                             if pages >= READ_MAX_PAGES {
@@ -501,7 +701,13 @@ impl AccountSync {
                             }
                         }
                     }
-                    if drained_all { read_done.push(f.rel.clone()); }
+                    if drained_all {
+                        read_done.push(f.rel.clone());
+                        // 排空才确认：版本集合的进入条件与戳记账一致。
+                        if let Some(v) = sampled_version {
+                            ack_versions.push((f.rel.clone(), v));
+                        }
+                    }
                 }
             }
         }
@@ -509,6 +715,8 @@ impl AccountSync {
         // phase 2: apply (single write lock) and emit events
         let mut applied_new = 0usize;
         let mut applied_revoke = 0usize;
+        // 压入 convs 的总行数（含信令行与自身发送）：updatedAt 的「索引变了吗」判据。
+        let mut applied_rows = 0usize;
         {
             let mut guard = self.store.write();
             // Deregistered while phase 1 was reading: discard the rows instead
@@ -519,10 +727,26 @@ impl AccountSync {
                 return Ok((0, 0));
             }
             let my_wxid = guard.my_wxid.clone();
+            for (wm_key, position) in scan_positions {
+                guard.scan_positions.insert(wm_key, position);
+            }
             for (wm_key, wm) in new_watermarks {
-                guard.watermarks.insert(wm_key, wm);
+                let previous = guard.watermarks.entry(wm_key).or_default();
+                *previous = (*previous).max(wm);
             }
             for (session, row) in new_rows {
+                // 撤回信令行入索引但不发 `message.new`：它的下游事件是 Revoke——
+                // 客户端同时收到「新消息：对方撤回了一条消息」和「撤回」两条通知
+                // 是重复告知；系统通知（10000）与撤回载荷行都只走索引 +
+                // Revoke/无事件这一条路。10000 无载荷时连 Revoke 都不发，但行在。
+                //
+                // 只按类型码判定即可：parser 只在 10000/10002 里提取撤回载荷，
+                // 「revoke.is_some() 但类型码不属于这两类」的行不存在——与
+                // phase 1 的分类条件合取形式在这里是冗余的，单条件更准确。
+                let is_signaling = matches!(
+                    crate::parser::split_local_type(row.local_type).0,
+                    10000 | 10002
+                );
                 let is_send = !row.sender_username.is_empty() && row.sender_username == my_wxid;
                 let sender_name = guard
                     .contacts
@@ -536,7 +760,8 @@ impl AccountSync {
                     is_send,
                     ..row
                 });
-                if !is_send {
+                applied_rows += 1;
+                if !is_send && !is_signaling {
                     applied_new += 1;
                     let ev = NewMessageEvent {
                         session_id: session.clone(),
@@ -585,24 +810,28 @@ impl AccountSync {
                 }
             }
             for (session, row) in revoke_rows {
-                if row.parsed.revoke.is_none() || row.create_time == 0 {
+                // 撤回**通知**只在行确实携带撤回载荷时发布。这里的 continue 只是
+                // 「不发撤回事件」——行本身已在上面随 new_rows 入索引，不再丢；
+                // create_time == 0 的行同样入索引（全量路径就是这么做的），只是
+                // 它的时间戳不能当通知时间用。
+                let Some(revoke) = row.parsed.revoke.as_ref().filter(|_| row.create_time > 0)
+                else {
                     continue;
-                }
+                };
                 let original = find_original(&guard, &session, &row);
                 let rawid = original
                     .as_ref()
                     .map(|o| o.server_id.to_string())
-                    .or_else(|| row.parsed.revoke.as_ref().and_then(|r| r.msg_id.clone()))
+                    .or_else(|| revoke.msg_id.clone())
                     .unwrap_or_default();
                 let original_content = original
                     .as_ref()
                     .map(|o| o.parsed.display.clone())
                     .unwrap_or_default();
                 let content = if original_content.is_empty() {
-                    row.parsed
-                        .revoke
-                        .as_ref()
-                        .and_then(|r| r.replace_msg.clone())
+                    revoke
+                        .replace_msg
+                        .clone()
                         .unwrap_or_else(|| "对方撤回了一条消息".to_string())
                 } else {
                     format!("对方撤回了一条消息（rawid：{rawid}） 内容为\"{original_content}\"")
@@ -632,7 +861,14 @@ impl AccountSync {
         }
 
         // phase 3: dependent section reloads over warm live connections
+        //
+        // 元库确认与消息库同一条纪律：确认的是**装载前采样**的版本。装载（全量
+        // 重载）不含装载之后落库的提交——确认「装载完成后」的版本会把那批提交
+        // 记成已读，它们要等到同库下一次提交或重启才会进索引。采样与连接在
+        // `get_or_open_sampled` 的同一次借用里取得；`load_*` 全量重载是幂等的，
+        // 装载前的版本已在 store 里充分体现。
         let keys = self.keys.clone();
+        let mut reloaded_sections = false;
         for w in &work {
             // Each arm takes its own write lock, so the flag is re-checked per
             // item rather than once for the whole loop.
@@ -642,37 +878,69 @@ impl AccountSync {
             match w {
                 Work::Sessions(f) => {
                         let Some(k) = keys.key_for(&f.rel) else { continue };
-                     if let Ok(conn) = self.pool.get_or_open(f, k) {
+                     if let Ok((conn, sampled)) = self.pool.get_or_open_sampled(f, k) {
                         let mut store = self.store.write();
-                        if let Err(e) = index::load_sessions(conn, &mut store) {
-                            tracing::warn!("sessions reload failed: {e}");
+                        match index::load_sessions(conn, &mut store) {
+                            Ok(()) => {
+                                // 刷新成功才确认：装载失败（表结构损坏等）本轮没有
+                                // 真正读过数据，版本留给下一轮。
+                                if let Some(v) = sampled {
+                                    ack_versions.push((f.rel.clone(), v));
+                                }
+                                reloaded_sections = true;
+                            }
+                            Err(e) => tracing::warn!("sessions reload failed: {e}"),
                         }
                     }
                 }
                 Work::Contacts(f) => {
-                        let Some(k) = keys.key_for(&f.rel) else { continue };
-                     if let Ok(conn) = self.pool.get_or_open(f, k) {
-                        let mut store = self.store.write();
-                        if let Err(e) = index::load_contacts(conn, &mut store) {
-                            tracing::warn!("contacts reload failed: {e}");
+                    let Some(k) = keys.key_for(&f.rel) else { continue };
+                    if let Ok((conn, sampled)) = self.pool.get_or_open_sampled(f, k) {
+                        match crate::store::group_meta::read_contact_metadata(conn) {
+                            Ok(metadata) => {
+                                let mut store = self.store.write();
+                                if self.is_stopped() { return Ok((applied_new, applied_revoke)); }
+                                metadata.apply(&mut store);
+                                if let Some(v) = sampled {
+                                    ack_versions.push((f.rel.clone(), v));
+                                }
+                                read_done.push(f.rel.clone());
+                                reloaded_sections = true;
+                            }
+                            Err(e) => tracing::warn!("contacts reload failed: {e}"),
                         }
-                        // 群主与名册也住 contact.db —— 顺带一起刷，免得它们只在启动时是对的。
-                        crate::store::group_meta::load_chatroom_meta(conn, &mut store);
                     }
                 }
                 Work::GroupMeta(f) => {
-                        let Some(k) = keys.key_for(&f.rel) else { continue };
-                     if let Ok(conn) = self.pool.get_or_open(f, k) {
-                        let mut store = self.store.write();
-                        crate::store::group_meta::load_group_cards(conn, &mut store);
+                    let Some(k) = keys.key_for(&f.rel) else { continue };
+                    if let Ok((conn, sampled)) = self.pool.get_or_open_sampled(f, k) {
+                        match crate::store::group_meta::read_group_cards(conn) {
+                            Ok(cards) => {
+                                let mut store = self.store.write();
+                                if self.is_stopped() { return Ok((applied_new, applied_revoke)); }
+                                store.group_cards = cards;
+                                if let Some(v) = sampled {
+                                    ack_versions.push((f.rel.clone(), v));
+                                }
+                                read_done.push(f.rel.clone());
+                                reloaded_sections = true;
+                            }
+                            Err(e) => tracing::warn!("group cards reload failed: {e}"),
+                        }
                     }
                 }
                 Work::Sns(f) => {
                         let Some(k) = keys.key_for(&f.rel) else { continue };
-                     if let Ok(conn) = self.pool.get_or_open(f, k) {
+                     if let Ok((conn, sampled)) = self.pool.get_or_open_sampled(f, k) {
                         let mut store = self.store.write();
-                        if let Err(e) = index::load_sns(conn, &mut store) {
-                            tracing::warn!("sns reload failed: {e}");
+                        match index::load_sns(conn, &mut store) {
+                            Ok(()) => {
+                                if let Some(v) = sampled {
+                                    ack_versions.push((f.rel.clone(), v));
+                                }
+                                reloaded_sections = true;
+                            }
+                            Err(e) => tracing::warn!("sns reload failed: {e}"),
                         }
                     }
                 }
@@ -696,12 +964,19 @@ impl AccountSync {
                 f.rel.clone(),
                 DbStamps { main, wal },
             );
-            // data_version 基线同理：只在**真读过**的文件上推进。
-            self.pool.advance_data_version(&f.rel);
+        }
+        // data_version 基线只在**真读过**的文件上推进，且推进到**读取前采样**的
+        // 版本：确认之后新落库的提交（版本更大）仍被判「已变更」，下一轮照读。
+        for (rel, v) in ack_versions {
+            self.pool.set_data_version(&rel, v);
         }
 
-        // 只有这一轮确实动过索引才更新时刻：空转的一轮不该让 updatedAt 看起来更新了。
-        if applied_new > 0 || applied_revoke > 0 || !work.is_empty() {
+        // 只有这一轮确实动过索引才更新时刻。判据是**内容变化**（压入 convs 的
+        // 行数、或任一元库完成重载），不是事件数：只含自己发出的消息、或只刷了
+        // 联系人/名册的轮次同样改变了索引内容，updatedAt（group_members 的
+        // roster 就住在 contact.db）必须跟着走；空轮询（工作项非空但零行、
+        // 全部读失败）则不该让「索引时间」失去意义。
+        if applied_rows > 0 || reloaded_sections {
             self.store.write().mark_index_built();
         }
 
@@ -732,12 +1007,27 @@ impl AccountSync {
             max_items,
         )
     }
+
+    pub fn export_media_targeted(
+        &self,
+        context: &crate::media::export::ExportCtx,
+        target: crate::media::target::Target<'_>,
+    ) -> Result<crate::media::export::PreparedExport, crate::media::target::ExportError> {
+        crate::media::target::export_live(&self.storage, &self.keys, context, target)
+    }
 }
 
 /// Locate the withdrawn original message inside a conversation.
 /// Candidates: server_id == msgid/newmsgid, else local_id == msgid,
 /// else the nearest preceding row within 5 minutes.
+///
+/// 信令行（10000/10002 系统通知与撤回信令）不作为候选：它们进索引之后
+/// （增量与全量现在一致）会出现在会话尾部，300 秒兜底会把「系统提示」
+/// 当成被撤回的原消息，RevokeEvent 的 rawid/content 随之变成系统行的。
 fn find_original(store: &Store, session: &str, revoke: &MessageRecord) -> Option<MessageRecord> {
+    let is_signaling = |m: &MessageRecord| {
+        matches!(crate::parser::split_local_type(m.local_type).0, 10000 | 10002)
+    };
     let ids: Vec<String> = [
         revoke.parsed.revoke.as_ref()?.msg_id.clone(),
         revoke.parsed.revoke.as_ref()?.new_msg_id.clone(),
@@ -747,7 +1037,7 @@ fn find_original(store: &Store, session: &str, revoke: &MessageRecord) -> Option
     .collect();
     let conv = store.convs.get(session)?;
     for m in conv.iter().rev() {
-        if m.local_id == revoke.local_id {
+        if m.local_id == revoke.local_id || is_signaling(m) {
             continue;
         }
         let svr = m.server_id.to_string();
@@ -758,7 +1048,7 @@ fn find_original(store: &Store, session: &str, revoke: &MessageRecord) -> Option
     // fallback: nearest previous incoming message within 300s
     let mut best: Option<&MessageRecord> = None;
     for m in conv.iter().rev() {
-        if m.local_id >= revoke.local_id {
+        if m.local_id >= revoke.local_id || is_signaling(m) {
             continue;
         }
         if revoke.create_time - m.create_time > 300 {
@@ -776,6 +1066,32 @@ fn find_original(store: &Store, session: &str, revoke: &MessageRecord) -> Option
 mod tests {
     use super::*;
 
+    /// 发送者映射读不出来时先欠账、到上限才降级。
+    ///
+    /// 欠账期**必须**不读这张库：读进来的是空发送者与错的 `is_send`，而扫描
+    /// 位置会随行推进——增量只读更大的 `local_id`，事后把映射修好也不回补。
+    /// 到上限仍失败则按空映射入库并告警：损坏的映射表永远读不出来，无限等待
+    /// 等于让这张库永久停止入库。
+    #[test]
+    fn sender_map_failures_defer_then_degrade() {
+        assert_eq!(sender_map_action(1), SenderMapAction::Defer);
+        assert_eq!(sender_map_action(2), SenderMapAction::Defer);
+        assert_eq!(sender_map_action(3), SenderMapAction::DegradeWithEmptyMap);
+        assert_eq!(sender_map_action(99), SenderMapAction::DegradeWithEmptyMap);
+    }
+
+    /// 欠账的库必须无视「未变更」结论被重查。
+    ///
+    /// 全量构建跳过它时**没有**任何新提交，`data_version` 基线的结论是「没变」；
+    /// 只看那一个判据，这张库会永久停在「一条消息都没有」的状态。
+    #[test]
+    fn deferred_database_is_reread_even_when_unchanged() {
+        assert!(reread_needed(true, false), "变了当然要读");
+        assert!(reread_needed(false, true), "欠账的库即使判「未变更」也要读");
+        assert!(reread_needed(true, true));
+        assert!(!reread_needed(false, false), "既没变也不欠账才跳过");
+    }
+
     #[test]
     fn find_original_by_server_id_matches_memory_rows() {
         let mut store = Store {
@@ -784,6 +1100,7 @@ mod tests {
         };
         let conv = store.convs.entry("sess".into()).or_default();
         conv.push(MessageRecord {
+            source_shard: Arc::from("fixture"),
             local_id: 1,
             server_id: 100,
             local_type: 1,
@@ -795,6 +1112,7 @@ mod tests {
             parsed: crate::parser::parse_message(1, 100, 1, "你好"),
         });
         conv.push(MessageRecord {
+            source_shard: Arc::from("fixture"),
             local_id: 2,
             server_id: 101,
             local_type: 10002,
@@ -927,6 +1245,39 @@ mod tests {
         base
     }
 
+    /// 世代只认身份类线索：真实追加不推进，整份换库才推进。
+    ///
+    /// 失败模式（修复前／写错时）：把大小或 mtime 也算进指纹，则每次入库都推进世代，
+    /// 所有在用游标每秒失效一次——游标等于不可用。
+    #[test]
+    fn source_generation_advances_only_when_the_database_is_replaced() {
+        let dir = unique_dir("source-generation");
+        let key = [0x3du8; 32];
+        let storage = build_message_account(&dir, &key);
+        let mut sync = AccountSync::new(
+            WXID,
+            &storage,
+            KeyMap::from(crate::keystore::DbKey(key)),
+            Arc::new(RwLock::new(Store::default())),
+        );
+        let generation = sync.generation_handle();
+        assert!(!sync.sample_source(), "第一次采样只建立基线");
+        assert_eq!(generation.load(Ordering::SeqCst), 0);
+
+        // 真实追加一行：文件大小变了，但身份没变。
+        append_row(&storage, &key, 8_100_000_000_000_000_002);
+        assert!(!sync.sample_source(), "追加不是身份变化");
+        assert_eq!(generation.load(Ordering::SeqCst), 0);
+
+        // 换库：整份替换成另一份库文件（salt 不同）。
+        let other_dir = unique_dir("source-generation-other");
+        let other = build_message_account(&other_dir, &key);
+        std::fs::copy(other.join("message/message_0.db"), storage.join("message/message_0.db"))
+            .unwrap();
+        assert!(sync.sample_source(), "换了库必须推进世代");
+        assert_eq!(generation.load(Ordering::SeqCst), 1);
+    }
+
     /// 候选 1 路：**mtime/size 戳与基线相同**（模拟 Windows 高负载下元数据回读滞后）
     /// 但数据已提交 ⇒ 廉价跳过不得吞掉这一行。修复前：戳相同 ⇒ classify 判「未变」⇒
     /// poll 返回 0 ⇒ 红；修复后：已打开的文件改查 data_version ⇒ 仍能捡到 ⇒ 绿。
@@ -1035,5 +1386,284 @@ mod tests {
         assert_eq!(n2, 1, "无密钥的那一轮不得吞掉变更：恢复后必须重查");
         assert_eq!(store.read().convs[GROUP].len(), 2);
     }
+
+    /// 排空与确认之间的提交不得被吞：phase 4 只确认**读取前采样**的版本。
+    ///
+    /// 精确的读窗口交错（phase 2 持锁停驻 → 提交 → 放行）在 `poll_once` 的
+    /// 单线程接口里无法逐指令构造，本条退而验证确认原语的最小性质：
+    /// 采样值固定后，窗口内落库的提交必然让 `foreign_commit_pending` 为真。
+    /// 本条尾部还直接钉住对照形态——`advance_data_version`（确认时刻的
+    /// 当前值）会把窗口内提交记成已读，这正是它被弃用的原因。
+    #[test]
+    fn unread_commit_between_read_and_ack_survives() {
+        let dir = unique_dir("ack-window");
+        let key = crate::keystore::parse_db_key(KEY_HEX).unwrap().0;
+        let storage = build_message_account(&dir, &key);
+        let store = Arc::new(RwLock::new(Store::default()));
+        let mut sync = AccountSync::new(WXID, &storage, crate::keystore::KeyMap::from(crate::keystore::DbKey(key)), store.clone());
+        sync.full_sync().unwrap();
+        assert_eq!(store.read().convs[GROUP].len(), 1);
+
+        // 读前采样：模拟 poll_once phase 1 的动作——拿到连接即取版本。
+        let files = scan::enum_db_files(&storage);
+        let f = files.iter().find(|f| f.rel == "message/message_0.db").unwrap().clone();
+        let (sampled_v, pending_after_sample) = {
+            let (_conn, sampled) = sync
+                .pool
+                .get_or_open_sampled(&f, crate::keystore::DbKey(key))
+                .unwrap();
+            let pending = sync.pool.foreign_commit_pending(&f.rel).unwrap();
+            (sampled, pending)
+        };
+        assert!(!pending_after_sample, "采样后没有新提交：无待处理变更");
+
+        // 读取窗口内（SELECT 已完成、确认未发生）微信落库——正是要防的交错。
+        append_row(&storage, &key, 8_100_000_000_000_000_004);
+        let pending_in_window = sync.pool.foreign_commit_pending(&f.rel).unwrap();
+        assert!(pending_in_window, "窗口内提交必须被判为待处理");
+
+        // 确认动作只写**采样值**：窗口内的提交（版本更大）留在基线之后。
+        sync.pool.set_data_version(&f.rel, sampled_v.expect("正常打开必有版本"));
+        let pending_after_ack = sync.pool.foreign_commit_pending(&f.rel).unwrap();
+        assert!(
+            pending_after_ack,
+            "确认采样值后窗口内提交仍待处理——这是下一轮必读的依据"
+        );
+
+        // 对照：变异为确认当前值（advance 的错法）会把它确认掉。直接验证
+        // 当前值确认的错误性：把基线推到当前值，pending 变假——证明两种
+        // 确认的差别就是丢不丢行。
+        sync.pool.advance_data_version(&f.rel);
+        assert_eq!(
+            sync.pool.foreign_commit_pending(&f.rel),
+            Some(false),
+            "对照：确认当前值会把窗口内提交记成已读（错误形态本身的可观察性）"
+        );
+    }
+
+    /// 系统通知行（10000）在增量路径照常入索引：增量结果必须与全量重建一致。
+    /// 修复前的失败模式：10000/10002 全部只进 revoke 分支，无撤回载荷的行被
+    /// continue 丢弃 ⇒ 增量后 8 条、全量重建 9 条。
+    #[test]
+    fn system_row_reaches_the_index_incrementally() {
+        let dir = unique_dir("sys-row");
+        let key = crate::keystore::parse_db_key(KEY_HEX).unwrap().0;
+        let storage = build_message_account(&dir, &key);
+        let store = Arc::new(RwLock::new(Store::default()));
+        let mut sync = AccountSync::new(WXID, &storage, crate::keystore::KeyMap::from(crate::keystore::DbKey(key)), store.clone());
+        sync.full_sync().unwrap();
+        assert_eq!(store.read().convs[GROUP].len(), 1);
+
+        // 追加一条普通系统通知（10000、无撤回载荷）。
+        append_typed_row(&storage, &key, 8_100_000_000_000_000_007, 10000, "<sysmsg type=\"notice\"/>");
+        let (n, _) = sync.poll_once().unwrap();
+        // 信令行不进 applied_new（不发 message.new 事件——它的下游不是「新消息」语义），
+        // 但必须**入索引**：convs 里必须能看到这一行。
+        assert_eq!(n, 0, "系统通知不产生新消息事件");
+        assert_eq!(store.read().convs[GROUP].len(), 2, "系统通知照常入索引");
+
+        // 与全量重建对照：两条路径必须等价。
+        let mut pool = crate::db::live::LivePool::new();
+        let files = scan::enum_db_files(&storage);
+        let rebuilt = crate::store::index::build_all_live(
+            &mut pool,
+            &crate::keystore::KeyMap::Single(crate::keystore::DbKey(key)),
+            WXID,
+            &files,
+            &crate::store::index::IndexProgress::default(),
+        ).unwrap();
+        // 增量与全量的行数与水位必须一致——这正是「系统行入索引」的性质。
+        assert_eq!(
+            rebuilt.convs[GROUP].len(),
+            store.read().convs[GROUP].len(),
+            "增量索引与全量重建的行数必须一致"
+        );
+        assert_eq!(
+            rebuilt.convs[GROUP].last().unwrap().local_type,
+            10000,
+            "全量重建同样保留系统行"
+        );
+    }
+
+    /// 元数据库（contact）成功刷新后确认版本：一次提交只产生一次有效重载，
+    /// 随后的空轮询不再重复扫描、不再刷 index_built_at_ms。
+    ///
+    /// 夹具补上 contact.db（此前版本没有它，整条测试空转——work 恒空、
+    /// phase 0 早退，修前修后一样绿）。反向变异：把 phase 3 的确认集合
+    /// 拿掉，第二轮 foreign_commit_pending 仍为真 ⇒ reloaded 再次为真
+    /// ⇒ 时间戳第二次被推进 ⇒ 本条变红。
+    #[test]
+    fn metadata_reload_confirms_once() {
+        let dir = unique_dir("meta-ack");
+        let key = crate::keystore::parse_db_key(KEY_HEX).unwrap().0;
+        let storage = build_message_account_with_contact(&dir, &key);
+        let store = Arc::new(RwLock::new(Store::default()));
+        let mut sync = AccountSync::new(WXID, &storage, crate::keystore::KeyMap::from(crate::keystore::DbKey(key)), store.clone());
+        sync.full_sync().unwrap();
+
+        // 一次联系人提交：下一轮 poll 必须重载 contacts 并推进时间戳。
+        append_contact_row(&storage, &key, "wxid_new_friend_0001", "新朋友");
+        let t0 = store.read().index_built_at_ms;
+        sync.poll_once().unwrap();
+        let t1 = store.read().index_built_at_ms;
+        assert!(t1 > t0, "一次联系人提交应当产生一次有效重载（重载推进 updatedAt）");
+        assert!(
+            store.read().contacts.contains_key("wxid_new_friend_0001"),
+            "重载必须真的把新联系人装进索引"
+        );
+
+        // 无任何新提交：再轮询不得再次重载——时间戳不再推进，
+        // 且 classify 对 contact 库给出「已确认」。
+        sync.poll_once().unwrap();
+        assert_eq!(
+            store.read().index_built_at_ms, t1,
+            "成功重载必须确认版本：随后的空轮询不得再刷新索引时刻"
+        );
+        assert_eq!(
+            sync.pool.foreign_commit_pending("contact/contact.db"),
+            Some(false),
+            "确认集合必须包含 contact：装载前采样值已写回基线"
+        );
+    }
+
+    /// 追加一条指定 local_type 的行（系统通知/撤回载荷测试用）。
+    fn append_typed_row(storage: &Path, key: &[u8; 32], server_id: i64, local_type: i64, content: &str) {
+        let conn = Connection::open(storage.join("message/message_0.db")).unwrap();
+        let key_hex = hex::encode(key);
+        conn
+            .execute_batch(&format!(
+                "PRAGMA cipher_page_size = 4096;\n             PRAGMA key = \"x'{key_hex}'\";\n             PRAGMA journal_mode = DELETE;"
+            ))
+            .unwrap();
+        let group_md5 = md5_hex(GROUP);
+        conn.execute(
+            &format!(
+                "INSERT INTO \"Msg_{group_md5}\" (server_id, local_type, create_time, sort_seq, real_sender_id, message_content) VALUES (?1, ?2, ?3, 0, 2, ?4)"
+            ),
+            rusqlite::params![server_id, local_type, 1_700_000_300i64, content],
+        )
+        .unwrap();
+    }
+
+    /// 在 build_message_account 之上补 contact.db：元库确认与联系人重载的
+    /// 夹具（Contact 表与真库同形的最小形状）。
+    fn build_message_account_with_contact(dir: &Path, key: &[u8; 32]) -> PathBuf {
+        let storage = build_message_account(dir, key);
+        std::fs::create_dir_all(storage.join("contact")).unwrap();
+        let conn = Connection::open(storage.join("contact/contact.db")).unwrap();
+        let key_hex = hex::encode(key);
+        conn.execute_batch(&format!(
+            "PRAGMA cipher_page_size = 4096;\n             PRAGMA key = \"x'{key_hex}'\";\n             PRAGMA journal_mode = DELETE;\n             CREATE TABLE Contact (\n                userName TEXT PRIMARY KEY,\n                nickName TEXT,\n                remark TEXT\n             );"
+        ))
+        .unwrap();
+        drop(conn);
+        storage
+    }
+
+    /// 向 contact.db 追加一行联系人（新开连接提交一次，触发 data_version 变化）。
+    fn append_contact_row(storage: &Path, key: &[u8; 32], username: &str, remark: &str) {
+        let conn = Connection::open(storage.join("contact/contact.db")).unwrap();
+        let key_hex = hex::encode(key);
+        conn.execute_batch(&format!(
+            "PRAGMA cipher_page_size = 4096;\n             PRAGMA key = \"x'{key_hex}'\";\n             PRAGMA journal_mode = DELETE;"
+        ))
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO Contact (userName, nickName, remark) VALUES (?1, ?2, ?2)",
+            rusqlite::params![username, remark],
+        )
+        .unwrap();
+    }
+
+    fn metadata_writer(storage: &Path, key: &[u8; 32], file: &str) -> Connection {
+        let conn = Connection::open(storage.join("contact").join(file)).unwrap();
+        let key_hex = hex::encode(key);
+        conn.execute_batch(&format!(
+            "PRAGMA cipher_page_size = 4096; PRAGMA key = \"x'{key_hex}'\"; PRAGMA journal_mode = DELETE;"
+        )).unwrap();
+        conn
+    }
+
+    #[test]
+    fn metadata_failure_preserves_snapshot_and_pending_version() {
+        let dir = unique_dir("meta-failed-read");
+        let key = crate::keystore::parse_db_key(KEY_HEX).unwrap().0;
+        let storage = build_message_account_with_contact(&dir, &key);
+        let writer = metadata_writer(&storage, &key, "contact.db");
+        writer.execute_batch(
+            "INSERT INTO Contact VALUES ('member', 'before', 'before');
+             CREATE TABLE name2id (username TEXT);
+             INSERT INTO name2id VALUES ('room'), ('member');
+             CREATE TABLE chat_room (username TEXT, owner TEXT);
+             INSERT INTO chat_room VALUES ('room', 'member');
+             CREATE TABLE chatroom_member (room_id INTEGER, member_id INTEGER);
+             INSERT INTO chatroom_member VALUES (1, 2);"
+        ).unwrap();
+        let store = Arc::new(RwLock::new(Store::default()));
+        let mut sync = AccountSync::new(WXID, &storage, KeyMap::Single(crate::keystore::DbKey(key)), store.clone());
+        sync.full_sync().unwrap();
+        let built = store.read().index_built_at_ms;
+
+        // The contact read succeeds; the later roster read yields one good row
+        // and then an invalid numeric ID. Nothing from this snapshot may apply.
+        writer.execute_batch(
+            "UPDATE Contact SET remark = 'after';
+             DELETE FROM chat_room;
+             INSERT INTO chatroom_member VALUES (1, 'broken');"
+        ).unwrap();
+        for _ in 0..2 {
+            sync.poll_once().unwrap();
+            let snapshot = store.read();
+            assert_eq!(snapshot.contacts["member"].remark.as_deref(), Some("before"));
+            assert_eq!(snapshot.chatroom_owner["room"], "member");
+            assert_eq!(snapshot.chatroom_roster["room"], vec!["member"]);
+            assert_eq!(snapshot.index_built_at_ms, built);
+            assert_eq!(sync.pool.foreign_commit_pending("contact/contact.db"), Some(true));
+        }
+        writer.execute_batch("DELETE FROM chatroom_member;").unwrap();
+        sync.poll_once().unwrap();
+        assert_eq!(store.read().contacts["member"].remark.as_deref(), Some("after"));
+        assert!(store.read().chatroom_owner.is_empty());
+        assert!(store.read().chatroom_roster.is_empty());
+        assert_eq!(sync.pool.foreign_commit_pending("contact/contact.db"), Some(false));
+        let accepted = store.read().index_built_at_ms;
+        sync.poll_once().unwrap();
+        assert_eq!(store.read().index_built_at_ms, accepted);
+    }
+
+    #[test]
+    fn group_cards_failure_retries_and_empty_snapshot_clears_deleted_cards() {
+        let dir = unique_dir("cards-failed-read");
+        let key = crate::keystore::parse_db_key(KEY_HEX).unwrap().0;
+        let storage = build_message_account_with_contact(&dir, &key);
+        let writer = metadata_writer(&storage, &key, "contact_fts.db");
+        writer.execute_batch(
+            "CREATE TABLE name2id (username TEXT);
+             INSERT INTO name2id VALUES ('room'), ('member');
+             CREATE TABLE chatroom_member_fts_v3_aux (room_id INTEGER, member_id INTEGER);
+             CREATE TABLE chatroom_member_fts_v3_content (c0 TEXT);
+             INSERT INTO chatroom_member_fts_v3_aux VALUES (1, 2);
+             INSERT INTO chatroom_member_fts_v3_content VALUES ('before');"
+        ).unwrap();
+        let store = Arc::new(RwLock::new(Store::default()));
+        let mut sync = AccountSync::new(WXID, &storage, KeyMap::Single(crate::keystore::DbKey(key)), store.clone());
+        sync.full_sync().unwrap();
+        assert_eq!(store.read().group_cards["room"]["member"], "before");
+        // The mapping itself must propagate a decode failure after valid rows.
+        writer.execute_batch(
+            "UPDATE chatroom_member_fts_v3_content SET c0 = 'after';
+             INSERT INTO name2id VALUES (x'80');"
+        ).unwrap();
+        sync.poll_once().unwrap();
+        assert_eq!(store.read().group_cards["room"]["member"], "before");
+        assert_eq!(sync.pool.foreign_commit_pending("contact/contact_fts.db"), Some(true));
+        writer.execute_batch("DELETE FROM name2id WHERE rowid = 3;").unwrap();
+        sync.poll_once().unwrap();
+        assert_eq!(store.read().group_cards["room"]["member"], "after");
+        writer.execute_batch("DELETE FROM chatroom_member_fts_v3_content;").unwrap();
+        sync.poll_once().unwrap();
+        assert!(store.read().group_cards.is_empty());
+        assert_eq!(sync.pool.foreign_commit_pending("contact/contact_fts.db"), Some(false));
+    }
+
 }
-// touch
