@@ -992,9 +992,13 @@ fn run_export(a: &ExportArgs) -> Result<()> {
             if !page.sync.has_more {
                 break;
             }
-            // hasMore 却没有游标是本端形状判断的问题：继续用旧游标会原地打转，当作排空
+            // hasMore 却没有游标、或游标与本次请求的原样相同，都是本端形状判断的问题：
+            // 继续用旧游标会原地打转（同一页反复追加进产物、永不完成），当作排空
             // 又会静默丢数据——两种都不能算成功。
             match page.sync.next_cursor.clone() {
+                Some(next) if cursor.as_deref() == Some(next.as_str()) => anyhow::bail!(
+                    "会话 {talker} 的拉取面在 hasMore=true 时返回了与请求相同的游标（原地打转），导出中止"
+                ),
                 Some(next) => cursor = Some(next),
                 None => anyhow::bail!(
                     "会话 {talker} 的拉取面在 hasMore=true 时没有给出 nextCursor"

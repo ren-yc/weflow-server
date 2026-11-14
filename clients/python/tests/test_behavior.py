@@ -457,30 +457,56 @@ async def test_pull_cursor_page_sends_the_token_verbatim() -> None:
     await client.aclose()
 
 
-async def test_drain_session_cursor_restarts_once_after_a_reset() -> None:
-    """A reset restarts **once**; looping forever would trap the caller."""
+async def test_drain_session_cursor_propagates_cursor_reset_without_restarting() -> None:
+    """A reset is raised as-is: pages already handed to ``on_page`` cannot be
+    revoked, and silently restarting would deliver them twice."""
+    import pytest
+
     mock = Mock()
     mock.pull_errors = [
         None,
         (409, {"success": False, "code": 409, "message": "游标已失效",
                "reason": "cursor_reset_required"}),
-        None,
     ]
     mock.pull_pages = [
         pull_page([msg(1, 1000)], True, 1000, 0, next_cursor="c1"),
-        pull_page([msg(2, 1001)], False, 1001, 0, next_cursor="c2"),
     ]
     client = make_client(mock)
     pages: list[list[int]] = []
-    total = await client.drain_session_cursor(
-        "alice", None,
-        lambda batch: pages.append([int(m.platform_message_id) for m in batch]),
-    )
-    assert total == 2, "the restarted pull must still count the remaining page"
-    assert pages == [[1], [2]]
-    assert len(mock.pull_queries) == 3, mock.pull_queries
-    assert mock.pull_queries[1] == {"cursor": "c1"}
-    assert "cursor" not in mock.pull_queries[2], "the restart must drop the cursor"
+    with pytest.raises(CursorReset):
+        await client.drain_session_cursor(
+            "alice", None,
+            lambda batch: pages.append([int(m.platform_message_id) for m in batch]),
+        )
+    # Only the page before the 409 was delivered; no further request, no replay.
+    assert pages == [[1]]
+    assert len(mock.pull_queries) == 2, mock.pull_queries
+    # Request order: cursor-less first page (200) -> cursor echo (409).
+    assert "cursor" not in mock.pull_queries[0], "the first page must not carry a cursor"
+    assert mock.pull_queries[1] == {"cursor": "c1"}, "the reset lands on the echo request"
+    await client.aclose()
+
+
+async def test_drain_session_cursor_rejects_a_non_advancing_cursor() -> None:
+    """``hasMore=true`` with a next cursor equal to the request cursor would
+    spin forever, handing the same page to ``on_page`` over and over."""
+    import pytest
+
+    mock = Mock()
+    mock.pull_pages = [
+        pull_page([msg(1, 1000)], True, 1000, 0, next_cursor="c1"),
+        pull_page([msg(1, 1000)], True, 1000, 0, next_cursor="c1"),
+    ]
+    client = make_client(mock)
+    pages: list[list[int]] = []
+    with pytest.raises(ShapeError):
+        await client.drain_session_cursor(
+            "alice", None,
+            lambda batch: pages.append([int(m.platform_message_id) for m in batch]),
+        )
+    # The looping page must not be delivered; one request beyond the first.
+    assert pages == [[1]]
+    assert len(mock.pull_queries) == 2, mock.pull_queries
     await client.aclose()
 
 

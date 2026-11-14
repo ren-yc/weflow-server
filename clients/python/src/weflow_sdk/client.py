@@ -600,33 +600,46 @@ class Client:
     ) -> int:
         """Drain one session through the opaque cursor, echoing it verbatim.
 
-        On :class:`CursorReset`: if the current request carried a server-issued
-        cursor, drop it and restart **once**. A second reset is raised - looping
-        forever would trap the caller, and repeated resets mean the source or
-        the registration is churning.
+        On :class:`CursorReset` the error is **raised as-is**: this loop has
+        already handed earlier pages to ``on_page`` and there is no mechanism
+        to revoke callback results or ask the caller to clear them - silently
+        restarting after delivery would give append-style callers duplicate
+        records and double-count ``total``. Recovering from a reset (drain
+        again from scratch, deduplicate what was already delivered) is the
+        caller's job: it knows how it consumes the pages.
+
+        A next cursor that is absent or **identical to the cursor this request
+        carried** is a shape error too: paging on would spin in place,
+        handing the same page to ``on_page`` forever. Both terminate with an
+        error instead of guessing.
         """
         cursor: str | None = None
-        restarted = False
         total = 0
         while True:
-            try:
-                page = await self.pull_page_cursor(talker, cursor, since)
-            except CursorReset:
-                if cursor is not None and not restarted:
-                    restarted = True
-                    cursor = None
-                    continue
-                raise
-            total += len(page.messages)
-            on_page(page.messages)
+            page = await self.pull_page_cursor(talker, cursor, since)
             if not page.sync.has_more:
+                total += len(page.messages)
+                on_page(page.messages)
                 return total
-            cursor = page.sync.next_cursor
-            if cursor is None:
+            # Shape guard BEFORE delivery: with hasMore=true, a next cursor that
+            # is absent or identical to the one this request carried would spin
+            # in place, handing the same page to ``on_page`` forever. Judge the
+            # page's shape first, then deliver - a rejected page never reaches
+            # the callback.
+            next_cursor = page.sync.next_cursor
+            if next_cursor is None:
                 raise ShapeError(
                     "sync.hasMore=true but sync.nextCursor is absent: "
                     "echoing the previous cursor would loop forever"
                 )
+            if next_cursor == cursor:
+                raise ShapeError(
+                    "sync.nextCursor did not advance beyond the request cursor "
+                    f"(hasMore=true would loop forever): {next_cursor}"
+                )
+            total += len(page.messages)
+            on_page(page.messages)
+            cursor = next_cursor
 
     async def drain_session(
         self,

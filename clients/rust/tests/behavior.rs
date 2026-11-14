@@ -571,18 +571,57 @@ async fn pull_cursor_page_sends_the_token_verbatim_and_drops_since() {
     assert!(!queries[0].contains("since="), "有游标就不该再发 since：{}", queries[0]);
 }
 
-/// 失效游标只重来**一次**：无限重来会把调用方拖进死循环。
+/// 失效游标**直接上抛**：循环已把先前的页交给 `on_page`，自动从头重来会重复
+/// 交付已交付的页——撤销回调结果或通知调用方清空的机制并不存在。
 #[tokio::test]
-async fn drain_session_cursor_restarts_once_after_a_reset() {
+async fn drain_session_cursor_propagates_cursor_reset_without_restarting() {
     let mock = Mock::default();
-    // 请求序列：第一页（给游标）→ 409（该游标失效）→ 重来后的最后一页。
+    // 请求序列：第一页（给游标）→ 409（该游标失效）。
     *mock.pull_errors.lock().unwrap() = vec![
         None,
         Some((409, serde_json::json!({
             "success": false, "code": 409, "message": "游标已失效", "reason": "cursor_reset_required"
         }))),
-        None,
     ];
+    *mock.pull_pages.lock().unwrap() = vec![
+        serde_json::json!({
+            "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
+            "members": [],
+            "messages": [{"accountName":"","content":"one","groupNickname":"","platformMessageId":"1",
+                          "sender":"alice","timestamp":1700000000,"type":0}],
+            "meta": {"groupId": "", "name": "", "ownerId": "", "platform": "weflow", "type": "chat"},
+            "sync": {"hasMore": true, "nextSince": 1700000000, "nextOffset": 0, "nextCursor": "c1", "watermark": 1700000000},
+        }),
+    ];
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+
+    let mut pages: Vec<usize> = Vec::new();
+    let err = client
+        .drain_session_cursor("alice", None, |page| {
+            pages.push(page.len());
+            Ok(())
+        })
+        .await
+        .expect_err("失效游标必须上抛，静默从头重来会重复交付已交付的页");
+    assert!(
+        matches!(err, weflow_client::client::ClientError::CursorReset { .. }),
+        "上抛的必须是 CursorReset 本身：{err}"
+    );
+    // 只交付了 409 之前的那一页；没有第三次请求，也没有重复交付。
+    assert_eq!(pages, vec![1], "{pages:?}");
+    let queries = mock.pull_queries.lock().unwrap().clone();
+    assert_eq!(queries.len(), 2, "失效后不得自行重启，实际 {queries:?}");
+    // 请求序列：无游标首页（200）→ 带游标续拉（409）。失效发生在续拉上。
+    assert!(!queries[0].contains("cursor="), "首页不带游标：{}", queries[0]);
+    assert!(queries[1].contains("cursor=c1"), "续拉带服务端给的游标：{}", queries[1]);
+}
+
+/// 服务端 hasMore=true 却回传**与请求相同**的游标：翻页会原地打转、把同一页
+/// 反复交给 `on_page`——必须在交付前拒绝，而不是循环到天荒地老。
+#[tokio::test]
+async fn drain_session_cursor_rejects_a_non_advancing_cursor() {
+    let mock = Mock::default();
     *mock.pull_pages.lock().unwrap() = vec![
         serde_json::json!({
             "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
@@ -595,29 +634,31 @@ async fn drain_session_cursor_restarts_once_after_a_reset() {
         serde_json::json!({
             "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
             "members": [],
-            "messages": [{"accountName":"","content":"two","groupNickname":"","platformMessageId":"2",
-                          "sender":"alice","timestamp":1700000001,"type":0}],
+            "messages": [{"accountName":"","content":"one-again","groupNickname":"","platformMessageId":"1",
+                          "sender":"alice","timestamp":1700000000,"type":0}],
             "meta": {"groupId": "", "name": "", "ownerId": "", "platform": "weflow", "type": "chat"},
-            "sync": {"hasMore": false, "nextSince": 1700000001, "nextOffset": 0, "nextCursor": "c2", "watermark": 1700000001},
+            "sync": {"hasMore": true, "nextSince": 1700000000, "nextOffset": 0, "nextCursor": "c1", "watermark": 1700000000},
         }),
     ];
     let base = spawn_mock(mock.clone()).await;
     let client = Client::new(&base, TOKEN);
 
-    let mut seen = 0u64;
-    let total = client
-        .drain_session_cursor("alice", None, |page| {
-            seen += page.len() as u64;
+    let mut pages = 0usize;
+    let err = client
+        .drain_session_cursor("alice", None, |_| {
+            pages += 1;
             Ok(())
         })
         .await
-        .unwrap();
-    assert_eq!(total, 2, "重来后要把剩下的那页也算上");
-    assert_eq!(seen, 2);
+        .expect_err("不推进的游标必须报错终止");
+    assert!(
+        matches!(err, weflow_client::client::ClientError::UnexpectedBody { .. }),
+        "形状错误必须是 UnexpectedBody：{err}"
+    );
+    // 第二页（同游标回环页）不得交付；总共只发两次请求、交付一页。
+    assert_eq!(pages, 1, "{pages}");
     let queries = mock.pull_queries.lock().unwrap().clone();
-    assert_eq!(queries.len(), 3, "被拒一次后应重来一次，实际 {queries:?}");
-    assert!(queries[1].contains("cursor=c1"), "第二次必须带上服务端给的游标：{}", queries[1]);
-    assert!(!queries[2].contains("cursor="), "重来必须不带游标：{}", queries[2]);
+    assert_eq!(queries.len(), 2, "{queries:?}");
 }
 
 /// 没有 `reason` 的 409 不是「重拉」信号：照旧当错误上抛，别把真冲突吞成重试。

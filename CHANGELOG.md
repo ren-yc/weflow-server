@@ -12,6 +12,8 @@
 ### 变更
 
 - 接口契约 pin 由 `v0.9.0` 升 `v0.10.0`：新增 `mediaExportByMessage` 能力与 `media_export` 端点，共享用例 `targeted-media-export-fetch` 随一致性套件执行。
+- **SDK 的 `drain_session_cursor` 收到游标失效改为直接上抛**：此前失效后自动从头重启一次，已交付给回调的页会重复投递、`total` 重复计数；撤销回调结果或通知调用方清空的机制并不存在。迁移：调用方改为捕获 `CursorReset` 自行从头拉取并对已交付集合去重（CLI 的批量导出语义不变——它本就把失效当失败处理）。回归：`drain_session_cursor_propagates_cursor_reset_without_restarting`（Rust）/ `test_drain_session_cursor_propagates_cursor_reset_without_restarting`（Python）。
+- **SDK 与 CLI 翻页拒绝不推进的游标**：`hasMore=true` 且下一游标为空或与请求游标相同时报错终止，而不是把同一页反复交付（或把重复行追加进导出产物）。回归：`drain_session_cursor_rejects_a_non_advancing_cursor`（Rust）/ `test_drain_session_cursor_rejects_a_non_advancing_cursor`（Python）。
 
 ### 破坏性变更
 

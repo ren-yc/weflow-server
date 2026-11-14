@@ -676,9 +676,14 @@ impl Client {
 
     /// 用不透明游标把一个会话排空；游标**原样**回传（`sync.nextCursor`）。
     ///
-    /// 收到 [`ClientError::CursorReset`] 时：本轮若用的是服务端给的游标，就丢弃它
-    /// 从头重来**一次**；再遇到就上抛——无限重来会把调用方拖进死循环，而反复失效
-    /// 本身说明数据源或注册在动荡，继续拉没有意义。
+    /// 收到 [`ClientError::CursorReset`] 时**直接上抛**：本循环已经把先前的页交给
+    /// 了 `on_page`，没有任何撤销回调结果或通知调用方清空结果的机制——在已交付
+    /// 之后静默从头重来，追加式调用方会拿到重复记录，`total` 也会重复计数。失效
+    /// 的处置（从头拉一次、对已交付集合去重）是**调用方**的事：它知道自己怎么
+    /// 消费这些页。
+    ///
+    /// 服务端返回的下一游标为空或**与本次请求的游标相同**都是形状错误：继续翻页
+    /// 会原地打转、把同一页反复交给 `on_page`。两者都以错误终止，而不是猜测。
     pub async fn drain_session_cursor<F>(
         &self,
         talker: &str,
@@ -689,32 +694,42 @@ impl Client {
         F: FnMut(&[gen_types::PullMessage]) -> Result<()>,
     {
         let mut cursor: Option<String> = None;
-        let mut restarted = false;
         let mut total = 0u64;
         loop {
-            let page = match self.pull_page_cursor(talker, cursor.as_deref(), since, None).await {
-                Ok(page) => page,
-                Err(ClientError::CursorReset { .. }) if cursor.is_some() && !restarted => {
-                    restarted = true;
-                    cursor = None;
-                    continue;
+            let page = self
+                .pull_page_cursor(talker, cursor.as_deref(), since, None)
+                .await?;
+            if !page.sync.has_more {
+                total += page.messages.len() as u64;
+                on_page(&page.messages)?;
+                return Ok(total);
+            }
+            // 形状守卫在**交付之前**：hasMore=true 却不推进游标（缺失，或原样回环）
+            // 时，继续翻页只会原地打转、把同一页反复交给 `on_page`。先把这一页的
+            // 形状判完，再决定交付与续页——被拒页不进回调。
+            let next = match page.sync.next_cursor.clone() {
+                None => {
+                    // 服务端在没有排空的情况下不给游标，是本端形状判断的问题：
+                    // 继续用旧游标会原地打转，静默退出又会丢数据。
+                    return Err(ClientError::UnexpectedBody {
+                        url: format!("/api/v1/sessions/{}/messages", encode_path_segment(talker)),
+                        detail: "sync.hasMore=true but sync.nextCursor is absent".to_string(),
+                    });
                 }
-                Err(e) => return Err(e),
+                Some(next) if cursor.as_deref() == Some(next.as_str()) => {
+                    return Err(ClientError::UnexpectedBody {
+                        url: format!("/api/v1/sessions/{}/messages", encode_path_segment(talker)),
+                        detail: format!(
+                            "sync.nextCursor did not advance beyond the request cursor \
+                             (hasMore=true would loop forever): {next}"
+                        ),
+                    });
+                }
+                Some(next) => next,
             };
             total += page.messages.len() as u64;
             on_page(&page.messages)?;
-            if !page.sync.has_more {
-                return Ok(total);
-            }
-            cursor = page.sync.next_cursor.clone();
-            if cursor.is_none() {
-                // 服务端在没有排空的情况下不给游标，是本端形状判断的问题：
-                // 继续用旧游标会原地打转，静默退出又会丢数据。
-                return Err(ClientError::UnexpectedBody {
-                    url: format!("/api/v1/sessions/{}/messages", encode_path_segment(talker)),
-                    detail: "sync.hasMore=true but sync.nextCursor is absent".to_string(),
-                });
-            }
+            cursor = Some(next);
         }
     }
 
