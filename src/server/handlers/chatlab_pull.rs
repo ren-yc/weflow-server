@@ -66,27 +66,34 @@ pub async fn handler(
         registration,
         source_generation,
     );
-    let cursor_local_id = match cursor_param.as_deref() {
+    let cursor_progress = match cursor_param.as_deref() {
         Some(raw) => Some(cursor_ctx.decode(raw).map_err(|e| e.into_api_error())?),
         None => None,
     };
 
     // 进度游标模式（cursor 给出）下整个分页只用行标识（local_id）：过滤用
-    // 「local_id > 游标值」的排他下界，排序与页推进都按 local_id 单调——
-    // 入库序与时间序在乱序行上分叉时，续拉严格无重放、无跳行；乱序行的
-    // messages 顺序不再是时间升序，这是「排空判据=入库进度」的直接后果。
+    // 「local_id > 该行所在分片的进度线」的排他下界，排序与页推进都按 local_id
+    // 单调——入库序与时间序在乱序行上分叉时，续拉严格无重放、无跳行；乱序行
+    // 的 messages 顺序不再是时间升序，这是「排空判据=入库进度」的直接后果。
+    //
+    // 进度线按**分片**（source_shard）记账而不是整个会话：local_id 只在分片内
+    // 唯一（`MessageRecord::source_shard` 的注释钉着这一事实），同一会话的行
+    // 可以来自多个分片表。只编码会话最大值时，低分片的新追加行永远落在
+    // 「local_id > 会话最大值」之外且拿不到任何重置信号——静默丢行。
     // 无 cursor 的时间模式保持规范原行为：(create_time, sort_seq, local_id)
     // 复合键升序、页不跨秒推进（nextSince 语义依赖它），契约不要求与游标同键。
     let mut ascending: Vec<&crate::store::MessageRecord> = conv
         .iter()
         .filter(|m| {
-            if let Some(lid) = cursor_local_id {
-                return m.local_id > lid && end.is_none_or(|e| m.create_time <= e);
+            if let Some(progress) = &cursor_progress {
+                let shard = crate::server::cursor::shard_code(&m.source_shard);
+                return progress.admits(shard, m.local_id)
+                    && end.is_none_or(|e| m.create_time <= e);
             }
             since.is_none_or(|s| m.create_time > s) && end.is_none_or(|e| m.create_time <= e)
         })
         .collect();
-    if cursor_local_id.is_some() {
+    if cursor_progress.is_some() {
         ascending.sort_by_key(|m| m.local_id);
     } else {
         ascending.sort_by(|a, b| {
@@ -98,9 +105,9 @@ pub async fn handler(
     // Page from `offset`, extending to the end of the last second's ts group:
     // pages never split a second, which is what lets `nextSince` (the page's
     // last timestamp) advance without dropping the rest of that second.
-    let start = if cursor_local_id.is_some() { 0 } else { offset.min(total) };
+    let start = if cursor_progress.is_some() { 0 } else { offset.min(total) };
     let mut page_end = start;
-    if cursor_local_id.is_some() {
+    if cursor_progress.is_some() {
         // 游标模式：页推进按 local_id 组——与排序键一致，页边界不切断单调序，
         // 页末 localId 是严格的「已交付上界」。
         let mut prev_lid = None;
@@ -132,7 +139,9 @@ pub async fn handler(
     // 进度游标编码「**已交付集合**」的进度上界——不是页末行：
     //
     // - cursor 模式：排序按 local_id 单调，页末行就是已交付集合的最大 local_id，
-    //   两者重合；空页时以本次游标值为准（进度不回退）。
+    //   两者重合；进度线**按分片记账**（local_id 只在分片内唯一），本页覆盖的
+    //   分片取「已交付集合的最大值」，没覆盖的分片保留请求游标里的旧值——
+    //   进度对每个分片都只前进不回退。空页时整条进度线保持请求原值。
     // - 时间模式非空页：排序按时间复合键，页末行 local_id **可能不是已交付集合
     //   里最大的**（回溯入库的行：时间早、行标识大）。编码页末行会让后续游标链
     //   重放它；必须编码「本次响应已交付的行里最大的 local_id」。
@@ -141,22 +150,39 @@ pub async fn handler(
     //   游标编码「end 界内已确立的最大 local_id」（end 缺省时水位线=now 覆盖
     //   全部行）。编码 0 是「从头拉取」，周期轮询的客户端采纳它再丢掉时间过滤
     //   就会重放全历史。
-    let last_local_id = if cursor_local_id.is_some() {
-        page.iter()
-            .map(|m| m.local_id)
-            .max()
-            .or(cursor_local_id)
-            .unwrap_or(0)
+    let request_progress = cursor_progress.clone().unwrap_or_default();
+    let next_progress = if cursor_progress.is_some() {
+        if page.is_empty() {
+            // 空页：进度保持（游标值不变，不回退为从头拉取）。
+            request_progress
+        } else {
+            // 本页覆盖的分片推进到已交付集合的最大值，其余分片保留旧值。
+            let mut bounds = std::collections::HashMap::<u64, i64>::new();
+            for m in &page {
+                let shard = crate::server::cursor::shard_code(&m.source_shard);
+                let slot = bounds.entry(shard).or_insert(m.local_id);
+                *slot = (*slot).max(m.local_id);
+            }
+            request_progress.merged(&crate::server::cursor::CursorProgress::from_bounds(bounds))
+        }
     } else if page.is_empty() {
-        conv.iter()
-            .filter(|m| m.create_time <= watermark)
-            .map(|m| m.local_id)
-            .max()
-            .unwrap_or(0)
+        let mut bounds = std::collections::HashMap::<u64, i64>::new();
+        for m in conv.iter().filter(|m| m.create_time <= watermark) {
+            let shard = crate::server::cursor::shard_code(&m.source_shard);
+            let slot = bounds.entry(shard).or_insert(m.local_id);
+            *slot = (*slot).max(m.local_id);
+        }
+        crate::server::cursor::CursorProgress::from_bounds(bounds)
     } else {
-        page.iter().map(|m| m.local_id).max().unwrap_or(0)
+        let mut bounds = std::collections::HashMap::<u64, i64>::new();
+        for m in &page {
+            let shard = crate::server::cursor::shard_code(&m.source_shard);
+            let slot = bounds.entry(shard).or_insert(m.local_id);
+            *slot = (*slot).max(m.local_id);
+        }
+        crate::server::cursor::CursorProgress::from_bounds(bounds)
     };
-    let next_cursor = cursor_ctx.encode(last_local_id);
+    let next_cursor = cursor_ctx.encode(&next_progress);
 
     // `groupNickname` is the sender's per-chatroom card, which lives in
     // `group_cards` — NOT the contact's 备注. The two are different things and

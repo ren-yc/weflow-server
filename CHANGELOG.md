@@ -21,6 +21,8 @@
 
 ### 修复
 
+- 进度游标改为**按分片记进度**：`local_id` 只在「库文件：表名」分片内唯一，同一会话的行可来自多个分片；此前游标只编码会话最大 local_id，先排空高分片再向低分片追加时，新行被「local_id > 会话最大值」永久滤掉且拿不到任何重置信号。游标不跨进程存活，旧游标随进程重启自然失效，无需迁移。回归：`cursor_progress_is_tracked_per_source_shard`。
+- 游标的账号/会话字段改为**先验语法再比身份**：字段形态非法（非十六进制、长度不对）从 409 改为 400——语法坏与身份不符的处置相反，判成失效会让客户端对一条永远重试不成功的损坏游标执行全量重拉。回归：`syntactically_broken_identity_fields_are_malformed_not_reset`。
 - 定向媒体在临时文件写完后复查注册，再发布产物；取消清理临时文件，已有有效副本可在源缓存清理后复用。回归：`targeted_media_cancels_staged_bytes_after_account_switch`。
 - 明文图片先识别格式再尝试 DAT 解密，跨分片重复本地行号按请求内位置回填媒体。回归：`page_media_backfill_keeps_equal_local_ids_in_separate_shards`。
 - 消息入库按每张表的本地行号推进，新增旧时间消息不再被时间水位跳过；初次构建也记录独立扫描位置。回归：`backdated_append_is_indexed_without_replaying_the_initial_snapshot`。

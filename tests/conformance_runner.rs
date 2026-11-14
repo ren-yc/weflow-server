@@ -706,3 +706,111 @@ async fn cursor_continuation_is_monotonic_when_row_order_diverges_from_time_orde
     dedup.dedup();
     assert_eq!(dedup.len(), sorted.len(), "游标链不得重复交付（重放判据）");
 }
+
+/// 进度游标必须**按分片记进度**（回归：低分片的新追加行可达）。
+///
+/// `local_id` 只在「库文件:表名」分片内唯一，而同一会话的行可以来自多个分片
+/// （真实库 16/32 位 md5 表共存）。修复前游标只编码会话最大 local_id：先排空
+/// 高分片（local_id 到 4），再向低分片追加 local_id=1 的新行，续拉的
+/// 「local_id > 4」过滤把它永久滤掉——且普通追加不推进数据源世代，客户端拿不到
+/// 任何重置信号。修复后进度线按分片记账，低分片从自己的进度线起算。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "真实索引链路回归：随一致性步骤显式运行（cargo test --test conformance_runner -- --ignored）"]
+async fn cursor_progress_is_tracked_per_source_shard() {
+    let dir = common::tmp_dir("cursor-shard");
+    let key = keystore::parse_db_key(common::FAKE_KEY_HEX).unwrap();
+    let storage = common::build_wechat_account(&dir, &key.0);
+    // 第二分片在注册**之前**建好并放一行：首轮全量构建把它一并收进索引，
+    // 两个分片的行同处一个会话（这是修复前丢行的前提形态）。
+    common::add_second_message_shard(&storage, &key.0);
+    let second_id = common::append_second_shard_message(&storage, &key.0, 1);
+
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let state = Arc::new(server::AppState::new(
+        cfg_for(&dir),
+        TOKEN.to_string(),
+        shutdown_tx,
+    ));
+    let app = server::build_router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = app.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let body = json!({
+        "wxid": common::FAKE_WXID,
+        "key": common::FAKE_KEY_HEX,
+        "db_path": dir.to_string_lossy(),
+    });
+    let mut r = req("POST", "/api/v1/accounts");
+    r.headers_mut().insert(
+        header::CONTENT_TYPE,
+        "application/json".parse().unwrap(),
+    );
+    *r.body_mut() = Body::from(body.to_string());
+    let reg = json_of(&client, r).await;
+    assert_eq!(reg["success"], json!(true), "注册失败：{reg}");
+    assert!(wait_ready(&client).await, "索引没能在 30 秒内到 ready");
+
+    let pull_url = format!("/chatlab/sessions/{}/messages", common::FAKE_GROUP);
+
+    // 段一：单页排空两个分片，取排空游标。
+    let v = json_of(&client, req("GET", &format!("{pull_url}?limit=5000"))).await;
+    let drained: Vec<String> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(v["sync"]["hasMore"], json!(false), "必须单页排空");
+    assert!(
+        drained.contains(&second_id.to_string()),
+        "第二分片的存量行必须在排空页里，实际：{drained:?}"
+    );
+    let c0 = v["sync"]["nextCursor"].as_str().unwrap().to_string();
+
+    // 段二：向低分片追加（它的 local_id 独立从 1 起算，远小于第一分片的 4+），
+    // 推进增量，然后按排空游标续拉——修复前「local_id > 会话最大值」把它滤掉。
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let appended = common::append_second_shard_message(&storage, &key.0, 2 + seq);
+    let acct = state.accounts.lock().values().next().cloned();
+    if let Some(a) = acct {
+        let sync = a.sync.clone();
+        let _ = tokio::task::spawn_blocking(move || sync.lock().poll_once()).await;
+    }
+    let v = json_of(
+        &client,
+        req("GET", &format!("{pull_url}?limit=5000&cursor={c0}")),
+    )
+    .await;
+    let got: Vec<String> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        got,
+        vec![appended.to_string()],
+        "低分片的新追加行必须经排空游标可达（且只交付它）"
+    );
+
+    // 段三：续拉后的游标再排空一次（无重放）。
+    let c1 = v["sync"]["nextCursor"].as_str().unwrap();
+    let v = json_of(
+        &client,
+        req("GET", &format!("{pull_url}?limit=5000&cursor={c1}")),
+    )
+    .await;
+    let got: Vec<String> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        got.is_empty(),
+        "按分片推进后的游标续拉不得重放，实际交付：{got:?}"
+    );
+}
