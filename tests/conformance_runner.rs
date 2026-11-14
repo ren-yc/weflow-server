@@ -814,3 +814,89 @@ async fn cursor_progress_is_tracked_per_source_shard() {
         "按分片推进后的游标续拉不得重放，实际交付：{got:?}"
     );
 }
+
+/// 初始 since 窗口的排除必须**随游标携带**（排除线），覆盖不到的分片在续拉时
+/// 不得把窗口外历史行冒出来。
+///
+/// 场景（修复后的二次复核指出的泄漏形态）：分片 A 只有窗口内行、分片 B 只有
+/// 窗口外历史行；首次请求 `since=…` 只交付 A，游标也只记录 A。修复前续拉对 B
+/// 从 0 起算且忽略 since——B 的历史行在续拉时被重新交付。修复后排除线（初始
+/// since）钉在游标里，未覆盖分片按它过滤，带不带 since 都不重放。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "真实索引链路回归：随一致性步骤显式运行（cargo test --test conformance_runner -- --ignored）"]
+async fn cursor_exclusion_line_covers_shards_outside_the_initial_window() {
+    let dir = common::tmp_dir("cursor-excl");
+    let key = keystore::parse_db_key(common::FAKE_KEY_HEX).unwrap();
+    let storage = common::build_wechat_account(&dir, &key.0);
+    // 分片 B：只有一条时间 1699999990 的行（早于主分片全部行与下面的 since）。
+    common::add_second_message_shard(&storage, &key.0);
+    let history_id = common::append_second_shard_message_at(&storage, &key.0, 1, 1_699_999_990);
+
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let state = Arc::new(server::AppState::new(
+        cfg_for(&dir),
+        TOKEN.to_string(),
+        shutdown_tx,
+    ));
+    let app = server::build_router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = app.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let body = json!({
+        "wxid": common::FAKE_WXID,
+        "key": common::FAKE_KEY_HEX,
+        "db_path": dir.to_string_lossy(),
+    });
+    let mut r = req("POST", "/api/v1/accounts");
+    r.headers_mut().insert(
+        header::CONTENT_TYPE,
+        "application/json".parse().unwrap(),
+    );
+    *r.body_mut() = Body::from(body.to_string());
+    let reg = json_of(&client, r).await;
+    assert_eq!(reg["success"], json!(true), "注册失败：{reg}");
+    assert!(wait_ready(&client).await, "索引没能在 30 秒内到 ready");
+
+    let pull_url = format!("/chatlab/sessions/{}/messages", common::FAKE_GROUP);
+
+    // 段一：首次拉取带 since=1700000000（高于分片 B 的历史行、低于主分片全部行）：
+    // 只交付主分片行，分片 B 的历史行被窗口排除。
+    let v = json_of(
+        &client,
+        req("GET", &format!("{pull_url}?limit=5000&since=1700000000")),
+    )
+    .await;
+    let got: Vec<String> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        !got.contains(&history_id.to_string()),
+        "分片 B 的窗口外历史行不得进入首次响应：{got:?}"
+    );
+    assert!(!got.is_empty(), "主分片行必须在窗口内");
+    let c0 = v["sync"]["nextCursor"].as_str().unwrap().to_string();
+
+    // 段二：按游标续拉，**不带 since**——排除线随游标携带，B 的历史行仍被排除。
+    let v = json_of(
+        &client,
+        req("GET", &format!("{pull_url}?limit=5000&cursor={c0}")),
+    )
+    .await;
+    let got: Vec<String> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        !got.contains(&history_id.to_string()),
+        "续拉（无 since）不得重放未覆盖分片的窗口外历史：{got:?}"
+    );
+    assert_eq!(v["sync"]["hasMore"], json!(false), "排除后没有新行可交付");
+}

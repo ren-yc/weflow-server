@@ -44,7 +44,9 @@ WEFLOW_BASE_URL=http://127.0.0.1:6002 weflow-server mcp
   - 游标失效是工具级错误，并指名「不要带 `cursor` 重来」：409 加 `reason` 属可自愈的输入过期。
 - `get_messages` 截断时**不返回**整页游标 `nextSince`（用它续拉会跳过没给出去的条），但**返回** `nextOffset` 与 `sinceResolved`。
   - **非游标模式**（请求没带 `cursor`）：`nextOffset` 是连续切片，正好指向被砍掉的第一条；续拉传 `nextOffset` 且 `since` 传 `sinceResolved`——不要重发相对串（如 `7d`）：续拉发生在下一轮对话，「现在」已经前移，相对串会把窗口悄悄前移。未提供 `since` 时 `sinceResolved` 为 null（等价于不传）。
-  - **游标模式**（请求带了 `cursor`）：`nextOffset` 为 null——它是同一时间组内的位置，套在游标流上没有意义。续拉**保留原游标**、减小 `limit` 重取本页，并按 `platformMessageId` 对已返回消息去重；此时 `nextCursor` 原样回传**本次入参游标**（表示「本页还没读完」）。`nextOffset` 不是游标页的续拉机制。
+  - **游标模式**（请求带了 `cursor`）：`nextOffset` 为 null——它是同一时间组内的位置，套在游标流上没有意义。续拉**保留原游标**、减小 `limit` 重取本页。
+    - 重取结果按 `(timestamp, sender, platformMessageId)` 组合去重：`platformMessageId` 单独不是全局唯一身份，不同源分片表的行可带同一 `server_id`。
+    - 此时 `nextCursor` 原样回传**本次入参游标**（表示「本页还没读完」）。`nextOffset` 不是游标页的续拉机制。
   - 截断时 `nextCursor` 原样回传**本次入参游标**：它表示「本页还没读完」，配更小的 `limit` 重取本页即可。
 - `search_messages` 与 `get_messages_raw` 同按 `offset` 翻页、本页是连续切片，截断时 `nextOffset` 正好指向被砍掉的第一条（并把 `hasMore` 置真）。
 

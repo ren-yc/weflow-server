@@ -354,11 +354,13 @@ impl WeflowMcp {
                 Value::Null
             } else if cursor_mode {
                 // 游标模式下 nextCursor 已原样回传入参游标：拿它配更小的 limit 重取本页。
-                json!("本页超过字符预算，已少给若干条：把响应里的 nextCursor 原样回传（它等于本次入参游标，表示本页还没读完）并减小 limit 重取本页，按 platformMessageId 去重")
+                // 去重键不能用 platformMessageId 单独担当：不同分片表的 server_id 可重复，
+                // 它不是全局唯一身份——用 (timestamp, sender, platformMessageId) 组合。
+                json!("本页超过字符预算，已少给若干条：把响应里的 nextCursor 原样回传（它等于本次入参游标，表示本页还没读完）并减小 limit 重取本页，重取结果按 (timestamp, sender, platformMessageId) 组合去重——platformMessageId 单独不是全局唯一身份（不同源分片可重复）")
             } else if since_resolved.is_some() {
-                json!("本页超过字符预算，已少给若干条：用 nextCursor 原样回传续拉，或改用 nextOffset 且 since 传响应里的 sinceResolved（绝对下界，不要重发相对串——下一轮 now 已前移会挪窗）续拉；也可用更小的 limit 重取本页，此时按 platformMessageId 去重")
+                json!("本页超过字符预算，已少给若干条：用 nextCursor 原样回传续拉，或改用 nextOffset 且 since 传响应里的 sinceResolved（绝对下界，不要重发相对串——下一轮 now 已前移会挪窗）续拉；也可用更小的 limit 重取本页，此时按 (timestamp, sender, platformMessageId) 组合去重（platformMessageId 单独不是全局唯一身份）")
             } else {
-                json!("本页超过字符预算，已少给若干条：用 nextCursor 原样回传续拉，或用 nextOffset 续拉（本次调用未提供 since，无绝对下界可回填）；也可用更小的 limit 重取本页，此时按 platformMessageId 去重")
+                json!("本页超过字符预算，已少给若干条：用 nextCursor 原样回传续拉，或用 nextOffset 续拉（本次调用未提供 since，无绝对下界可回填）；也可用更小的 limit 重取本页，此时按 (timestamp, sender, platformMessageId) 组合去重（platformMessageId 单独不是全局唯一身份）")
             },
             "messages": proj.items,
         })))

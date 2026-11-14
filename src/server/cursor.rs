@@ -150,11 +150,23 @@ impl CursorContext {
     }
 }
 
-/// 游标末段的进度：会话内每个分片各自的已交付上界（排他下界，严格大于才算新行）。
+/// 游标末段的进度：会话内每个分片各自的已交付上界（排他下界，严格大于才算新行），
+/// 以及**未覆盖分片的时间排除线**。
+///
+/// 时间排除线解决「首次响应只覆盖部分分片」的泄漏：请求带 `since=20` 时，
+/// 窗口外的分片 B（历史行时间 10）不在本次交付里，游标线上也就没有它的进度——
+/// 续拉若对它从 0 起算，它的历史行会冒出来。排除线把「初始窗口对未覆盖分片的
+/// 排除」钉进游标：续拉对线上没有进度线的分片仍按排除线过滤，带不带 since
+/// 都不会重放窗口外历史。分片一旦被任何响应覆盖，排除线即被进度线取代
+/// （进度线是更强的上界）。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CursorProgress {
     /// `(分片代号, 该分片已交付的最大 local_id)`，按代号升序。
     shards: Vec<(u64, i64)>,
+    /// 本游标的**排除线**：初始请求的 since（不排除历史 = `i64::MIN`）。
+    /// 对 `shards` 里没有进度线的分片，续拉按它过滤 `create_time`。
+    /// 排除线只收紧不放松：续拉携带新的 since（更晚）时取两者较大值。
+    excluded_until: i64,
 }
 
 impl CursorProgress {
@@ -165,16 +177,26 @@ impl CursorProgress {
         let mut shards: Vec<(u64, i64)> = bounds.into_iter().collect();
         shards.sort_unstable_by_key(|(s, _)| *s);
         shards.dedup_by(|a, b| a.0 == b.0);
-        Self { shards }
+        Self { shards, excluded_until: i64::MIN }
+    }
+
+    /// 带排除线的构造（初始请求带 since 时）。
+    pub fn with_exclusion(
+        bounds: impl IntoIterator<Item = (u64, i64)>,
+        since: i64,
+    ) -> Self {
+        let mut out = Self::from_bounds(bounds);
+        out.excluded_until = since;
+        out
     }
 
     /// 空进度：全部行从 0 起算（「从头拉取」的语义位）。
     pub fn empty() -> Self {
-        Self { shards: Vec::new() }
+        Self { shards: Vec::new(), excluded_until: i64::MIN }
     }
 
     /// 请求携带的旧进度与本页覆盖的分片合并：本页没覆盖到的分片保留旧值
-    /// （进度不回退），覆盖到的取新值。
+    /// （进度不回退），覆盖到的取新值；排除线只收紧（取较大 since）。
     pub fn merged(self, fresh: &CursorProgress) -> CursorProgress {
         let mut out = self.shards.clone();
         for (shard, bound) in &fresh.shards {
@@ -184,7 +206,20 @@ impl CursorProgress {
             }
         }
         out.sort_unstable_by_key(|(s, _)| *s);
-        Self { shards: out }
+        let excluded_until = self.excluded_until.max(fresh.excluded_until);
+        Self { shards: out, excluded_until }
+    }
+
+    /// 某分片当前的**时间下界**：进度线上的分片已无时间排除（None）；
+    /// 线上没有的分片按排除线（`excluded_until`；`i64::MIN` = 不排除）。
+    pub fn time_bound_for(&self, shard: u64) -> Option<i64> {
+        if self.shards.iter().any(|(s, _)| *s == shard) {
+            None
+        } else if self.excluded_until == i64::MIN {
+            None
+        } else {
+            Some(self.excluded_until)
+        }
     }
 
     /// 一行是否已越过该行所在分片的进度线：严格大于（上界是「已交付集合的
@@ -203,9 +238,9 @@ impl CursorProgress {
     }
 
     fn encode(&self) -> String {
-        if self.shards.is_empty() {
-            return "0".to_string();
-        }
+        // 排除线用 `e<since>` 后缀段表达（`i64::MIN` = 无排除，整段省略）；
+        // 其余与分片进度线相同。空进度（无分片、无排除）仍编码 "0"——「从头拉取」
+        // 的语义位，空串解不出来。
         let mut out = String::new();
         for (i, (shard, bound)) in self.shards.iter().enumerate() {
             if i > 0 {
@@ -213,6 +248,16 @@ impl CursorProgress {
             }
             out.push_str(&format!("{shard:016x}"));
             out.push_str(&bound.to_string());
+        }
+        if self.excluded_until != i64::MIN {
+            if !out.is_empty() {
+                out.push('~');
+            }
+            out.push('e');
+            out.push_str(&self.excluded_until.to_string());
+        }
+        if out.is_empty() {
+            return "0".to_string();
         }
         out
     }
@@ -223,7 +268,15 @@ impl CursorProgress {
             return Some(Self::empty());
         }
         let mut shards = Vec::new();
+        let mut excluded_until = i64::MIN;
         for seg in text.split('~') {
+            if let Some(rest) = seg.strip_prefix('e') {
+                if rest.is_empty() {
+                    return None;
+                }
+                excluded_until = rest.parse().ok()?;
+                continue;
+            }
             if seg.len() <= SHARD_HEX || !seg.bytes().take(SHARD_HEX).all(|b| b.is_ascii_hexdigit()) {
                 return None;
             }
@@ -231,7 +284,7 @@ impl CursorProgress {
             let bound: i64 = seg[SHARD_HEX..].parse().ok()?;
             shards.push((shard, bound));
         }
-        Some(Self { shards })
+        Some(Self { shards, excluded_until })
     }
 }
 
@@ -284,8 +337,26 @@ mod tests {
     }
 
     #[test]
-    fn merged_keeps_uncovered_shards_and_never_regresses() {
+    fn exclusion_line_survives_round_trip_and_merges_forward() {
         let a = shard_code("db0:Msg_a");
+        let b = shard_code("db1:Msg_b");
+        // 首次响应只覆盖 a（b 在 since 窗口外没有行）：排除线记下 since。
+        let first = CursorProgress::with_exclusion([(a, 1)], 20);
+        let encoded = ctx().encode(&first);
+        assert_eq!(ctx().decode(&encoded), Ok(first.clone()));
+        assert_eq!(first.time_bound_for(b), Some(20), "未覆盖分片按排除线过滤");
+        assert_eq!(first.time_bound_for(a), None, "已覆盖分片由进度线接管");
+        // 续拉覆盖到 b：排除线仍在（只收紧不放松），但 b 已被进度线接管。
+        let next = first.merged(&CursorProgress::with_exclusion([(b, 1)], 30));
+        assert_eq!(next.time_bound_for(b), None);
+        assert_eq!(next.time_bound_for(a), None);
+        // 无排除线的游标编码后不带 e 段（与旧载荷逐字节兼容）。
+        let plain = CursorProgress::from_bounds([(a, 1)]);
+        assert!(!ctx().encode(&plain).contains('e'), "无排除线不得引入 e 段");
+    }
+
+    #[test]
+    fn merged_keeps_uncovered_shards_and_never_regresses() {        let a = shard_code("db0:Msg_a");
         let b = shard_code("db1:Msg_b");
         let old = CursorProgress::from_bounds([(a, 100), (b, 10)]);
         // 本页只覆盖 a：b 的进度原样保留。

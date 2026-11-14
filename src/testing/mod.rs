@@ -670,3 +670,24 @@ pub fn append_second_shard_message(storage: &Path, key: &Key, seq: i64) -> i64 {
     drop(conn);
     server_id
 }
+
+/// 向**第二分片**追加一行，业务时间由调用方指定（`append_second_shard_message`
+/// 的回溯变体）。回归「跨分片的历史排除」需要：分片 B 只有比首次请求 since
+/// 更早的行——首次响应只覆盖分片 A，续拉不得把 B 的窗口外历史行冒出来。
+pub fn append_second_shard_message_at(storage: &Path, key: &Key, seq: i64, create_time: i64) -> i64 {
+    let path = storage.join("message/message_1.db");
+    let conn = wx_conn(&path, key, false);
+    let group_md5 = md5_hex(FAKE_GROUP);
+    let server_id = 8_500_000_000_000_000_000i64 + seq;
+    conn.execute(
+        &format!(
+            "INSERT INTO \"Msg_{md5}\" (server_id, local_type, create_time, sort_seq, real_sender_id, message_content) \
+             VALUES (?1, 1, ?2, 0, 2, ?3)",
+            md5 = group_md5
+        ),
+        rusqlite::params![server_id, create_time, format!("第二分片回溯-{seq}")],
+    )
+    .unwrap();
+    drop(conn);
+    server_id
+}

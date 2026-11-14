@@ -12,6 +12,18 @@ use crate::server::error::{ApiError, ApiResult};
 use crate::server::handlers::{require_auth, ready_account};
 use crate::server::AppState;
 
+/// 本页覆盖分片的进度 + 请求的排除线（见 handler 内「排除线」注释）。
+fn fresh_progress(
+    bounds: std::collections::HashMap<u64, i64>,
+    excluded_until: i64,
+) -> crate::server::cursor::CursorProgress {
+    if excluded_until == i64::MIN {
+        crate::server::cursor::CursorProgress::from_bounds(bounds)
+    } else {
+        crate::server::cursor::CursorProgress::with_exclusion(bounds, excluded_until)
+    }
+}
+
 // 游标编解码一律走 `crate::server::cursor`：它把「进程 / 账号 / 会话 / 注册代次 /
 // 数据源世代」绑进载荷，失效时返回 409 + `reason`，而不是静默退回时间模式。
 pub async fn handler(
@@ -71,7 +83,7 @@ pub async fn handler(
         None => None,
     };
 
-    // 进度游标模式（cursor 给出）下整个分页只用行标识（local_id）：过滤用
+    // 进度游标模式（cursor 给出）下分页以行标识（local_id）为准：过滤用
     // 「local_id > 该行所在分片的进度线」的排他下界，排序与页推进都按 local_id
     // 单调——入库序与时间序在乱序行上分叉时，续拉严格无重放、无跳行；乱序行
     // 的 messages 顺序不再是时间升序，这是「排空判据=入库进度」的直接后果。
@@ -80,20 +92,29 @@ pub async fn handler(
     // 唯一（`MessageRecord::source_shard` 的注释钉着这一事实），同一会话的行
     // 可以来自多个分片表。只编码会话最大值时，低分片的新追加行永远落在
     // 「local_id > 会话最大值」之外且拿不到任何重置信号——静默丢行。
+    //
+    // **初始 since 窗口的排除随游标携带**（`CursorProgress` 的排除线）：首次
+    // 响应只覆盖部分分片时（其余分片在窗口外没有行），游标线上没有它们的进度；
+    // 排除线把「初始窗口对未覆盖分片的排除」钉进游标，续拉对未覆盖分片仍按它
+    // 过滤——带不带 since 都不会重放窗口外历史（分片 A 时间 30 响应了 since=20，
+    // 分片 B 时间 10 的历史行在续拉时不得冒出来）。分片一旦被覆盖，进度线接管。
     // 无 cursor 的时间模式保持规范原行为：(create_time, sort_seq, local_id)
     // 复合键升序、页不跨秒推进（nextSince 语义依赖它），契约不要求与游标同键。
+    let cursor_mode = cursor_progress.is_some();
     let mut ascending: Vec<&crate::store::MessageRecord> = conv
         .iter()
         .filter(|m| {
             if let Some(progress) = &cursor_progress {
                 let shard = crate::server::cursor::shard_code(&m.source_shard);
+                let time_bound = progress.time_bound_for(shard);
                 return progress.admits(shard, m.local_id)
+                    && time_bound.is_none_or(|s| m.create_time > s)
                     && end.is_none_or(|e| m.create_time <= e);
             }
             since.is_none_or(|s| m.create_time > s) && end.is_none_or(|e| m.create_time <= e)
         })
         .collect();
-    if cursor_progress.is_some() {
+    if cursor_mode {
         ascending.sort_by_key(|m| m.local_id);
     } else {
         ascending.sort_by(|a, b| {
@@ -151,6 +172,15 @@ pub async fn handler(
     //   全部行）。编码 0 是「从头拉取」，周期轮询的客户端采纳它再丢掉时间过滤
     //   就会重放全历史。
     let request_progress = cursor_progress.clone().unwrap_or_default();
+    // 本请求的排除线：cursor 模式沿用请求游标里的线（merged 只收紧），时间模式
+    // 取本请求的 since（无 since = 无排除 = i64::MIN）。fresh 的排除线只在
+    // 「请求带 since」时进入下一游标——不带 since 的纯增量续拉不得凭空引入排除。
+    let fresh_exclusion = if cursor_progress.is_some() {
+        // 游标模式：排除线已在 request_progress 里，fresh 不再携带。
+        i64::MIN
+    } else {
+        since.unwrap_or(i64::MIN)
+    };
     let next_progress = if cursor_progress.is_some() {
         if page.is_empty() {
             // 空页：进度保持（游标值不变，不回退为从头拉取）。
@@ -163,7 +193,7 @@ pub async fn handler(
                 let slot = bounds.entry(shard).or_insert(m.local_id);
                 *slot = (*slot).max(m.local_id);
             }
-            request_progress.merged(&crate::server::cursor::CursorProgress::from_bounds(bounds))
+            request_progress.merged(&fresh_progress(bounds, fresh_exclusion))
         }
     } else if page.is_empty() {
         let mut bounds = std::collections::HashMap::<u64, i64>::new();
@@ -172,7 +202,7 @@ pub async fn handler(
             let slot = bounds.entry(shard).or_insert(m.local_id);
             *slot = (*slot).max(m.local_id);
         }
-        crate::server::cursor::CursorProgress::from_bounds(bounds)
+        fresh_progress(bounds, fresh_exclusion)
     } else {
         let mut bounds = std::collections::HashMap::<u64, i64>::new();
         for m in &page {
@@ -180,7 +210,7 @@ pub async fn handler(
             let slot = bounds.entry(shard).or_insert(m.local_id);
             *slot = (*slot).max(m.local_id);
         }
-        crate::server::cursor::CursorProgress::from_bounds(bounds)
+        fresh_progress(bounds, fresh_exclusion)
     };
     let next_cursor = cursor_ctx.encode(&next_progress);
 
