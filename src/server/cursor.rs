@@ -213,13 +213,9 @@ impl CursorProgress {
     /// 某分片当前的**时间下界**：进度线上的分片已无时间排除（None）；
     /// 线上没有的分片按排除线（`excluded_until`；`i64::MIN` = 不排除）。
     pub fn time_bound_for(&self, shard: u64) -> Option<i64> {
-        if self.shards.iter().any(|(s, _)| *s == shard) {
-            None
-        } else if self.excluded_until == i64::MIN {
-            None
-        } else {
-            Some(self.excluded_until)
-        }
+        let covered = self.shards.iter().any(|(s, _)| *s == shard);
+        let excluded = self.excluded_until != i64::MIN;
+        (excluded && !covered).then_some(self.excluded_until)
     }
 
     /// 一行是否已越过该行所在分片的进度线：严格大于（上界是「已交付集合的
