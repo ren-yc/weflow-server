@@ -2,7 +2,7 @@
 
 本文件从 0.5.0 起维护。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-## [Unreleased]
+## [0.11.0] - 2026-11-14
 
 ### 新增
 
@@ -11,11 +11,14 @@
 
 ### 变更
 
+- 接口契约 pin 升 `v0.11.0`：新增 `cursorReset` 能力与两条用例（语法坏 400、跨会话 409 + `reason`），随一致性套件执行（41/41，含长游标链）。夹具声明 `opaqueCursor` 与 `cursorReset`。
 - 接口契约 pin 由 `v0.9.0` 升 `v0.10.0`：新增 `mediaExportByMessage` 能力与 `media_export` 端点，共享用例 `targeted-media-export-fetch` 随一致性套件执行。
 - **SDK 的 `drain_session_cursor` 收到游标失效改为直接上抛**：此前失效后自动从头重启一次，已交付给回调的页会重复投递、`total` 重复计数；撤销回调结果或通知调用方清空的机制并不存在。迁移：调用方改为捕获 `CursorReset` 自行从头拉取并对已交付集合去重（CLI 的批量导出语义不变——它本就把失效当失败处理）。回归：`drain_session_cursor_propagates_cursor_reset_without_restarting`（Rust）/ `test_drain_session_cursor_propagates_cursor_reset_without_restarting`（Python）。
 - **SDK 与 CLI 翻页拒绝不推进的游标**：`hasMore=true` 且下一游标为空或与请求游标相同时报错终止，而不是把同一页反复交付（或把重复行追加进导出产物）。回归：`drain_session_cursor_rejects_a_non_advancing_cursor`（Rust）/ `test_drain_session_cursor_rejects_a_non_advancing_cursor`（Python）。
 
 ### 破坏性变更
+
+- **拉取面进度游标升级为能自证身份的 v2**：载荷绑定进程 nonce、账号摘要、注册代次、数据源世代与会话摘要，续拉经 `cursor` 参数原样回传（给出时取代 `since`/`offset`）；旧 v1 游标返回 409 加 `reason: "cursor_reset_required"`，语法坏返回 400，服务端绝不静默退回时间模式。游标按分片记入库进度（`local_id` 只在分片内唯一），按行标识排除初始窗口外历史。迁移：客户端丢弃失效游标、从头拉一次（SDK 捕获 `CursorReset`；CLI 的批量导出把失效当失败处理）；游标不跨进程存活，服务端重启即自然失效。回归：`pull_cursor_rejects_foreign_or_stale_tokens`、`syntactically_broken_identity_fields_are_malformed_not_reset`、`cursor_progress_is_tracked_per_source_shard`、`cursor_continuation_excludes_same_shard_history_but_reaches_later_backfill`。
 
 - 定向导出响应的 `fileName` 改为消息自带的展示名（取不到时为空串），`mediaId` 才是可取句柄，两者通常不相等。迁移：取字节一律用 `mediaId`，不要拿 `fileName` 拼地址。回归：`targeted_media_restores_old_image_and_actual_handle`。
 - 自动媒体恢复改用定向接口；旧服务缺少该能力时显式报错，源不可恢复时 CLI 导出返回失败。迁移：服务与 SDK/CLI 同步升级，调用方处理 404、409 和 422。回归：`targeted_export_reports_missing_server_capability`、`with_media_reports_an_unrecoverable_source`。
