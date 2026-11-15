@@ -2,6 +2,13 @@
 
 本文件从 0.5.0 起维护。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.11.1] - 2026-11-15
+
+### 修复
+
+- **Python 同步门面补齐两个游标入口**：`SyncClient` 一直承诺「方法面与 `Client` 一一对应」，但 0.11.0 把 `pull_page_cursor` / `drain_session_cursor` 加在异步 `Client` 上时同步侧没跟上，两个入口在门面上根本不存在。`drain_session_cursor` 在调用方线程循环，保留「`CursorReset` 原样上抛」与「下一游标为空或不推进即形状错误」两条语义；两条循环共用的守卫抽成 `_advanced_cursor`，免得两个入口各自作答。回归：`test_sync_client_drain_session_cursor_propagates_cursor_reset`、`test_sync_client_drain_session_cursor_rejects_a_non_advancing_cursor`。
+- **同步门面的方法面从此有机器判据**：反射比对 `Client` 的公共协程方法与 `SyncClient` 的同名成员，少一个即失败。此前这类掉队没有任何测试能发现——没有调用方失败，也就没有测试失败。回归：`test_sync_client_surface_mirrors_client`。
+
 ## [0.11.0] - 2026-11-14
 
 ### 新增

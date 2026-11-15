@@ -123,6 +123,7 @@ clients/                       # 类型化 SDK（rust / python / ts；ts 未发�
 - **`clients/python`（`weflow-sdk`）**：模型由 openapi-generator 从同一份规范化 spec 生成（`scripts/regen.py`）；行为层是 `httpx.AsyncClient` 异步实现，与 Rust 侧逐方法同构。
   - `wait_ready` 是 wait-only 就绪轮询；`ensure_ready` 把注册应答里的 200 拒绝态映射成 `StatusError` 快速失败。
   - `watch` 单连接连续产出多帧：字节级 LF 分帧、1 MiB 缓冲上限、单帧解码失败跳过不杀流、EOF 冲刷未终结残行、退避仅在干净结束时复位。
+  - `SyncClient` 是 `Client` 的同步门面：方法面一一对应由 `test_sync_client_surface_mirrors_client` 反射校验。缺这条校验时，0.11.0 新增的两个游标入口只落在异步侧而无人察觉——没有调用方失败，也就没有测试失败。
 - **`clients/ts`**：TypeScript 示例客户端（仅示例，不发布 npm）。演示级子集；配套 `stub-server.mjs` 可无真实服务跑 smoke。不进 CI 产物矩阵。
 
 分层理由：描述文档只声明「形状」，不声明「翻页到什么时候停、断线后从哪续」——后者是行为，生成不出来。所以形状交给生成器，行为交给手写层。SDK 不反依赖服务端 crate：只依赖 `reqwest`，对 API 的耦合全部在「描述 → 生成」这一步。
