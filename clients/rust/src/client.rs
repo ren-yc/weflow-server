@@ -699,9 +699,20 @@ impl Client {
             let page = self
                 .pull_page_cursor(talker, cursor.as_deref(), since, None)
                 .await?;
+            // 第二段（入库补发）不应用窗口：页里可能夹着早于 `since` 的回溯行。
+            // 排空循环是调用方的边界，在这里丢掉——`on_page` 只看到窗口内的行，
+            // `total` 也是实际交付的条数。丢掉不影响进度：服务端已把它们记进下一个游标。
+            // 回归：`drain_session_cursor_drops_rows_below_the_since_bound`。
+            let in_window = |messages: Vec<gen_types::PullMessage>| -> Vec<gen_types::PullMessage> {
+                messages
+                    .into_iter()
+                    .filter(|m| since.is_none_or(|s| m.timestamp > s))
+                    .collect()
+            };
             if !page.sync.has_more {
-                total += page.messages.len() as u64;
-                on_page(&page.messages)?;
+                let kept = in_window(page.messages);
+                total += kept.len() as u64;
+                on_page(&kept)?;
                 return Ok(total);
             }
             // 形状守卫在**交付之前**：hasMore=true 却不推进游标（缺失，或原样回环）
@@ -727,8 +738,9 @@ impl Client {
                 }
                 Some(next) => next,
             };
-            total += page.messages.len() as u64;
-            on_page(&page.messages)?;
+            let kept = in_window(page.messages);
+            total += kept.len() as u64;
+            on_page(&kept)?;
             cursor = Some(next);
         }
     }

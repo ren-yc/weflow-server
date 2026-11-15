@@ -617,6 +617,40 @@ async fn drain_session_cursor_propagates_cursor_reset_without_restarting() {
     assert!(queries[1].contains("cursor=c1"), "续拉带服务端给的游标：{}", queries[1]);
 }
 
+/// 游标第二段不应用窗口：页里夹着早于 `since` 的回溯行时，排空循环必须在交给
+/// `on_page` 之前丢掉它们，`total` 也只能数实际交付的条数——否则调用方会拿到、
+/// 也会计到它没要的时间段。
+#[tokio::test]
+async fn drain_session_cursor_drops_rows_below_the_since_bound() {
+    let mock = Mock::default();
+    *mock.pull_pages.lock().unwrap() = vec![serde_json::json!({
+        "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
+        "members": [],
+        "messages": [
+            {"accountName":"","content":"in","groupNickname":"","platformMessageId":"in-1",
+             "sender":"alice","timestamp":1700000530,"type":0},
+            {"accountName":"","content":"out","groupNickname":"","platformMessageId":"out-1",
+             "sender":"alice","timestamp":1700000400,"type":0},
+        ],
+        "meta": {"groupId": "", "name": "", "ownerId": "", "platform": "wechat", "type": "chat"},
+        "sync": {"hasMore": false, "nextSince": 1700000530, "nextOffset": 0,
+                 "nextCursor": "c1", "watermark": 1700000530},
+    })];
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+
+    let mut delivered: Vec<String> = Vec::new();
+    let total = client
+        .drain_session_cursor("alice", Some(1_700_000_500), |page| {
+            delivered.extend(page.iter().map(|m| m.platform_message_id.clone()));
+            Ok(())
+        })
+        .await
+        .expect("排空应成功");
+    assert_eq!(delivered, vec!["in-1".to_string()], "窗口外的行不得交付：{delivered:?}");
+    assert_eq!(total, 1, "计数只能是实际交付的条数");
+}
+
 /// 服务端 hasMore=true 却回传**与请求相同**的游标：翻页会原地打转、把同一页
 /// 反复交给 `on_page`——必须在交付前拒绝，而不是循环到天荒地老。
 #[tokio::test]

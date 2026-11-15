@@ -296,7 +296,7 @@ curl -H "Authorization: Bearer <token>" \
 | `end` | string | 否 | 上界，Unix 秒或 `YYYYMMDD`（含当天 23:59:59） |
 | `limit` | integer | 否 | 单页条数，默认与上限均为 5000 |
 | `offset` | integer | 否 | 页内偏移，默认 0 |
-| `cursor` | string | 否 | 不透明进度游标，原样回传 `sync.nextCursor`；给出时取代 `since` / `offset` |
+| `cursor` | string | 否 | 不透明进度游标，原样回传 `sync.nextCursor`；给出时取代 `since` / `offset`，`end` 只作用于第一段 |
 
 **响应**：
 ```json
@@ -316,10 +316,13 @@ curl -H "Authorization: Bearer <token>" \
 游标语义：
 
 - `since` 排他（`create_time > since`），`end` 包含（`<= end`）。
-- 页面按时间戳整秒组补齐：达到 `limit` 后仍会把当前秒的剩余消息取完，故一页可能略多于 `limit`。这保证 `nextSince` 一定能前进。
+- 第一段按时间戳整秒组补齐：达到 `limit` 后仍会把当前秒的剩余消息取完，故一页可能略多于 `limit`。这保证 `nextSince` 一定能前进。
 - `nextSince` 是本页最后一条的时间戳，不是整个会话的最大时间戳。`nextOffset` 常为 `0`；两个游标都应原样回传，叠加会二次跳过同一批行。`watermark` 是本次拉取的时间上界；排空后 `nextSince` 停在该上界。类型码与字段语义见「ChatLab 适配面」的「字段语义」小节。
 - `nextCursor` 是不透明进度游标：原样回传给 `cursor`，不要解析，也不要自己按 `nextSince` / `offset` 续拉。排空后它仍在场（与消息面 `page.nextCursor` 排空为 `null` 不同），它是下一次增量请求的起点。
-- 它绑定进程、账号、会话、注册代次与数据源世代。语法坏或版本未知返回 400；旧格式游标、跨进程 / 账号 / 会话、代次不符一律返回 409，响应体带 `reason: "cursor_reset_required"`。此时丢弃游标、从头拉一次，不要重试同一条。
+- 游标分两段交付：第一段在链开始时**已索引**的行里按时间序交付窗口内的行（`end` 每页生效）；这一段耗尽后，第二段按行标识交付此后入库的行，**不再应用窗口**，因此响应可能带出早于 `since` 或晚于 `end` 的行。
+- 第二段的 `nextSince` 是 `watermark`（本次拉取的时间上界）：那一段按行标识排序，页末行的时间会回退，按它续拉会重放已交付的行。
+- 要严格窗口的调用方在落盘前丢掉窗口外的行；CLI 的批量导出按 `--since` 这么做。
+- 它绑定进程、账号、会话、注册代次与数据源世代。语法坏或版本未知返回 400；旧格式游标（v1 / v2）、跨进程 / 账号 / 会话、代次不符一律返回 409，响应体带 `reason: "cursor_reset_required"`。此时丢弃游标、从头拉一次，不要重试同一条。
 - 失效判据只到数据源身份（换库、分片增删）；同一库文件的备份还原检测不到，边界见 `docs/architecture.md` 的「导出与媒体」。
 
 ### GET `/api/v1/contacts` — 联系人

@@ -717,7 +717,7 @@ async fn media_for_page(
     client: &Client,
     talker: &str,
     media_dir: &std::path::Path,
-    page: &[weflow_client::generated::r#gen::types::PullMessage],
+    page: &[&weflow_client::generated::r#gen::types::PullMessage],
 ) -> Result<(std::collections::BTreeMap<(String, String, i64), String>, usize)> {
     let mut by_message: std::collections::BTreeMap<(String, String, i64), String> =
         std::collections::BTreeMap::new();
@@ -730,7 +730,7 @@ async fn media_for_page(
     let mut need_export:
         Vec<&weflow_client::generated::r#gen::types::PullMessage> = Vec::new();
     // 快路径：吃拉取面已经给出的句柄。
-    for m in page {
+    for &m in page {
         if m.media.is_none() {
             continue;
         }
@@ -931,10 +931,11 @@ fn run_export(a: &ExportArgs) -> Result<()> {
         // 账号、会话、注册代次与数据源世代）在客户端抄一份，随后必然与它漂移，而漂移
         // 的表现是「少了几页」——产物看起来完整，缺口无从发现。
         let mut cursor: Option<String> = None;
-        // SDK 的回调要求它自己的错误类型，而这里真正会失败的是**写盘**：把写失败硬塞成
-        // ClientError 会丢信息，所以错误先存起来、循环后立即上抛，后续页只跳过不再写
-        // （半途而废的会话由 run 删掉，交给 --resume 重来）。
-        let mut write_err: Option<anyhow::Error> = None;
+        // 写盘失败**立即上抛**，不存起来延后。延后会让一次取数失败把写错误盖掉：某个
+        // `on_page` 已经失败、后续某一页的取数又出错时，循环会带着取数错误返回，原先那条
+        // 写错误（可能是 `SecretLeak`，本应中止整轮）就消失了——run 只会当作单会话失败
+        // 跳过，泄漏检查形同不存在。半途而废的会话由 run 删掉，交给 --resume 重来。
+        // 回归：`export_aborts_on_a_write_error_instead_of_masking_it`。
         loop {
             let page = match rt.block_on(client.pull_page_cursor(
                 &talker,
@@ -951,10 +952,23 @@ fn run_export(a: &ExportArgs) -> Result<()> {
                 ),
                 Err(e) => return Err(anyhow::Error::new(e)),
             };
-            if page.messages.is_empty() {
-                break;
-            }
-            if write_err.is_none() {
+            // 空页**不是**终点：空页 + `hasMore=true` 是合法形态（第一段耗尽后的结算页
+            // 没有窗口内的行，但第二段还有）。按「空页即结束」收尾会把后面那段静默
+            // 截断，而产物看起来完整、退出码还是 0。终止判据只有下面的 `hasMore`。
+            // 回归：`export_follows_an_empty_page_that_still_has_more`。
+            // 游标的第二段（入库补发）**不应用窗口**：它按行标识交付「链开始后入库的
+            // 行」，响应里因此可能带出早于 `--since` 的回溯行。导出物的窗口由调用方
+            // 保证——先丢掉窗口外的行，再配媒体（不为被丢的行下字节），最后写盘。
+            // 判据是 `>= since`，与服务端那条请求一致：请求带的是 `since - 1`（服务端
+            // 排他、`--since` 对用户含边界），所以「时间戳恰好等于 `--since` 的行」属于
+            // 窗口内，改成 `>` 会让起点那一条凭空消失。
+            // 回归：`export_with_since_drops_out_of_window_rows`。
+            let window: Vec<&weflow_client::generated::r#gen::types::PullMessage> = page
+                .messages
+                .iter()
+                .filter(|m| since.is_none_or(|s| m.timestamp >= s))
+                .collect();
+            if !window.is_empty() {
                 // --with-media：**先**按本页时间窗触发导出并落盘，**再**写行 —— 消息面
                 // 只有在真的写出本地副本之后才给得出可取句柄；行仍来自拉取面，句柄靠
                 // 消息 id 对回。映射只活在这一页：上一批句柄不需要为整会话驻留内存
@@ -965,7 +979,7 @@ fn run_export(a: &ExportArgs) -> Result<()> {
                             &client,
                             &talker,
                             &media_dir,
-                            &page.messages,
+                            &window,
                         ))
                         .context("取本页媒体失败")?;
                     media_total += got.len();
@@ -974,8 +988,7 @@ fn run_export(a: &ExportArgs) -> Result<()> {
                 } else {
                     std::collections::BTreeMap::new()
                 };
-                let rows: Vec<export::Row> = page
-                    .messages
+                let rows: Vec<export::Row> = window
                     .iter()
                     .map(|m| {
                         let mut r = row_from_pull(m);
@@ -985,9 +998,7 @@ fn run_export(a: &ExportArgs) -> Result<()> {
                         r
                     })
                     .collect();
-                if let Err(e) = on_page(&rows) {
-                    write_err = Some(e);
-                }
+                on_page(&rows)?;
             }
             if !page.sync.has_more {
                 break;
@@ -1005,10 +1016,7 @@ fn run_export(a: &ExportArgs) -> Result<()> {
                 ),
             }
         }
-        match write_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+        Ok(())
     })?;
     println!(
         "[export] {} 个会话、{} 条消息、{} 个媒体 → {}（复用 {}，跳过 {}，索引 {}），用时 {:?}",

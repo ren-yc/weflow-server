@@ -101,7 +101,9 @@ struct GetMessagesArgs {
     limit: Option<usize>,
     /// 同一时间组内的游标：翻页时原样回传上一次的 nextOffset
     offset: Option<u64>,
-    /// 不透明进度游标：原样回传上一次的 nextCursor。给出时它取代 since/offset
+    /// 不透明进度游标：原样回传上一次的 nextCursor。给出时它取代 since/offset。
+    /// 续拉时**一并回传首次的时间下界**（或当时的 sinceResolved），否则本页不应用窗口
+    /// ——服务端在给出 cursor 时忽略入参 since，游标里的窗口也不回显。
     cursor: Option<String>,
 }
 
@@ -247,6 +249,21 @@ fn now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
+/// 工具面的窗口判据：`since` 是**排他**下界，与拉取面（`create_time > since`）同一口径。
+///
+/// 游标的第二段（入库补发）按行标识交付「链开始后入库的行」，**不应用窗口**，因此一条
+/// 链的页里可能夹着早于 `since` 的回溯行。工具面就是调用方的边界：不在这里丢掉，模型
+/// 会拿到它没要的时间段，而调用方无从分辨哪些行在窗口外。丢掉不影响进度——服务端已经
+/// 把这些行记进新游标，下一页不会再要求它们。
+///
+/// 回归：`since_window_is_exclusive_on_a_wide_page`。
+fn in_since_window(
+    messages: &[weflow_client::generated::r#gen::types::PullMessage],
+    since: Option<i64>,
+) -> Vec<&weflow_client::generated::r#gen::types::PullMessage> {
+    messages.iter().filter(|m| since.is_none_or(|s| m.timestamp > s)).collect()
+}
+
 // ---- 工具 --------------------------------------------------------------------
 
 #[tool_router]
@@ -282,7 +299,7 @@ impl WeflowMcp {
         })))
     }
 
-    #[tool(description = "取一个会话的消息（ChatLab 形状，时间升序）。输出会离开本机。", annotations(read_only_hint = true))]
+    #[tool(description = "取一个会话的消息（ChatLab 形状）。不带 cursor 时按时间升序；带 cursor 续拉时按入库序，时间可能回退。输出会离开本机。", annotations(read_only_hint = true))]
     async fn get_messages(
         &self,
         Parameters(a): Parameters<GetMessagesArgs>,
@@ -306,8 +323,10 @@ impl WeflowMcp {
             Ok(p) => p,
             Err(e) => return sdk_outcome(e),
         };
-        let raw: Vec<Value> =
-            page.messages.iter().filter_map(|m| serde_json::to_value(m).ok()).collect();
+        let raw: Vec<Value> = in_since_window(&page.messages, since)
+            .iter()
+            .filter_map(|m| serde_json::to_value(m).ok())
+            .collect();
         let page_size = raw.len();
         let proj = project_messages(project_list(&raw, CHATLAB_MESSAGE_KEYS), limit, CHAR_BUDGET);
         // 本页被预算截短时不能给出整页游标：Pull 的 nextSince 是整页最后一条的时间，用它
@@ -351,7 +370,14 @@ impl WeflowMcp {
             // hint 只在真被截断时出现；`since` 未提供时 sinceResolved 为 null，此时教调用方
             // 「传响应里的 sinceResolved」会得到 null/反序列化失败（见最后一个分支）。
             "hint": if !cut {
-                Value::Null
+                // 续拉没带 since 时工具面无从得知首次的下界：服务端在给出 cursor 时既忽略
+                // 入参 since、也不把游标里的窗口回显出来（解析游标是被禁止的）。本页因此
+                // 不应用时间窗口，而「沉默地放宽窗口」正是这条要避免的形态。
+                if cursor_mode && since.is_none() {
+                    json!("续拉未带 since，本页未应用时间窗口：若首次请求带过 since，请把它（或当时的 sinceResolved）一并回传")
+                } else {
+                    Value::Null
+                }
             } else if cursor_mode {
                 // 游标模式下 nextCursor 已原样回传入参游标：拿它配更小的 limit 重取本页。
                 // 去重键不能用 platformMessageId 单独担当：不同分片表的 server_id 可重复，
@@ -628,5 +654,31 @@ mod tests {
         assert_eq!(clamp_limit(Some(0)), 1);
         assert_eq!(clamp_limit(Some(1_000)), MAX_LIMIT);
         assert_eq!(clamp_limit(Some(10)), 10);
+    }
+
+    #[test]
+    fn since_window_is_exclusive_on_a_wide_page() {
+        // 一条链的页里夹着早于 since 的回溯行（第二段是宽口径）：工具面按排他下界丢。
+        fn mk(ts: i64) -> weflow_client::generated::r#gen::types::PullMessage {
+            serde_json::from_value(json!({
+                "accountName": "",
+                "content": "x",
+                "groupNickname": "",
+                "platformMessageId": format!("m{ts}"),
+                "sender": "s",
+                "timestamp": ts,
+                "type": 1_i64,
+            }))
+            .expect("夹具必须能反序列化成 PullMessage")
+        }
+        let page = [mk(1_700_000_530), mk(1_700_000_510), mk(1_700_000_500)];
+        let kept: Vec<i64> =
+            in_since_window(&page, Some(1_700_000_510)).iter().map(|m| m.timestamp).collect();
+        assert_eq!(kept, vec![1_700_000_530], "等于下界的行必须丢（排他），更早的也丢");
+        assert!(
+            in_since_window(&page, Some(1_700_000_530)).is_empty(),
+            "整页都不晚于下界时应全部丢掉，而不是留一条"
+        );
+        assert_eq!(in_since_window(&page, None).len(), 3, "没有窗口时一条都不丢");
     }
 }
