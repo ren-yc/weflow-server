@@ -33,7 +33,7 @@ sha2 = "0.10"
 tokio = { optional = true, version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "io-util", "fs"] }
 tokio-stream = { optional = true, version = "0.1", features = ["sync"] }
 tokio-util = { optional = true, version = "0.7", features = ["io"] }
-tower-http = { optional = true, version = "0.6", features = ["trace"] }
+tower-http = { optional = true, version = "0.7", features = ["trace"] }
 tracing = "0.1"
 # json feature 供 `--log-format json`（stderr 逐行 JSON）。新增的唯一依赖是 tracing-serde
 # （json formatter 的 serde 粘合层）；它不拉 axum/tokio/clap——嵌入契约的依赖树钉子照常成立。
