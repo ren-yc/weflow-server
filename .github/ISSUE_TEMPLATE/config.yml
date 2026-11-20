@@ -1,0 +1,10 @@
+# issue 表单的全局配置：保留「Open a blank issue」入口，
+# 便于不属于 bug / 功能建议两类的反馈（使用咨询、误报申诉等）。
+blank_issues_enabled: true
+contact_links:
+  - name: 使用与配置问题（先看 quickstart）
+    url: https://github.com/ren-yc/weflow-server/blob/master/docs/quickstart.md
+    about: 启动、注册账号、密钥、导出与 MCP 的操作步骤都在这里；文档没覆盖再开 issue。
+  - name: 接口契约与一致性用例
+    url: https://github.com/ren-yc/flow-contract/issues
+    about: 字段形状、游标语义、跨仓一致性问题该提到契约仓库，改完再回到本仓升级 pin。

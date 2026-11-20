@@ -1,0 +1,28 @@
+# 只跟 cargo：运行时依赖全在根 Cargo.lock，根包与两个 workspace 成员
+# （clients/rust、clients/regen）共用一份锁文件，所以一条 entry 就够。
+#
+# 为什么不加 npm / pip：clients/ts 是示例、不进 npm；clients/python 的主干是
+# openapi-generator 的生成物，升 Python 依赖的收益抵不过噪声 PR（手写层的 ruff
+# 与 pytest 已在 dev extras 里按版本锁定，由 check.yml 的 SDK 作业钉住）。
+#
+# 月度而非每周：vendored OpenSSL / SQLCipher 由 Cargo.lock 与 feature 组合决定，
+# 一次升级要跑完 Windows 与 Linux 两套门禁，没有「小步快跑」的空间。
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      # patch 与 minor 合成一个 PR；major 单独提，逐个看迁移成本。
+      cargo-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch

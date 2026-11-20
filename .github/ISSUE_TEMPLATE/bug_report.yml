@@ -1,0 +1,107 @@
+name: Bug 报告
+description: 报告 weflow-server 运行中的错误或与预期不符的行为
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **提交前请务必脱敏**：本服务读取的是真实微信聊天库，以下内容不得出现在本 issue 的任何位置（含日志、截图、配置片段）：
+        真实聊天内容、wxid、群 id、手机号、地址、库密钥（64-hex）与鉴权 token。
+        密钥与 token 一律用占位符（如 `<64-hex>`、`<token>`）代替；配置只写键名，不贴值。
+  - type: dropdown
+    id: module
+    attributes:
+      label: 影响模块
+      description: 问题最可能出在哪个环节？维护者会据此补 `area/*` 标签。
+      options:
+        - 拉取面与消息游标（/api/v1/sessions/{id}/messages）
+        - 消息与会话查询（/api/v1/messages、/api/v1/sessions）
+        - SSE 推送（/api/v1/push/messages）
+        - 账号生命周期与就绪态（注册 / 注销 / 503）
+        - 库读取与索引（SQLCipher 解密、活库直读、水位增量）
+        - 媒体导出与解密（图片 / 语音 / 视频 / wxgf）
+        - ChatLab 适配面（/chatlab/*）
+        - SNS 朋友圈只读面
+        - CLI 子命令与批量导出
+        - MCP 工具面（stdio）
+        - 类型化 SDK（Rust / Python / TS 示例）
+        - 构建、工具链与 CI
+        - 文档
+        - 其它
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: 版本
+      description: '`weflow-server --version` 的输出，并说明来源（Release 归档 / `cargo install` / 源码构建的 commit）'
+      placeholder: weflow-server 0.11.1（源码构建，commit abc1234）
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 运行平台
+      options:
+        - Windows
+        - Linux
+        - macOS
+        - 容器 / WSL / 其它
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述
+      description: 实际发生了什么？你期望的是什么？
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      description: 从启动到出错的完整顺序；涉及多个账号或多个库时注明数量。
+      placeholder: |
+        1. 起服务：`weflow-server`
+        2. 注册账号：`POST /api/v1/accounts`
+        3. 请求：`GET /api/v1/sessions?limit=10`
+        4. 出现 …
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志 / 截图（已脱敏）
+      description: 终端输出、响应体或截图；提交前再次确认不含真实聊天内容、wxid 与凭据。
+      render: shell
+    validations:
+      required: false
+  - type: textarea
+    id: environment
+    attributes:
+      label: 环境信息
+      placeholder: |
+        - 监听地址与端口（默认 127.0.0.1:5033）：
+        - 启动方式（二进制 / cargo install / 源码构建）：
+        - 账号与库数量：
+        - 微信版本：
+        - 是否命中过媒体导出或 MCP：
+    validations:
+      required: true
+  - type: textarea
+    id: config_names
+    attributes:
+      label: 涉及的配置项（仅键名）
+      description: '写了哪些环境变量或配置字段？只写键名（如 `WEFLOW_TOKEN`、`WEFLOW_SERVER_FFMPEG`、`weflow-server.json` 的字段名），禁止贴值。'
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已确认以上内容全部脱敏，不含真实聊天记录、wxid、库密钥、token 或其它个人身份信息
+          required: true
+        - label: 我已搜索既有 issue，确认无重复
+          required: true
+        - label: 我运行的是最新 `master` 或最新发布版本（否则已在复现步骤注明具体 commit）
