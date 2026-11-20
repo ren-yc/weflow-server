@@ -604,6 +604,10 @@ async def test_drain_session_cursor_accepts_a_repeated_cursor_on_the_terminal_pa
     client = make_client(mock)
     outcome = await client.drain_session_cursor("alice", None, lambda batch: None)
     assert outcome == DrainOutcome(count=2, cursor="c1")
+    assert mock.pull_queries[1] == {"cursor": "c1"}, (
+        "the second page must still echo the server's cursor, or this case degrades "
+        "into 'no advance is fine too'"
+    )
     await client.aclose()
 
 

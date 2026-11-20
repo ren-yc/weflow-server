@@ -854,6 +854,12 @@ async fn drain_session_cursor_accepts_a_repeated_cursor_on_the_terminal_page() {
         .expect("终页重复游标必须被接受");
     assert_eq!(outcome.count, 2);
     assert_eq!(outcome.cursor.as_deref(), Some("c1"));
+    let queries = mock.pull_queries.lock().unwrap().clone();
+    assert_eq!(
+        sent_cursor(&queries[1]).as_deref(),
+        Some("c1"),
+        "第二页仍要回传服务端给的游标，否则这条用例退化成「不推进也放行」"
+    );
 }
 
 /// `on_page` 失败即整体失败，不交出结果：半截的 `count` 会让人以为那部分已经
