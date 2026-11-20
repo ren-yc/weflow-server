@@ -8,7 +8,14 @@
 
 - **拉取面进度游标升级为两段式**：第一段在**链开始时已索引的行**里按时间序交付窗口内的行，第二段按行标识补发此后入库的行。修掉的是「首页按时间排序、续页按行标识过滤」把「时间更晚、行标识更小」的行永久跨过去的少行形态；同一形态此前也把「排除线确立后入库的回溯行」压在一维水位上，现在由第二段承载。迁移：旧游标（v1 / v2）一律 409 加 `reason: "cursor_reset_required"`，丢弃后从头拉一次即可；不传 `cursor` 的时间序翻页行为不变。回归：契约用例 `cursor-window-drain-equals-single-page` 与 `cursor-drain-equals-full-out-of-order`。
 - **第二段可能带出窗口外的行**：它不应用 `since` / `end`，响应里因此可能出现早于 `since` 或晚于 `end` 的行，那一段的 `nextSince` 是 `watermark`。迁移：需要严格窗口的调用方在落盘前自行丢弃窗口外的行，CLI 的批量导出已按 `--since` 这么做。回归：`export_with_since_drops_out_of_window_rows`。
-- **SDK 的 `drain_session_cursor` 排空后交出游标**：返回值从条数改成 `DrainOutcome`（`count` ＋ `cursor`；Python 是同形冻结 dataclass），`cursor` 是终页 `nextCursor` 原样，交给 `pull_page_cursor` 就能接着排空处续拉。此前只能拿条数，续拉点得调用方自己从已交付消息反推——窗口外的回溯行在交付前已被丢掉，最大时间戳并不等于进度。迁移：Rust 把 `let total = client.drain_session_cursor(…)` 改为 `let outcome = …` 后取 `outcome.count` / `outcome.cursor`，Python 同形（`SyncClient` 也返回该对象）。回归：`drain_session_cursor_returns_the_terminal_cursor`、`drain_session_cursor_returns_the_cursor_of_an_empty_terminal_page`、`drain_session_cursor_returns_the_cursor_when_the_window_drops_every_row`、`drain_session_cursor_reports_no_cursor_for_a_response_without_one`、`drain_session_cursor_accepts_a_repeated_cursor_on_the_terminal_page`、`drain_session_cursor_hands_no_outcome_when_the_callback_fails`、`drain_session_cursor_resumes_from_the_cursor_it_returned`。
+- **SDK 的 `drain_session_cursor` 排空后交出游标**：返回值从条数改成 `DrainOutcome`（`count` ＋ `cursor`；Python 是同形冻结 dataclass），`cursor` 是终页 `nextCursor` 原样，交给 `pull_page_cursor` 就能接着排空处续拉。此前只能拿条数，续拉点得调用方自己从已交付消息反推——窗口外的回溯行在交付前已被丢掉，最大时间戳并不等于进度。迁移：Rust 把 `let total = client.drain_session_cursor(…)` 改为 `let outcome = …` 后取 `outcome.count` / `outcome.cursor`，Python 同形（`SyncClient` 也返回该对象）。回归：
+  - `drain_session_cursor_returns_the_terminal_cursor`
+  - `drain_session_cursor_returns_the_cursor_of_an_empty_terminal_page`
+  - `drain_session_cursor_returns_the_cursor_when_the_window_drops_every_row`
+  - `drain_session_cursor_reports_no_cursor_for_a_response_without_one`
+  - `drain_session_cursor_accepts_a_repeated_cursor_on_the_terminal_page`
+  - `drain_session_cursor_hands_no_outcome_when_the_callback_fails`
+  - `drain_session_cursor_resumes_from_the_cursor_it_returned`
 
 ### 变更
 

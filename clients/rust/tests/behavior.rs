@@ -697,6 +697,28 @@ async fn drain_session_cursor_rejects_a_non_advancing_cursor() {
 
 // ---- drain_session_cursor: what it hands back ----------------------------
 
+/// Parse one recorded query into its `(key, value)` pairs.
+///
+/// Assertions on a parameter must compare the parsed value, not a substring of
+/// the whole query: `contains("cursor=c1")` also accepts `cursor=c1x`, and the
+/// mock answers pages in FIFO order regardless of the query, so a client that
+/// mangles the cursor before sending it would still pass.
+fn query_params(query: &str) -> Vec<(String, String)> {
+    let raw = query.split_once('?').map_or("", |(_, q)| q);
+    raw.split('&')
+        .filter(|kv| !kv.is_empty())
+        .map(|kv| match kv.split_once('=') {
+            Some((k, v)) => (k.to_string(), v.to_string()),
+            None => (kv.to_string(), String::new()),
+        })
+        .collect()
+}
+
+/// The `cursor` parameter as sent, or `None` when the request carried no cursor.
+fn sent_cursor(query: &str) -> Option<String> {
+    query_params(query).into_iter().find(|(k, _)| k == "cursor").map(|(_, v)| v)
+}
+
 /// One Pull page in the server's wire shape. `next_cursor: None` models the
 /// responses that predate the cursor face: they omit the field entirely, which
 /// is not the same as sending `null`.
@@ -749,7 +771,7 @@ async fn drain_session_cursor_returns_the_terminal_cursor() {
     assert_eq!(outcome.cursor.as_deref(), Some("c2"), "交出的是终页游标，不是首页的");
     let queries = mock.pull_queries.lock().unwrap().clone();
     assert_eq!(queries.len(), 2, "{queries:?}");
-    assert!(queries[1].contains("cursor=c1"), "续页必须回传服务端给的游标：{}", queries[1]);
+    assert_eq!(sent_cursor(&queries[1]).as_deref(), Some("c1"), "续页必须原样回传服务端游标");
 }
 
 /// 空页也是排空：没有消息可交付时游标照样交出——调用方据此推进增量位置，
@@ -889,8 +911,12 @@ async fn drain_session_cursor_resumes_from_the_cursor_it_returned() {
     assert_eq!(next.messages[0].platform_message_id, "2");
     let queries = mock.pull_queries.lock().unwrap().clone();
     assert_eq!(queries.len(), 2, "{queries:?}");
-    assert!(queries[1].contains("cursor=c2"), "续拉必须带上交出的游标：{}", queries[1]);
-    assert!(!queries[1].contains("since="), "有游标就不该再发 since：{}", queries[1]);
+    assert_eq!(sent_cursor(&queries[1]).as_deref(), Some("c2"), "续拉必须带上交出的游标");
+    assert!(
+        query_params(&queries[1]).iter().all(|(k, _)| k != "since"),
+        "有游标就不该再发 since：{}",
+        queries[1]
+    );
 }
 
 /// 没有 `reason` 的 409 不是「重拉」信号：照旧当错误上抛，别把真冲突吞成重试。
