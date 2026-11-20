@@ -167,6 +167,26 @@ class RegisterOutcome:
     body: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class DrainOutcome:
+    """What :meth:`Client.drain_session_cursor` hands back once drained.
+
+    ``cursor`` is the terminal page's ``sync.nextCursor``, echoed verbatim:
+    pass it to :meth:`Client.pull_page_cursor` and the next pull continues
+    exactly where the drain stopped. Reconstructing that point from the
+    delivered messages does not work - rows below the window are dropped
+    before delivery, so the highest delivered timestamp is not the progress
+    mark.
+
+    The server omits the cursor on responses that predate the opaque-cursor
+    face; that is ``None``, not an error - those messages were delivered,
+    only the resume point is unknown.
+    """
+
+    count: int
+    cursor: str | None
+
+
 def _encode_path_segment(s: str) -> str:
     """Percent-encode one path segment (unreserved set plus ``@``, which ids use).
 
@@ -645,7 +665,7 @@ class Client:
         talker: str,
         since: int | None,
         on_page: Callable[[list[gen.PullMessage]], None],
-    ) -> int:
+    ) -> DrainOutcome:
         """Drain one session through the opaque cursor, echoing it verbatim.
 
         On :class:`CursorReset` the error is **raised as-is**: this loop has
@@ -660,6 +680,12 @@ class Client:
         carried** is a shape error too: paging on would spin in place,
         handing the same page to ``on_page`` forever. Both terminate with an
         error instead of guessing.
+
+        The drained state is handed back rather than only counted: the
+        terminal page's ``sync.nextCursor`` becomes :attr:`DrainOutcome.cursor`
+        so the next pull resumes where this one stopped. If ``on_page`` raises,
+        nothing is returned - a partial count would look like that part had
+        landed.
         """
         cursor: str | None = None
         total = 0
@@ -676,7 +702,10 @@ class Client:
             total += len(kept)
             on_page(kept)
             if next_cursor is None:
-                return total
+                # Drained: ``_advanced_cursor`` returns None only for a page with
+                # hasMore=false, so this is the terminal page - its cursor is the
+                # resume point, whether or not the server supplied one.
+                return DrainOutcome(count=total, cursor=page.sync.next_cursor)
             cursor = next_cursor
 
     async def drain_session(
@@ -1295,14 +1324,14 @@ class SyncClient:
         talker: str,
         since: int | None,
         on_page: Callable[[list[gen.PullMessage]], None],
-    ) -> int:
+    ) -> DrainOutcome:
         """Synchronous counterpart of :meth:`Client.drain_session_cursor`.
 
         The loop runs in the caller thread so ``on_page`` stays where the caller
         expects it, and keeps both judgments of the async entry: a
         :class:`CursorReset` propagates instead of restarting, and the shared
         ``_advanced_cursor`` guard rejects a non-advancing cursor before the
-        page is delivered.
+        page is delivered. The terminal cursor is handed back the same way.
         """
         cursor: str | None = None
         total = 0
@@ -1313,7 +1342,7 @@ class SyncClient:
             total += len(kept)
             on_page(kept)
             if next_cursor is None:
-                return total
+                return DrainOutcome(count=total, cursor=page.sync.next_cursor)
             cursor = next_cursor
 
     def drain_session(

@@ -119,6 +119,7 @@ clients/                       # 类型化 SDK（rust / python / ts；ts 未发�
 三个成员，与 src 的模块边界不同——它们消费 HTTP 面，不属于 crate 本体。
 
 - **`clients/rust`（`weflow-client`）**：类型与操作客户端 ＋ 手写行为层（就绪轮询 / 游标排空 / SSE 重连 / 媒体重试 / 检索）。`generated/` 只许生成器改（`clients/regen`，CI 断言重生成无 diff）。
+  - `drain_session_cursor` 交出 `DrainOutcome`（条数 ＋ 终页游标），Python 侧同名同义。窗口外的回溯行在交付前已被丢掉，最大时间戳并不等于进度——续拉点只能由服务端游标给出。回归：`drain_session_cursor_returns_the_terminal_cursor`。
 - **`clients/regen`（`weflow-regen`）**：生成工具。取 `server::openapi::document()`，做确定性规范化（3.1 → 3.0）后交给生成器；`--dump-spec` 同时供 Python 侧取规范化 spec。
 - **`clients/python`（`weflow-sdk`）**：模型由 openapi-generator 从同一份规范化 spec 生成（`scripts/regen.py`）；行为层是 `httpx.AsyncClient` 异步实现，与 Rust 侧逐方法同构。
   - `wait_ready` 是 wait-only 就绪轮询；`ensure_ready` 把注册应答里的 200 拒绝态映射成 `StatusError` 快速失败。

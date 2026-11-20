@@ -151,6 +151,25 @@ impl RegisterOutcome {
     }
 }
 
+/// What [`Client::drain_session_cursor`] hands back once the loop has finished.
+///
+/// The cursor is the terminal page's `sync.nextCursor`, echoed verbatim: feed it
+/// to [`Client::pull_page_cursor`] and the next pull continues exactly where the
+/// drain stopped, without the caller reconstructing a `since` bound from the
+/// messages it happened to receive (rows below the window are dropped before
+/// delivery, so the highest delivered timestamp is not the resume point).
+///
+/// The server omits the cursor on responses that predate the opaque-cursor
+/// face; that is `None`, not an error — those messages were delivered, only the
+/// resume point is unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainOutcome {
+    /// Messages handed to `on_page`, summed across every page.
+    pub count: u64,
+    /// Resume point from the terminal page, unmodified.
+    pub cursor: Option<String>,
+}
+
 /// Query for the native messages face ([`Client::list_messages`]).
 ///
 /// Time bounds accept either unix seconds or `YYYYMMDD`; as an upper bound a
@@ -684,12 +703,17 @@ impl Client {
     ///
     /// 服务端返回的下一游标为空或**与本次请求的游标相同**都是形状错误：继续翻页
     /// 会原地打转、把同一页反复交给 `on_page`。两者都以错误终止，而不是猜测。
+    ///
+    /// 排空后交出游标：终页的 `sync.nextCursor` 原样放进 [`DrainOutcome::cursor`]，
+    /// 作为续拉点。让调用方从已交付的消息反推续拉点做不到——窗口外的回溯行在交
+    /// 付前就被丢掉了，最大时间戳并不等于进度。`on_page` 报错时整体失败、不交出
+    /// 结果：半截的 `count` 会让人以为那部分已经安全落地。
     pub async fn drain_session_cursor<F>(
         &self,
         talker: &str,
         since: Option<i64>,
         mut on_page: F,
-    ) -> Result<u64>
+    ) -> Result<DrainOutcome>
     where
         F: FnMut(&[gen_types::PullMessage]) -> Result<()>,
     {
@@ -713,7 +737,7 @@ impl Client {
                 let kept = in_window(page.messages);
                 total += kept.len() as u64;
                 on_page(&kept)?;
-                return Ok(total);
+                return Ok(DrainOutcome { count: total, cursor: page.sync.next_cursor });
             }
             // 形状守卫在**交付之前**：hasMore=true 却不推进游标（缺失，或原样回环）
             // 时，继续翻页只会原地打转、把同一页反复交给 `on_page`。先把这一页的

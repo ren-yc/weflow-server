@@ -37,6 +37,27 @@ Source databases stay read-only. `sync` refreshes the in-memory index; media exp
 
 SNS timelines are the one gap: the server has those endpoints, the generated layer does not wrap them yet.
 
+## Cursor drain outcome
+
+`Client.drain_session_cursor` returns a `DrainOutcome` instead of a bare count.
+
+- `count`: how many messages reached `on_page`.
+- `cursor`: the terminal page's `nextCursor`, echoed verbatim.
+
+Feed `cursor` to `pull_page_cursor` and the next pull resumes where the drain stopped.
+
+Rebuilding that point from the delivered messages does not work.
+
+Rows below the window are dropped before delivery, so the highest delivered timestamp is not the progress mark.
+
+`cursor` is `None` only when the server sent none, which means a response older than the opaque-cursor face.
+
+The messages were delivered; only the resume point is unknown.
+
+A failing `on_page` fails the call and returns no outcome — a partial count would look like that part had landed.
+
+`SyncClient.drain_session_cursor` hands back the same object.
+
 ## Targeted media recovery
 
 Restore one unique message with `export_media_by_message(talker, platform_message_id, sender, timestamp)`.

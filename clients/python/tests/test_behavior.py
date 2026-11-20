@@ -22,6 +22,7 @@ from weflow_sdk import (
     Client,
     ClientError,
     CursorReset,
+    DrainOutcome,
     NotReady,
     ShapeError,
     StatusError,
@@ -498,12 +499,13 @@ async def test_drain_session_cursor_drops_rows_below_the_since_bound() -> None:
     ]
     client = make_client(mock)
     delivered: list[int] = []
-    total = await client.drain_session_cursor(
+    outcome = await client.drain_session_cursor(
         "alice", 1500,
         lambda batch: delivered.append([int(m.platform_message_id) for m in batch]),
     )
     assert delivered == [[1]], delivered
-    assert total == 1, "the count must be what was actually delivered"
+    assert outcome.count == 1, "the count must be what was actually delivered"
+    assert outcome.cursor == "c1"
     await client.aclose()
 
 
@@ -527,6 +529,120 @@ async def test_drain_session_cursor_rejects_a_non_advancing_cursor() -> None:
     # The looping page must not be delivered; one request beyond the first.
     assert pages == [[1]]
     assert len(mock.pull_queries) == 2, mock.pull_queries
+    await client.aclose()
+
+
+async def test_drain_session_cursor_returns_the_terminal_cursor() -> None:
+    """The terminal page's ``sync.nextCursor`` comes back verbatim: that is the
+    resume point, not a timestamp reconstructed from what was delivered."""
+    mock = Mock()
+    mock.pull_pages = [
+        pull_page([msg(1, 1000)], True, 1000, 0, next_cursor="c1"),
+        pull_page([msg(2, 1001)], False, 1001, 0, next_cursor="c2"),
+    ]
+    client = make_client(mock)
+    outcome = await client.drain_session_cursor("alice", None, lambda batch: None)
+    assert outcome == DrainOutcome(count=2, cursor="c2")
+    assert mock.pull_queries[1] == {"cursor": "c1"}, "the next page echoes the server's cursor"
+    await client.aclose()
+
+
+async def test_drain_session_cursor_returns_the_cursor_of_an_empty_terminal_page() -> None:
+    """An empty page still ends a drain and still advances the incremental
+    position: "delivered nothing" is not "position unknown"."""
+    mock = Mock()
+    mock.pull_pages = [pull_page([], False, 1000, 0, next_cursor="c9")]
+    client = make_client(mock)
+    deliveries: list[int] = []
+    outcome = await client.drain_session_cursor(
+        "alice", None, lambda batch: deliveries.append(len(batch))
+    )
+    assert outcome.count == 0
+    assert outcome.cursor == "c9"
+    assert deliveries == [0], "an empty page still reaches on_page once"
+    await client.aclose()
+
+
+async def test_drain_session_cursor_returns_the_cursor_when_the_window_drops_every_row() -> None:
+    """Rows below the window are dropped before delivery, but the server already
+    recorded them in the cursor: the resume point must survive the filtering."""
+    mock = Mock()
+    mock.pull_pages = [pull_page([msg(1, 1400)], False, 1400, 0, next_cursor="c7")]
+    client = make_client(mock)
+    delivered: list[int] = []
+    outcome = await client.drain_session_cursor(
+        "alice", 1500, lambda batch: delivered.append(len(batch))
+    )
+    assert delivered == [0], delivered
+    assert outcome.count == 0
+    assert outcome.cursor == "c7", "the cursor is not lost to filtering"
+    await client.aclose()
+
+
+async def test_drain_session_cursor_reports_no_cursor_for_a_response_without_one() -> None:
+    """Responses from before the cursor face omit ``nextCursor`` entirely: the
+    messages were delivered, only the resume point is unknown - None, not an error."""
+    mock = Mock()
+    page = pull_page([msg(1, 1000)], False, 1000, 0)
+    del page["sync"]["nextCursor"]
+    mock.pull_pages = [page]
+    client = make_client(mock)
+    outcome = await client.drain_session_cursor("alice", None, lambda batch: None)
+    assert outcome.count == 1
+    assert outcome.cursor is None, "do not invent a cursor the server never sent"
+    await client.aclose()
+
+
+async def test_drain_session_cursor_accepts_a_repeated_cursor_on_the_terminal_page() -> None:
+    """The echo guard only applies while ``hasMore=true``: a terminal page that
+    repeats the request cursor ends the drain normally - no page follows it."""
+    mock = Mock()
+    mock.pull_pages = [
+        pull_page([msg(1, 1000)], True, 1000, 0, next_cursor="c1"),
+        pull_page([msg(2, 1001)], False, 1001, 0, next_cursor="c1"),
+    ]
+    client = make_client(mock)
+    outcome = await client.drain_session_cursor("alice", None, lambda batch: None)
+    assert outcome == DrainOutcome(count=2, cursor="c1")
+    await client.aclose()
+
+
+async def test_drain_session_cursor_hands_no_outcome_when_the_callback_fails() -> None:
+    """A failing ``on_page`` fails the whole call: a partial count would look
+    like that part had landed, while the caller may have rolled it back."""
+    mock = Mock()
+    mock.pull_pages = [
+        pull_page([msg(1, 1000)], True, 1000, 0, next_cursor="c1"),
+        pull_page([msg(2, 1001)], False, 1001, 0, next_cursor="c2"),
+    ]
+    client = make_client(mock)
+    calls: list[int] = []
+
+    def boom(batch: list[gen.PullMessage]) -> None:
+        calls.append(len(batch))
+        raise ShapeError("disk full")
+
+    with pytest.raises(ShapeError, match="disk full"):
+        await client.drain_session_cursor("alice", None, boom)
+    assert calls == [1], "the first page was delivered, then the failure stopped the loop"
+    assert len(mock.pull_queries) == 1, "no further page after the failure"
+    await client.aclose()
+
+
+async def test_drain_session_cursor_resumes_from_the_cursor_it_returned() -> None:
+    """Feeding ``outcome.cursor`` back to ``pull_page_cursor`` continues right
+    after the drained page - no ``since`` guesswork."""
+    mock = Mock()
+    mock.pull_pages = [
+        pull_page([msg(1, 1000)], False, 1000, 0, next_cursor="c2"),
+        pull_page([msg(2, 1001)], False, 1001, 0, next_cursor="c3"),
+    ]
+    client = make_client(mock)
+    first = await client.drain_session_cursor("alice", None, lambda batch: None)
+    assert first.cursor == "c2"
+    nxt = await client.pull_page_cursor("alice", first.cursor)
+    assert [str(m.platform_message_id) for m in nxt.messages] == ["2"]
+    assert mock.pull_queries[1] == {"cursor": "c2"}
     await client.aclose()
 
 
@@ -1697,7 +1813,7 @@ def test_sync_client_drain_session_cursor_runs_callbacks_on_the_caller_thread(mo
     caller = threading.get_ident()
     seen: list[tuple[int, list[str]]] = []
     try:
-        total = client.drain_session_cursor(
+        outcome = client.drain_session_cursor(
             "alice",
             None,
             lambda batch: seen.append(
@@ -1706,7 +1822,7 @@ def test_sync_client_drain_session_cursor_runs_callbacks_on_the_caller_thread(mo
         )
     finally:
         client.close()
-    assert total == 3
+    assert outcome == DrainOutcome(count=3, cursor="c2")
     assert [ids for _, ids in seen] == [["1", "2"], ["3"]]
     assert all(ident == caller for ident, _ in seen), "on_page must stay on the caller thread"
     assert "cursor" not in mock.pull_queries[0], "the first page must not carry a cursor"
