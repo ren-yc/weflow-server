@@ -20,9 +20,10 @@
 - [ ] `python scripts/check_docs.py --tree`（折点）
 - [ ] `python scripts/check_docs_structure.py --tree`（结构）
 - [ ] `python scripts/forbidden_refs.py --tree`（编号引用；提交信息用 `--message-file`）
-- [ ] `bash scripts/check-privacy.sh`（敏感值；CI 侧只跑形态层，别把「CI 绿」当成本地值也干净）
+- [ ] `bash scripts/check-privacy.sh`（Windows 用 Git Bash；WSL 的 `bash` 把 `whoami` 读成 `ubuntu`，会假红）
 - [ ] `git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904..HEAD`（空白错误与冲突标记，空树口径）
-- [ ] 改到生成物时：`cargo run --locked -p weflow-regen -- --check` 与 `cd clients/python && python3 scripts/regen.py --check` 均无 diff
+- [ ] 改到 `clients/` 时：`cargo test --locked -p weflow-client`；Python SDK 在 `clients/python` 的 venv 里跑 `pytest tests/`
+- [ ] 改到生成物时：`powershell -File scripts/build.ps1 run --locked -p weflow-regen -- --check` 与 `cd clients/python && python3 scripts/regen.py --check` 均无 diff
 - [ ] 改到契约面时：pin 未变则跑 `--test conformance_runner -- --ignored`；要升 pin 则按 AGENTS.md「公共段」的流程走
 
 ## 测试
