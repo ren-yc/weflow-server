@@ -488,6 +488,25 @@ async def test_drain_session_cursor_propagates_cursor_reset_without_restarting()
     await client.aclose()
 
 
+async def test_drain_session_cursor_drops_rows_below_the_since_bound() -> None:
+    """Phase two does not apply the window, so a cursor page can carry rows older
+    than ``since``. The drain loops are the caller-facing boundary: drop them
+    before ``on_page`` and count only what was actually delivered."""
+    mock = Mock()
+    mock.pull_pages = [
+        pull_page([msg(1, 1530), msg(2, 1400)], False, 1530, 0, next_cursor="c1"),
+    ]
+    client = make_client(mock)
+    delivered: list[int] = []
+    total = await client.drain_session_cursor(
+        "alice", 1500,
+        lambda batch: delivered.append([int(m.platform_message_id) for m in batch]),
+    )
+    assert delivered == [[1]], delivered
+    assert total == 1, "the count must be what was actually delivered"
+    await client.aclose()
+
+
 async def test_drain_session_cursor_rejects_a_non_advancing_cursor() -> None:
     """``hasMore=true`` with a next cursor equal to the request cursor would
     spin forever, handing the same page to ``on_page`` over and over."""

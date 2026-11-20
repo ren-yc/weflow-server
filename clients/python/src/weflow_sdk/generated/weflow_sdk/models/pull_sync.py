@@ -26,10 +26,10 @@ from pydantic_core import to_jsonable_python
 
 class PullSync(BaseModel):
     """
-    翻页与水位。**两个游标都要原样回传**：`nextSince` 是排他下界、`nextOffset` 只用于 时间戳没能前进的退化情形，客户端自行推导会跳行。
+    翻页与水位。两条路径的续拉方式**不同**：时间序翻页（不带 `cursor`）用 `nextSince` （排他下界）/ `nextOffset`（时间戳没能前进的退化情形）续拉；游标链只回传 `nextCursor`，拿那两个续拉会重放或漏行。
     """ # noqa: E501
     has_more: StrictBool = Field(alias="hasMore")
-    next_cursor: Optional[StrictStr] = Field(default=None, description="不透明进度游标（契约 0.9.0 的 opaqueCursor 能力）：编码入库进度，客户端 原样回传、不得解析。v2 起它还绑定「进程 / 账号 / 会话 / 注册代次 / 数据源 世代」，所以**换进程、换账号、换会话或数据源被替换后，旧游标一律失效**。  排空后仍在场且非空——进度游标不终结（与消息面 page.nextCursor 排空为 null 的约定不同），它是下一次增量请求的起点。失效时请求返回 409，响应体带 `reason: \"cursor_reset_required\"`：客户端丢弃游标、从头拉一次， **不要重试同一条游标**。时间游标的盲区（排空后同秒晚入库的行永远落在 nextSince 之后）由它补上。", alias="nextCursor")
+    next_cursor: Optional[StrictStr] = Field(default=None, description="不透明进度游标（契约 0.9.0 的 opaqueCursor 能力）：编码入库进度，客户端 原样回传、不得解析。载荷绑定「进程 / 账号 / 会话 / 注册代次 / 数据源 世代」，所以**换进程、换账号、换会话或数据源被替换后，旧游标一律失效**。  两段式：第一段在链开始时**已索引**的行里按时间序交付窗口内的行（`end` 每页生效）；这一段耗尽后，第二段按行标识补发此后入库的行，**不再应用 窗口**——响应因此可能带出早于 `since` 或晚于 `end` 的行，那一段的 `nextSince` 是 `watermark`。要严格窗口的调用方在落盘前丢掉窗口外的行。  排空后仍在场且非空——进度游标不终结（与消息面 page.nextCursor 排空为 null 的约定不同），它是下一次增量请求的起点。失效时请求返回 409，响应体带 `reason: \"cursor_reset_required\"`：客户端丢弃游标、从头拉一次， **不要重试同一条游标**。时间游标的盲区（排空后同秒晚入库的行永远落在 nextSince 之后）由它补上。", alias="nextCursor")
     next_offset: Annotated[int, Field(strict=True, ge=0)] = Field(alias="nextOffset")
     next_since: StrictInt = Field(alias="nextSince")
     watermark: StrictInt

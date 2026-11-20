@@ -1832,7 +1832,8 @@ async fn both_pull_paths_are_byte_identical() {
             .decode(&cursor)
             .expect("游标必须是 URL-safe base64");
         let text = String::from_utf8(decoded).expect("游标必须是 UTF-8");
-        // v2.<nonce>.<账号摘要>.<注册代次>.<数据源世代>.<会话摘要>.<localId>
+        // v3.<nonce>.<账号摘要>.<注册代次>.<数据源世代>.<会话摘要>.<两段式进度>
+        // 进度段整体参与比较：两条路的段号、位置与边界必须逐字一致。
         let parts: Vec<&str> = text.split('.').collect();
         assert_eq!(parts.len(), 7, "游标字段数固定，实际 {text}");
         format!("{}.{}", parts[0], parts[6])

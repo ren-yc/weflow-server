@@ -30,6 +30,12 @@ pub const FAKE_KEY_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef
 pub const FAKE_WXID: &str = "wxid_fake000000000000001";
 pub const FAKE_FRIEND: &str = "wxid_friend_a";
 pub const FAKE_GROUP: &str = "wxid_fake_group@chatroom";
+/// 「时间序与入库序分叉」的专用群：一致性套件的 `group_out_of_order` 槽位绑它。
+/// 单独一个会话而不是往 `FAKE_GROUP` 里加行，是为了不扰动既有用例与 golden 的行数。
+pub const FAKE_OOO_GROUP: &str = "wxid_fake_ooo@chatroom";
+/// `group_out_of_order` 槽位的窗口下界，以及该会话里「时间最晚」那一行的时间戳。
+pub const OOO_SINCE: i64 = 1_700_000_500;
+pub const OOO_LATEST_TS: i64 = 1_700_000_530;
 
 /// Unique temp dir per test binary invocation (kept under target/).
 pub fn tmp_dir(tag: &str) -> PathBuf {
@@ -358,6 +364,63 @@ pub fn append_group_message_backdated(storage: &Path, key: &Key, seq: i64, creat
         ],
     )
     .unwrap();
+    drop(conn);
+}
+
+/// 「时间序与入库序分叉」的专用会话夹具（一致性套件 `group_out_of_order` 槽位）。
+///
+/// 行按 `local_id` 升序插入，时间戳故意反着走：**窗口内时间最晚的那一行 `local_id` 最小**，
+/// 另有一条时间早于窗口下界的回溯行 `local_id` 最大。单水位游标（首页按时间交付、
+/// 续页只按 `local_id > 水位` 过滤）在小页下会把「时间更晚、行标识更小」的那行永久
+/// 跨过去；没有排除线的实现还会把回溯行放出来。两个方向分别由
+/// `cursor-window-drain-equals-single-page` 与 `cursor-drain-equals-full-out-of-order` 钉住。
+///
+/// 窗口内 3 行、下界为 [`OOO_SINCE`]：引用它的用例用小页 limit（2 与 3），
+/// 因此游标链至少翻两页，不会一次就排空。
+pub fn add_out_of_order_group(storage: &Path, key: &Key) {
+    // 会话行：发现面与 displayName 从这里取；缺它时对话键会退化成 md5 串。
+    {
+        let path = storage.join("session/session.db");
+        let conn = wx_conn(&path, key, false);
+        conn.execute(
+            "INSERT INTO Session VALUES (?1, '分叉群', ?2, ?2, '晚入库', 1, 0, 2)",
+            rusqlite::params![FAKE_OOO_GROUP, OOO_LATEST_TS],
+        )
+        .unwrap();
+    }
+    let path = storage.join("message/message_0.db");
+    let conn = wx_conn(&path, key, false);
+    let md5 = md5_hex(FAKE_OOO_GROUP);
+    conn.execute_batch(&format!(
+        "CREATE TABLE \"Msg_{md5}\" (
+            local_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            server_id INTEGER NOT NULL,
+            local_type INTEGER NOT NULL,
+            create_time INTEGER NOT NULL,
+            sort_seq INTEGER NOT NULL DEFAULT 0,
+            real_sender_id INTEGER NOT NULL,
+            message_content TEXT,
+            compress_content BLOB
+        );"
+    ))
+    .unwrap();
+    // 插入序 = 入库序 = local_id 序；时间戳与它反着走。
+    let rows = [
+        (OOO_LATEST_TS, "分叉-时间最晚、入库最早"),
+        (1_700_000_510i64, "分叉-窗口内早"),
+        (1_700_000_520i64, "分叉-窗口内中"),
+        (1_700_000_400i64, "分叉-回溯入库"),
+    ];
+    for (i, (ts, content)) in rows.iter().enumerate() {
+        conn.execute(
+            &format!(
+                "INSERT INTO \"Msg_{md5}\" (server_id, local_type, create_time, sort_seq, real_sender_id, message_content) \
+                 VALUES (?1, 1, ?2, 0, 2, ?3)"
+            ),
+            rusqlite::params![8_500_000_000_000_000_000i64 + i as i64, ts, content],
+        )
+        .unwrap();
+    }
     drop(conn);
 }
 

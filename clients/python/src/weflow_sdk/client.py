@@ -284,6 +284,25 @@ def _advanced_cursor(page: gen.PullEnvelope, cursor: str | None) -> str | None:
     return next_cursor
 
 
+def _kept_in_window(
+    messages: list[gen.PullMessage], since: int | None
+) -> list[gen.PullMessage]:
+    """Drop messages at or before the chain's exclusive lower bound.
+
+    The server's phase two (rows indexed after the chain started) deliberately
+    does not apply the window, so a cursor page can carry rows older than
+    ``since``. The drain loops are the caller-facing boundary: dropping them
+    here is what makes "``since`` is honored" true for SDK users, and the count
+    they get back stays the number of messages actually delivered. Skipping
+    them does not lose progress - the server already recorded them in the next
+    cursor.
+    """
+    if since is None:
+        return list(messages)
+    return [m for m in messages if m.timestamp > since]
+
+
+
 class Client:
     """Async client for one weflow-server instance.
 
@@ -653,8 +672,9 @@ class Client:
             # the callback. The guard itself lives in ``_advanced_cursor`` so the
             # synchronous facade cannot answer the same question differently.
             next_cursor = _advanced_cursor(page, cursor)
-            total += len(page.messages)
-            on_page(page.messages)
+            kept = _kept_in_window(page.messages, since)
+            total += len(kept)
+            on_page(kept)
             if next_cursor is None:
                 return total
             cursor = next_cursor
@@ -1289,8 +1309,9 @@ class SyncClient:
         while True:
             page = self.pull_page_cursor(talker, cursor, since)
             next_cursor = _advanced_cursor(page, cursor)
-            total += len(page.messages)
-            on_page(page.messages)
+            kept = _kept_in_window(page.messages, since)
+            total += len(kept)
+            on_page(kept)
             if next_cursor is None:
                 return total
             cursor = next_cursor

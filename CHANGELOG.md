@@ -2,6 +2,24 @@
 
 本文件从 0.5.0 起维护。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.12.0] - 未发布
+
+### 破坏性变更
+
+- **拉取面进度游标升级为两段式**：第一段在**链开始时已索引的行**里按时间序交付窗口内的行，第二段按行标识补发此后入库的行。修掉的是「首页按时间排序、续页按行标识过滤」把「时间更晚、行标识更小」的行永久跨过去的少行形态；同一形态此前也把「排除线确立后入库的回溯行」压在一维水位上，现在由第二段承载。迁移：旧游标（v1 / v2）一律 409 加 `reason: "cursor_reset_required"`，丢弃后从头拉一次即可；不传 `cursor` 的时间序翻页行为不变。回归：契约用例 `cursor-window-drain-equals-single-page` 与 `cursor-drain-equals-full-out-of-order`。
+- **第二段可能带出窗口外的行**：它不应用 `since` / `end`，响应里因此可能出现早于 `since` 或晚于 `end` 的行，那一段的 `nextSince` 是 `watermark`。迁移：需要严格窗口的调用方在落盘前自行丢弃窗口外的行，CLI 的批量导出已按 `--since` 这么做。回归：`export_with_since_drops_out_of_window_rows`。
+
+### 变更
+
+- 接口契约 pin 升 `v0.12.0`：新增 `group_out_of_order` 槽位与两条游标用例，随一致性套件执行。
+
+### 修复
+
+- 批量导出跟随游标链的分段语义：`--since` 的产物严格不出窗口（用户口径含边界，请求带 `since - 1`），且不再有「第二页少行」的形态。回归：`export_with_since_drains_an_out_of_order_session`、`export_with_since_drops_out_of_window_rows`、`cursor_end_window_does_not_freeze_the_chain`、`cursor_continuation_excludes_same_shard_history_but_reaches_later_backfill`。
+- **空页不再被当成导出终点**：首屏是「空页 + `hasMore=true`」（服务端第一段耗尽的结算形态）时，旧代码直接收尾，第二段整段丢失而退出码仍是 0。回归：`export_follows_an_empty_page_that_still_has_more`。
+- **游标的长度预算先折回原始载荷、再扣身份字段**：原来的顺序把 base64 的 4/3 膨胀算在扣减之后，多分片会话能签出一条超过解码上限、自己解不回的游标（续拉永远 400）。回归：`issued_cursor_never_exceeds_the_length_ceiling`。
+- **MCP 取消息按 `since` 丢掉窗口外的行**：游标的第二段是宽口径，工具面此前会把早于 `since` 的回溯行一起交给模型。判据与服务端同口径（排他）。回归：`since_window_is_exclusive_on_a_wide_page`。
+
 ## [0.11.1] - 2026-11-15
 
 ### 修复

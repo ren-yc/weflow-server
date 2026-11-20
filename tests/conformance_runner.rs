@@ -228,7 +228,7 @@ async fn wait_ready(app: &axum::Router) -> bool {
 
 /// 夹具声明的契约版本。**必须与 `conformance.pin` 同改** —— 见下面的
 /// `pinned_contract_version_matches_the_fixture`。
-const CONTRACT_VERSION: &str = "0.11.0";
+const CONTRACT_VERSION: &str = "0.12.0";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "由 CI 的一致性步骤显式运行：需要 FLOW_CONTRACT_DIR"]
@@ -249,6 +249,9 @@ async fn conformance_suite_passes() {
     // 用更晚的会让水位线越过 200，于是 harness 追加的那条被判成「旧的」，
     // `poll_once` 返回 0、SSE 上永远等不到 `message.new`（我第一版就是这么写的）。
     common::append_same_second_burst(&storage, &key.0, 4, 1_700_000_150);
+    // 时间序与入库序分叉的专用会话：游标两段式的用例（窗口等集、纯排空等集）绑它。
+    // 单独一个会话而不是往 `FAKE_GROUP` 里加行，是为了不扰动既有用例的行数。
+    common::add_out_of_order_group(&storage, &key.0);
     // The existing group image gets a real matching local source before indexing.
     {
         use md5::Digest;
@@ -370,6 +373,9 @@ async fn conformance_suite_passes() {
             "group_with_messages": { "id": common::FAKE_GROUP, "expect": { "messages": 9 } },
             "private_with_messages": { "id": common::FAKE_FRIEND, "expect": { "messages": 4 } },
             "same_second_burst": { "id": common::FAKE_GROUP, "expect": { "same_second": 4 } },
+            // 时间序与入库序分叉：窗口下界与窗口内行数由夹具给出，用例据此取 since。
+            "group_out_of_order": { "id": common::FAKE_OOO_GROUP,
+                "expect": { "since": common::OOO_SINCE, "messages": 3 } },
             "unknown": { "id": "wxid_does_not_exist_000000000", "expect": {} },
             // harness 保证句柄此刻可取的媒体（mediaId 承诺用例的槽位）。
             // harness 保证句柄此刻可取的媒体（mediaId 承诺用例的槽位）：
@@ -542,10 +548,11 @@ async fn cursor_continuation_is_monotonic_when_row_order_diverges_from_time_orde
     );
 
     // 段二：空页游标语义。
-    //  - 带 cursor 的空页：进度保持（游标值不变，不回退为从头拉取）；
-    //  - 无 cursor 的空 time-filtered 页：游标编码「end 界内已确立的最大行
-    //    标识」——不是 0（从头拉取）。周期轮询的客户端（end=now）采纳空页
-    //    游标再丢掉时间过滤，必须不重放全历史。
+    //  - 带 cursor 的空页：**不得重放**任何已交付的行。两段式下「第一段确实耗尽」时
+    //    游标会前进到第二段，所以这里不再断言游标逐字不变（那是单水位时代的判据），
+    //    改为钉住可观察行为：采纳空页游标续拉，一个字都不交付；
+    //  - 无 cursor 的空 time-filtered 页：`end` 界内的一切都已确立，游标不得编成
+    //    「从头拉取」——否则周期轮询的客户端丢掉时间过滤就会重放窗口外的历史行。
     let v = json_of(
         &client,
         req("GET", &format!("{pull_url}?limit=5000&cursor={c0}&end=1700000000")),
@@ -558,45 +565,37 @@ async fn cursor_continuation_is_monotonic_when_row_order_diverges_from_time_orde
         .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
         .collect();
     assert!(got.is_empty(), "end 过滤必须让本页为空");
-    let c1 = v["sync"]["nextCursor"].as_str().unwrap();
-    assert_eq!(c1, c0, "带 cursor 的空页必须保持进度（游标不变）");
+    let c1 = v["sync"]["nextCursor"]
+        .as_str()
+        .expect("空页也必须给游标")
+        .to_string();
+    let v = json_of(
+        &client,
+        req("GET", &format!("{pull_url}?limit=5000&cursor={c1}")),
+    )
+    .await;
+    assert!(
+        v["messages"].as_array().unwrap().is_empty(),
+        "空页游标续拉不得重放已交付的行"
+    );
 
-    // 无 cursor 的空 time-filtered 页：窗口 (1700000060, 1700000099] 内
-    // 无行，但「ts ≤ end 的行都已确立」——游标必须编码回溯行（ts=…050、行标识
-    // 最大），而不是 0（从头拉取）。周期轮询的客户端（end=now）采纳空页游标
-    // 再丢掉时间过滤，必须不重放全历史。
+    // 无 cursor 的空 time-filtered 页：窗口 (1700000060, 1700000099] 内无行，
+    // 于是「ts ≤ end 的行都已确立」——采纳它再丢掉时间过滤，窗口外的回溯行
+    // （ts=…050）**不得**冒出来；窗口内的时间更大行本来就该交付。
     let v = json_of(
         &client,
         req("GET", &format!("{pull_url}?limit=5000&since=1700000060&end=1700000099")),
     )
     .await;
-    let got: Vec<String> = v["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
-        .collect();
-    assert!(got.is_empty(), "end 过滤必须让本页为空");
-    let c_empty = v["sync"]["nextCursor"].as_str().unwrap();
-    // 游标形状 `v2.<nonce>.<账号>.<注册代次>.<数据源世代>.<会话>.<localId>`，
-    // 整段 URL-safe base64（无填充）：标准字母表的 `+` 会在 query 里被解成空格。
-    use base64::Engine as _;
-    let decoded = String::from_utf8(
-        base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(c_empty)
-            .unwrap(),
-    )
-    .unwrap();
-    let lid: i64 = decoded
-        .split('.')
-        .next_back()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(-1);
-    assert_ne!(
-        lid, 0,
-        "空页游标不得编码行标识 0（从头拉取）：{decoded}"
+    assert!(
+        v["messages"].as_array().unwrap().is_empty(),
+        "窗口内无行，本页必须为空"
     );
-    // 采纳空页游标续拉（不带时间过滤）：不得重放全历史。
+    let c_empty = v["sync"]["nextCursor"]
+        .as_str()
+        .expect("空页也必须给游标")
+        .to_string();
+    // 采纳空页游标续拉（不带时间过滤）：窗口外的回溯行不得重放。
     let v = json_of(
         &client,
         req("GET", &format!("{pull_url}?limit=5000&cursor={c_empty}")),
@@ -608,9 +607,19 @@ async fn cursor_continuation_is_monotonic_when_row_order_diverges_from_time_orde
         .iter()
         .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
         .collect();
-    assert!(
-        got.is_empty(),
-        "空页游标（end 界内已确立进度）续拉不得重放全历史，实际交付：{got:?}"
+    // 被 `end` 挡住的行必须经同一游标交付：只断言「回溯行不出现」挡不住「续拉返回空」
+    // ——那正是这条分支要防的少行形态。整集比对，别只看排除项。
+    let mut expected: Vec<String> = first_page
+        .iter()
+        .filter(|id| id.as_str() != backdated.as_str())
+        .cloned()
+        .collect();
+    expected.sort();
+    let mut delivered = got.clone();
+    delivered.sort();
+    assert_eq!(
+        delivered, expected,
+        "空页游标续拉必须交付被 end 挡住的行、且不得重放回溯行，实际交付：{delivered:?}"
     );
 
     // 段三：排空后追加（同秒、行标识更大）→ 游标续拉可达。
@@ -1033,4 +1042,110 @@ async fn cursor_continuation_excludes_same_shard_history_but_reaches_later_backf
         got.is_empty(),
         "按游标推进后的续拉不得重放：{got:?}"
     );
+}
+
+/// `end` 挡住的行**不算**第一段耗尽：带同一 `end` 的续页是空页，但**不能切段**。
+///
+/// 两段式里第二段只认「行标识大于快照」的行，因此一旦在「被 `end` 挡住」的空页上切段，
+/// 那些行（行标识在快照内、时间大于 `end`）就永久留在第一段之外——客户端抬高 `end`
+/// 也拿不到，且没有任何信号。判据必须是「`end` 视作无上界时第一段也为空」。
+///
+/// 段一取全量为基准；段二用 `end` 卡出一个真子集；段三同一 `end` 的续页必须是空页；
+/// 段四丢掉 `end` 后，被挡住的行必须经同一游标到达，且与段二无重放、无缺口。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "真实索引链路回归：随一致性步骤显式运行（cargo test --test conformance_runner -- --ignored）"]
+async fn cursor_end_window_does_not_freeze_the_chain() {
+    let dir = common::tmp_dir("cursor-end-window");
+    let key = keystore::parse_db_key(common::FAKE_KEY_HEX).unwrap();
+    let storage = common::build_wechat_account(&dir, &key.0);
+    // 多条不同时间戳，且都晚于段二用的 end：没有它们，「被挡住」与「真的耗尽」不可区分。
+    common::append_same_second_burst(&storage, &key.0, 4, 1_700_000_150);
+
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let state = Arc::new(server::AppState::new(
+        cfg_for(&dir),
+        TOKEN.to_string(),
+        shutdown_tx,
+    ));
+    let app = server::build_router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = app.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let body = json!({
+        "wxid": common::FAKE_WXID,
+        "key": common::FAKE_KEY_HEX,
+        "db_path": dir.to_string_lossy(),
+    });
+    let mut r = req("POST", "/api/v1/accounts");
+    r.headers_mut().insert(
+        header::CONTENT_TYPE,
+        "application/json".parse().unwrap(),
+    );
+    *r.body_mut() = Body::from(body.to_string());
+    let reg = json_of(&client, r).await;
+    assert_eq!(reg["success"], json!(true), "注册失败：{reg}");
+    assert!(wait_ready(&client).await, "索引没能在 30 秒内到 ready");
+
+    let pull_url = format!("/chatlab/sessions/{}/messages", common::FAKE_GROUP);
+    let ids = |v: &Value| -> Vec<String> {
+        v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // 段一：基准集合（大 limit、无 end）。
+    let v = json_of(&client, req("GET", &format!("{pull_url}?limit=5000"))).await;
+    let full = {
+        let mut x = ids(&v);
+        x.sort();
+        x
+    };
+    assert!(full.len() >= 5, "夹具行数太少，测不到窗口切分：{full:?}");
+
+    // 段二：`end` 卡在第二早的时间戳上——只交付它之前（含）的行。
+    let v = json_of(
+        &client,
+        req("GET", &format!("{pull_url}?limit=5000&end=1700000101")),
+    )
+    .await;
+    let mut window = ids(&v);
+    window.sort();
+    assert!(!window.is_empty(), "窗口内必须有行，否则测不到「被挡住」");
+    assert!(window.len() < full.len(), "end 必须真的切掉一部分行：{window:?}");
+    assert_eq!(v["sync"]["hasMore"], json!(false), "窗口内的行一页装得下");
+    let c0 = v["sync"]["nextCursor"].as_str().unwrap().to_string();
+
+    // 段三：同一 `end` 的续页——空页、hasMore=false，游标仍在场且**不得前进**：
+    // 被 `end` 挡住的行属于第一段，空页上切段或推进位置都会让它们永久够不到。
+    let v = json_of(
+        &client,
+        req("GET", &format!("{pull_url}?limit=5000&cursor={c0}&end=1700000101")),
+    )
+    .await;
+    assert!(ids(&v).is_empty(), "窗口内已排空，续页必须是空页");
+    assert_eq!(v["sync"]["hasMore"], json!(false), "空页不是「还有更多」");
+    let c1 = v["sync"]["nextCursor"].as_str().unwrap().to_string();
+    assert_eq!(c1, c0, "被 end 挡住的空页不得推进游标：那些行还在第一段里等更高的 end");
+
+    // 段四：丢掉 `end`——被挡住的行必须经**段三返回的**游标到达（用旧的 `c0` 会掩盖
+    // 「空页错误推进游标」这一缺陷：旧游标照样能取回剩余行，集合断言于是假通过）。
+    let v = json_of(
+        &client,
+        req("GET", &format!("{pull_url}?limit=5000&cursor={c1}")),
+    )
+    .await;
+    let rest = ids(&v);
+    assert!(
+        !rest.is_empty(),
+        "被 end 挡住的行不可达：空页上切了段，第二段只认行标识大于快照的行"
+    );
+    let mut union: Vec<String> = window.iter().chain(rest.iter()).cloned().collect();
+    union.sort();
+    assert_eq!(union, full, "窗口页 + 抬高 end 的续页必须恰好覆盖全量（无重放、无缺口）");
 }
