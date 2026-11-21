@@ -139,9 +139,10 @@ VS 环境脚本可用 `$env:WEFLOW_VCVARS` 覆盖。
 
 正式上传由 CI 的 `crates` 与 `pypi` 两个作业执行（tag 触发，各自停在 `crates-io` / `pypi` 两个人工审批闸门，逐一放行）。
 
-1. **版本号五处同改**：`Cargo.toml`（根包）、`clients/rust/Cargo.toml`、`clients/python/pyproject.toml`、`clients/ts/package.json` 与 `package-lock.json`。
+1. **版本号六处同改**：根 `Cargo.toml`（含 `weflow-client = { path, version }` 这条 SDK 依赖约束）、`clients/rust/Cargo.toml`、`clients/python/pyproject.toml`、`clients/ts/package.json` 与 `package-lock.json`。
+   - 那条 SDK 依赖约束的 caret 上界卡在旧 minor 上，不跟着升会让发布产物指回旧 SDK。
    - 生成物与快照内嵌的版本号**不手改**：改完必须重跑 regen 与 golden（`UPDATE_GOLDEN=1`），否则 `regen --check` 在 push 时红——那是版本链完整性的唯一机器判据。
-2. `CHANGELOG.md` 对应段的日期回填为实际发布日，作为**独立提交**推上去；tag 必须指向这笔回填提交（CHANGELOG 会进 sdist，tag 指错会把准备日永久发出去）。
+2. 先把 `[Unreleased]` 的条目补齐（行为变化、迁移方式、回归位置），再把对应段的日期回填为实际发布日，作为**独立提交**推上去；tag 必须指向这笔回填提交（CHANGELOG 会进 sdist，tag 指错会把准备日永久发出去）。顺序反了就没机会补——日期回填即定版。
 3. **先 push master、等 check 绿、再打 tag**：`check.yml` 只在 push 到 master 触发，推 tag 不跑它；release 链的门比 check 少（不含 regen --check）。
    - 顺序：`git push origin master` → 盯该提交的 check 绿 → `git rev-parse HEAD` 与 `git ls-remote origin refs/heads/master` 逐字一致 → `git tag v<版本>` → `git push origin v<版本>`。
    - Windows PowerShell 5.1 不认 `&&`，两条 git 命令必须分两行写。
