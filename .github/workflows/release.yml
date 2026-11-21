@@ -220,8 +220,11 @@ jobs:
           shopt -s nullglob
           sha256sum *.zip *.tar.gz > SHA256SUMS
 
+      # 本文件三个第三方步骤都持有 contents:write 或 id-token:write（发布与 OIDC
+      # 换凭据），一律钉 commit SHA（行尾注释记原浮动引用）：可变引用等于把发布链
+      # 的执行代码交给上游 tag / 分支的移动权；升级 action 时换 SHA 并同步注释。
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             artifacts/*.zip
@@ -259,7 +262,7 @@ jobs:
       # action 的 post step 在 job 结束时撤销。
       - name: Authenticate with crates.io via OIDC
         id: auth
-        uses: rust-lang/crates-io-auth-action@v1
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1
 
       # 顺序＝先 SDK、后根包：根包的依赖声明带 version，必须等 registry 上
       # 存在该版本才发布得出去。
@@ -345,7 +348,7 @@ jobs:
       # 上传用 pypa 的官方动作（OIDC 换短期凭据，仓库里不留长期 token）。
       # 它是容器动作，只能在 Linux runner 上跑；dist 路径相对工作区根。
       - name: Publish Python SDK to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
         with:
           packages-dir: clients/python/dist/
           # 重跑作业不该因为「这版本已发过」而红。

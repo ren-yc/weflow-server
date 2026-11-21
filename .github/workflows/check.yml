@@ -304,7 +304,9 @@ jobs:
       - name: Install pinned toolchain (rust-toolchain.toml)
         run: rustup show
 
-      - uses: Swatinem/rust-cache@v2
+      # 第三方 action 钉 commit SHA（行尾注释记原浮动引用）：tag / 分支可被上游
+      # 改指到任意提交，SHA 才能让这一步实际执行的代码可复现、可审计。
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: ${{ matrix.os }}
 
