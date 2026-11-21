@@ -598,7 +598,7 @@ async fn drain_session_cursor_propagates_cursor_reset_without_restarting() {
 
     let mut pages: Vec<usize> = Vec::new();
     let err = client
-        .drain_session_cursor("alice", None, |page| {
+        .drain_session_cursor("alice", None, |page, _| {
             pages.push(page.len());
             Ok(())
         })
@@ -615,6 +615,35 @@ async fn drain_session_cursor_propagates_cursor_reset_without_restarting() {
     // 请求序列：无游标首页（200）→ 带游标续拉（409）。失效发生在续拉上。
     assert!(!queries[0].contains("cursor="), "首页不带游标：{}", queries[0]);
     assert!(queries[1].contains("cursor=c1"), "续拉带服务端给的游标：{}", queries[1]);
+}
+
+/// 每页的第二个回调参数是本页之后的续拉点。中途遇到传输或状态错误时循环交不出
+/// `DrainOutcome`，调用方唯一能存下的就是它——所以它必须每页都给，且与终页返回值
+/// 同源。
+#[tokio::test]
+async fn drain_session_cursor_hands_each_page_its_resume_cursor() {
+    let mock = Mock::default();
+    *mock.pull_pages.lock().unwrap() = vec![
+        pull_page_fixture(true, Some("c1"), &[("1", 1_700_000_000)]),
+        pull_page_fixture(false, Some("c2"), &[("2", 1_700_000_001)]),
+    ];
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+
+    let mut checkpoints: Vec<(usize, Option<String>)> = Vec::new();
+    let outcome = client
+        .drain_session_cursor("alice", None, |page, resume| {
+            checkpoints.push((page.len(), resume.map(str::to_string)));
+            Ok(())
+        })
+        .await
+        .expect("排空应成功");
+    assert_eq!(
+        checkpoints,
+        vec![(1, Some("c1".to_string())), (1, Some("c2".to_string()))],
+        "第一页交出下一页的游标，终页交出排空点"
+    );
+    assert_eq!(outcome.cursor, checkpoints[1].1, "终页检查点与返回值必须同源");
 }
 
 /// 游标第二段不应用窗口：页里夹着早于 `since` 的回溯行时，排空循环必须在交给
@@ -641,7 +670,7 @@ async fn drain_session_cursor_drops_rows_below_the_since_bound() {
 
     let mut delivered: Vec<String> = Vec::new();
     let outcome = client
-        .drain_session_cursor("alice", Some(1_700_000_500), |page| {
+        .drain_session_cursor("alice", Some(1_700_000_500), |page, _| {
             delivered.extend(page.iter().map(|m| m.platform_message_id.clone()));
             Ok(())
         })
@@ -679,7 +708,7 @@ async fn drain_session_cursor_rejects_a_non_advancing_cursor() {
 
     let mut pages = 0usize;
     let err = client
-        .drain_session_cursor("alice", None, |_| {
+        .drain_session_cursor("alice", None, |_, _| {
             pages += 1;
             Ok(())
         })
@@ -764,7 +793,7 @@ async fn drain_session_cursor_returns_the_terminal_cursor() {
     let client = Client::new(&base, TOKEN);
 
     let outcome = client
-        .drain_session_cursor("alice", None, |_| Ok(()))
+        .drain_session_cursor("alice", None, |_, _| Ok(()))
         .await
         .expect("排空应成功");
     assert_eq!(outcome.count, 2);
@@ -785,7 +814,7 @@ async fn drain_session_cursor_returns_the_cursor_of_an_empty_terminal_page() {
 
     let mut deliveries: Vec<usize> = Vec::new();
     let outcome = client
-        .drain_session_cursor("alice", None, |page| {
+        .drain_session_cursor("alice", None, |page, _| {
             deliveries.push(page.len());
             Ok(())
         })
@@ -808,7 +837,7 @@ async fn drain_session_cursor_returns_the_cursor_when_the_window_drops_every_row
 
     let mut delivered: Vec<String> = Vec::new();
     let outcome = client
-        .drain_session_cursor("alice", Some(1_700_000_500), |page| {
+        .drain_session_cursor("alice", Some(1_700_000_500), |page, _| {
             delivered.extend(page.iter().map(|m| m.platform_message_id.clone()));
             Ok(())
         })
@@ -829,7 +858,7 @@ async fn drain_session_cursor_reports_no_cursor_for_a_response_without_one() {
     let client = Client::new(&base, TOKEN);
 
     let outcome = client
-        .drain_session_cursor("alice", None, |_| Ok(()))
+        .drain_session_cursor("alice", None, |_, _| Ok(()))
         .await
         .expect("缺游标不是错误");
     assert_eq!(outcome.count, 1);
@@ -849,7 +878,7 @@ async fn drain_session_cursor_accepts_a_repeated_cursor_on_the_terminal_page() {
     let client = Client::new(&base, TOKEN);
 
     let outcome = client
-        .drain_session_cursor("alice", None, |_| Ok(()))
+        .drain_session_cursor("alice", None, |_, _| Ok(()))
         .await
         .expect("终页重复游标必须被接受");
     assert_eq!(outcome.count, 2);
@@ -875,9 +904,11 @@ async fn drain_session_cursor_hands_no_outcome_when_the_callback_fails() {
     let client = Client::new(&base, TOKEN);
 
     let mut calls = 0usize;
+    let mut checkpoints: Vec<Option<String>> = Vec::new();
     let err = client
-        .drain_session_cursor("alice", None, |_| {
+        .drain_session_cursor("alice", None, |_, resume| {
             calls += 1;
+            checkpoints.push(resume.map(str::to_string));
             Err(ClientError::UnexpectedBody {
                 url: "on_page".to_string(),
                 detail: "disk full".to_string(),
@@ -890,6 +921,11 @@ async fn drain_session_cursor_hands_no_outcome_when_the_callback_fails() {
         other => panic!("必须是回调自己的错误：{other:?}"),
     }
     assert_eq!(calls, 1, "第一页就失败，不该继续");
+    assert_eq!(
+        checkpoints,
+        vec![Some("c1".to_string())],
+        "失败前续拉点已经交出去了，调用方存得下"
+    );
     assert_eq!(mock.pull_queries.lock().unwrap().len(), 1, "失败即停，不再续页");
 }
 
@@ -906,7 +942,7 @@ async fn drain_session_cursor_resumes_from_the_cursor_it_returned() {
     let client = Client::new(&base, TOKEN);
 
     let first = client
-        .drain_session_cursor("alice", None, |_| Ok(()))
+        .drain_session_cursor("alice", None, |_, _| Ok(()))
         .await
         .expect("首次排空应成功");
     let next = client

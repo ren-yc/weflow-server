@@ -478,7 +478,9 @@ async def test_drain_session_cursor_propagates_cursor_reset_without_restarting()
     with pytest.raises(CursorReset):
         await client.drain_session_cursor(
             "alice", None,
-            lambda batch: pages.append([int(m.platform_message_id) for m in batch]),
+            lambda batch, _resume: pages.append(
+                [int(m.platform_message_id) for m in batch]
+            ),
         )
     # Only the page before the 409 was delivered; no further request, no replay.
     assert pages == [[1]]
@@ -501,7 +503,7 @@ async def test_drain_session_cursor_drops_rows_below_the_since_bound() -> None:
     delivered: list[int] = []
     outcome = await client.drain_session_cursor(
         "alice", 1500,
-        lambda batch: delivered.append([int(m.platform_message_id) for m in batch]),
+        lambda batch, _resume: delivered.append([int(m.platform_message_id) for m in batch]),
     )
     assert delivered == [[1]], delivered
     assert outcome.count == 1, "the count must be what was actually delivered"
@@ -524,7 +526,9 @@ async def test_drain_session_cursor_rejects_a_non_advancing_cursor() -> None:
     with pytest.raises(ShapeError):
         await client.drain_session_cursor(
             "alice", None,
-            lambda batch: pages.append([int(m.platform_message_id) for m in batch]),
+            lambda batch, _resume: pages.append(
+                [int(m.platform_message_id) for m in batch]
+            ),
         )
     # The looping page must not be delivered; one request beyond the first.
     assert pages == [[1]]
@@ -541,7 +545,7 @@ async def test_drain_session_cursor_returns_the_terminal_cursor() -> None:
         pull_page([msg(2, 1001)], False, 1001, 0, next_cursor="c2"),
     ]
     client = make_client(mock)
-    outcome = await client.drain_session_cursor("alice", None, lambda batch: None)
+    outcome = await client.drain_session_cursor("alice", None, lambda batch, _resume: None)
     assert outcome == DrainOutcome(count=2, cursor="c2")
     assert mock.pull_queries[1] == {"cursor": "c1"}, "the next page echoes the server's cursor"
     await client.aclose()
@@ -555,11 +559,11 @@ async def test_drain_session_cursor_returns_the_cursor_of_an_empty_terminal_page
     client = make_client(mock)
     deliveries: list[int] = []
     outcome = await client.drain_session_cursor(
-        "alice", None, lambda batch: deliveries.append(len(batch))
+        "alice", None, lambda batch, resume: deliveries.append((len(batch), resume))
     )
     assert outcome.count == 0
     assert outcome.cursor == "c9"
-    assert deliveries == [0], "an empty page still reaches on_page once"
+    assert deliveries == [(0, "c9")], "an empty page still reaches on_page once, with its cursor"
     await client.aclose()
 
 
@@ -571,9 +575,9 @@ async def test_drain_session_cursor_returns_the_cursor_when_the_window_drops_eve
     client = make_client(mock)
     delivered: list[int] = []
     outcome = await client.drain_session_cursor(
-        "alice", 1500, lambda batch: delivered.append(len(batch))
+        "alice", 1500, lambda batch, resume: delivered.append((len(batch), resume))
     )
-    assert delivered == [0], delivered
+    assert delivered == [(0, "c7")], delivered
     assert outcome.count == 0
     assert outcome.cursor == "c7", "the cursor is not lost to filtering"
     await client.aclose()
@@ -587,7 +591,7 @@ async def test_drain_session_cursor_reports_no_cursor_for_a_response_without_one
     del page["sync"]["nextCursor"]
     mock.pull_pages = [page]
     client = make_client(mock)
-    outcome = await client.drain_session_cursor("alice", None, lambda batch: None)
+    outcome = await client.drain_session_cursor("alice", None, lambda batch, _resume: None)
     assert outcome.count == 1
     assert outcome.cursor is None, "do not invent a cursor the server never sent"
     await client.aclose()
@@ -602,7 +606,7 @@ async def test_drain_session_cursor_accepts_a_repeated_cursor_on_the_terminal_pa
         pull_page([msg(2, 1001)], False, 1001, 0, next_cursor="c1"),
     ]
     client = make_client(mock)
-    outcome = await client.drain_session_cursor("alice", None, lambda batch: None)
+    outcome = await client.drain_session_cursor("alice", None, lambda batch, _resume: None)
     assert outcome == DrainOutcome(count=2, cursor="c1")
     assert mock.pull_queries[1] == {"cursor": "c1"}, (
         "the second page must still echo the server's cursor, or this case degrades "
@@ -620,16 +624,36 @@ async def test_drain_session_cursor_hands_no_outcome_when_the_callback_fails() -
         pull_page([msg(2, 1001)], False, 1001, 0, next_cursor="c2"),
     ]
     client = make_client(mock)
-    calls: list[int] = []
+    calls: list[tuple[int, str | None]] = []
 
-    def boom(batch: list[gen.PullMessage]) -> None:
-        calls.append(len(batch))
+    def boom(batch: list[gen.PullMessage], resume: str | None) -> None:
+        calls.append((len(batch), resume))
         raise ShapeError("disk full")
 
     with pytest.raises(ShapeError, match="disk full"):
         await client.drain_session_cursor("alice", None, boom)
-    assert calls == [1], "the first page was delivered, then the failure stopped the loop"
+    assert calls == [(1, "c1")], "the resume point was handed over before the failure"
     assert len(mock.pull_queries) == 1, "no further page after the failure"
+    await client.aclose()
+
+
+async def test_drain_session_cursor_hands_each_page_its_resume_cursor() -> None:
+    """The callback's second argument is where the page after this one starts.
+
+    A transport or status error mid-drain returns no outcome, so this per-page
+    value is the only resume point the caller can keep."""
+    mock = Mock()
+    mock.pull_pages = [
+        pull_page([msg(1, 1000)], True, 1000, 0, next_cursor="c1"),
+        pull_page([msg(2, 1001)], False, 1001, 0, next_cursor="c2"),
+    ]
+    client = make_client(mock)
+    checkpoints: list[tuple[int, str | None]] = []
+    outcome = await client.drain_session_cursor(
+        "alice", None, lambda batch, resume: checkpoints.append((len(batch), resume))
+    )
+    assert checkpoints == [(1, "c1"), (1, "c2")]
+    assert outcome.cursor == checkpoints[1][1], "the terminal checkpoint and the outcome agree"
     await client.aclose()
 
 
@@ -642,7 +666,7 @@ async def test_drain_session_cursor_resumes_from_the_cursor_it_returned() -> Non
         pull_page([msg(2, 1001)], False, 1001, 0, next_cursor="c3"),
     ]
     client = make_client(mock)
-    first = await client.drain_session_cursor("alice", None, lambda batch: None)
+    first = await client.drain_session_cursor("alice", None, lambda batch, _resume: None)
     assert first.cursor == "c2"
     nxt = await client.pull_page_cursor("alice", first.cursor)
     assert [str(m.platform_message_id) for m in nxt.messages] == ["2"]
@@ -1820,7 +1844,7 @@ def test_sync_client_drain_session_cursor_runs_callbacks_on_the_caller_thread(mo
         outcome = client.drain_session_cursor(
             "alice",
             None,
-            lambda batch: seen.append(
+            lambda batch, _resume: seen.append(
                 (threading.get_ident(), [str(m.platform_message_id) for m in batch])
             ),
         )
@@ -1847,7 +1871,9 @@ def test_sync_client_drain_session_cursor_propagates_cursor_reset(monkeypatch) -
         with pytest.raises(CursorReset):
             client.drain_session_cursor(
                 "alice", None,
-                lambda batch: pages.append([str(m.platform_message_id) for m in batch]),
+                lambda batch, _resume: pages.append(
+                    [str(m.platform_message_id) for m in batch]
+                ),
             )
     finally:
         client.close()
@@ -1870,7 +1896,9 @@ def test_sync_client_drain_session_cursor_rejects_a_non_advancing_cursor(monkeyp
         with pytest.raises(ShapeError):
             client.drain_session_cursor(
                 "alice", None,
-                lambda batch: pages.append([str(m.platform_message_id) for m in batch]),
+                lambda batch, _resume: pages.append(
+                    [str(m.platform_message_id) for m in batch]
+                ),
             )
     finally:
         client.close()

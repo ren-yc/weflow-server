@@ -57,6 +57,10 @@ The messages were delivered; only the resume point is unknown.
 
 A failing `on_page` fails the call and returns no outcome — a partial count would look like that part had landed.
 
+`on_page` also receives the resume cursor for the page after the one it was given.
+
+A mid-drain failure returns no outcome, so that per-page value is the only checkpoint a caller can keep.
+
 ## Targeted media recovery
 
 Restore one unique message with `export_media_by_message(talker, platform_message_id, sender, timestamp)`.

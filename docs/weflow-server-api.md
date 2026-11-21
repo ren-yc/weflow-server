@@ -691,6 +691,7 @@ timeline / export 的条目键共 20 个：
   - 翻页中「下一游标为空或与请求游标相同」是形状错误，同样上抛（继续翻页会原地打转）。
 - `drain_session_cursor` 返回 `DrainOutcome`（`count` ＋ `cursor`）：`count` 是交给回调的条数，`cursor` 是终页 `nextCursor` 原样，可直接交给 `pull_page_cursor` 续拉。
 - 回调失败时整体失败、不交出结果；历史响应缺该字段时 `cursor` 为 `None`，不报错。
+- `on_page` 的第二个参数是本页之后的续拉点：中途遇到传输或状态错误时交不出 `DrainOutcome`，每页这个值才是调用方唯一存得下的检查点。
 - `group_members` 的计数开关关闭时不发参数（不是发 `0`）；`list_all_sessions` 的 `page_size` 上限 10000。`media_bytes` 在 404 后按「先 `media=1` 导出再取」自动重试一次；`media_bytes_by_id` 不触发导出。
 - 重试时导出行按（平台消息 id、sender、timestamp）三元组定位：恰好一行用它的落盘名重试，零行报「导出页不含目标」，多行报「无法确定哪一行才是本条」。
 - `watch()` 的游标只在帧被消费时推进；只有 `id:` 没有 `data:` 的悬空帧不推进。类型与操作客户端由 `/openapi.json` 生成（`cargo run -p weflow-regen` / `python scripts/regen.py`），生成物入库、CI 断言无 diff；不要手改生成物。

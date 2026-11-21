@@ -664,7 +664,7 @@ class Client:
         self,
         talker: str,
         since: int | None,
-        on_page: Callable[[list[gen.PullMessage]], None],
+        on_page: Callable[[list[gen.PullMessage], str | None], None],
     ) -> DrainOutcome:
         """Drain one session through the opaque cursor, echoing it verbatim.
 
@@ -686,6 +686,12 @@ class Client:
         so the next pull resumes where this one stopped. If ``on_page`` raises,
         nothing is returned - a partial count would look like that part had
         landed.
+
+        ``on_page`` receives ``(messages, resume_cursor)``: the second argument
+        is where the page **after** this one starts (the terminal page's own
+        cursor on the last page). A transport or status error mid-drain returns
+        no outcome, so that per-page value is the only resume point the caller
+        can keep - persist it before doing anything that can fail.
         """
         cursor: str | None = None
         total = 0
@@ -700,12 +706,14 @@ class Client:
             next_cursor = _advanced_cursor(page, cursor)
             kept = _kept_in_window(page.messages, since)
             total += len(kept)
-            on_page(kept)
+            # The second callback argument is this page's resume point: the
+            # advanced cursor while hasMore is true, the terminal page's own
+            # nextCursor otherwise. Handing it out per page is what lets a
+            # caller survive a mid-drain failure - that path returns no outcome.
+            resume = next_cursor if next_cursor is not None else page.sync.next_cursor
+            on_page(kept, resume)
             if next_cursor is None:
-                # Drained: ``_advanced_cursor`` returns None only for a page with
-                # hasMore=false, so this is the terminal page - its cursor is the
-                # resume point, whether or not the server supplied one.
-                return DrainOutcome(count=total, cursor=page.sync.next_cursor)
+                return DrainOutcome(count=total, cursor=resume)
             cursor = next_cursor
 
     async def drain_session(
@@ -1323,7 +1331,7 @@ class SyncClient:
         self,
         talker: str,
         since: int | None,
-        on_page: Callable[[list[gen.PullMessage]], None],
+        on_page: Callable[[list[gen.PullMessage], str | None], None],
     ) -> DrainOutcome:
         """Synchronous counterpart of :meth:`Client.drain_session_cursor`.
 
@@ -1331,7 +1339,8 @@ class SyncClient:
         expects it, and keeps both judgments of the async entry: a
         :class:`CursorReset` propagates instead of restarting, and the shared
         ``_advanced_cursor`` guard rejects a non-advancing cursor before the
-        page is delivered. The terminal cursor is handed back the same way.
+        page is delivered. The terminal cursor is handed back the same way, and
+        each page gets its own resume point as the callback's second argument.
         """
         cursor: str | None = None
         total = 0
@@ -1340,9 +1349,10 @@ class SyncClient:
             next_cursor = _advanced_cursor(page, cursor)
             kept = _kept_in_window(page.messages, since)
             total += len(kept)
-            on_page(kept)
+            resume = next_cursor if next_cursor is not None else page.sync.next_cursor
+            on_page(kept, resume)
             if next_cursor is None:
-                return DrainOutcome(count=total, cursor=page.sync.next_cursor)
+                return DrainOutcome(count=total, cursor=resume)
             cursor = next_cursor
 
     def drain_session(
