@@ -524,6 +524,15 @@ pub struct PullSync {
     pub has_more: bool,
     pub next_offset: usize,
     pub next_since: i64,
+    /// 本页所属链的窗口下界（契约 0.13.0）：带 `since` 建链时回显它，无下界时为
+    /// `null`。**键始终在场**，不走 `skip_serializing_if`：缺键让客户端分不清
+    /// 「旧服务端」与「这一页没有下界」，两者的续拉策略不同。
+    ///
+    /// 为什么要回显：游标第二段不应用窗口、会带出早于下界的回溯行，调用方从交付
+    /// 的行反推下界只会得到更小的值，按它做严格窗口过滤会漏掉本该保留的行。
+    #[schema(required = true)]
+    pub since: Option<i64>,
+    pub watermark: i64,
     /// 不透明进度游标（契约 0.9.0 的 opaqueCursor 能力）：编码入库进度，客户端
     /// 原样回传、不得解析。载荷绑定「进程 / 账号 / 会话 / 注册代次 / 数据源
     /// 世代」，所以**换进程、换账号、换会话或数据源被替换后，旧游标一律失效**。
@@ -540,7 +549,6 @@ pub struct PullSync {
     /// nextSince 之后）由它补上。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
-    pub watermark: i64,
 }
 // ── 联系人 ────────────────────────────────────────────────
 

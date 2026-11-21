@@ -21,6 +21,9 @@
 ### 变更
 
 - 接口契约 pin 升 `v0.12.0`：新增 `group_out_of_order` 槽位与两条游标用例，随一致性套件执行。
+- 接口契约 pin 升 `v0.13.0`：新增 `cursor-sync-since-window` 与 `cursor-sync-since-no-window` 两条用例，钉住窗口下界的回显形状与「无窗口时为 null」。
+- **拉取响应逐页回显窗口下界 `sync.since`**：带 `since` 建链时等于该值，无下界时为 `null`，**键始终在场**。此前调用方只能从交付的行反推，而游标第二段不应用窗口、会带出更早的回溯行，反推出的下界偏小——按它做严格窗口过滤会漏行。行为对齐：`since=0` 现在与省略等价（此前会签出一条 `since=0` 的链），回显同样是 `null`。迁移：无需动作，新增字段；要严格窗口的调用方改用回显值，不要自己反推。回归：`chatlab_pull_echoes_the_window_lower_bound`、契约用例 `cursor-sync-since-window` 与 `cursor-sync-since-no-window`。
+- **MCP 取消息改用回显的窗口下界**：工具按响应里的 `since` 过滤，不再用调用方重发的相对串——游标链的窗口在建链时就冻结了，「24h 前」到下一轮已经前移，按它过滤会丢掉本该交付的行；不带 `since` 时也靠它拦住第二段带出的回溯行。输出按**字符串**给这个下界（入参是字符串，回填数字会在下一轮反序列化失败）。回归：`mcp_get_messages_echoes_the_opaque_cursor_and_says_what_to_do_when_it_expires`。
 
 ### 修复
 

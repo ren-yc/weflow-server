@@ -792,6 +792,14 @@ nextSince 之后）由它补上。*/
         pub next_offset: u64,
         #[serde(rename = "nextSince")]
         pub next_since: i64,
+        /**本页所属链的窗口下界（契约 0.13.0）：带 `since` 建链时回显它，无下界时为
+`null`。**键始终在场**，不走 `skip_serializing_if`：缺键让客户端分不清
+「旧服务端」与「这一页没有下界」，两者的续拉策略不同。
+
+为什么要回显：游标第二段不应用窗口、会带出早于下界的回溯行，调用方从交付
+的行反推下界只会得到更小的值，按它做严格窗口过滤会漏掉本该保留的行。*/
+        #[serde(deserialize_with = "::std::option::Option::deserialize")]
+        pub since: ::std::option::Option<i64>,
         pub watermark: i64,
     }
     ///引用（回复）的渲染信息。

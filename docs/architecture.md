@@ -309,9 +309,9 @@ Python 只用于钩子与套件执行器，纯标准库——CI 与开发机都�
 
 ### 一致性套件
 
-`tests/conformance_runner.rs` 起真服务、造夹具，跑契约仓库（版本记在 `conformance.pin`）里的 36 条用例（`v0.8.0`：auth 1／cursor 13／discovery 3／envelope 6／lifecycle 8／nails 5）。
+`tests/conformance_runner.rs` 起真服务、造夹具，跑契约仓库（版本记在 `conformance.pin`）里的 45 条用例（`v0.13.0`：auth 1／cursor 20／discovery 3／envelope 6／lifecycle 9／nails 6）。
 
-v0.6.1 至 v0.6.6 都是纯文档 tag，v0.7.0 新增跨仓文档模板；v0.8.0 移除该模板层、用例集未增删。换 pin 时这里要跟着改，它没有机器判据。
+v0.6.1 至 v0.6.6 都是纯文档 tag，v0.7.0 新增跨仓文档模板；v0.8.0 移除该模板层、用例集未增删；v0.9.0 起逐版加游标与媒体用例，`v0.13.0` 加两条 `sync.since` 用例。换 pin 时这里要跟着改，它没有机器判据。
 
 两条硬规矩：带 `--fail-on-skip`（有用例被跳过即失败），缺 `FLOW_CONTRACT_DIR` 即失败（不是跳过）。
 
@@ -394,6 +394,7 @@ v0.6.1 至 v0.6.6 都是纯文档 tag，v0.7.0 新增跨仓文档模板；v0.8.0
   - 两段为什么必须分开：首页按时间键交付、续页若只按行标识过滤，两种序下的已交付集合互不为前缀，时间更晚而行标识更小的行会被跨过去、永不交付。分段之后每段内部只剩一种序，「已交付 = 该序的前缀」才成立。回归契约用例 `cursor-window-drain-equals-single-page` 与 `cursor-drain-equals-full-out-of-order`。
   - 快照取已索引上界而不是库文件上界：索引事后补齐的行行标识必然更大、落第二段；取库文件上界会把它们冻在第一段里又被键过滤掉。第一段**不推进**这个边界——推进会把已被页切掉、但键更小的新行跨过去。
   - 第二段不应用窗口，它承载的是「排除线确立后入库的回溯行可达」这条承诺；需要严格窗口的调用方在落盘前自行丢弃。回归 `cursor_continuation_excludes_same_shard_history_but_reaches_later_backfill`。
+  - 窗口下界逐页回显在 `sync.since`：它说明「这一页属于哪个窗口」，而第二段带出的回溯行让调用方无从反推（反推出来的下界更小）。无窗口时键仍在场、值为 `null`；`since=0` 与省略等价，建链时归一化成无下界，内部哨兵 `i64::MIN` 不外泄。回归 `chatlab_pull_echoes_the_window_lower_bound`。
   - 段切换只在一处判：**`end` 视作无上界时第一段也为空**才切。被 `end` 挡住不算耗尽——那些行键大于位置，客户端抬高 `end` 后照样交付。回归 `cursor_end_window_does_not_freeze_the_chain`。
   - 进度线按分片（`source_shard`）记账：`local_id` 只在分片内唯一，同一会话的行可以来自多个分片表。
   - 字段多到没有「解析一下再用」的价值，是刻意的：任何客户端解析实现都绑定当版服务端，而服务端换代时那份实现只会安静地少几页。

@@ -102,8 +102,8 @@ struct GetMessagesArgs {
     /// 同一时间组内的游标：翻页时原样回传上一次的 nextOffset
     offset: Option<u64>,
     /// 不透明进度游标：原样回传上一次的 nextCursor。给出时它取代 since/offset。
-    /// 续拉时**一并回传首次的时间下界**（或当时的 sinceResolved），否则本页不应用窗口
-    /// ——服务端在给出 cursor 时忽略入参 since，游标里的窗口也不回显。
+    /// 续拉时**一并回传首次的时间下界**（或当时的 sinceResolved）。不传也行：本页
+    /// 按服务端回显的 `since`（游标里冻结的窗口下界）过滤，比重新发一个相对串更准。
     cursor: Option<String>,
 }
 
@@ -257,6 +257,18 @@ fn now_secs() -> i64 {
 /// 把这些行记进新游标，下一页不会再要求它们。
 ///
 /// 回归：`since_window_is_exclusive_on_a_wide_page`。
+/// 过滤用的窗口下界：**服务端回显的值优先**。
+///
+/// 游标链的窗口在建链时就冻结了；续拉时重发的相对串（「24h 前」）已经前移，
+/// 按它过滤会丢掉本该交付的行，不带 `since` 时又会放进第二段带出的回溯行。
+/// 回显为 `null` 表示这条链确实没有窗口，此时才看调用方这次传的 `since`。
+fn window_bound(
+    sync: &weflow_client::generated::r#gen::types::PullSync,
+    requested: Option<i64>,
+) -> Option<i64> {
+    sync.since.or(requested)
+}
+
 fn in_since_window(
     messages: &[weflow_client::generated::r#gen::types::PullMessage],
     since: Option<i64>,
@@ -323,7 +335,11 @@ impl WeflowMcp {
             Ok(p) => p,
             Err(e) => return sdk_outcome(e),
         };
-        let raw: Vec<Value> = in_since_window(&page.messages, since)
+        // 过滤用**服务端回显的**窗口下界（契约 0.13.0）：游标链的窗口在建链时就冻结了，
+        // 续拉时重发的相对串（「24h 前」）已经前移，按它过滤会丢掉本该交付的行；不带
+        // since 时用回显值才拦得住第二段带出的回溯行。回显为 null 才表示这条链无窗口。
+        let window = window_bound(&page.sync, since);
+        let raw: Vec<Value> = in_since_window(&page.messages, window)
             .iter()
             .filter_map(|m| serde_json::to_value(m).ok())
             .collect();
@@ -367,14 +383,16 @@ impl WeflowMcp {
             },
             // 绝对下界：续拉时传它而不是原始 since 串（下一轮 now 已前移，相对串会挪窗）。
             "sinceResolved": since_resolved,
+            // 服务端逐页回显的链窗口下界（契约 0.13.0）。序列化成**字符串**：本工具的
+            // `since` 入参是字符串，回填数字会让下一轮调用在反序列化时失败。
+            "since": page.sync.since.map(|v| v.to_string()),
             // hint 只在真被截断时出现；`since` 未提供时 sinceResolved 为 null，此时教调用方
             // 「传响应里的 sinceResolved」会得到 null/反序列化失败（见最后一个分支）。
             "hint": if !cut {
-                // 续拉没带 since 时工具面无从得知首次的下界：服务端在给出 cursor 时既忽略
-                // 入参 since、也不把游标里的窗口回显出来（解析游标是被禁止的）。本页因此
-                // 不应用时间窗口，而「沉默地放宽窗口」正是这条要避免的形态。
-                if cursor_mode && since.is_none() {
-                    json!("续拉未带 since，本页未应用时间窗口：若首次请求带过 since，请把它（或当时的 sinceResolved）一并回传")
+                // 续拉没带 since 且这条链本来就没有窗口时，工具面确实无从得知下界：
+                // 让调用方补一个 since 只会凭空造出一个窗口。
+                if cursor_mode && since.is_none() && page.sync.since.is_none() {
+                    json!("续拉未带 since，且该链没有窗口下界：本页未应用时间窗口")
                 } else {
                     Value::Null
                 }

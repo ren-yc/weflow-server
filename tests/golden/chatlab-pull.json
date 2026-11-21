@@ -74,6 +74,7 @@
       "nextCursor": "<volatile>",
       "nextOffset": 0,
       "nextSince": "<volatile>",
+      "since": null,
       "watermark": "<volatile>"
     }
   },
@@ -134,8 +135,9 @@
     "hasMore",
     "nextOffset",
     "nextSince",
-    "nextCursor",
-    "watermark"
+    "since",
+    "watermark",
+    "nextCursor"
   ],
   "status": 200
 }

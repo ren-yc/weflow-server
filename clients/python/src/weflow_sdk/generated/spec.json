@@ -1170,6 +1170,12 @@
             "format": "int64",
             "type": "integer"
           },
+          "since": {
+            "description": "本页所属链的窗口下界（契约 0.13.0）：带 `since` 建链时回显它，无下界时为\n`null`。**键始终在场**，不走 `skip_serializing_if`：缺键让客户端分不清\n「旧服务端」与「这一页没有下界」，两者的续拉策略不同。\n\n为什么要回显：游标第二段不应用窗口、会带出早于下界的回溯行，调用方从交付\n的行反推下界只会得到更小的值，按它做严格窗口过滤会漏掉本该保留的行。",
+            "format": "int64",
+            "nullable": true,
+            "type": "integer"
+          },
           "watermark": {
             "format": "int64",
             "type": "integer"
@@ -1179,6 +1185,7 @@
           "hasMore",
           "nextOffset",
           "nextSince",
+          "since",
           "watermark"
         ],
         "type": "object"

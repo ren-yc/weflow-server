@@ -299,7 +299,7 @@ def pull_page(msgs: list[dict], has_more: bool, next_since: int, next_offset: in
         "messages": msgs,
         "meta": {"groupId": "", "name": "", "ownerId": "",
                  "platform": "weflow", "type": "chat"},
-        "sync": {"hasMore": has_more, "nextSince": next_since,
+        "sync": {"since": None, "hasMore": has_more, "nextSince": next_since,
                  "nextOffset": next_offset, "nextCursor": next_cursor, "watermark": 2000},
     }
 
