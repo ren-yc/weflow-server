@@ -29,7 +29,7 @@ pub async fn handler(
     let since = query.get("since").and_then(|s| crate::server::parse_time_bound(s));
     // `since=0` 与省略等价：0 是纪元起点，挡不住任何真实行，却会让游标与回显带上
     // 一个假下界（`sync.since: 0` 读起来像「从 1970 年起」）。在建链入口归一化成
-    // 「无下界」，游标里因此统一存 `i64::MIN` 哨兵。回归：`pull_since_zero_is_no_window`。
+    // 「无下界」，游标里因此统一存 `i64::MIN` 哨兵。回归：`chatlab_pull_echoes_the_window_lower_bound`。
     let since = since.filter(|s| *s != 0);
     let end = query.get("end").and_then(|s| crate::server::parse_time_bound_end(s));
     let limit = crate::server::parse_limit(&query, "limit", 5000, 5000);
@@ -340,6 +340,7 @@ pub async fn handler(
                 i64::MIN | 0 => None,
                 bound => Some(bound),
             },
+            watermark,
             // Both cursors are meant to be echoed back verbatim, so they must
             // not skip the same rows twice. `nextSince` is exclusive and the
             // page ends on a complete ts group, so re-filtering with it drops
@@ -348,7 +349,6 @@ pub async fn handler(
             // degenerate case where the timestamp could not advance at all,
             // and never on a cursor chain（进度由游标承载）。
             next_offset,
-            watermark,
         },
     };
     Ok(Json(body))

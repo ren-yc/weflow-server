@@ -136,8 +136,8 @@
     "nextOffset",
     "nextSince",
     "since",
-    "nextCursor",
-    "watermark"
+    "watermark",
+    "nextCursor"
   ],
   "status": 200
 }

@@ -306,9 +306,9 @@ Python 只用于钩子与套件执行器，纯标准库——CI 与开发机都�
 
 ### 一致性套件
 
-`tests/conformance_runner.rs` 起真服务、造夹具，跑契约仓库（版本记在 `conformance.pin`）里的 36 条用例（`v0.8.0`：auth 1／cursor 13／discovery 3／envelope 6／lifecycle 8／nails 5）。
+`tests/conformance_runner.rs` 起真服务、造夹具，跑契约仓库（版本记在 `conformance.pin`）里的 45 条用例（`v0.13.0`：auth 1／cursor 20／discovery 3／envelope 6／lifecycle 9／nails 6）。
 
-v0.6.1 至 v0.6.6 都是纯文档 tag，v0.7.0 新增跨仓文档模板；v0.8.0 移除该模板层、用例集未增删。换 pin 时这里要跟着改，它没有机器判据。
+v0.6.1 至 v0.6.6 都是纯文档 tag，v0.7.0 新增跨仓文档模板；v0.8.0 移除该模板层、用例集未增删；v0.9.0 起逐版加游标与媒体用例，`v0.13.0` 加两条 `sync.since` 用例。换 pin 时这里要跟着改，它没有机器判据。
 
 两条硬规矩：带 `--fail-on-skip`（有用例被跳过即失败），缺 `FLOW_CONTRACT_DIR` 即失败（不是跳过）。
 
