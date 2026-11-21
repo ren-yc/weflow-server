@@ -598,7 +598,7 @@ async fn drain_session_cursor_propagates_cursor_reset_without_restarting() {
 
     let mut pages: Vec<usize> = Vec::new();
     let err = client
-        .drain_session_cursor("alice", None, |page| {
+        .drain_session_cursor("alice", None, |page, _| {
             pages.push(page.len());
             Ok(())
         })
@@ -615,6 +615,35 @@ async fn drain_session_cursor_propagates_cursor_reset_without_restarting() {
     // 请求序列：无游标首页（200）→ 带游标续拉（409）。失效发生在续拉上。
     assert!(!queries[0].contains("cursor="), "首页不带游标：{}", queries[0]);
     assert!(queries[1].contains("cursor=c1"), "续拉带服务端给的游标：{}", queries[1]);
+}
+
+/// 每页的第二个回调参数是本页之后的续拉点。中途遇到传输或状态错误时循环交不出
+/// `DrainOutcome`，调用方唯一能存下的就是它——所以它必须每页都给，且与终页返回值
+/// 同源。
+#[tokio::test]
+async fn drain_session_cursor_hands_each_page_its_resume_cursor() {
+    let mock = Mock::default();
+    *mock.pull_pages.lock().unwrap() = vec![
+        pull_page_fixture(true, Some("c1"), &[("1", 1_700_000_000)]),
+        pull_page_fixture(false, Some("c2"), &[("2", 1_700_000_001)]),
+    ];
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+
+    let mut checkpoints: Vec<(usize, Option<String>)> = Vec::new();
+    let outcome = client
+        .drain_session_cursor("alice", None, |page, resume| {
+            checkpoints.push((page.len(), resume.map(str::to_string)));
+            Ok(())
+        })
+        .await
+        .expect("排空应成功");
+    assert_eq!(
+        checkpoints,
+        vec![(1, Some("c1".to_string())), (1, Some("c2".to_string()))],
+        "第一页交出下一页的游标，终页交出排空点"
+    );
+    assert_eq!(outcome.cursor, checkpoints[1].1, "终页检查点与返回值必须同源");
 }
 
 /// 游标第二段不应用窗口：页里夹着早于 `since` 的回溯行时，排空循环必须在交给
@@ -640,15 +669,15 @@ async fn drain_session_cursor_drops_rows_below_the_since_bound() {
     let client = Client::new(&base, TOKEN);
 
     let mut delivered: Vec<String> = Vec::new();
-    let total = client
-        .drain_session_cursor("alice", Some(1_700_000_500), |page| {
+    let outcome = client
+        .drain_session_cursor("alice", Some(1_700_000_500), |page, _| {
             delivered.extend(page.iter().map(|m| m.platform_message_id.clone()));
             Ok(())
         })
         .await
         .expect("排空应成功");
     assert_eq!(delivered, vec!["in-1".to_string()], "窗口外的行不得交付：{delivered:?}");
-    assert_eq!(total, 1, "计数只能是实际交付的条数");
+    assert_eq!(outcome.count, 1, "计数只能是实际交付的条数");
 }
 
 /// 服务端 hasMore=true 却回传**与请求相同**的游标：翻页会原地打转、把同一页
@@ -679,7 +708,7 @@ async fn drain_session_cursor_rejects_a_non_advancing_cursor() {
 
     let mut pages = 0usize;
     let err = client
-        .drain_session_cursor("alice", None, |_| {
+        .drain_session_cursor("alice", None, |_, _| {
             pages += 1;
             Ok(())
         })
@@ -693,6 +722,243 @@ async fn drain_session_cursor_rejects_a_non_advancing_cursor() {
     assert_eq!(pages, 1, "{pages}");
     let queries = mock.pull_queries.lock().unwrap().clone();
     assert_eq!(queries.len(), 2, "{queries:?}");
+}
+
+// ---- drain_session_cursor: what it hands back ----------------------------
+
+/// Parse one recorded query into its `(key, value)` pairs.
+///
+/// Assertions on a parameter must compare the parsed value, not a substring of
+/// the whole query: `contains("cursor=c1")` also accepts `cursor=c1x`, and the
+/// mock answers pages in FIFO order regardless of the query, so a client that
+/// mangles the cursor before sending it would still pass.
+fn query_params(query: &str) -> Vec<(String, String)> {
+    let raw = query.split_once('?').map_or("", |(_, q)| q);
+    raw.split('&')
+        .filter(|kv| !kv.is_empty())
+        .map(|kv| match kv.split_once('=') {
+            Some((k, v)) => (k.to_string(), v.to_string()),
+            None => (kv.to_string(), String::new()),
+        })
+        .collect()
+}
+
+/// The `cursor` parameter as sent, or `None` when the request carried no cursor.
+fn sent_cursor(query: &str) -> Option<String> {
+    query_params(query).into_iter().find(|(k, _)| k == "cursor").map(|(_, v)| v)
+}
+
+/// One Pull page in the server's wire shape. `next_cursor: None` models the
+/// responses that predate the cursor face: they omit the field entirely, which
+/// is not the same as sending `null`.
+fn pull_page_fixture(
+    has_more: bool,
+    next_cursor: Option<&str>,
+    rows: &[(&str, i64)],
+) -> serde_json::Value {
+    let messages: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(id, timestamp)| {
+            serde_json::json!({
+                "accountName": "", "content": *id, "groupNickname": "",
+                "platformMessageId": id, "sender": "alice", "timestamp": timestamp, "type": 0,
+            })
+        })
+        .collect();
+    let mut sync = serde_json::json!({
+        "hasMore": has_more, "nextSince": 0, "nextOffset": 0, "watermark": 0,
+    });
+    if let Some(cursor) = next_cursor {
+        sync["nextCursor"] = serde_json::json!(cursor);
+    }
+    serde_json::json!({
+        "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
+        "members": [],
+        "messages": messages,
+        "meta": {"groupId": "", "name": "", "ownerId": "", "platform": "weflow", "type": "chat"},
+        "sync": sync,
+    })
+}
+
+/// 排空交出的游标是终页的 `sync.nextCursor`，原样传递，不是从已交付的消息反推
+/// 出来的时间戳：窗口外的回溯行在交付前就被丢掉了，最大时间戳并不等于进度。
+#[tokio::test]
+async fn drain_session_cursor_returns_the_terminal_cursor() {
+    let mock = Mock::default();
+    *mock.pull_pages.lock().unwrap() = vec![
+        pull_page_fixture(true, Some("c1"), &[("1", 1_700_000_000)]),
+        pull_page_fixture(false, Some("c2"), &[("2", 1_700_000_001)]),
+    ];
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+
+    let outcome = client
+        .drain_session_cursor("alice", None, |_, _| Ok(()))
+        .await
+        .expect("排空应成功");
+    assert_eq!(outcome.count, 2);
+    assert_eq!(outcome.cursor.as_deref(), Some("c2"), "交出的是终页游标，不是首页的");
+    let queries = mock.pull_queries.lock().unwrap().clone();
+    assert_eq!(queries.len(), 2, "{queries:?}");
+    assert_eq!(sent_cursor(&queries[1]).as_deref(), Some("c1"), "续页必须原样回传服务端游标");
+}
+
+/// 空页也是排空：没有消息可交付时游标照样交出——调用方据此推进增量位置，
+/// 「交付 0 条」不等于「位置未知」。
+#[tokio::test]
+async fn drain_session_cursor_returns_the_cursor_of_an_empty_terminal_page() {
+    let mock = Mock::default();
+    *mock.pull_pages.lock().unwrap() = vec![pull_page_fixture(false, Some("c9"), &[])];
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+
+    let mut deliveries: Vec<usize> = Vec::new();
+    let outcome = client
+        .drain_session_cursor("alice", None, |page, _| {
+            deliveries.push(page.len());
+            Ok(())
+        })
+        .await
+        .expect("空页排空应成功");
+    assert_eq!(outcome.count, 0);
+    assert_eq!(outcome.cursor.as_deref(), Some("c9"));
+    assert_eq!(deliveries, vec![0], "空页仍过一次回调，调用方才知道这段没有内容");
+}
+
+/// 窗口把所有行都滤掉时，游标仍要交出：被丢掉的行服务端早已记进游标，交付 0 条
+/// 不等于进度没动。
+#[tokio::test]
+async fn drain_session_cursor_returns_the_cursor_when_the_window_drops_every_row() {
+    let mock = Mock::default();
+    *mock.pull_pages.lock().unwrap() =
+        vec![pull_page_fixture(false, Some("c7"), &[("old-1", 1_700_000_400)])];
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+
+    let mut delivered: Vec<String> = Vec::new();
+    let outcome = client
+        .drain_session_cursor("alice", Some(1_700_000_500), |page, _| {
+            delivered.extend(page.iter().map(|m| m.platform_message_id.clone()));
+            Ok(())
+        })
+        .await
+        .expect("全被滤掉也要成功收尾");
+    assert!(delivered.is_empty(), "窗口外的行不得交付：{delivered:?}");
+    assert_eq!(outcome.count, 0);
+    assert_eq!(outcome.cursor.as_deref(), Some("c7"), "游标不因过滤而丢失");
+}
+
+/// 早于游标面世的响应可能整段没有 `nextCursor`：消息已经交付，只有续拉点未知。
+/// 那是 `None`，不是错误——报错会把一次成功的排空说成失败。
+#[tokio::test]
+async fn drain_session_cursor_reports_no_cursor_for_a_response_without_one() {
+    let mock = Mock::default();
+    *mock.pull_pages.lock().unwrap() = vec![pull_page_fixture(false, None, &[("1", 1_700_000_000)])];
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+
+    let outcome = client
+        .drain_session_cursor("alice", None, |_, _| Ok(()))
+        .await
+        .expect("缺游标不是错误");
+    assert_eq!(outcome.count, 1);
+    assert_eq!(outcome.cursor, None, "缺字段只能是 None，不能编一个出来");
+}
+
+/// 回环守卫只在 `hasMore=true` 时生效：终页回传与请求相同的游标是正常收尾，
+/// 不是形状错误——终页不再续拉，原地打转无从发生。
+#[tokio::test]
+async fn drain_session_cursor_accepts_a_repeated_cursor_on_the_terminal_page() {
+    let mock = Mock::default();
+    *mock.pull_pages.lock().unwrap() = vec![
+        pull_page_fixture(true, Some("c1"), &[("1", 1_700_000_000)]),
+        pull_page_fixture(false, Some("c1"), &[("2", 1_700_000_001)]),
+    ];
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+
+    let outcome = client
+        .drain_session_cursor("alice", None, |_, _| Ok(()))
+        .await
+        .expect("终页重复游标必须被接受");
+    assert_eq!(outcome.count, 2);
+    assert_eq!(outcome.cursor.as_deref(), Some("c1"));
+    let queries = mock.pull_queries.lock().unwrap().clone();
+    assert_eq!(
+        sent_cursor(&queries[1]).as_deref(),
+        Some("c1"),
+        "第二页仍要回传服务端给的游标，否则这条用例退化成「不推进也放行」"
+    );
+}
+
+/// `on_page` 失败即整体失败，不交出结果：半截的 `count` 会让人以为那部分已经
+/// 落地，而调用方的落盘可能随异常回滚了。
+#[tokio::test]
+async fn drain_session_cursor_hands_no_outcome_when_the_callback_fails() {
+    let mock = Mock::default();
+    *mock.pull_pages.lock().unwrap() = vec![
+        pull_page_fixture(true, Some("c1"), &[("1", 1_700_000_000)]),
+        pull_page_fixture(false, Some("c2"), &[("2", 1_700_000_001)]),
+    ];
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+
+    let mut calls = 0usize;
+    let mut checkpoints: Vec<Option<String>> = Vec::new();
+    let err = client
+        .drain_session_cursor("alice", None, |_, resume| {
+            calls += 1;
+            checkpoints.push(resume.map(str::to_string));
+            Err(ClientError::UnexpectedBody {
+                url: "on_page".to_string(),
+                detail: "disk full".to_string(),
+            })
+        })
+        .await
+        .expect_err("回调失败必须整体失败");
+    match err {
+        ClientError::UnexpectedBody { detail, .. } => assert_eq!(detail, "disk full"),
+        other => panic!("必须是回调自己的错误：{other:?}"),
+    }
+    assert_eq!(calls, 1, "第一页就失败，不该继续");
+    assert_eq!(
+        checkpoints,
+        vec![Some("c1".to_string())],
+        "失败前续拉点已经交出去了，调用方存得下"
+    );
+    assert_eq!(mock.pull_queries.lock().unwrap().len(), 1, "失败即停，不再续页");
+}
+
+/// 交出的游标能直接续拉：交给 `pull_page_cursor` 就接着这一页之后，调用方不必
+/// 重新猜一个 `since` 下界。
+#[tokio::test]
+async fn drain_session_cursor_resumes_from_the_cursor_it_returned() {
+    let mock = Mock::default();
+    *mock.pull_pages.lock().unwrap() = vec![
+        pull_page_fixture(false, Some("c2"), &[("1", 1_700_000_000)]),
+        pull_page_fixture(false, Some("c3"), &[("2", 1_700_000_001)]),
+    ];
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+
+    let first = client
+        .drain_session_cursor("alice", None, |_, _| Ok(()))
+        .await
+        .expect("首次排空应成功");
+    let next = client
+        .pull_page_cursor("alice", first.cursor.as_deref(), None, None)
+        .await
+        .expect("用交出的游标续拉应成功");
+    assert_eq!(next.messages.len(), 1);
+    assert_eq!(next.messages[0].platform_message_id, "2");
+    let queries = mock.pull_queries.lock().unwrap().clone();
+    assert_eq!(queries.len(), 2, "{queries:?}");
+    assert_eq!(sent_cursor(&queries[1]).as_deref(), Some("c2"), "续拉必须带上交出的游标");
+    assert!(
+        query_params(&queries[1]).iter().all(|(k, _)| k != "since"),
+        "有游标就不该再发 since：{}",
+        queries[1]
+    );
 }
 
 /// 没有 `reason` 的 409 不是「重拉」信号：照旧当错误上抛，别把真冲突吞成重试。

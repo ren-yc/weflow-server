@@ -151,6 +151,25 @@ impl RegisterOutcome {
     }
 }
 
+/// What [`Client::drain_session_cursor`] hands back once the loop has finished.
+///
+/// The cursor is the terminal page's `sync.nextCursor`, echoed verbatim: feed it
+/// to [`Client::pull_page_cursor`] and the next pull continues exactly where the
+/// drain stopped, without the caller reconstructing a `since` bound from the
+/// messages it happened to receive (rows below the window are dropped before
+/// delivery, so the highest delivered timestamp is not the resume point).
+///
+/// The server omits the cursor on responses that predate the opaque-cursor
+/// face; that is `None`, not an error — those messages were delivered, only the
+/// resume point is unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainOutcome {
+    /// Messages handed to `on_page`, summed across every page.
+    pub count: u64,
+    /// Resume point from the terminal page, unmodified.
+    pub cursor: Option<String>,
+}
+
 /// Query for the native messages face ([`Client::list_messages`]).
 ///
 /// Time bounds accept either unix seconds or `YYYYMMDD`; as an upper bound a
@@ -684,14 +703,23 @@ impl Client {
     ///
     /// 服务端返回的下一游标为空或**与本次请求的游标相同**都是形状错误：继续翻页
     /// 会原地打转、把同一页反复交给 `on_page`。两者都以错误终止，而不是猜测。
+    ///
+    /// 排空后交出游标：终页的 `sync.nextCursor` 原样放进 [`DrainOutcome::cursor`]。
+    /// 让调用方从已交付的消息反推续拉点做不到——窗口外的回溯行在交付前就被丢掉了，
+    /// 最大时间戳并不等于进度。
+    ///
+    /// 回调的第二个参数是**本页之后的续拉点**（`hasMore=false` 时是终页游标）。中途
+    /// 遇到传输或状态错误时循环交不出结果，调用方只能指望这个检查点：每页把它落盘，
+    /// 失败或进程退出后交给 `pull_page_cursor` 从那一点接着拉。`on_page` 报错时整体
+    /// 失败、不交出 `DrainOutcome`——半截的 `count` 会让人以为那部分已经安全落地。
     pub async fn drain_session_cursor<F>(
         &self,
         talker: &str,
         since: Option<i64>,
         mut on_page: F,
-    ) -> Result<u64>
+    ) -> Result<DrainOutcome>
     where
-        F: FnMut(&[gen_types::PullMessage]) -> Result<()>,
+        F: FnMut(&[gen_types::PullMessage], Option<&str>) -> Result<()>,
     {
         let mut cursor: Option<String> = None;
         let mut total = 0u64;
@@ -712,8 +740,10 @@ impl Client {
             if !page.sync.has_more {
                 let kept = in_window(page.messages);
                 total += kept.len() as u64;
-                on_page(&kept)?;
-                return Ok(total);
+                // 终页游标同时是回调的检查点与返回值，两处必须是同一个值。
+                let resume = page.sync.next_cursor;
+                on_page(&kept, resume.as_deref())?;
+                return Ok(DrainOutcome { count: total, cursor: resume });
             }
             // 形状守卫在**交付之前**：hasMore=true 却不推进游标（缺失，或原样回环）
             // 时，继续翻页只会原地打转、把同一页反复交给 `on_page`。先把这一页的
@@ -740,7 +770,7 @@ impl Client {
             };
             let kept = in_window(page.messages);
             total += kept.len() as u64;
-            on_page(&kept)?;
+            on_page(&kept, Some(next.as_str()))?;
             cursor = Some(next);
         }
     }
