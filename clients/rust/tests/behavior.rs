@@ -766,7 +766,9 @@ fn pull_page_fixture(
         })
         .collect();
     let mut sync = serde_json::json!({
-        "hasMore": has_more, "nextSince": 0, "nextOffset": 0, "watermark": 0,
+        // 桩页必须带 `sync.since`（契约 0.13.0 起必填、无窗口为 null）：生成的客户端
+        // 模型不接受缺键。本夹具不建模窗口，统一给 `null`。
+        "hasMore": has_more, "since": null, "nextSince": 0, "nextOffset": 0, "watermark": 0,
     });
     if let Some(cursor) = next_cursor {
         sync["nextCursor"] = serde_json::json!(cursor);
