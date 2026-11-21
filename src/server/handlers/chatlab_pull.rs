@@ -27,6 +27,10 @@ pub async fn handler(
     // 8-digit unix second is 1970-04-26, far below any real message), and it
     // keeps this face consistent with `/api/v1/messages`'s time bounds.
     let since = query.get("since").and_then(|s| crate::server::parse_time_bound(s));
+    // `since=0` 与省略等价：0 是纪元起点，挡不住任何真实行，却会让游标与回显带上
+    // 一个假下界（`sync.since: 0` 读起来像「从 1970 年起」）。在建链入口归一化成
+    // 「无下界」，游标里因此统一存 `i64::MIN` 哨兵。回归：`pull_since_zero_is_no_window`。
+    let since = since.filter(|s| *s != 0);
     let end = query.get("end").and_then(|s| crate::server::parse_time_bound_end(s));
     let limit = crate::server::parse_limit(&query, "limit", 5000, 5000);
     let offset = crate::server::parse_offset(&query, "offset");
@@ -330,6 +334,12 @@ pub async fn handler(
             has_more,
             next_cursor: Some(next_cursor),
             next_since,
+            // `i64::MIN` 是「无下界」的内部哨兵，0 是归一化之前签出的旧游标里才可能
+            // 出现的值；两者都回显 `null`，其余原样回显。哨兵不外泄（契约 0.13.0）。
+            since: match excluded_since {
+                i64::MIN | 0 => None,
+                bound => Some(bound),
+            },
             // Both cursors are meant to be echoed back verbatim, so they must
             // not skip the same rows twice. `nextSince` is exclusive and the
             // page ends on a complete ts group, so re-filtering with it drops

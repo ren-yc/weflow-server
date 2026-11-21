@@ -461,14 +461,14 @@ async fn drain_session_echoes_cursors_verbatim_until_exhausted() {
             "members": [],
             "messages": [msg(1, 990), msg(2, 1000)],
             "meta": {"groupId": "", "name": "", "ownerId": "", "platform": "weflow", "type": "chat"},
-            "sync": {"hasMore": true, "nextSince": 1000, "nextOffset": 7, "watermark": 2000},
+            "sync": {"since": null, "hasMore": true, "nextSince": 1000, "nextOffset": 7, "watermark": 2000},
         }),
         serde_json::json!({
             "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
             "members": [],
             "messages": [msg(3, 1500)],
             "meta": {"groupId": "", "name": "", "ownerId": "", "platform": "weflow", "type": "chat"},
-            "sync": {"hasMore": false, "nextSince": 2000, "nextOffset": 0, "watermark": 2000},
+            "sync": {"since": null, "hasMore": false, "nextSince": 2000, "nextOffset": 0, "watermark": 2000},
         }),
     ];
     let base = spawn_mock(mock.clone()).await;
@@ -505,7 +505,7 @@ async fn pull_page_decodes_the_sync_block_and_sends_the_cursors() {
             "platformMessageId": "1", "sender": "alice", "timestamp": 1000, "type": 1,
         }],
         "meta": {"groupId": "", "name": "", "ownerId": "", "platform": "weflow", "type": "chat"},
-        "sync": {"hasMore": true, "nextSince": 1000, "nextOffset": 4, "watermark": 2000},
+        "sync": {"since": null, "hasMore": true, "nextSince": 1000, "nextOffset": 4, "watermark": 2000},
     })];
     let base = spawn_mock(mock.clone()).await;
     let client = Client::new(&base, TOKEN);
@@ -533,7 +533,7 @@ async fn pull_page_omits_defaulted_cursors_instead_of_sending_zero() {
         "members": [],
         "messages": [],
         "meta": {"groupId": "", "name": "", "ownerId": "", "platform": "weflow", "type": "chat"},
-        "sync": {"hasMore": false, "nextSince": 0, "nextOffset": 0, "watermark": 0},
+        "sync": {"since": null, "hasMore": false, "nextSince": 0, "nextOffset": 0, "watermark": 0},
     })];
     let base = spawn_mock(mock.clone()).await;
     let client = Client::new(&base, TOKEN);
@@ -558,7 +558,7 @@ async fn pull_cursor_page_sends_the_token_verbatim_and_drops_since() {
         "members": [],
         "messages": [],
         "meta": {"groupId": "", "name": "", "ownerId": "", "platform": "weflow", "type": "chat"},
-        "sync": {"hasMore": false, "nextSince": 0, "nextOffset": 0, "nextCursor": "tok+/=", "watermark": 0},
+        "sync": {"since": null, "hasMore": false, "nextSince": 0, "nextOffset": 0, "nextCursor": "tok+/=", "watermark": 0},
     })];
     let base = spawn_mock(mock.clone()).await;
     let client = Client::new(&base, TOKEN);
@@ -590,7 +590,7 @@ async fn drain_session_cursor_propagates_cursor_reset_without_restarting() {
             "messages": [{"accountName":"","content":"one","groupNickname":"","platformMessageId":"1",
                           "sender":"alice","timestamp":1700000000,"type":0}],
             "meta": {"groupId": "", "name": "", "ownerId": "", "platform": "weflow", "type": "chat"},
-            "sync": {"hasMore": true, "nextSince": 1700000000, "nextOffset": 0, "nextCursor": "c1", "watermark": 1700000000},
+            "sync": {"since": null, "hasMore": true, "nextSince": 1700000000, "nextOffset": 0, "nextCursor": "c1", "watermark": 1700000000},
         }),
     ];
     let base = spawn_mock(mock.clone()).await;
@@ -633,7 +633,7 @@ async fn drain_session_cursor_drops_rows_below_the_since_bound() {
              "sender":"alice","timestamp":1700000400,"type":0},
         ],
         "meta": {"groupId": "", "name": "", "ownerId": "", "platform": "wechat", "type": "chat"},
-        "sync": {"hasMore": false, "nextSince": 1700000530, "nextOffset": 0,
+        "sync": {"since": null, "hasMore": false, "nextSince": 1700000530, "nextOffset": 0,
                  "nextCursor": "c1", "watermark": 1700000530},
     })];
     let base = spawn_mock(mock.clone()).await;
@@ -663,7 +663,7 @@ async fn drain_session_cursor_rejects_a_non_advancing_cursor() {
             "messages": [{"accountName":"","content":"one","groupNickname":"","platformMessageId":"1",
                           "sender":"alice","timestamp":1700000000,"type":0}],
             "meta": {"groupId": "", "name": "", "ownerId": "", "platform": "weflow", "type": "chat"},
-            "sync": {"hasMore": true, "nextSince": 1700000000, "nextOffset": 0, "nextCursor": "c1", "watermark": 1700000000},
+            "sync": {"since": null, "hasMore": true, "nextSince": 1700000000, "nextOffset": 0, "nextCursor": "c1", "watermark": 1700000000},
         }),
         serde_json::json!({
             "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
@@ -671,7 +671,7 @@ async fn drain_session_cursor_rejects_a_non_advancing_cursor() {
             "messages": [{"accountName":"","content":"one-again","groupNickname":"","platformMessageId":"1",
                           "sender":"alice","timestamp":1700000000,"type":0}],
             "meta": {"groupId": "", "name": "", "ownerId": "", "platform": "weflow", "type": "chat"},
-            "sync": {"hasMore": true, "nextSince": 1700000000, "nextOffset": 0, "nextCursor": "c1", "watermark": 1700000000},
+            "sync": {"since": null, "hasMore": true, "nextSince": 1700000000, "nextOffset": 0, "nextCursor": "c1", "watermark": 1700000000},
         }),
     ];
     let base = spawn_mock(mock.clone()).await;

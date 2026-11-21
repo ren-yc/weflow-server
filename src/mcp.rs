@@ -367,14 +367,16 @@ impl WeflowMcp {
             },
             // 绝对下界：续拉时传它而不是原始 since 串（下一轮 now 已前移，相对串会挪窗）。
             "sinceResolved": since_resolved,
+            // 服务端逐页回显的链窗口下界（契约 0.13.0）。它比调用方传来的相对串权威：
+            // 游标链的窗口在建链时就定死了，后续轮次重算的「24h 前」已经前移。
+            "since": page.sync.since,
             // hint 只在真被截断时出现；`since` 未提供时 sinceResolved 为 null，此时教调用方
             // 「传响应里的 sinceResolved」会得到 null/反序列化失败（见最后一个分支）。
             "hint": if !cut {
-                // 续拉没带 since 时工具面无从得知首次的下界：服务端在给出 cursor 时既忽略
-                // 入参 since、也不把游标里的窗口回显出来（解析游标是被禁止的）。本页因此
-                // 不应用时间窗口，而「沉默地放宽窗口」正是这条要避免的形态。
-                if cursor_mode && since.is_none() {
-                    json!("续拉未带 since，本页未应用时间窗口：若首次请求带过 since，请把它（或当时的 sinceResolved）一并回传")
+                // 续拉没带 since 且这条链本来就没有窗口时，工具面确实无从得知下界：
+                // 让调用方补一个 since 只会凭空造出一个窗口。
+                if cursor_mode && since.is_none() && page.sync.since.is_none() {
+                    json!("续拉未带 since，且该链没有窗口下界：本页未应用时间窗口")
                 } else {
                     Value::Null
                 }

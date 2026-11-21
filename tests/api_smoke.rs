@@ -1258,6 +1258,54 @@ async fn chatlab_pull_pagination_drains_every_message() {
     );
 }
 
+/// `sync.since` 回显链的窗口下界：带 `since` 时等于它，无窗口时为 `null`，且
+/// **键始终在场**；`since=0` 与省略等价（0 是纪元起点，不是「从 1970 年起」的窗口）。
+///
+/// 回归：`pull_since_zero_is_no_window`。这条与契约用例
+/// `cursor-sync-since-window` / `cursor-sync-since-no-window` 同口径：那边钉跨实现的
+/// 响应形状，这里钉本服务端的两档取值与 `0` 的归一化。
+#[tokio::test]
+async fn chatlab_pull_echoes_the_window_lower_bound() {
+    let dir = common::tmp_dir("smoke-pull-since");
+    let state = test_state(&dir);
+    let app = server::build_router(state);
+    let uri = |q: &str| {
+        format!(
+            "/api/v1/sessions/{}/messages?{q}limit=5000&access_token={TOKEN}",
+            common::FAKE_GROUP
+        )
+    };
+
+    let (status, no_since) =
+        json_body(app.clone().oneshot(request("GET", &uri(""), None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        no_since["sync"].get("since").is_some(),
+        "键必须始终在场，缺键与 null 不是一回事：{}",
+        no_since["sync"]
+    );
+    assert!(no_since["sync"]["since"].is_null(), "无窗口时回显 null：{}", no_since["sync"]);
+
+    let (_, zero) =
+        json_body(app.clone().oneshot(request("GET", &uri("since=0&"), None)).await.unwrap())
+            .await;
+    assert!(zero["sync"]["since"].is_null(), "since=0 与省略等价，回显同样是 null：{}", zero["sync"]);
+    assert_eq!(
+        zero["messages"], no_since["messages"],
+        "since=0 归一化成无下界，页面集合必须与省略时逐字相同"
+    );
+
+    let (_, windowed) =
+        json_body(app.clone().oneshot(request("GET", &uri("since=1700000000&"), None)).await.unwrap())
+            .await;
+    assert_eq!(
+        windowed["sync"]["since"].as_i64(),
+        Some(1_700_000_000),
+        "带窗口时回显该下界：{}",
+        windowed["sync"]
+    );
+}
+
 #[tokio::test]
 async fn media_and_sync_endpoints() {
     let dir = common::tmp_dir("smoke-media");

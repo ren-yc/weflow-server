@@ -99,6 +99,9 @@ async fn sessions(axum::extract::RawQuery(q): axum::extract::RawQuery) -> Json<V
     }
 }
 
+// 桩响应必须带 `sync.since`：契约 0.13.0 把它列为必填——服务端总是回这个键，
+// 无窗口时是 `null`，生成的客户端模型因此不接受缺键。桩统一给 `null`：它不建模
+// 窗口，真实服务端在带 `since` 建链时会回显那个值。
 async fn pull(
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::extract::RawQuery(q): axum::extract::RawQuery,
@@ -129,7 +132,7 @@ async fn pull(
             "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
             "members": [], "messages": [],
             "meta": {"groupId": "", "name": "空会话", "ownerId": "", "platform": "wechat", "type": "private"},
-            "sync": {"hasMore": false, "nextSince": 1_700_000_000, "nextOffset": 0, "watermark": 1_700_000_000},
+            "sync": {"since": null, "hasMore": false, "nextSince": 1_700_000_000, "nextOffset": 0, "watermark": 1_700_000_000},
         }))
         .into_response();
     }
@@ -156,7 +159,7 @@ async fn pull(
             "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
             "members": [], "messages": messages,
             "meta": {"groupId": "", "name": "演示会话", "ownerId": "", "platform": "wechat", "type": "private"},
-            "sync": {"hasMore": false, "nextSince": 1_700_000_500, "nextOffset": 0, "watermark": 1_700_000_500},
+            "sync": {"since": null, "hasMore": false, "nextSince": 1_700_000_500, "nextOffset": 0, "watermark": 1_700_000_500},
         }))
         .into_response();
     }
@@ -186,7 +189,7 @@ async fn pull(
             "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
             "members": [], "messages": messages,
             "meta": {"groupId": "", "name": "演示会话", "ownerId": "", "platform": "wechat", "type": "private"},
-            "sync": {
+            "sync": {"since": null,
                 "hasMore": !second,
                 "nextCursor": if second { "ct2" } else { "ct1" },
                 "nextSince": 1_700_000_002, "nextOffset": 0, "watermark": 1_700_000_002,
@@ -223,7 +226,7 @@ async fn pull(
             "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
             "members": [], "messages": messages,
             "meta": {"groupId": "", "name": "分叉会话", "ownerId": "", "platform": "wechat", "type": "private"},
-            "sync": {
+            "sync": {"since": null,
                 "hasMore": !has("cursor=ooo2"),
                 "nextCursor": next_cursor,
                 "nextSince": 1_700_000_530, "nextOffset": 0, "watermark": 1_700_000_530,
@@ -253,7 +256,7 @@ async fn pull(
             "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
             "members": [], "messages": messages,
             "meta": {"groupId": "", "name": "结算页会话", "ownerId": "", "platform": "wechat", "type": "private"},
-            "sync": {
+            "sync": {"since": null,
                 "hasMore": !second,
                 "nextCursor": if second { "e2" } else { "e1" },
                 "nextSince": 1_700_000_520, "nextOffset": 0, "watermark": 1_700_000_520,
@@ -294,7 +297,7 @@ async fn pull(
             "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
             "members": [], "messages": messages,
             "meta": {"groupId": "", "name": "窗口会话", "ownerId": "", "platform": "wechat", "type": "private"},
-            "sync": {
+            "sync": {"since": null,
                 "hasMore": !has("cursor=w2"),
                 "nextCursor": if has("cursor=w1") { "w2" } else { "w1" },
                 "nextSince": 1_700_000_530, "nextOffset": 0, "watermark": 1_700_000_530,
@@ -322,7 +325,7 @@ async fn pull(
             "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
             "members": [], "messages": [m],
             "meta": {"groupId": "", "name": "泄露会话", "ownerId": "", "platform": "wechat", "type": "private"},
-            "sync": {
+            "sync": {"since": null,
                 "hasMore": true, "nextCursor": "leak1",
                 "nextSince": 1_700_000_000, "nextOffset": 0, "watermark": 1_700_000_000,
             },
@@ -348,7 +351,7 @@ async fn pull(
             "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
             "members": [], "messages": [pull_message()],
             "meta": {"groupId": "", "name": "演示会话", "ownerId": "", "platform": "wechat", "type": "private"},
-            "sync": {"hasMore": true, "nextCursor": "r1", "nextSince": 1_700_000_000, "nextOffset": 0, "watermark": 1_700_000_000},
+            "sync": {"since": null, "hasMore": true, "nextCursor": "r1", "nextSince": 1_700_000_000, "nextOffset": 0, "watermark": 1_700_000_000},
         }))
         .into_response();
     }
@@ -398,7 +401,7 @@ async fn pull(
             "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
             "members": [], "messages": messages,
             "meta": {"groupId": "", "name": "演示会话", "ownerId": "", "platform": "wechat", "type": "private"},
-            "sync": {
+            "sync": {"since": null,
                 "hasMore": !second,
                 // 排空后仍给一条游标：与「hasMore 决定是否继续」的约定一起钉住。
                 "nextCursor": if second { "c2" } else { "c1" },
@@ -437,7 +440,7 @@ async fn pull(
         "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
         "members": [], "messages": messages,
         "meta": {"groupId": "", "name": "演示会话", "ownerId": "", "platform": "wechat", "type": "private"},
-        "sync": {"hasMore": false, "nextSince": 1_700_000_000, "nextOffset": 0, "watermark": 1_700_000_000},
+        "sync": {"since": null, "hasMore": false, "nextSince": 1_700_000_000, "nextOffset": 0, "watermark": 1_700_000_000},
     }))
     .into_response()
 }
